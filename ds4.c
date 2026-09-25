@@ -38298,6 +38298,14 @@ static bool metal_graph_prefill_chunked_range(
                 if (to_boundary < local_cap) local_cap = to_boundary;
             }
         }
+        /* A nonzero chunk stores itself into the SWA ring before attention
+         * reads the previous window from it, so both must fit.  raw_cap is
+         * clamped to 8192, which is not window + prefill_cap for 8192-token
+         * chunks. */
+        if (pos0 != 0 && g->raw_cap > g->raw_window &&
+            local_cap > g->raw_cap - g->raw_window) {
+            local_cap = g->raw_cap - g->raw_window;
+        }
         if (g->deepseek4_vision_weights &&
             prompt->v[pos0] >= (int)DS4_N_VOCAB) {
             local_cap = chunk_cap;
