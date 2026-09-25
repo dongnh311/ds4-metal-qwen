@@ -45360,26 +45360,31 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
             g_dsv4_hc_producer_last_completion = completion;
         }
         [g_transient_buffers addObject:completion];
-        /* Monotonic cross-threadgroup barrier counter for this mix tensor,
-         * plus the host-side dispatch count that sets the target. */
+        /* Monotonic cross-threadgroup barrier counter for this mix tensor.
+         * The kernel derives each dispatch's target from the arrival index;
+         * the host only counts dispatches to swap in a zeroed counter long
+         * before 6 * count could wrap a uint32. */
         NSString *barrier_key = [NSString stringWithFormat:@"%p:%llu",
             (void *)mixbuf, (unsigned long long)mix_offset];
         if (!g_dsv4_hc_barrier_cache) {
             g_dsv4_hc_barrier_cache = [NSMutableDictionary dictionary];
             g_dsv4_hc_barrier_gen = [NSMutableDictionary dictionary];
         }
+        const uint32_t barrier_group = 6u;
+        uint32_t gen =
+            (uint32_t)[[g_dsv4_hc_barrier_gen objectForKey:barrier_key] unsignedIntValue] + 1u;
         id<MTLBuffer> barrier = [g_dsv4_hc_barrier_cache objectForKey:barrier_key];
-        if (!barrier) {
+        if (!barrier || gen > (1u << 28)) {
+            /* In-flight command buffers keep the old counter alive through
+             * g_transient_buffers. */
             barrier = [g_device newBufferWithLength:sizeof(uint32_t)
                                             options:MTLResourceStorageModeShared];
             if (!barrier) return 0;
             *((uint32_t *)[barrier contents]) = 0u;
             [g_dsv4_hc_barrier_cache setObject:barrier forKey:barrier_key];
+            gen = 1u;
         }
-        const uint32_t gen =
-            (uint32_t)[[g_dsv4_hc_barrier_gen objectForKey:barrier_key] unsignedIntValue] + 1u;
         [g_dsv4_hc_barrier_gen setObject:@(gen) forKey:barrier_key];
-        const uint32_t barrier_target = 6u * gen;
         [g_transient_buffers addObject:barrier];
         ds4_gpu_hc_expand_args ex = {
             .n_embd = n_embd,
@@ -45439,7 +45444,7 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         [enc setBytes:&mix_args length:sizeof(mix_args) atIndex:0];
         [enc setBytes:&split_args length:sizeof(split_args) atIndex:1];
         [enc setBytes:&ex length:sizeof(ex) atIndex:2];
-        [enc setBytes:&barrier_target length:sizeof(barrier_target) atIndex:3];
+        [enc setBytes:&barrier_group length:sizeof(barrier_group) atIndex:3];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:4];
         [enc setBuffer:mix_weight offset:(NSUInteger)mix_weight_inner atIndex:5];
         [enc setBuffer:mixbuf offset:ds4_gpu_tensor_offset(mix) atIndex:6];
