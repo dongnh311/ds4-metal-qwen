@@ -43446,7 +43446,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_mm_id &&
             !(gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               (ds4_gpu_routed_mm_mpp_mask() & 3) == 3) &&
-            g_tp_split_world != 2 &&    /* pair-swiglu mm kernel lacks expert ownership */
+            g_tp_split_world <= 1 &&    /* pair-swiglu mm kernel lacks expert ownership */
             request_mid_f16 &&
             n_expert == 6 &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
