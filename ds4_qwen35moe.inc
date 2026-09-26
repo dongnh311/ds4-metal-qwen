@@ -196,13 +196,62 @@ static bool qwen35_gemv(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *out, const ds4_m
     return ok;
 }
 
+static bool qwen35_attn_multi_gemv(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_QWEN35_ATTN_MULTI_GEMV"); v = e && e[0] && e[0] != '0'; }
+    return v;
+}
+
+/* q/attn_q, k and v projections folded into one ds4_gpu_qwen4_multi_gemv_tensor
+ * dispatch (DS4_QWEN35_ATTN_MULTI_GEMV, default off): its reduction order
+ * differs from three separate qwen4_gemv calls, so it is a non-exact lever
+ * kept only where gate 1 shows identical output.  Under a speculative
+ * verify's g->verify_rows_exact (T > 1u) the fused call still runs once per
+ * row with n_tokens = 1 on row views of x and every output, exactly the
+ * qwen35_gemv pattern above, so row 0 of a verify's fused call takes the
+ * same n_tokens = 1 path a plain T = 1 decode step would (with the lever on). */
+static bool qwen35_attn_proj_fused(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                   uint32_t T) {
+    ds4_gpu_tensor *outs[3] = { g->qg, g->kp, g->vp };
+    const uint64_t offs[3] = { l->attn_q->abs_offset, l->attn_k->abs_offset, l->attn_v->abs_offset };
+    const uint32_t types[3] = { l->attn_q->type, l->attn_k->type, l->attn_v->type };
+    const uint32_t rows[3] = { (uint32_t)l->attn_q->dim[1], (uint32_t)l->attn_k->dim[1], (uint32_t)l->attn_v->dim[1] };
+    if (!g->verify_rows_exact || T <= 1u) {
+        return ds4_gpu_qwen4_multi_gemv_tensor(g->mixed, T, DS4_N_EMBD, 3, outs, m->map, m->size,
+                                               offs, types, rows) != 0;
+    }
+    const uint64_t xrow = (uint64_t)DS4_N_EMBD * sizeof(float);
+    bool ok = true;
+    for (uint32_t t = 0; t < T && ok; t++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(g->mixed, (uint64_t)t * xrow, xrow);
+        ds4_gpu_tensor *outr[3] = { NULL, NULL, NULL };
+        bool have = xr != NULL;
+        for (uint32_t i = 0; i < 3 && have; i++) {
+            const uint64_t orow = (uint64_t)rows[i] * sizeof(float);
+            outr[i] = ds4_gpu_tensor_view(outs[i], (uint64_t)t * orow, orow);
+            have = outr[i] != NULL;
+        }
+        ok = have && ds4_gpu_qwen4_multi_gemv_tensor(xr, 1u, DS4_N_EMBD, 3, outr, m->map, m->size,
+                                                      offs, types, rows) != 0;
+        for (uint32_t i = 0; i < 3; i++) ds4_gpu_tensor_free(outr[i]);
+        ds4_gpu_tensor_free(xr);
+    }
+    return ok;
+}
+
 /* q/gate, k and v projections of the rows in mixed, then the indexer-free
  * prep: q/k norms, RoPE and the F16 K/V append at positions pos0.. */
 static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                         uint32_t il, uint32_t pos0, uint32_t T) {
-    return qwen35_gemv(g, g->qg, m, l->attn_q, g->mixed, T) &&
-           qwen35_gemv(g, g->kp, m, l->attn_k, g->mixed, T) &&
-           qwen35_gemv(g, g->vp, m, l->attn_v, g->mixed, T) &&
+    bool proj;
+    if (T <= 2u && qwen35_attn_multi_gemv()) {
+        proj = qwen35_attn_proj_fused(g, m, l, T);
+    } else {
+        proj = qwen35_gemv(g, g->qg, m, l->attn_q, g->mixed, T) &&
+               qwen35_gemv(g, g->kp, m, l->attn_k, g->mixed, T) &&
+               qwen35_gemv(g, g->vp, m, l->attn_v, g->mixed, T);
+    }
+    return proj &&
            ds4_gpu_qwen35_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il],
                                            g->qg, g->kp, g->vp, g->pos3, m->map, m->size,
                                            l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
