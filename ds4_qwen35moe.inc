@@ -411,9 +411,30 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     if (!glm_graph_begin_commands_if_needed()) return false;
     g->snap_after_first = snap;
     if (snap) g->snap_pos = pos0 + 1u;
+    /* DS4_QWEN35_PROFILE stage timer (Ornith-only, additive; off by default
+     * so the env-unset path below is byte-identical to before this change).
+     *   =1 profiles prefill chunks (T>1, one stderr line per chunk) and the
+     *      T==2 MTP verify step, so the 128K verify's KV cost is visible.
+     *   =2 additionally profiles T==1 decode steps.  Decode issues one call
+     *      per token, so printing every step would be mostly noise; instead
+     *      accumulate DS4_QWEN35_PROF_DECODE_N steps and print the mean
+     *      ms/step.  That is the least-noisy form that still separates GDN,
+     *      attention and head cost during steady-state decode.
+     * Each QWEN35_PROF() call ends and re-begins the command buffer, which
+     * is only safe to do off the T==1 decode fast path when explicitly
+     * asked for (level 2); T>1u alone already implies extra syncs are fine
+     * because prefill chunking already flushes between chunks. */
+#define DS4_QWEN35_PROF_DECODE_N 64u
+    static int prof_level = -1;
+    if (prof_level < 0) { const char *e = getenv("DS4_QWEN35_PROFILE"); prof_level = e && e[0] ? atoi(e) : 0; }
+    const bool prof = (prof_level >= 1 && T > 1u) || (prof_level >= 2 && T == 1u);
+    double p[5] = {0}, prof_last = prof ? now_sec() : 0.0;
+#define QWEN35_PROF(idx_) do { if (prof) { ds4_gpu_end_commands(); const double n_ = now_sec(); \
+        p[idx_] += n_ - prof_last; prof_last = n_; glm_graph_begin_commands_if_needed(); } } while (0)
     bool ok = qwen35_graph_carry_h(g, pos0);
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && ok; il++) {
         ok = qwen35_graph_layer(g, m, w, il, pos0, T);
+        QWEN35_PROF(ds4_qwen35_layer_is_attention(il) ? 2 : 1);   /* 1 gdn, 2 attn (moe folded into the layer's own bucket) */
     }
     if (ok && g->mtp_h) {
         /* post-output_norm rows: the MTP seed rows 1..T and the LM head input */
@@ -433,6 +454,31 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
              qwen4_gemv(g->logits, m, w->output, g->mixed, 1u);
         ds4_gpu_tensor_free(last);
     }
+    QWEN35_PROF(4);
+    if (prof) {
+        if (T > 1u) {
+            /* Also covers the T==2 MTP verify chunk, so the 128K verify's
+             * attention/KV cost shows up here alongside ordinary prefill. */
+            fprintf(stderr, "ds4: Ornith stage ms/chunk (pos=%u T=%u): gdn %.1f attn %.1f head %.1f\n",
+                    pos0, T, 1000.0 * p[1], 1000.0 * p[2], 1000.0 * p[4]);
+        } else {
+            static double dprof[5] = {0};
+            static uint32_t dprof_n = 0, dprof_pos0 = 0;
+            if (dprof_n == 0) dprof_pos0 = pos0;
+            for (int i = 0; i < 5; i++) dprof[i] += p[i];
+            dprof_n++;
+            if (dprof_n >= DS4_QWEN35_PROF_DECODE_N) {
+                fprintf(stderr, "ds4: Ornith decode stage ms/step (avg over %u steps, pos=%u..%u): "
+                        "gdn %.2f attn %.2f head %.2f\n",
+                        dprof_n, dprof_pos0, pos0, 1000.0 * dprof[1] / dprof_n,
+                        1000.0 * dprof[2] / dprof_n, 1000.0 * dprof[4] / dprof_n);
+                for (int i = 0; i < 5; i++) dprof[i] = 0;
+                dprof_n = 0;
+            }
+        }
+    }
+#undef QWEN35_PROF
+#undef DS4_QWEN35_PROF_DECODE_N
     if (!ds4_gpu_end_commands()) ok = false;
     const uint32_t n_rows = all_rows ? T : 1u;
     if (ok && logits_out) {
