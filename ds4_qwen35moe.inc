@@ -287,8 +287,11 @@ static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model 
 static int qwen35_attn_decode2_env(void) {
     static int on = -1;
     if (on < 0) {
+        /* On by default since the M4 A/B (+4.9% decode at 32K, bit-exact
+         * verify by construction); DS4_QWEN35_ATTN_DECODE2=0 restores the
+         * per-row decode kernel. */
         const char *e = getenv("DS4_QWEN35_ATTN_DECODE2");
-        on = e && e[0] && e[0] != '0';
+        on = (e && e[0]) ? e[0] != '0' : 1;
     }
     return on;
 }
