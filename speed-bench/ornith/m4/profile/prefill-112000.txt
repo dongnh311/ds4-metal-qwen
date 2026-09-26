@@ -1,0 +1,18 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: Ornith stage ms/chunk (pos=0 T=2048): gdn 714.3 attn 409.3 head 2.2
+ds4: Ornith stage ms/chunk (pos=2048 T=2048): gdn 702.6 attn 620.7 head 2.1
+ds4: Ornith stage ms/chunk (pos=4096 T=2048): gdn 701.0 attn 903.8 head 2.1
+ds4: Ornith stage ms/chunk (pos=6144 T=2048): gdn 703.5 attn 1180.2 head 2.1
+ds4: Ornith stage ms/chunk (pos=8192 T=2048): gdn 699.1 attn 1456.8 head 2.2
+ds4: Ornith stage ms/chunk (pos=10240 T=2048): gdn 704.7 attn 1735.9 head 2.2
+ds4: Ornith stage ms/chunk (pos=12288 T=2048): gdn 701.6 attn 2015.6 head 2.2
+ds4: Ornith stage ms/chunk (pos=14336 T=2048): gdn 701.1 attn 2294.7 head 2.2
+ds4: Ornith stage ms/chunk (pos=16384 T=2048): gdn 698.8 attn 2570.8 head 2.2
+ds4: Ornith stage ms/chunk (pos=18432 T=2048): gdn 700.6 attn 2854.2 head 2.2
+ds4: Ornith stage ms/chunk (pos=20480 T=2048): gdn 704.7 attn 3140.8 head 2.2
+ds4: Ornith stage ms/chunk (pos=22528 T=2048): gdn 702.1 attn 3405.5 head 2.2
+ds4: Ornith stage ms/chunk (pos=24576 T=2048): gdn 701.6 attn 3688.7 head 2.2
+ds4: Ornith stage ms/chunk (pos=26624 T=2048): gdn 699.9 attn 3971.1 head 2.2
+ds4: Ornith stage ms/chunk (pos=28672 T=2048): gdn 699.7 attn 4241.1 head 2.2
+ds4: Ornith stage ms/chunk (pos=30720 T=1939): gdn 687.1 attn 4305.2 head 2.2
+ds4: prefill: 652.14 t/s, generation: 46.54 t/s

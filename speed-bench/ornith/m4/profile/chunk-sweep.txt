@@ -1,0 +1,3 @@
+chars=112000 (~32K tokens) chunk=2048 ds4: prefill: 620.05 t/s, generation: 47.56 t/s
+chars=112000 (~32K tokens) chunk=4096 ds4: prefill: 630.05 t/s, generation: 46.55 t/s
+chars=112000 (~32K tokens) chunk=8192 ds4: prefill: 632.76 t/s, generation: 47.32 t/s

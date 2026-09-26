@@ -1,0 +1,3 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: Ornith stage ms/chunk (pos=0 T=1999): gdn 725.8 attn 423.9 head 7.3
+ds4: prefill: 1723.27 t/s, generation: 72.59 t/s
