@@ -40141,12 +40141,23 @@ static DS4_MAYBE_UNUSED uint32_t qwen35_prefill_chunk_tokens(uint32_t ctx) {
 /* Ornith KV storage: f16 (default) | fp8 (E4M3) | q4 (4-bit). Own knob per
  * §7.3.  4-bit needs head dim 256 (the qwen4 4-bit KV path's constraint). */
 static DS4_MAYBE_UNUSED void qwen35_kv_mode_env(bool *fp8, bool *q4) {
-    const char *e = getenv("DS4_QWEN35_KV");
-    *fp8 = *q4 = false;
-    if (!e || !e[0] || !strcmp(e, "f16")) return;
-    if (!strcmp(e, "fp8")) *fp8 = true;
-    else if (!strcmp(e, "q4") && DS4_N_HEAD_DIM == 256u) { *fp8 = true; *q4 = true; }
-    else fprintf(stderr, "ds4: DS4_QWEN35_KV=%s ignored (use f16|fp8|q4)\n", e);
+    /* Parsed once and cached: this is called on every KV lookup/store, and
+     * an unrecognised DS4_QWEN35_KV value used to print its "ignored"
+     * warning on every one of those calls instead of once per process. */
+    static bool parsed = false;
+    static bool cached_fp8 = false, cached_q4 = false;
+    if (!parsed) {
+        const char *e = getenv("DS4_QWEN35_KV");
+        cached_fp8 = cached_q4 = false;
+        if (e && e[0] && strcmp(e, "f16")) {
+            if (!strcmp(e, "fp8")) cached_fp8 = true;
+            else if (!strcmp(e, "q4") && DS4_N_HEAD_DIM == 256u) { cached_fp8 = true; cached_q4 = true; }
+            else fprintf(stderr, "ds4: DS4_QWEN35_KV=%s ignored (use f16|fp8|q4)\n", e);
+        }
+        parsed = true;
+    }
+    *fp8 = cached_fp8;
+    *q4 = cached_q4;
 }
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
@@ -60279,7 +60290,12 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     if (g->draft_head_tried) return g->draft_head != NULL;
     g->draft_head_tried = true;
     const char *path = getenv(env_name);
-    if (!path || !path[0] || w->type != DS4_TENSOR_Q8_0 || w->ndim < 2 || (w->dim[0] % 32u) != 0) return false;
+    if (!path || !path[0]) return false;
+    if (w->type != DS4_TENSOR_Q8_0) {
+        fprintf(stderr, "ds4: %s ignored (output head is not Q8_0)\n", env_name);
+        return false;
+    }
+    if (w->ndim < 2 || (w->dim[0] % 32u) != 0) return false;
     FILE *fp = fopen(path, "r");
     if (!fp) { fprintf(stderr, "ds4: MTP draft vocabulary %s: %s\n", path, strerror(errno)); return false; }
     const uint64_t V = w->dim[1];

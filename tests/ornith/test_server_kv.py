@@ -11,10 +11,13 @@ before turn 3.  Every turn ends with stop and no tool call; turns 2 and 3
 reuse more than 3000 cached tokens (turn 3 from disk).
 Phase 2, the same cache without --mtp, replays the last turn of tools-echo
 (its checkpoints are the newest; the 512 MB budget evicts older ones): the
---mtp checkpoint is refused with a clear log line and the prompt is
-prefilled and answered.
+payload-variant byte (h[21]) makes the lookup skip the --mtp checkpoint
+instead of loading and refusing it, so the prompt is cold-prefilled and
+answered (0 cached tokens, no "kv cache load failed"), and the flipped
+server then stores and reuses its own checkpoint for that text.
 Phase 3, a fresh cache: a plain server answers the same replay and stores
-checkpoints without MTP, then a --mtp server refuses them the same way.
+checkpoints without MTP, then a --mtp server hits the same variant skip on
+those checkpoints.
 Hard: the three cold answers of phases 2-3 are byte-identical (greedy, same
 prefill chunks, M2's --mtp output equals plain).  Soft: the arithmetic
 answers, and the cold answer equal to phase 1's, which came through a
@@ -48,14 +51,29 @@ def content(result):
     return result["choices"][0]["message"].get("content") or ""
 
 
-def refused(srv, body, saved, save):
-    """The best checkpoint for body is refused; the prompt is prefilled and answered."""
+def flipped(srv, body, desc, save):
+    """The best on-disk checkpoint for body was saved under the other
+    --mtp/DS4_QWEN35_KV state (payload variant, h[21]): the lookup skips it
+    instead of loading it and being refused, so the prompt is cold-prefilled
+    and answered, and this (flipped) server then stores and reuses its own
+    checkpoint for the same text."""
     result = sl.post("/v1/chat/completions", body, save=save)
     log = srv.new_log()
-    sl.check("kv cache load failed" in log and saved in log, f"a checkpoint {saved} is refused")
+    usage = result["usage"]
+    cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+    sl.check("kv cache load failed" not in log, f"{desc}: no kv cache load failed (the mismatch was skipped)")
+    sl.check(cached == 0, f"{desc}: the mismatched checkpoint is not used (0 cached tokens, got {cached})")
     sl.check(result["choices"][0]["finish_reason"] == "stop" and content(result).strip() != "",
-             "after the refusal the prompt is prefilled and answered")
-    return content(result)
+             "after the variant skip the prompt is prefilled and answered")
+    sl.check("kv cache stored" in log, f"{desc}: the flipped server stores its own checkpoint")
+    answer = content(result)
+
+    save2 = save.with_name(save.name + "-again")
+    result2 = sl.post("/v1/chat/completions", body, save=save2)
+    cached2 = (result2["usage"].get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+    sl.check(cached2 > 0, f"{desc}: a second identical request on the flipped server reuses its "
+                          f"own checkpoint ({cached2} cached)")
+    return answer
 
 
 def main(argv):
@@ -118,7 +136,7 @@ def main(argv):
         sl.check("kv cache evicted reason=disk-cache-full" in text, "the disk budget evicted old checkpoints")
 
         srv = sl.Server(log, server_args(cache, False))
-        phase2 = refused(srv, replay, "saved with --mtp", out / "phase2")
+        phase2 = flipped(srv, replay, "phase2 (mtp cache, plain server)", out / "phase2")
         srv.stop()
 
         plain_cache = out / "kv-plain"
@@ -130,7 +148,7 @@ def main(argv):
         phase3_plain = content(result)
         srv.stop()
         srv = sl.Server(log, server_args(plain_cache, True))
-        phase3_mtp = refused(srv, replay, "saved without --mtp", out / "phase3-mtp")
+        phase3_mtp = flipped(srv, replay, "phase3-mtp (plain cache, mtp server)", out / "phase3-mtp")
         srv.stop()
 
         sl.check(phase2 == phase3_plain == phase3_mtp, "the three cold answers are byte-identical")

@@ -39,6 +39,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -115,7 +116,8 @@ def _omlx_running():
     return "\n".join(hits)
 
 
-MODEL_COMMS = {"ds4", "ds4-server", "ds4-agent", "ds4_test", "omlx-server", "omlx", "llama-server"}
+MODEL_COMMS = {"ds4", "ds4-server", "ds4-agent", "ds4-bench", "ds4-eval", "ds4_test",
+              "omlx-server", "omlx", "llama-server"}
 _PYTHON_COMM_RE = re.compile(r"^python\d*(\.\d+)?$")
 
 
@@ -434,7 +436,21 @@ def verdict(summary):
     return failures
 
 
+def _raise_signal_exit(signum, frame):
+    """SIGTERM/SIGHUP default to a bare process exit that skips `finally:`
+    blocks; turning them into SystemExit lets interleave()'s
+    `finally: arm.stop()` run its bounded SIGTERM stop of the current arm
+    instead of orphaning it."""
+    raise SystemExit(128 + signum)
+
+
+def install_signal_exit_handlers():
+    signal.signal(signal.SIGTERM, _raise_signal_exit)
+    signal.signal(signal.SIGHUP, _raise_signal_exit)
+
+
 def main():
+    install_signal_exit_handlers()
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["baseline", "lever"], required=True)
     ap.add_argument("--ds4-model", required=True)

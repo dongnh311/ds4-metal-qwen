@@ -97,7 +97,7 @@ template [[host_name("kernel_qwen35_moe_mm_down_q5k_nax64")]] kernel void kernel
     text = open(DST, encoding="utf-8").read()
     if MARK in text:
         head = text[:text.index(MARK)].rstrip("\n")
-        tail_after = text[text.index(END) + len(END):].lstrip("\n")
+        tail_after = text[text.index(END) + len(END):].strip("\n")
     else:
         head = text.rstrip("\n")
         tail_after = ""

@@ -331,6 +331,37 @@ class VerdictTest(unittest.TestCase):
         self.assertTrue(any("TTFT" in f for f in m.verdict(summary)))
 
 
+class SignalExitTest(unittest.TestCase):
+    """Important 2 (final review): SIGTERM/SIGHUP must not orphan the model
+    arm. _raise_signal_exit turns the signal into a SystemExit so
+    interleave()'s `finally: arm.stop()` runs."""
+
+    def test_raise_signal_exit_raises_systemexit_with_128_plus_signum(self):
+        with self.assertRaises(SystemExit) as cm:
+            m._raise_signal_exit(15, None)  # SIGTERM = 15
+        self.assertEqual(cm.exception.code, 143)
+
+    def test_sigterm_during_interleave_still_stops_the_arm(self):
+        stopped = []
+
+        class _SigtermArm(_FakeArm):
+            def ready(self, timeout=1):
+                # Simulate a SIGTERM landing mid-measurement: the installed
+                # handler raises SystemExit(143), which is what a real
+                # signal delivery would do at any point in the try block.
+                m._raise_signal_exit(15, None)
+
+            def stop(self):
+                stopped.append(self.name)
+
+        with self.assertRaises(SystemExit):
+            m.interleave({"ds4": lambda: _SigtermArm()}, contexts=[2048], cold_tokens=0,
+                        filler="x" * 100000, max_tokens=8, warmup=0, order=("ds4",),
+                        guard=lambda: None, wait_free=lambda: None,
+                        swap_used=iter([0.0] * 8).__next__, wait_idle=lambda: None)
+        self.assertEqual(stopped, ["ds4"])
+
+
 class _FakeArm:
     base_url = "http://127.0.0.1:18296"
     model_id = "ornith-1.5-35b-a3b"

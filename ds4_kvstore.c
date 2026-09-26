@@ -859,10 +859,11 @@ static bool kv_cache_file_text_matches(const char *path, const char sha[41],
     return ok;
 }
 
-static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
+bool ds4_kvstore_existing_compatible(ds4_kvstore *kc, const char *path,
                                          const char sha[41],
                                          const char *text, size_t text_len,
-                                         int model_id, int quant_bits, int ctx_size) {
+                                         int model_id, int quant_bits, int ctx_size,
+                                         int payload_variant) {
     if (access(path, F_OK) != 0) return false;
     ds4_kvstore_entry e = {0};
     if (!ds4_kvstore_read_entry_file(path, sha, &e)) return false;
@@ -870,6 +871,7 @@ static bool kv_cache_existing_compatible(ds4_kvstore *kc, const char *path,
                       (!kc->reject_different_quant ||
                        e.quant_bits == (uint8_t)quant_bits) &&
                       e.ctx_size <= (uint32_t)ctx_size &&
+                      e.payload_variant == (uint8_t)payload_variant &&
                       kv_cache_file_text_matches(path, sha, text, text_len);
     ds4_kvstore_entry_free(&e);
     if (!compatible) {
@@ -1014,9 +1016,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
-    if (kv_cache_existing_compatible(kc, path, sha, text, text_len,
+    if (ds4_kvstore_existing_compatible(kc, path, sha, text, text_len,
                                      model_id,
-                                     quant_bits, ds4_session_ctx(session))) {
+                                     quant_bits, ds4_session_ctx(session),
+                                     ds4_engine_payload_variant(engine))) {
         kv_cache_rewrite_trailer(kc, path, text, hooks);
         free(text);
         free(path);

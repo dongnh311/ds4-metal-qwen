@@ -212,6 +212,17 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                              uint32_t *text_bytes);
 bool ds4_kvstore_read_entry_file(const char *path, const char sha[41],
                                  ds4_kvstore_entry *out);
+/* Model-free: true if the on-disk entry at path (matching sha/text) is
+ * still usable for a new store of model_id/quant_bits/ctx_size/
+ * payload_variant; unlinks and returns false on a mismatch (including a
+ * payload_variant mismatch, e.g. an Ornith --mtp/DS4_QWEN35_KV flip), which
+ * is what makes ds4_kvstore_store_live_prefix_text() replace a stale file
+ * instead of silently keeping it. Exposed (not static) for unit testing. */
+bool ds4_kvstore_existing_compatible(ds4_kvstore *kc, const char *path,
+                                     const char sha[41],
+                                     const char *text, size_t text_len,
+                                     int model_id, int quant_bits, int ctx_size,
+                                     int payload_variant);
 void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t model_id, uint8_t quant_bits,
                              uint8_t reason, uint8_t ext_flags,

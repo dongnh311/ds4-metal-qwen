@@ -278,8 +278,8 @@ static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model 
  * attn_o.  per_row gives every row its own dispatch: the key split then
  * matches a plain decode at that position, which a speculative verify
  * needs to reproduce plain decoding bit for bit. */
-/* L12 (DS4_QWEN35_SHARED_KV_VERIFY -> DS4_QWEN35_ATTN_DECODE2): shared-KV
- * decode.  When on, both a plain T=1 decode and each 2-row verify use
+/* L12 (DS4_QWEN35_ATTN_DECODE2): shared-KV decode.  When on, both a plain
+ * T=1 decode and each 2-row verify use
  * kernel_qwen35_attn_decode2 -- the verify's two rows in ONE call sharing
  * their K/V reads, plain decode as a lone rows==1 call of the SAME kernel --
  * so decode-with-MTP and plain decoding read identical instructions at

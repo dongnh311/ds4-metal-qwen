@@ -210,8 +210,12 @@ and `ds4_gpu_add_tensor`.
   2. A prep kernel without the indexer: q/k RMSNorm, NEOX RoPE on the first
      64 dims, KV append. It is a new entry point beside the qwen4
      `attn_prep`, not a change to it.
-  3. Dense attention over all positions through the existing `attn_decode` /
-     `attn_mm` kernels (scale 1/16, GQA 8:1), with the qwen4 KV modes.
+  3. Dense attention over all positions (scale 1/16, GQA 8:1) with the qwen4
+     KV modes. Prefill runs `attn_mm`; decode (plain T=1 and the 2-row MTP
+     verify alike) runs `kernel_qwen35_attn_decode2`
+     (`DS4_QWEN35_ATTN_DECODE2`, default on; `=0` restores the older
+     per-row `attn_decode` kernel) — see the M4 decode section below for why
+     the verify rows are bit-exact against plain decode under it.
   4. `o *= sigmoid(gate)`, then the `attn_output` GEMV into `blk`.
 - **MoE.** Reuse `qwen4_graph_moe`'s router and top-k kernel (softmax over
   256, top 8, renormalise, sigmoid shared-expert gate) and its mid/down
@@ -221,9 +225,7 @@ and `ds4_gpu_add_tensor`.
   decode row kernels are `qwen35.metal`'s own. The reduce runs with
   `n_hc = 0` into `blk`, then the residual add.
   Q5_K routed experts take the tiled GEMM above 64 tokens like Q4_K (M4,
-  `speed-bench/ornith/m4/REPORT.md`); the tiles were generated from the
-  qwen4 Q4_K templates by `speed-bench/ornith/m4/extract_q5k_tiles.py`, not
-  ported from GLM.
+  `speed-bench/ornith/m4/REPORT.md`); not ported from GLM.
 - **MTP block (`blk.40`).**
   1. `x = eh_proj . concat[RMSNorm(embed(tok)) * enorm, RMSNorm(h) * hnorm]`,
      embedding half first; `h` is the trunk hidden after `output_norm` (the
@@ -258,11 +260,17 @@ A/B shows a gain.
   draft restores the snapshot and keeps one. The cycle is
   `ds4_session_qwen35_spec_cycle` in `ds4.c`, shaped like the qwen4 cycle
   (whose snapshot helpers need hyper-connections and PLE); the GDN kernels'
-  after-first-row snapshot is reused. The verify runs its attention, dense
-  projections and GDN layers one row per dispatch, because the shared
-  `qwen4_gemv` picks a different matvec kernel for T=1 than for T=2
-  (including the GDN mixer's `lin_qkv`/`lin_gate`/`lin_out` projections), so
-  each row equals plain decoding bit for bit; the experts stay batched.
+  after-first-row snapshot is reused; the experts stay batched.
+  Since bbf5966, plain T=1 decode and the 2-row verify both dispatch
+  `kernel_qwen35_attn_decode2` (`DS4_QWEN35_ATTN_DECODE2`, default on; `=0`
+  restores the per-row `attn_decode` kernel). The exactness argument: plain
+  decode is a rows==1 call of that same kernel, and each row keeps its own
+  split geometry inside the T=2 call, so the verify's rows equal plain
+  decode bit for bit (memcmp-tested) — attention does not need the per-row
+  dispatch the way the dense projections and GDN layers still do under
+  `verify_rows_exact` (the shared `qwen4_gemv` picks a different matvec
+  kernel for T=1 than for T=2, including the GDN mixer's
+  `lin_qkv`/`lin_gate`/`lin_out` projections).
   Drafts are accepted when they are the target argmax (greedy and
   opportunistic sampling); `--mtp-exact-sampling` is refused. Draft depth
   starts at 1 and follows measured acceptance. At temperature 0 the output
@@ -385,6 +393,21 @@ A/B shows a gain.
    attention split, tiled and merge) choose between arithmetic-equivalent
    kernel paths and apply to both families by design. Tuning keyed on
    `n_embd == 2560`, `n_rank == 320` or `n_hc == 4` stays as is.
+   The Ornith (`DS4_QWEN35_*`) knobs added through M4:
+   - `DS4_QWEN35_PROFILE` — per-stage timing breakdown to stderr.
+   - `DS4_QWEN35_FLUSH_LAYER` — command-buffer flush cadence (default 2; 0 or
+     -1 disables mid-graph flushing).
+   - `DS4_QWEN35_FUSE_NORM` — fused norm+add decode path (default 0).
+   - `DS4_QWEN35_ATTN_MULTI_GEMV` — multi-row attention GEMV variant (default
+     0).
+   - `DS4_QWEN35_MOE_MR_MID` / `DS4_QWEN35_MOE_MR_DOWN` — MoE mid/down
+     multi-row tiling (M5 default 1/4).
+   - `DS4_QWEN35_MTP_DRAFT_VOCAB` — restricted draft vocabulary file for the
+     MTP head.
+   - `DS4_QWEN35_ATTN_DECODE2` — batched decode attention kernel for both
+     plain T=1 decode and the 2-row MTP verify (default 1).
+   - `DS4_QWEN35_KV` — KV cache payload mode: f16 (default), fp8 or q4.
+   - `DS4_QWEN35_PREFILL_CHUNK` — prefill chunk size override.
 4. **Qwen gate.** Every commit that touches a shared file (`ds4.c` outside the
    `.inc`, `ds4_metal.m`, `ds4_gpu.h`, `metal/*.metal`, `ds4_server.c`) passes
    before merge:

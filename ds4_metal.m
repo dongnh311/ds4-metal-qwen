@@ -50772,9 +50772,9 @@ static uint32_t qwen4_attn_split_keys(void) {
 }
 
 /* The split count/width a solo single-row decode of this key count would
- * pick (mirrors metal/qwen4.metal's qwen4_attn_row_splits). Shared by the
- * batched-rows path and L12's shared-KV decode2 so a row's own geometry is
- * computed identically wherever it is used. */
+ * pick (mirrors metal/qwen4.metal's qwen4_attn_row_splits). Used only by
+ * L12's shared-KV decode2, so each row of the batched 2-row verify computes
+ * the same split geometry a lone plain decode of that row would. */
 static void qwen4_attn_row_splits_host(uint32_t n_keys, uint32_t split_keys,
                                        uint32_t *n_splits, uint32_t *keys_per_split) {
     uint32_t ns = (n_keys + split_keys - 1u) / split_keys;
