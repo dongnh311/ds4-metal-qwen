@@ -60256,13 +60256,14 @@ static bool qwen4_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor
  * those output rows, so the draft is scored over that subset and the argmax
  * maps back through the list; the verify rows still use the full head.
  * Loaded once per graph; a missing or invalid file leaves the full head. */
-static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_tensor *w) {
+static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_tensor *w,
+                                      const char *env_name) {
     if (g->draft_head_tried) return g->draft_head != NULL;
     g->draft_head_tried = true;
-    const char *path = getenv("DS4_QWEN4_MTP_DRAFT_VOCAB");
+    const char *path = getenv(env_name);
     if (!path || !path[0] || w->type != DS4_TENSOR_Q8_0 || w->ndim < 2 || (w->dim[0] % 32u) != 0) return false;
     FILE *fp = fopen(path, "r");
-    if (!fp) { fprintf(stderr, "ds4: Qwen3.8 MTP draft vocabulary %s: %s\n", path, strerror(errno)); return false; }
+    if (!fp) { fprintf(stderr, "ds4: MTP draft vocabulary %s: %s\n", path, strerror(errno)); return false; }
     const uint64_t V = w->dim[1];
     int32_t *ids = malloc(V * sizeof(int32_t));
     uint8_t *seen = calloc(V, 1);
@@ -60276,7 +60277,7 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     fclose(fp);
     free(seen);
     if (!ids || n == 0 || n >= V) {
-        fprintf(stderr, "ds4: Qwen3.8 MTP draft vocabulary %s: need 1..%" PRIu64 " distinct ids (got %u)\n", path, V - 1u, n);
+        fprintf(stderr, "ds4: MTP draft vocabulary %s: need 1..%" PRIu64 " distinct ids (got %u)\n", path, V - 1u, n);
         free(ids);
         return false;
     }
@@ -60291,7 +60292,7 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     const bool ok = rows && head && ds4_gpu_tensor_write(head, 0, rows, bytes);
     free(rows);
     if (!ok) {
-        fprintf(stderr, "ds4: Qwen3.8 MTP draft head upload failed\n");
+        fprintf(stderr, "ds4: MTP draft head upload failed\n");
         ds4_gpu_tensor_free(head);
         free(ids);
         return false;
@@ -60299,9 +60300,15 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     g->draft_head = head;
     g->draft_ids = ids;
     g->draft_rows = n;
-    fprintf(stderr, "ds4: Qwen3.8 MTP draft head: %u of %" PRIu64 " vocabulary rows from %s (%.0f MiB)\n",
+    fprintf(stderr, "ds4: MTP draft head: %u of %" PRIu64 " vocabulary rows from %s (%.0f MiB)\n",
             n, V, path, (double)bytes / (1024.0 * 1024.0));
     return true;
+}
+
+/* Ornith draft head from DS4_QWEN35_MTP_DRAFT_VOCAB (its own knob, spec sec 7.3);
+ * same gathered-head machinery as Qwen3.8, verify rows use the full output. */
+static DS4_MAYBE_UNUSED bool qwen35_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_tensor *w) {
+    return qwen4_mtp_draft_head_load(g, m, w, "DS4_QWEN35_MTP_DRAFT_VOCAB");
 }
 
 /* Decode-sized batches (a token, or the 2/3-token MTP verify) take the fused
@@ -61583,7 +61590,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     const bool gpu_argmax = want_logits && draft_out && !logits_out &&
         (!argmax_env || strcmp(argmax_env, "0") != 0);
     /* draft-only rows: host logits consumers always see the full head */
-    const bool gathered = gpu_argmax && qwen4_mtp_draft_head_load(g, m, w->output);
+    const bool gathered = gpu_argmax && qwen4_mtp_draft_head_load(g, m, w->output, "DS4_QWEN4_MTP_DRAFT_VOCAB");
     const uint32_t head_rows = gathered ? g->draft_rows : gpu_argmax ? qwen4_mtp_draft_rows() : DS4_N_VOCAB;
     if (ok && want_logits) {
         last = ds4_gpu_tensor_view(g->mtp_R, (T - 1u) * hc * emb_bytes, hc * emb_bytes);

@@ -652,6 +652,8 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_mtp(ds4_qwen4_gpu_graph *g, const ds4_
         /* the next sub-batch rewrites the staged embeddings */
         if (done < T && !ds4_gpu_end_commands()) ok = false;
     }
+    const bool gathered = want_draft && qwen35_mtp_draft_head_load(g, m, w->output);
+    const uint32_t head_rows = gathered ? g->draft_rows : (uint32_t)DS4_N_VOCAB;
     if (ok && want_draft) {
         ds4_gpu_tensor *x = ds4_gpu_tensor_view(g->mtp_R, (uint64_t)last * row, row);
         ds4_gpu_tensor *o = ds4_gpu_tensor_view(g->attn_o, (uint64_t)last * qrow, qrow);
@@ -665,8 +667,10 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_mtp(ds4_qwen4_gpu_graph *g, const ds4_
              ds4_gpu_add_tensor(x, x, g->blk, E) != 0 &&
              ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, x, m->map, m->size,
                                                  l->nextn_shared_head_norm->abs_offset, E, 1u, DS4_RMS_EPS) != 0 &&
-             qwen4_gemv(g->logits, m, w->output, g->mixed, 1u) &&
-             ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp, g->logits, DS4_N_VOCAB) != 0;
+             (gathered ? ds4_gpu_qwen4_matmul_q8_0_weights_tensor(g->logits, g->draft_head,
+                             (uint32_t)w->output->dim[0], head_rows, g->mixed)
+                       : qwen4_gemv(g->logits, m, w->output, g->mixed, 1u)) &&
+             ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp, g->logits, head_rows) != 0;
         ds4_gpu_tensor_free(x);
         ds4_gpu_tensor_free(o);
     }
@@ -674,7 +678,9 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_mtp(ds4_qwen4_gpu_graph *g, const ds4_
     if (ok && want_draft) {
         int32_t token = -1;
         ok = ds4_gpu_tensor_read(g->mtp_argmax, 0, &token, sizeof(token)) != 0 &&
-             token >= 0 && token < (int32_t)DS4_N_VOCAB;
+             token >= 0 && token < (int32_t)head_rows;
+        if (ok && gathered) token = g->draft_ids[token];
+        if (ok && (token < 0 || token >= (int32_t)DS4_N_VOCAB)) ok = false;
         if (ok) *draft_out = token;
     }
     if (ok) g->mtp_pos = pos0 + T;
