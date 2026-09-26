@@ -11713,7 +11713,7 @@ static void kv_fill_header(uint8_t h[KV_CACHE_FIXED_HEADER], uint8_t quant_bits,
                            uint64_t created_at, uint64_t last_used,
                            uint64_t payload_bytes) {
     ds4_kvstore_fill_header(h, 0, quant_bits, reason, ext_flags, tokens, hits,
-                            ctx_size, created_at, last_used, payload_bytes, 0);
+                            ctx_size, created_at, last_used, payload_bytes);
 }
 #endif
 
@@ -12050,7 +12050,7 @@ static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
 #ifdef DS4_SERVER_TEST
 static int kv_cache_find_text_prefix(kv_disk_cache *kc, const char *prompt_text,
                                      int quant_bits, int ctx_size) {
-    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size, 0);
+    return ds4_kvstore_find_text_prefix(kc, prompt_text, 0, quant_bits, ctx_size);
 }
 #endif
 
@@ -22510,37 +22510,6 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
-static void test_kv_text_stub_file_model(const char *dir, const char *text,
-                                         uint8_t model_id, uint8_t reason,
-                                         uint32_t tokens,
-                                         uint64_t payload_bytes) {
-    char sha[41];
-    sha1_bytes_hex(text, strlen(text), sha);
-    char name[44];
-    snprintf(name, sizeof(name), "%.40s.kv", sha);
-    char *path = path_join(dir, name);
-    FILE *fp = fopen(path, "wb");
-    TEST_ASSERT(fp != NULL);
-    if (!fp) {
-        free(path);
-        return;
-    }
-
-    uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
-                            32768, 100, 100, payload_bytes, 0);
-    uint8_t text_len[4];
-    le_put32(text_len, (uint32_t)strlen(text));
-    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
-    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
-    TEST_ASSERT(fwrite(text, 1, strlen(text), fp) == strlen(text));
-    for (uint64_t i = 0; i < payload_bytes; i++) {
-        TEST_ASSERT(fputc(0, fp) != EOF);
-    }
-    TEST_ASSERT(fclose(fp) == 0);
-    free(path);
-}
-
 /* Like test_kv_text_stub_file_model but with an explicit payload variant
  * (h[21], Task 14), for tests exercising the Ornith KV-mode/MTP lookup
  * filter. */
@@ -22561,8 +22530,8 @@ static void test_kv_text_stub_file_model_variant(const char *dir, const char *te
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
-                            32768, 100, 100, payload_bytes, payload_variant);
+    ds4_kvstore_fill_header_v(h, model_id, 2, reason, 0, tokens, 0,
+                              32768, 100, 100, payload_bytes, payload_variant);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -22573,6 +22542,14 @@ static void test_kv_text_stub_file_model_variant(const char *dir, const char *te
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static void test_kv_text_stub_file_model(const char *dir, const char *text,
+                                         uint8_t model_id, uint8_t reason,
+                                         uint32_t tokens,
+                                         uint64_t payload_bytes) {
+    test_kv_text_stub_file_model_variant(dir, text, model_id, 0, reason, tokens,
+                                         payload_bytes);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
@@ -22636,9 +22613,9 @@ static void test_kv_cache_lookup_rejects_wrong_model(void) {
     kc.opt = kv_cache_default_options();
 
     TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
-                                             0, 2, 32768, 0) < 0);
+                                             0, 2, 32768) < 0);
     int idx = ds4_kvstore_find_text_prefix(&kc, "shared rendered prefix and tail",
-                                           1, 2, 32768, 0);
+                                           1, 2, 32768);
     TEST_ASSERT(idx >= 0);
     TEST_ASSERT(idx >= 0 && kc.entry[idx].model_id == 1);
 
@@ -22686,7 +22663,7 @@ static void test_kv_cache_lookup_rejects_stale_payload_abi(void) {
     kc.opt = kv_cache_default_options();
 
     TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, "stale rendered prefix and tail",
-                                             0, 2, 32768, 0) < 0);
+                                             0, 2, 32768) < 0);
 
     kv_cache_close(&kc);
     unlink(path);
@@ -24266,8 +24243,8 @@ static void test_kv_cache_lookup_separates_qwen38_and_ornith(void) {
     kc.enabled = true;
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
-    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 5, 2, 32768, 0) < 0);
-    const int idx = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768, 0);
+    TEST_ASSERT(ds4_kvstore_find_text_prefix(&kc, prompt, 5, 2, 32768) < 0);
+    const int idx = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768);
     TEST_ASSERT(idx >= 0 && kc.entry[idx].model_id == 7);
     kv_cache_close(&kc);
     char sha[41];
@@ -24304,10 +24281,10 @@ static void test_kv_cache_lookup_filters_by_payload_variant(void) {
     kc.dir = xstrdup(dir);
     kc.opt = kv_cache_default_options();
 
-    const int idx1 = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768, 1);
+    const int idx1 = ds4_kvstore_find_text_prefix_v(&kc, prompt, 7, 2, 32768, 1);
     TEST_ASSERT(idx1 >= 0 && kc.entry[idx1].payload_variant == 1 &&
                 kc.entry[idx1].text_bytes == strlen(short_text));
-    const int idx0 = ds4_kvstore_find_text_prefix(&kc, prompt, 7, 2, 32768, 0);
+    const int idx0 = ds4_kvstore_find_text_prefix_v(&kc, prompt, 7, 2, 32768, 0);
     TEST_ASSERT(idx0 >= 0 && kc.entry[idx0].payload_variant == 0 &&
                 kc.entry[idx0].text_bytes == strlen(long_text));
 
@@ -24332,7 +24309,7 @@ static void test_kv_cache_lookup_filters_by_payload_variant(void) {
     TEST_ASSERT(fp != NULL);
     if (!fp) return;
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, 7, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0, 3);
+    ds4_kvstore_fill_header_v(h, 7, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0, 3);
     TEST_ASSERT(h[21] == 3);
     uint8_t text_len[4] = {0};
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -24345,7 +24322,7 @@ static void test_kv_cache_lookup_filters_by_payload_variant(void) {
     fclose(fp);
 
     uint8_t hq[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(hq, 5, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0, 0);
+    ds4_kvstore_fill_header(hq, 5, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
     TEST_ASSERT(hq[21] == 0);
 }
 

@@ -162,8 +162,14 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size,
-                                 int payload_variant);
+                                 int model_id, int quant_bits, int ctx_size);
+/* Same lookup, but also skips entries whose payload_variant (h[21], Task 14)
+ * differs from the caller's.  ds4_kvstore_find_text_prefix() is a thin
+ * wrapper around this that passes variant 0, kept at its original signature
+ * so pre-existing callers (including unit tests) do not need to change. */
+int ds4_kvstore_find_text_prefix_v(ds4_kvstore *kc, const char *prompt_text,
+                                   int model_id, int quant_bits, int ctx_size,
+                                   int payload_variant);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
@@ -211,7 +217,17 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t reason, uint8_t ext_flags,
                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
-                             uint64_t payload_bytes, uint8_t payload_variant);
+                             uint64_t payload_bytes);
+/* Same header fill, but also writes payload_variant to h[21] (Task 14).
+ * ds4_kvstore_fill_header() is a thin wrapper around this that passes
+ * variant 0, kept at its original signature so pre-existing callers
+ * (including unit tests) do not need to change. */
+void ds4_kvstore_fill_header_v(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
+                               uint8_t model_id, uint8_t quant_bits,
+                               uint8_t reason, uint8_t ext_flags,
+                               uint32_t tokens, uint32_t hits, uint32_t ctx_size,
+                               uint64_t created_at, uint64_t last_used,
+                               uint64_t payload_bytes, uint8_t payload_variant);
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
