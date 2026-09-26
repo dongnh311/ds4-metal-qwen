@@ -18,9 +18,12 @@ The user wants all three outcomes, checked as ordered gates:
    current gateway Ornith (Shiftedx MLX abliterated, index 86.6 in
    `AI-Gateway-MLX/reports/ornith-abliterated-vs-current-2026-09-09`), aiming
    at the regular Ornith's 92.3.
-3. **Speed (A).** Decode with MTP and prefill are at least as fast as Ornith on
-   oMLX on the same machine (about 54.5 t/s decode, 31K-token first turn in
-   about 19 s, `reports/ornith15-vs-qwen38-2026-08-21`), at 2K, 32K and 128K.
+3. **Speed (A).** Decode with MTP and prefill are at least the live oMLX on
+   this machine, measured by an interleaved A-B-B-A
+   (`speed-bench/ornith/m4_ab.py`): oMLX decodes about 80/65/39 t/s at
+   2K/32K/128K and completes a cold ~31K first turn in about 21 s
+   (`speed-bench/ornith/m4/speed/BASELINE.md`; see
+   `speed-bench/ornith/m4/REPORT.md` for the final comparison).
 4. **One runtime (C).** After v2, deploy through `prod/<feature>-YYYYMMDD` and
    move the gateway Ornith slot from oMLX to ds4 with the capabilities the slot
    has today (vision, tools, thinking, 262K context).
@@ -213,13 +216,14 @@ and `ds4_gpu_add_tensor`.
 - **MoE.** Reuse `qwen4_graph_moe`'s router and top-k kernel (softmax over
   256, top 8, renormalise, sigmoid shared-expert gate) and its mid/down
   kernels. Q5_K routed experts are new in the qwen4 kernels: add Q5_K row-dot
-  and tile-GEMM dequant, ported from the GLM `block_q5_K` kernels in
-  `metal/moe.metal`. The reduce runs with `n_hc = 0` into `blk`, then the
-  residual add.
-  *M1 deviation:* M1 ships the Q5_K row kernels only. Q5_K layers use the
-  per-token row kernels at every prefill size (Q4_K layers switch to the
-  tile GEMM above 64 tokens). The tiled Q5_K GEMM is deferred to M4, where
-  prefill speed is measured.
+  and tile-GEMM dequant; the tile dequant is generated from the qwen4 Q4_K
+  tile templates (`speed-bench/ornith/m4/extract_q5k_tiles.py`), and the
+  decode row kernels are `qwen35.metal`'s own. The reduce runs with
+  `n_hc = 0` into `blk`, then the residual add.
+  Q5_K routed experts take the tiled GEMM above 64 tokens like Q4_K (M4,
+  `speed-bench/ornith/m4/REPORT.md`); the tiles were generated from the
+  qwen4 Q4_K templates by `speed-bench/ornith/m4/extract_q5k_tiles.py`, not
+  ported from GLM.
 - **MTP block (`blk.40`).**
   1. `x = eh_proj . concat[RMSNorm(embed(tok)) * enorm, RMSNorm(h) * hnorm]`,
      embedding half first; `h` is the trunk hidden after `output_norm` (the
@@ -272,16 +276,21 @@ A/B shows a gain.
     rope positions and, with `--mtp`, the MTP block's KV rows and the trunk
     hidden-state carry the next draft pairs with. The payload records whether
     it carries MTP state; a payload whose MTP presence differs from the
-    session's is refused and the server prefills instead. F16 KV only.
+    session's is refused and the server prefills instead. The payload tag
+    also encodes the KV mode (F16/FP8/Q4, `DS4_QWEN35_KV`), so a checkpoint
+    never cross-loads into a session in a different mode.
   - The KV-cache file header records the model id (`qwen35moe` = 7) and the
     payload its own tag, so Qwen3.8 and Ornith checkpoints can never load
     into each other. Existing Qwen3.8 checkpoints are unaffected. The routed
     quant byte stays 2 for both Ornith tiers (Q5_K in layer 0), so a 25G
     server accepts a 23G checkpoint of the same text, as the Qwen3.8 IQ2
     tiers do.
-- **KV cache.** F16 by default. KV is 20 KiB per token, about 5.4 GB at 262K,
-  on top of 21 GiB of weights. kv-grow is not used in v1. The qwen4 FP8/Q4 KV
-  modes remain available as a speed lever (section 8, gate 3).
+- **KV cache.** F16 by default (`DS4_QWEN35_KV=f16`, `fp8` and `q4` are the
+  optional non-default modes). KV is 20 KiB per token, about 5.4 GB at 262K,
+  on top of 21 GiB of weights. kv-grow is not used in v1. M4 measured both
+  fp8 and q4 slower than f16 for Ornith's decode and prefill
+  (`speed-bench/ornith/m4/speed/LEVERS.md`), so f16 stays the default; a
+  non-F16 mode is only promoted to default if it passes gate 2 again.
 - **Chat rendering.**
   - Reuse the Qwen3.8 ChatML turns, XML tool-call syntax, parser and live
     continuation tails (`SERVER_MODEL_SYNTAX_QWEN`). The generation prompt
@@ -424,19 +433,24 @@ PPL of the tier: 2.194208 x 1.0018 = 2.1982 for 23G.
 ### Gate 2: quality (B)
 
 - ds4-server on a staging port, never the live stack; 23G and 25G tiers.
-- The gateway intelligence harness (`run_ab.py`) scores at least 86.6.
-- The 7-case agentic matrix passes with no guard incidents.
-- The abliteration smoke probes behave as before.
+- Pass rule: the gateway intelligence harness (`run_ab.py`) scores index
+  >= 86.6 AND truncated = errored = 0, on both tiers.
+- The 7-case agentic matrix passes 7/7 with no guard movement.
+- The abliteration smoke probes match a first-captured oMLX baseline.
 
 ### Gate 3: speed (A)
 
-- Interleaved A/B against Ornith on oMLX, same machine and prompts, at 2K, 32K
-  and 128K context.
-- Decode with MTP must be at least oMLX at each context. Prefill must be at
-  least oMLX (31K first turn within about 19 s).
-- F16 KV reads about 2.7 GB per token at 128K, about as much as the weights. If
-  long-context decode falls below oMLX, switch to the existing FP8 KV mode,
-  and only if gate 2 still passes with it.
+- Interleaved A-B-B-A against the live oMLX, same machine and prompts
+  (`speed-bench/ornith/m4_ab.py`), at 2K, 32K and 128K context.
+- Decode with MTP must be at least the live oMLX at each context. Prefill
+  must be at least the live oMLX (cold ~31K first turn within about 21 s,
+  `speed-bench/ornith/m4/speed/BASELINE.md`). See
+  `speed-bench/ornith/m4/REPORT.md` for the final comparison.
+- F16 KV reads about 2.7 GB per token at 128K, about as much as the weights.
+  The KV-mode lever is `DS4_QWEN35_KV` (f16 default; fp8/q4 optional). M4
+  measured both fp8 and q4 slower than f16 for Ornith
+  (`speed-bench/ornith/m4/speed/LEVERS.md`), so f16 stays the default; any
+  non-F16 mode must pass gate 2 again before it can become a default.
 
 ### Gate Qwen3.8
 

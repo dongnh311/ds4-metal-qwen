@@ -78,4 +78,4 @@ Outside the gate, taking selected token ids over every reference step on the sam
 
 ## Deviation: Q5_K prefill
 
-M1 ships the Q5_K row kernels only. Q5_K layers use the per-token row kernels at every prefill size; Q4_K layers switch to the tile GEMM above 64 tokens. The tiled Q5_K GEMM is deferred to M4, where prefill speed is measured. The spec, §4 (MoE), records the same deviation.
+M1 ships the Q5_K row kernels only. Q5_K layers use the per-token row kernels at every prefill size; Q4_K layers switch to the tile GEMM above 64 tokens. The tiled Q5_K GEMM landed in M4; see `speed-bench/ornith/m4/REPORT.md`.
