@@ -115,9 +115,56 @@ def _omlx_running():
     return "\n".join(hits)
 
 
+MODEL_COMMS = {"ds4", "ds4-server", "ds4-agent", "ds4_test", "omlx-server", "omlx", "llama-server"}
+_PYTHON_COMM_RE = re.compile(r"^python\d*(\.\d+)?$")
+
+
+def _is_model_command(command):
+    """True if `command` (a full ps command line, argv[0] + args) names a
+    model/Metal process we care about: one of MODEL_COMMS by argv[0]
+    basename, or a python interpreter whose command line mentions omlx."""
+    argv0 = command.split(None, 1)[0] if command.strip() else ""
+    name = os.path.basename(argv0)
+    if name in MODEL_COMMS:
+        return True
+    if _PYTHON_COMM_RE.match(name) and "omlx" in command:
+        return True
+    return False
+
+
+def _ps_estate_snapshot():
+    """pid -> (stat, command) for every process currently in state E or U,
+    using the full command line (needed to spot a python/omlx process)."""
+    p = subprocess.run(["ps", "-axo", "pid,stat,command"], capture_output=True, text=True)
+    snap = {}
+    for line in p.stdout.splitlines()[1:]:
+        parts = line.strip().split(None, 2)
+        if len(parts) < 3:
+            continue
+        pid, stat, command = parts
+        if re.search(r"[EU]", stat):
+            snap[pid] = (stat, command)
+    return snap
+
+
 def _procs_in_estate():
-    p = subprocess.run(["ps", "-axo", "pid,stat,comm"], capture_output=True, text=True)
-    return "\n".join(l for l in p.stdout.splitlines()[1:] if re.match(r"\s*\d+\s+[EU]", l))
+    """Report a process only if it is one of the model/Metal processes we
+    care about (see _is_model_command) AND its E/U state persists across a
+    second check ~2s later (same pid still E/U). A momentary U (normal for
+    unrelated system processes like macmon in disk/IO wait) never trips
+    this, and unrelated processes are never reported at all."""
+    snap1 = _ps_estate_snapshot()
+    candidates = {pid: cmd for pid, (stat, cmd) in snap1.items() if _is_model_command(cmd)}
+    if not candidates:
+        return ""
+    time.sleep(2)
+    snap2 = _ps_estate_snapshot()
+    hits = []
+    for pid, cmd in candidates.items():
+        if pid in snap2:
+            stat2, cmd2 = snap2[pid]
+            hits.append("%s %s %s" % (pid, stat2, cmd2))
+    return "\n".join(hits)
 
 
 def _get_json(url, timeout=2):

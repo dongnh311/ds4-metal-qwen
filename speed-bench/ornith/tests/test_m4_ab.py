@@ -149,6 +149,42 @@ class TerminateTest(unittest.TestCase):
         # the SystemExit above without that error proves kill() was unused.
 
 
+class ProcsInEstateTest(unittest.TestCase):
+    """_procs_in_estate() must ignore unrelated processes and momentary E/U
+    states, and only report a model/Metal process whose E/U state persists
+    across a second check ~2s later."""
+
+    @staticmethod
+    def _ps_output(lines):
+        header = "  PID STAT COMMAND"
+        return "\n".join([header] + lines) + "\n"
+
+    def test_unrelated_process_in_u_is_ignored(self):
+        out = self._ps_output(["92936 U   macmon"])
+        with unittest.mock.patch.object(m.subprocess, "run") as run, \
+             unittest.mock.patch.object(m.time, "sleep") as sleep:
+            run.return_value = unittest.mock.Mock(stdout=out)
+            self.assertEqual(m._procs_in_estate(), "")
+        sleep.assert_not_called()
+
+    def test_ds4_server_in_u_on_both_checks_is_reported(self):
+        out = self._ps_output(["4242 U   /opt/ds4/ds4-server --metal -m /models/x.gguf"])
+        with unittest.mock.patch.object(m.subprocess, "run") as run, \
+             unittest.mock.patch.object(m.time, "sleep") as sleep:
+            run.return_value = unittest.mock.Mock(stdout=out)
+            result = m._procs_in_estate()
+        self.assertIn("4242", result)
+        sleep.assert_called_once()
+
+    def test_ds4_server_in_u_on_first_check_only_is_ignored(self):
+        first = self._ps_output(["4242 U   /opt/ds4/ds4-server --metal -m /models/x.gguf"])
+        second = self._ps_output([])  # gone / no longer E/U
+        with unittest.mock.patch.object(m.subprocess, "run") as run, \
+             unittest.mock.patch.object(m.time, "sleep"):
+            run.side_effect = [unittest.mock.Mock(stdout=first), unittest.mock.Mock(stdout=second)]
+            self.assertEqual(m._procs_in_estate(), "")
+
+
 class LeverModeTest(unittest.TestCase):
     def test_lever_order_is_abba(self):
         self.assertEqual(m.LEVER_ORDER, ("base", "lever", "lever", "base"))
