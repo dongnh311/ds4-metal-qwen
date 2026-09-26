@@ -278,15 +278,44 @@ static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model 
  * attn_o.  per_row gives every row its own dispatch: the key split then
  * matches a plain decode at that position, which a speculative verify
  * needs to reproduce plain decoding bit for bit. */
+/* L12 (DS4_QWEN35_SHARED_KV_VERIFY -> DS4_QWEN35_ATTN_DECODE2): shared-KV
+ * decode.  When on, both a plain T=1 decode and each 2-row verify use
+ * kernel_qwen35_attn_decode2 -- the verify's two rows in ONE call sharing
+ * their K/V reads, plain decode as a lone rows==1 call of the SAME kernel --
+ * so decode-with-MTP and plain decoding read identical instructions at
+ * identical split geometry per row and stay bit for bit exact. */
+static int qwen35_attn_decode2_env(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DS4_QWEN35_ATTN_DECODE2");
+        on = e && e[0] && e[0] != '0';
+    }
+    return on;
+}
+
 static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t pos0,
                                 uint32_t r0, uint32_t n, bool per_row) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     if (r0 == 0 && !per_row) {
+        if (n == 1u && qwen35_attn_decode2_env()) {
+            return ds4_gpu_qwen35_attn_decode2_tensor(g->attn_o, g->q, g->gate,
+                        qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
+                        DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 1u, scale,
+                        g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                        g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+        }
         return ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                                 NULL, NULL, n <= 2u ? g->attn_part : NULL, n,
                                                 DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 0u, 0u, scale,
                                                 g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
                                                 g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+    }
+    if (per_row && r0 == 0u && n == 2u && qwen35_attn_decode2_env()) {
+        return ds4_gpu_qwen35_attn_decode2_tensor(g->attn_o, g->q, g->gate,
+                    qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
+                    DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 2u, scale,
+                    g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                    g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
     }
     const uint64_t qrow = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
     const uint32_t step = per_row ? 1u : n;

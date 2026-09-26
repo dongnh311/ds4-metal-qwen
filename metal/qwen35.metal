@@ -822,3 +822,169 @@ template [[host_name("kernel_qwen35_moe_mm_down_q5k_nax")]]   kernel void kernel
 template [[host_name("kernel_qwen35_moe_mm_down_q5k_nax64")]] kernel void kernel_qwen35_moe_mm_down_q5k_nax_t<64, half, false>(constant ds4_metal_args_qwen4_moe_mm &, device const char *, device const int32_t *, device const int32_t *, device const half *, device float *, device const half *, threadgroup char *, uint3, ushort, ushort, ushort);
 #endif
 // END GENERATED q5_K tiles
+
+/* --- L12: shared-KV decode (DS4_QWEN35_ATTN_DECODE2) --------------------- */
+
+struct ds4_metal_args_qwen35_attn_decode2 {
+    uint32_t n_head, n_head_kv, head_dim, pos0;
+    uint32_t rows, split_keys, ns0, ns1;
+    uint32_t fp8;
+    float scale;
+};
+
+/* One threadgroup per (key split, kv head) serves every row in [0, args.rows)
+ * -- 1 for a lone decode, 2 for the MTP verify's two rows (pos0, pos0+1) --
+ * sharing each key's K/V load across the rows that both need it instead of
+ * reading it once per row.  Row r's own split count (ns0/ns1, from
+ * qwen4_attn_row_splits on that row's OWN key count, host side) and its
+ * [lo,hi) boundary within a split never depend on the other row, so decode2
+ * called with rows==1 for a given pos0 visits exactly the same keys in the
+ * same order, with the same online-softmax arithmetic, as row 0 of a
+ * decode2(rows==2) call at that same pos0: bit-identical by construction.
+ * Mode 0 F16, 1 E4M3, 2 4-bit, exactly as qwen4_attn_decode_tile.  A row
+ * whose own split count is 1 writes its gated output directly; a row with
+ * more splits writes partials into its own compact block of `part`
+ * ([Hkv][own n_splits][group][2+D], row 0's block first), consumed by a
+ * plain single-row kernel_qwen4_attn_merge call (that row's own n_splits,
+ * tok=0). */
+template <uint NPT>
+kernel void kernel_qwen35_attn_decode2(
+        constant ds4_metal_args_qwen35_attn_decode2 & args,
+        device const float   *q,          /* [rows][H*D] */
+        device const float   *gate,       /* [rows][H*D] */
+        device const half    *k_cache,
+        device const half    *v_cache,
+        device float         *out,        /* [rows][H*D] */
+        device float         *part,       /* row0 block, then row1 block if rows==2 */
+        device const uchar   *k_cache_fp8,
+        device const uchar   *v_cache_fp8,
+        device const half    *k_scale,
+        device const half    *v_scale,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint split = tgpig.x, kvh = tgpig.y;
+    const uint H = args.n_head, Hkv = args.n_head_kv;
+    if (kvh >= Hkv) return;
+    constexpr uint D = NPT * 32;
+    const uint group = H / Hkv;
+    const uint hps = (group + QWEN4_ATTN_NSG - 1) / QWEN4_ATTN_NSG;
+    const uint g0 = (uint)sgitg * hps;
+    if (g0 >= group) return;
+    const uint ng = min(hps, group - g0);
+    const uint rows = args.rows;
+    const uint n0 = args.pos0 + 1u, n1 = args.pos0 + 2u;
+    const uint ns0 = args.ns0, ns1 = args.ns1;
+    const uint kps0 = (n0 + ns0 - 1u) / ns0;
+    const uint kps1 = rows > 1u ? (n1 + ns1 - 1u) / ns1 : 0u;
+    const bool v0 = split < ns0;
+    const bool v1 = rows > 1u && split < ns1;
+    if (!v0 && !v1) return;
+    const uint lo0 = split * kps0, hi0 = v0 ? min(n0, lo0 + kps0) : lo0;
+    const uint lo1 = split * kps1, hi1 = v1 ? min(n1, lo1 + kps1) : lo1;
+    uint k0, k1;
+    if (v0 && v1) { k0 = min(lo0, lo1); k1 = max(hi0, hi1); }
+    else if (v0)  { k0 = lo0; k1 = hi0; }
+    else          { k0 = lo1; k1 = hi1; }
+    const uint fp8 = args.fp8;
+
+    float qv[2][QWEN4_ATTN_HPS][NPT], m[2][QWEN4_ATTN_HPS], l[2][QWEN4_ATTN_HPS], acc[2][QWEN4_ATTN_HPS][NPT];
+    for (uint r = 0; r < rows; r++) {
+#pragma unroll
+        for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
+            const uint h = kvh * group + g0 + min(g, ng - 1u);
+            device const float *qh = q + ((uint64_t)r * H + h) * D + tiisg * NPT;
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) qv[r][g][i] = qh[i] * args.scale;
+            m[r][g] = -3.0e38f;
+            l[r][g] = 0.0f;
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) acc[r][g][i] = 0.0f;
+        }
+    }
+    for (uint idx = k0; idx < k1; idx++) {
+        const uint64_t kvbase = ((uint64_t)idx * Hkv + kvh) * D + tiisg * NPT;
+        float kv[NPT], vv[NPT];
+        if (fp8 == 2u && NPT == 8u) {
+            const uint64_t sidx = ((uint64_t)idx * Hkv + kvh) * (D / 64u) + (tiisg * NPT) / 64u;
+            const float ksc = (float)k_scale[sidx], vsc = (float)v_scale[sidx];
+            const uint kw = reinterpret_cast<device const uint *>(k_cache_fp8)[kvbase >> 3];
+            const uint vw = reinterpret_cast<device const uint *>(v_cache_fp8)[kvbase >> 3];
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) {
+                kv[i] = (float)(half)((float)((int)((kw >> (4u * i)) & 15u) - 8) * ksc);
+                vv[i] = (float)(half)((float)((int)((vw >> (4u * i)) & 15u) - 8) * vsc);
+            }
+        } else if (fp8) {
+            const uint64_t sidx = ((uint64_t)idx * Hkv + kvh) * (D / 64u) + (tiisg * NPT) / 64u;
+            const float ksc = (float)k_scale[sidx], vsc = (float)v_scale[sidx];
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) {
+                kv[i] = (float)(half)(dsv4_e4m3fn_decode(k_cache_fp8[kvbase + i]) * ksc);
+                vv[i] = (float)(half)(dsv4_e4m3fn_decode(v_cache_fp8[kvbase + i]) * vsc);
+            }
+        } else {
+            device const half *kr = k_cache + kvbase, *vr = v_cache + kvbase;
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) { kv[i] = (float)kr[i]; vv[i] = (float)vr[i]; }
+        }
+        const bool in0 = v0 && idx >= lo0 && idx < hi0;
+        const bool in1 = v1 && idx >= lo1 && idx < hi1;
+        for (uint r = 0; r < rows; r++) {
+            if ((r == 0u && !in0) || (r == 1u && !in1)) continue;
+#pragma unroll
+            for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
+                if (g < ng) {
+                    float s = 0.0f;
+#pragma unroll
+                    for (uint i = 0; i < NPT; i++) s += qv[r][g][i] * kv[i];
+                    s = simd_sum(s);
+                    const float mn = max(m[r][g], s), corr = exp(m[r][g] - mn), w = exp(s - mn);
+                    l[r][g] = l[r][g] * corr + w;
+#pragma unroll
+                    for (uint i = 0; i < NPT; i++) acc[r][g][i] = acc[r][g][i] * corr + w * vv[i];
+                    m[r][g] = mn;
+                }
+            }
+        }
+    }
+    for (uint g = 0; g < QWEN4_ATTN_HPS; g++) {
+        if (g >= ng) break;
+        const uint h = kvh * group + g0 + g;
+        if (v0) {
+            if (ns0 == 1u) {
+                device float *dst = out + h * D + tiisg * NPT;
+                device const float *gt = gate + h * D + tiisg * NPT;
+                const float inv = l[0][g] > 0.0f ? 1.0f / l[0][g] : 0.0f;
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) dst[i] = acc[0][g][i] * inv * qwen4_sigmoid(gt[i]);
+            } else {
+                device float *dst = part + (((uint64_t)kvh * ns0 + split) * group + g0 + g) * (2u + D);
+                if (tiisg == 0) { dst[0] = m[0][g]; dst[1] = l[0][g]; }
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) dst[2u + tiisg * NPT + i] = acc[0][g][i];
+            }
+        }
+        if (v1) {
+            if (ns1 == 1u) {
+                device float *dst = out + ((uint64_t)1u * H + h) * D + tiisg * NPT;
+                device const float *gt = gate + ((uint64_t)1u * H + h) * D + tiisg * NPT;
+                const float inv = l[1][g] > 0.0f ? 1.0f / l[1][g] : 0.0f;
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) dst[i] = acc[1][g][i] * inv * qwen4_sigmoid(gt[i]);
+            } else {
+                device float *dst = part + ((uint64_t)ns0 * Hkv * group +
+                                            (((uint64_t)kvh * ns1 + split) * group + g0 + g)) * (2u + D);
+                if (tiisg == 0) { dst[0] = m[1][g]; dst[1] = l[1][g]; }
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) dst[2u + tiisg * NPT + i] = acc[1][g][i];
+            }
+        }
+    }
+}
+template [[host_name("kernel_qwen35_attn_decode2_npt8")]]
+kernel void kernel_qwen35_attn_decode2<8>(
+        constant ds4_metal_args_qwen35_attn_decode2 &, device const float *, device const float *,
+        device const half *, device const half *, device float *, device float *,
+        device const uchar *, device const uchar *, device const half *, device const half *,
+        uint3, ushort, ushort);
