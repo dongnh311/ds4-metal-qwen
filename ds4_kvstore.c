@@ -395,7 +395,7 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t reason, uint8_t ext_flags,
                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
-                             uint64_t payload_bytes) {
+                             uint64_t payload_bytes, uint8_t payload_variant) {
     memset(h, 0, DS4_KVSTORE_FIXED_HEADER);
     h[0] = KV_CACHE_MAGIC0;
     h[1] = KV_CACHE_MAGIC1;
@@ -409,6 +409,7 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
     ds4_kvstore_le_put32(h + 12, hits);
     ds4_kvstore_le_put32(h + 16, ctx_size);
     h[20] = KV_CACHE_PAYLOAD_ABI;
+    h[21] = payload_variant;
     kv_le_put64(h + 24, created_at);
     kv_le_put64(h + 32, last_used);
     kv_le_put64(h + 40, payload_bytes);
@@ -432,6 +433,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
                 DS4_KVSTORE_REASON_UNKNOWN;
     e->ext_flags = h[6];
     e->model_id = h[7];
+    e->payload_variant = h[21];
     e->tokens = ds4_kvstore_le_get32(h + 8);
     e->hits = ds4_kvstore_le_get32(h + 12);
     e->ctx_size = ds4_kvstore_le_get32(h + 16);
@@ -499,7 +501,7 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
         uint64_t now = (uint64_t)time(NULL);
         ds4_kvstore_fill_header(h, e.model_id, e.quant_bits, e.reason, e.ext_flags,
                                 e.tokens, hits, e.ctx_size,
-                                e.created_at, now, e.payload_bytes);
+                                e.created_at, now, e.payload_bytes, e.payload_variant);
         ok = fseek(fp, 0, SEEK_SET) == 0 &&
              fwrite(h, 1, sizeof(h), fp) == sizeof(h);
     }
@@ -915,7 +917,8 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
             ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason,
                                     (uint8_t)(hdr.ext_flags | hooks->ext_flag),
                                     hdr.tokens, hdr.hits, hdr.ctx_size,
-                                    hdr.created_at, now, hdr.payload_bytes);
+                                    hdr.created_at, now, hdr.payload_bytes,
+                                    hdr.payload_variant);
             ok = fseeko(fp, 0, SEEK_SET) == 0 &&
                  fwrite(h, 1, sizeof(h), fp) == sizeof(h) &&
                  fflush(fp) == 0;
@@ -1083,7 +1086,8 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                             reason_code, ext_flags,
                             (uint32_t)store_tokens.len, 0,
                             (uint32_t)ds4_session_ctx(session),
-                            now, now, payload_bytes);
+                            now, now, payload_bytes,
+                            (uint8_t)ds4_engine_payload_variant(engine));
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
     uint64_t trailer_bytes = 0;
@@ -1194,7 +1198,8 @@ bool ds4_kvstore_maybe_store_continued(ds4_kvstore *kc,
 }
 
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size) {
+                                 int model_id, int quant_bits, int ctx_size,
+                                 int payload_variant) {
     if (!prompt_text) return -1;
     const size_t prompt_bytes = strlen(prompt_text);
     kv_cache_refresh(kc);
@@ -1204,6 +1209,7 @@ int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
         if (e->text_bytes > prompt_bytes || e->text_bytes > SIZE_MAX) continue;
         if ((int)e->tokens < kc->opt.min_tokens) continue;
         if (e->model_id != (uint8_t)model_id) continue;
+        if (e->payload_variant != (uint8_t)payload_variant) continue;
         if ((uint32_t)ctx_size < e->ctx_size) continue;
         if (kc->reject_different_quant && e->quant_bits != (uint8_t)quant_bits) continue;
         if (best >= 0) {
@@ -1234,7 +1240,8 @@ int ds4_kvstore_try_load_text(ds4_kvstore *kc,
     const int model_id = ds4_engine_model_id(engine);
     const size_t prompt_bytes = strlen(prompt_text);
     int idx = ds4_kvstore_find_text_prefix(kc, prompt_text, model_id, quant_bits,
-                                           ds4_session_ctx(session));
+                                           ds4_session_ctx(session),
+                                           ds4_engine_payload_variant(engine));
     if (idx < 0) return 0;
 
     ds4_kvstore_entry e = kc->entry[idx];

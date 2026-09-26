@@ -306,6 +306,12 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
  * KV files with the previously-zero reserved byte remain Flash-compatible;
  * Pro and later shapes must use nonzero ids. */
 int ds4_engine_model_id(ds4_engine *e);
+/* Disk-KV payload variant (h[21], Task 14): 0 for every model except Ornith.
+ * For Ornith, bit0 is whether the engine keeps MTP state (--mtp) and bits1-2
+ * are the DS4_QWEN35_KV mode (0 f16, 1 fp8, 2 q4), computed from the same
+ * state qwen35_session_save_payload/qwen35_session_load_payload use so a
+ * lookup never picks a checkpoint the session would refuse to load. */
+int ds4_engine_payload_variant(ds4_engine *e);
 bool ds4_engine_is_glm_dsa(ds4_engine *e);
 bool ds4_engine_is_glm53(ds4_engine *e);
 bool ds4_engine_is_qwen4(ds4_engine *e);

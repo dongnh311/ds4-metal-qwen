@@ -74844,6 +74844,20 @@ int ds4_engine_model_id(ds4_engine *e) {
     return (int)DS4_MODEL_VARIANT;
 }
 
+int ds4_engine_payload_variant(ds4_engine *e) {
+    if (!e || !ds4_model_is_qwen35moe()) return 0;
+    bool kv_fp8 = false, kv_q4 = false;
+#ifndef DS4_NO_GPU
+    /* The Ornith Metal payload (qwen35_session_save_payload /
+     * qwen35_session_load_payload, DS4_HAS_QWEN4_METAL) is the only place
+     * a non-F16 KV mode exists; a CPU build has no such payload, so it
+     * always reports mode 0 (f16), matching qwen35_kv_mode_env's default. */
+    qwen35_kv_mode_env(&kv_fp8, &kv_q4);
+#endif
+    const int kv_mode = kv_q4 ? 2 : kv_fp8 ? 1 : 0;
+    return (e->glm_mtp ? 1 : 0) | (kv_mode << 1);
+}
+
 bool ds4_engine_is_glm53(ds4_engine *e) {
     (void)e;
     return ds4_model_is_glm53();

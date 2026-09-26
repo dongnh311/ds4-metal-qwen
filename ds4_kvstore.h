@@ -44,6 +44,11 @@ typedef struct {
     /* Stored in header byte 7.  Flash is 0 for backward compatibility with
      * older cache files where this reserved byte was always written as zero. */
     uint8_t model_id;
+    /* Stored in header byte 21 (Task 14).  0 for every model except Ornith,
+     * where bit0 is whether the session that saved it kept MTP state and
+     * bits1-2 are its DS4_QWEN35_KV mode (0 f16, 1 fp8, 2 q4).  Older files
+     * read this reserved-zero byte as variant 0. */
+    uint8_t payload_variant;
     uint8_t reason;
     uint32_t tokens;
     uint32_t hits;
@@ -157,7 +162,8 @@ void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
-                                 int model_id, int quant_bits, int ctx_size);
+                                 int model_id, int quant_bits, int ctx_size,
+                                 int payload_variant);
 
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
@@ -205,7 +211,7 @@ void ds4_kvstore_fill_header(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                              uint8_t reason, uint8_t ext_flags,
                              uint32_t tokens, uint32_t hits, uint32_t ctx_size,
                              uint64_t created_at, uint64_t last_used,
-                             uint64_t payload_bytes);
+                             uint64_t payload_bytes, uint8_t payload_variant);
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
