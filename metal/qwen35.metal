@@ -106,6 +106,63 @@ kernel void kernel_qwen35_moe_down(
     }
 }
 
+/* Q5_K decode: NR rows per SIMD group, each row's per-lane dot order identical
+ * to the M1 2-row kernel, so output is bit-for-bit the same. */
+template <uint NR>
+kernel void kernel_qwen35_moe_mid_q5k_nr(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *gate_base, device const char *up_base,
+        device const int32_t *selected, device const float *x, device float *mid,
+        device const char *sh_gate, device const char *sh_up,
+        uint3 tgpig [[threadgroup_position_in_grid]], ushort3 ntg [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const bool shared = slot == args.n_slots;
+    const uint type = shared ? args.shared_type : args.weight_type;
+    const uint rb = shared ? args.shared_row_bytes : args.row_bytes;
+    device const char *gb = shared ? sh_gate : gate_base;
+    device const char *ub = shared ? sh_up : up_base;
+    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    device const float *xt = x + (uint64_t)tok * args.in_dim;
+    const uint64_t mb = ((uint64_t)tok * n_out + slot) * args.out_rows;
+    for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
+        const uint64_t off = ebase + (uint64_t)r * rb;
+        const float g = qwen35_row_dot(gb + off, xt, type, args.in_dim, tiisg);
+        const float u = qwen35_row_dot(ub + off, xt, type, args.in_dim, tiisg);
+        if (tiisg == 0) mid[mb + r] = qwen4_silu(g) * u;
+    }
+}
+template <uint NR>
+kernel void kernel_qwen35_moe_down_q5k_nr(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *down_base, device const int32_t *selected,
+        device const float *mid, device float *part, device const char *sh_down,
+        uint3 tgpig [[threadgroup_position_in_grid]], ushort3 ntg [[threads_per_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]], ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint n_out = args.n_slots + args.has_shared;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * NR;
+    if (row0 >= args.out_rows || slot >= n_out || tok >= args.n_tokens) return;
+    const bool shared = slot == args.n_slots;
+    const uint type = shared ? args.shared_type : args.weight_type;
+    const uint rb = shared ? args.shared_row_bytes : args.row_bytes;
+    device const char *db = shared ? sh_down : down_base;
+    const uint64_t pair = (uint64_t)tok * n_out + slot;
+    const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
+    device const float *m = mid + pair * args.in_dim;
+    for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
+        const float v = qwen35_row_dot(db + ebase + (uint64_t)r * rb, m, type, args.in_dim, tiisg);
+        if (tiisg == 0) part[pair * args.out_rows + r] = v;
+    }
+}
+template [[host_name("kernel_qwen35_moe_mid_q5k_nr1")]] kernel void kernel_qwen35_moe_mid_q5k_nr<1>(constant ds4_metal_args_qwen4_moe &, device const char *, device const char *, device const int32_t *, device const float *, device float *, device const char *, device const char *, uint3, ushort3, ushort, ushort);
+template [[host_name("kernel_qwen35_moe_mid_q5k_nr4")]] kernel void kernel_qwen35_moe_mid_q5k_nr<4>(constant ds4_metal_args_qwen4_moe &, device const char *, device const char *, device const int32_t *, device const float *, device float *, device const char *, device const char *, uint3, ushort3, ushort, ushort);
+template [[host_name("kernel_qwen35_moe_down_q5k_nr1")]] kernel void kernel_qwen35_moe_down_q5k_nr<1>(constant ds4_metal_args_qwen4_moe &, device const char *, device const int32_t *, device const float *, device float *, device const char *, uint3, ushort3, ushort, ushort);
+template [[host_name("kernel_qwen35_moe_down_q5k_nr4")]] kernel void kernel_qwen35_moe_down_q5k_nr<4>(constant ds4_metal_args_qwen4_moe &, device const char *, device const int32_t *, device const float *, device float *, device const char *, uint3, ushort3, ushort, ushort);
+
 /* --- Q5_K tiled prefill GEMM (additive; qwen4.metal untouched) ----------- */
 
 /* Stage 16 consecutive Q5_K values (quarters q0 and q0+1 of 32-block b, q0

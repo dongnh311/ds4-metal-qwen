@@ -49545,6 +49545,10 @@ enum {
     QWEN4_K_QWEN35_MM_MID_Q5K_NAX64,
     QWEN4_K_QWEN35_MM_DOWN_Q5K_NAX,
     QWEN4_K_QWEN35_MM_DOWN_Q5K_NAX64,
+    QWEN4_K_QWEN35_MOE_MID_Q5K_NR1,
+    QWEN4_K_QWEN35_MOE_MID_Q5K_NR4,
+    QWEN4_K_QWEN35_MOE_DOWN_Q5K_NR1,
+    QWEN4_K_QWEN35_MOE_DOWN_Q5K_NR4,
     QWEN4_K_COUNT,
 };
 
@@ -49683,6 +49687,10 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_moe_mm_mid_q5k_nax64",
     "kernel_qwen35_moe_mm_down_q5k_nax",
     "kernel_qwen35_moe_mm_down_q5k_nax64",
+    "kernel_qwen35_moe_mid_q5k_nr1",
+    "kernel_qwen35_moe_mid_q5k_nr4",
+    "kernel_qwen35_moe_down_q5k_nr1",
+    "kernel_qwen35_moe_down_q5k_nr4",
 };
 
 typedef struct {
@@ -51248,6 +51256,23 @@ static uint32_t qwen35_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     return qwen4_expert_row_bytes(weight_type, in_dim);
 }
 
+/* L8 default NR: the M1 2-row kernel (0) until the controller's A/B
+ * (speed-bench/ornith/m4/speed/l8) picks the NR kernels as default on M5.
+ * Flip by changing the return value here (mid -> 1u, down -> 4u); this is
+ * the single place the controller edits/reverts. */
+static uint32_t qwen35_moe_mr_default_mid(void) { return 0u; }
+static uint32_t qwen35_moe_mr_default_down(void) { return 0u; }
+
+/* L8 Q5_K decode split: mid default 1 row / 4 groups, down default 4 rows /
+ * 8 groups on M5; 0 (or 2) keeps the M1 2-row / 4-group kernel.  Each row's
+ * per-lane dot order is unchanged, so every setting is bit-identical. */
+static void qwen35_moe_mr(bool down, uint32_t *nr, uint32_t *groups) {
+    const uint64_t v = ds4_gpu_env_u64(down ? "DS4_QWEN35_MOE_MR_DOWN" : "DS4_QWEN35_MOE_MR_MID",
+                                       down ? qwen35_moe_mr_default_down() : qwen35_moe_mr_default_mid(), 0u, 4u);
+    *nr = v >= 4u ? 4u : v == 1u ? 1u : 0u;         /* 0 and 2 -> the M1 2-row kernel */
+    *groups = (down && *nr == 4u) ? 8u : 4u;
+}
+
 int ds4_gpu_qwen35_moe_mid_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *selected,
         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
@@ -51280,6 +51305,13 @@ int ds4_gpu_qwen35_moe_mid_tensor(
         b[5] = b[0];
         b[6] = b[1];
     }
+    uint32_t nr, groups;
+    qwen35_moe_mr(false, &nr, &groups);
+    const int k = nr == 1u ? QWEN4_K_QWEN35_MOE_MID_Q5K_NR1 : nr == 4u ? QWEN4_K_QWEN35_MOE_MID_Q5K_NR4 : 0;
+    if (k)
+        return qwen4_dispatch(k, &args, sizeof(args), b, 7,
+                              MTLSizeMake((ff_dim + nr * groups - 1u) / (nr * groups), n_out, n_tokens),
+                              MTLSizeMake(32u * groups, 1, 1), 0);
     return qwen4_dispatch(QWEN4_K_QWEN35_MOE_MID, &args, sizeof(args), b, 7,
                           MTLSizeMake((ff_dim + 7u) / 8u, n_out, n_tokens), MTLSizeMake(128, 1, 1), 0);
 }
@@ -51313,6 +51345,13 @@ int ds4_gpu_qwen35_moe_down_tensor(
     } else {
         b[4] = b[0];
     }
+    uint32_t nr, groups;
+    qwen35_moe_mr(true, &nr, &groups);
+    const int k = nr == 1u ? QWEN4_K_QWEN35_MOE_DOWN_Q5K_NR1 : nr == 4u ? QWEN4_K_QWEN35_MOE_DOWN_Q5K_NR4 : 0;
+    if (k)
+        return qwen4_dispatch(k, &args, sizeof(args), b, 5,
+                              MTLSizeMake((out_dim + nr * groups - 1u) / (nr * groups), n_out, n_tokens),
+                              MTLSizeMake(32u * groups, 1, 1), 0);
     return qwen4_dispatch(QWEN4_K_QWEN35_MOE_DOWN, &args, sizeof(args), b, 5,
                           MTLSizeMake((out_dim + 7u) / 8u, n_out, n_tokens), MTLSizeMake(128, 1, 1), 0);
 }

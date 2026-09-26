@@ -554,6 +554,58 @@ static void test_moe_mm_q5k(arena_t *a, uint32_t T) {
     ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart); ds4_gpu_tensor_free(rmid); ds4_gpu_tensor_free(rpart);
 }
 
+/* L8: the Q5_K decode kernels at each NR are bit-identical (each row's
+ * per-lane dot order is unchanged; only the row-per-simdgroup split changes). */
+static void test_moe_q5k_rows(arena_t *a) {
+    const uint32_t NE = 16, slots = 8, E = 512, F = 256, T = 2, n_out = slots + 1;
+    double *gate_w, *up_w, *down_w, *sg_w, *su_w, *sd_w;
+    const uint64_t gate_off = arena_q5_K(a, (uint64_t)NE * F, E, &gate_w, 0.05f);
+    const uint64_t up_off = arena_q5_K(a, (uint64_t)NE * F, E, &up_w, 0.05f);
+    const uint64_t down_off = arena_q5_K(a, (uint64_t)NE * E, F, &down_w, 0.05f);
+    const uint64_t sg_off = arena_q8_0(a, F, E, &sg_w, 0.05f);
+    const uint64_t su_off = arena_q8_0(a, F, E, &su_w, 0.05f);
+    const uint64_t sd_off = arena_q8_0(a, E, F, &sd_w, 0.05f);
+    float *x = rand_vec((uint64_t)T * E, 1.0f);
+    float *mid_in = rand_vec((uint64_t)T * n_out * F, 1.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * 4);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < slots; s++) sel[t * slots + s] = (int32_t)((t * 7u + s * 3u) % NE);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    require_ok(ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "l8 sel");
+    ds4_gpu_tensor *gmidin = upload(mid_in, (uint64_t)T * n_out * F);
+    ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)T * n_out * F), *gpart = upload(NULL, (uint64_t)T * n_out * E);
+    const char *mk = "DS4_QWEN35_MOE_MR_MID", *dk = "DS4_QWEN35_MOE_MR_DOWN";
+    char *sm = getenv(mk) ? strdup(getenv(mk)) : NULL, *sd = getenv(dk) ? strdup(getenv(dk)) : NULL;
+    float *ref_mid = NULL, *ref_part = NULL;
+    const char *mrv[] = {"0", "1", "2", "4"}, *drv[] = {"0", "1", "2", "4"};
+    for (uint32_t mi = 0; mi < 4u; mi++) {
+        setenv(mk, mrv[mi], 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gmid, -1234.5f, (uint64_t)T * n_out * F), "l8 mid sentinel");
+        require_ok(ds4_gpu_qwen35_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, 13u,
+                       NE, T, slots, E, F, sg_off, su_off, 8u), "l8 mid");
+        float *got = download(gmid, (uint64_t)T * n_out * F);
+        if (ref_mid) { for (uint64_t i = 0; i < (uint64_t)T * n_out * F; i++) require_ok(got[i] == ref_mid[i], "l8 mid NR bit-identical"); free(got); }
+        else ref_mid = got;
+    }
+    for (uint32_t di = 0; di < 4u; di++) {
+        setenv(dk, drv[di], 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gpart, -1234.5f, (uint64_t)T * n_out * E), "l8 down sentinel");
+        require_ok(ds4_gpu_qwen35_moe_down_tensor(gpart, gmidin, gsel, a->base, a->size, down_off, 13u,
+                       NE, T, slots, F, E, sd_off, 8u), "l8 down");
+        float *got = download(gpart, (uint64_t)T * n_out * E);
+        if (ref_part) { for (uint64_t i = 0; i < (uint64_t)T * n_out * E; i++) require_ok(got[i] == ref_part[i], "l8 down NR bit-identical"); free(got); }
+        else ref_part = got;
+    }
+    printf("  q5_K decode NR {mid 0/1/2/4, down 0/1/2/4}: bit-identical\n");
+    if (sm) { setenv(mk, sm, 1); free(sm); } else unsetenv(mk);
+    if (sd) { setenv(dk, sd, 1); free(sd); } else unsetenv(dk);
+    free(x); free(mid_in); free(sel); free(ref_mid); free(ref_part);
+    free(gate_w); free(up_w); free(down_w); free(sg_w); free(su_w); free(sd_w);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gmidin);
+    ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart);
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)512 << 20;
@@ -567,6 +619,7 @@ int main(void) {
     test_moe_q5k(&arena, 16, 8, 512, 256, 1);
     test_moe_q5k(&arena, 16, 8, 512, 256, 2);
     test_moe_q5k(&arena, 16, 8, 512, 512, 5);
+    printf("qwen35 q5_K decode row variants (L8)\n"); test_moe_q5k_rows(&arena);
     printf("qwen35 moe q5_K tiled GEMM (simdgroup + tensor tiles)\n");
     test_moe_mm_q5k(&arena, 65);
     test_moe_mm_q5k(&arena, 200);
