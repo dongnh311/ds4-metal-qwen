@@ -40141,23 +40141,22 @@ static DS4_MAYBE_UNUSED uint32_t qwen35_prefill_chunk_tokens(uint32_t ctx) {
 /* Ornith KV storage: f16 (default) | fp8 (E4M3) | q4 (4-bit). Own knob per
  * §7.3.  4-bit needs head dim 256 (the qwen4 4-bit KV path's constraint). */
 static DS4_MAYBE_UNUSED void qwen35_kv_mode_env(bool *fp8, bool *q4) {
-    /* Parsed once and cached: this is called on every KV lookup/store, and
-     * an unrecognised DS4_QWEN35_KV value used to print its "ignored"
-     * warning on every one of those calls instead of once per process. */
-    static bool parsed = false;
-    static bool cached_fp8 = false, cached_q4 = false;
-    if (!parsed) {
-        const char *e = getenv("DS4_QWEN35_KV");
-        cached_fp8 = cached_q4 = false;
-        if (e && e[0] && strcmp(e, "f16")) {
-            if (!strcmp(e, "fp8")) cached_fp8 = true;
-            else if (!strcmp(e, "q4") && DS4_N_HEAD_DIM == 256u) { cached_fp8 = true; cached_q4 = true; }
-            else fprintf(stderr, "ds4: DS4_QWEN35_KV=%s ignored (use f16|fp8|q4)\n", e);
+    /* Parsed on every call (getenv is cheap): tests switch DS4_QWEN35_KV at
+     * runtime and create new sessions per mode, so a cached parse would
+     * make later modes silently run as the first one parsed. Only the
+     * "ignored" warning for an unrecognised value is de-duplicated, to
+     * avoid printing it on every KV lookup/store. */
+    static bool warned = false;
+    const char *e = getenv("DS4_QWEN35_KV");
+    *fp8 = *q4 = false;
+    if (e && e[0] && strcmp(e, "f16")) {
+        if (!strcmp(e, "fp8")) *fp8 = true;
+        else if (!strcmp(e, "q4") && DS4_N_HEAD_DIM == 256u) { *fp8 = true; *q4 = true; }
+        else if (!warned) {
+            fprintf(stderr, "ds4: DS4_QWEN35_KV=%s ignored (use f16|fp8|q4)\n", e);
+            warned = true;
         }
-        parsed = true;
     }
-    *fp8 = cached_fp8;
-    *q4 = cached_q4;
 }
 
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(

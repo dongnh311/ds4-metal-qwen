@@ -68,10 +68,20 @@ def flipped(srv, body, desc, save):
     sl.check("kv cache stored" in log, f"{desc}: the flipped server stores its own checkpoint")
     answer = content(result)
 
-    save2 = save.with_name(save.name + "-again")
-    result2 = sl.post("/v1/chat/completions", body, save=save2)
+    # An identical re-request can't reuse the live KV on Ornith (the
+    # recurrent GDN state can't be trimmed back to the prompt end), and the
+    # disk checkpoint is keyed to the conversation text, so instead extend
+    # the conversation with a follow-up turn (append the assistant reply and
+    # a new short user message, exactly like phase 1's turns) and require
+    # that it reuses the checkpoint the flipped server just stored.
+    followup = copy.deepcopy(body)
+    followup["messages"] += [{"role": "assistant", "content": answer},
+                             {"role": "user", "content": "Now add 2 to your previous answer. "
+                                                          "Answer with just the number."}]
+    save2 = save.with_name(save.name + "-followup")
+    result2 = sl.post("/v1/chat/completions", followup, save=save2)
     cached2 = (result2["usage"].get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-    sl.check(cached2 > 0, f"{desc}: a second identical request on the flipped server reuses its "
+    sl.check(cached2 > 0, f"{desc}: a follow-up turn on the flipped server reuses its "
                           f"own checkpoint ({cached2} cached)")
     return answer
 
