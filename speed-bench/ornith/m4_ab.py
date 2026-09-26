@@ -102,8 +102,17 @@ def guard_free(ds4_running=None, omlx_running=None, estate=None):
 
 
 def _omlx_running():
-    p = subprocess.run(["pgrep", "-fl", "omlx-server"], capture_output=True, text=True)
-    return p.stdout.strip()
+    """True (non-empty) if the live oMLX is up, whether or not it has
+    setproctitle-renamed itself to omlx-server yet. A freshly spawned oMLX
+    starts as .../omlx-venv/bin/omlx serve ... and may still be in that
+    window when guard_free() checks, so both forms are matched."""
+    hits = []
+    for cmd in (["pgrep", "-x", "omlx-server"], ["pgrep", "-f", "omlx-venv/bin/omlx"]):
+        p = subprocess.run(cmd, capture_output=True, text=True)
+        out = p.stdout.strip()
+        if out:
+            hits.append(out)
+    return "\n".join(hits)
 
 
 def _procs_in_estate():

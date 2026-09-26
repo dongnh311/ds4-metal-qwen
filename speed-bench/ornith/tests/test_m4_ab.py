@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import unittest
+import unittest.mock
 
 HERE = os.path.dirname(__file__)
 sys.path.insert(0, os.path.join(HERE, ".."))                       # speed-bench/ornith
@@ -48,6 +49,39 @@ class GuardTest(unittest.TestCase):
 
     def test_one_process_guard_passes_when_free(self):
         m.guard_free(ds4_running=lambda: "", omlx_running=lambda: "", estate=lambda: "")
+
+
+class OmlxRunningTest(unittest.TestCase):
+    """A freshly spawned oMLX starts as .../omlx-venv/bin/omlx serve ... and may
+    not have setproctitle-renamed itself to omlx-server yet; _omlx_running()
+    must catch either form."""
+
+    @staticmethod
+    def _fake_run(dash_x_hit, dash_f_hit):
+        def run(cmd, **kwargs):
+            class _Result:
+                pass
+            r = _Result()
+            if "-x" in cmd:
+                r.stdout = "40263\n" if dash_x_hit else ""
+            elif "-f" in cmd:
+                r.stdout = "40263 /Users/dongnh/.local/omlx-venv/bin/omlx serve\n" if dash_f_hit else ""
+            else:
+                r.stdout = ""
+            return r
+        return run
+
+    def test_true_when_only_dash_x_pattern_matches(self):
+        with unittest.mock.patch.object(m.subprocess, "run", side_effect=self._fake_run(True, False)):
+            self.assertTrue(m._omlx_running())
+
+    def test_true_when_only_dash_f_omlx_venv_pattern_matches(self):
+        with unittest.mock.patch.object(m.subprocess, "run", side_effect=self._fake_run(False, True)):
+            self.assertTrue(m._omlx_running())
+
+    def test_false_when_neither_pattern_matches(self):
+        with unittest.mock.patch.object(m.subprocess, "run", side_effect=self._fake_run(False, False)):
+            self.assertFalse(m._omlx_running())
 
 
 class CachedTokensTest(unittest.TestCase):
