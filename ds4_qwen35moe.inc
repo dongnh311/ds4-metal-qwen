@@ -369,6 +369,17 @@ static bool qwen35_graph_linear_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m,
     return ok;
 }
 
+/* DS4_QWEN35_FUSE_NORM (Ornith decode lever L2, off by default): at T==1,
+ * fuse the attn/GDN residual add with the following ffn_norm RMSNorm into
+ * one kernel instead of two.  Off by default (0); the controller's gate 1
+ * decides whether the fused kernel is bit-identical to the separate
+ * add+rms_norm pair before this default can flip. */
+static bool qwen35_fuse_norm_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_QWEN35_FUSE_NORM"); v = e && e[0] && e[0] != '0'; }
+    return v;
+}
+
 /* One trunk layer: pre-norm mixer and pre-norm MoE, each added to R. */
 static bool qwen35_graph_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                uint32_t il, uint32_t pos0, uint32_t T) {
@@ -378,9 +389,16 @@ static bool qwen35_graph_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                                   DS4_N_EMBD, T, DS4_RMS_EPS) != 0;
     if (ok) ok = ds4_qwen35_layer_is_attention(il) ? qwen35_graph_attention(g, m, l, il, pos0, T)
                                                     : qwen35_graph_linear_rows(g, m, l, il, T);
-    if (ok) ok = ds4_gpu_add_tensor(g->R, g->R, g->blk, n) != 0;
-    if (ok) ok = ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, g->R, m->map, m->size, l->ffn_norm->abs_offset,
+    if (ok) {
+        if (T == 1u && qwen35_fuse_norm_enabled()) {
+            ok = ds4_gpu_add_rms_norm_weight_tensor(g->mixed, g->R, g->R, g->blk, m->map, m->size,
+                                                    l->ffn_norm->abs_offset, DS4_N_EMBD, DS4_RMS_EPS) != 0;
+        } else {
+            ok = ds4_gpu_add_tensor(g->R, g->R, g->blk, n) != 0 &&
+                 ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, g->R, m->map, m->size, l->ffn_norm->abs_offset,
                                                      DS4_N_EMBD, T, DS4_RMS_EPS) != 0;
+        }
+    }
     if (ok) ok = qwen35_graph_moe(g, m, l, T);
     if (ok) ok = ds4_gpu_add_tensor(g->R, g->R, g->blk, n) != 0;
     return ok;
@@ -431,10 +449,29 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     double p[5] = {0}, prof_last = prof ? now_sec() : 0.0;
 #define QWEN35_PROF(idx_) do { if (prof) { ds4_gpu_end_commands(); const double n_ = now_sec(); \
         p[idx_] += n_ - prof_last; prof_last = n_; glm_graph_begin_commands_if_needed(); } } while (0)
+    /* DS4_QWEN35_FLUSH_LAYER (Ornith decode lever L1, on by default at
+     * layer 2): submit the command buffer after the given trunk layer so
+     * the GPU can start executing while the host is still encoding the
+     * rest of the layers, exactly as qwen4's early flush does.  Submission
+     * only -- it never changes the arithmetic, only when work is handed to
+     * the GPU.  -1 or "off" disables it; unset or any other invalid value
+     * falls back to the default (layer 2). */
+    static int flush_layer = -2; /* -2 = not parsed yet; -1 = disabled */
+    if (flush_layer == -2) {
+        const char *e = getenv("DS4_QWEN35_FLUSH_LAYER");
+        const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+        if (e && e[0] && strcmp(e, "off") == 0) {
+            flush_layer = -1;
+        } else {
+            const long v = (e && e[0]) ? strtol(e, NULL, 10) : 2;
+            flush_layer = (v == -1) ? -1 : ((v >= 0 && (uint32_t)v < n_trunk) ? (int)v : 2);
+        }
+    }
     bool ok = qwen35_graph_carry_h(g, pos0);
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && ok; il++) {
         ok = qwen35_graph_layer(g, m, w, il, pos0, T);
         QWEN35_PROF(ds4_qwen35_layer_is_attention(il) ? 2 : 1);   /* 1 gdn, 2 attn (moe folded into the layer's own bucket) */
+        if (ok && flush_layer >= 0 && (int)(il + 1u) == flush_layer && !prof) ok = ds4_gpu_flush_commands() != 0;
     }
     if (ok && g->mtp_h) {
         /* post-output_norm rows: the MTP seed rows 1..T and the LM head input */
