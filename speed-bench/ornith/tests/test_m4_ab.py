@@ -4,6 +4,7 @@ No model, no GPU: the process guards, prompt building, cached-tokens assertion,
 one-process-at-a-time discipline, the ds4-vs-ds4 lever mode and the gate-3
 verdict are checked with fakes.
 """
+import json
 import os
 import subprocess
 import sys
@@ -196,6 +197,78 @@ class LeverModeTest(unittest.TestCase):
         self.assertNotIn("DS4_LEVER", calls[0])
         self.assertIn("DS4_LEVER", calls[1])
         self.assertEqual(calls[1]["DS4_LEVER"], "1")
+
+
+class _FakeHTTPResponse:
+    def __init__(self, data):
+        self._data = data
+
+    def read(self):
+        return self._data
+
+
+class _RunningProc:
+    def poll(self):
+        return None
+
+
+class _ExitedProc:
+    def poll(self):
+        return 1
+
+
+class OmlxReadyTest(unittest.TestCase):
+    """Fix round 2: the live oMLX (0.6.4) loads models lazily on the first
+    request. Right after startup /api/status returns loaded_models=[]
+    forever until a request comes in, so ready() must not wait on
+    loaded_models; it must accept a model merely *discovered* via
+    /v1/models, then force-load it itself via one unmeasured request."""
+
+    @staticmethod
+    def _status_body(status="ok"):
+        return json.dumps({"status": status, "models_loaded": 0, "loaded_models": []}).encode()
+
+    @staticmethod
+    def _models_body(discovered):
+        data = [{"id": m.OMLX_MODEL}] if discovered else []
+        return json.dumps({"data": data}).encode()
+
+    def test_ready_true_when_status_ok_and_model_discovered_not_loaded(self):
+        arm = m.OmlxArm(_tmp_out())
+        arm.proc = _RunningProc()
+        arm.stream = unittest.mock.Mock(return_value=({}, {}))
+
+        def fake_urlopen(url, timeout=2):
+            if "/api/status" in url:
+                return _FakeHTTPResponse(self._status_body())
+            return _FakeHTTPResponse(self._models_body(True))
+
+        with unittest.mock.patch.object(m.urllib.request, "urlopen", side_effect=fake_urlopen):
+            self.assertTrue(arm.ready(timeout=3))
+        arm.stream.assert_called_once()  # the unmeasured load request
+
+    def test_ready_keeps_polling_while_v1_models_lacks_the_model(self):
+        arm = m.OmlxArm(_tmp_out())
+        arm.proc = _RunningProc()
+        arm.stream = unittest.mock.Mock(return_value=({}, {}))
+        seen = {"n": 0}
+
+        def fake_urlopen(url, timeout=2):
+            if "/api/status" in url:
+                return _FakeHTTPResponse(self._status_body())
+            seen["n"] += 1
+            return _FakeHTTPResponse(self._models_body(seen["n"] >= 3))
+
+        with unittest.mock.patch.object(m.urllib.request, "urlopen", side_effect=fake_urlopen), \
+             unittest.mock.patch.object(m.time, "sleep", lambda s: None):
+            self.assertTrue(arm.ready(timeout=10))
+        self.assertGreaterEqual(seen["n"], 3)
+
+    def test_ready_raises_systemexit_when_process_exits(self):
+        arm = m.OmlxArm(_tmp_out())
+        arm.proc = _ExitedProc()
+        with self.assertRaises(SystemExit):
+            arm.ready(timeout=5)
 
 
 class ParseEnvTest(unittest.TestCase):

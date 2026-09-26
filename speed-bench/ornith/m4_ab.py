@@ -120,6 +120,16 @@ def _procs_in_estate():
     return "\n".join(l for l in p.stdout.splitlines()[1:] if re.match(r"\s*\d+\s+[EU]", l))
 
 
+def _get_json(url, timeout=2):
+    return json.loads(urllib.request.urlopen(url, timeout=timeout).read())
+
+
+def _model_discovered(models, model_id):
+    """True if `model_id` appears in a /v1/models response's data list,
+    whether or not the live oMLX has actually loaded it yet."""
+    return any(entry.get("id") == model_id for entry in (models or {}).get("data") or [])
+
+
 def _parse_env(spec):
     """'K=V,K2=V2' -> {'K': 'V', 'K2': 'V2'}; '' -> {}."""
     return dict(kv.split("=", 1) for kv in spec.split(",") if "=" in kv)
@@ -215,19 +225,37 @@ class OmlxArm:
                                          stdout=log, stderr=subprocess.STDOUT)
 
     def ready(self, timeout=900):
+        """True once the server answers /api/status with status=='ok' AND
+        /v1/models lists OMLX_MODEL as discovered. The live oMLX (0.6.4)
+        loads models lazily on the first request: right after startup
+        /api/status returns loaded_models=[] forever until a request comes
+        in, so waiting on loaded_models (as this used to) never returns.
+        Once discovered, sends one unmeasured load request so the model is
+        actually resident before any measured request runs."""
         for _ in range(timeout):
-            try:
-                st = json.loads(urllib.request.urlopen(self.base_url + "/api/status", timeout=2).read())
-                if any(OMLX_MODEL in m for m in (st.get("loaded_models") or [])):
-                    return True
-            except OSError:
-                pass
-            except Exception:
-                pass
             if self.proc and self.proc.poll() is not None:
                 raise SystemExit("m4_ab: omlx exited during startup, see omlx-server.log")
+            try:
+                st = _get_json(self.base_url + "/api/status")
+                models = _get_json(self.base_url + "/v1/models")
+            except OSError:
+                time.sleep(1)
+                continue
+            except Exception:
+                time.sleep(1)
+                continue
+            if st.get("status") == "ok" and _model_discovered(models, self.model_id):
+                self._load()
+                return True
             time.sleep(1)
         raise SystemExit("m4_ab: omlx not ready in %d s" % timeout)
+
+    def _load(self):
+        """One unmeasured request that forces the lazily-loading oMLX to
+        actually load self.model_id, so the first measured request (sent by
+        measure_arm's warmup loop, or the first ctx row if --warmup 0) never
+        includes model load time."""
+        self.stream("nonce-omlx-load ping", max_tokens=1)
 
     def stream(self, prompt, max_tokens):
         return _chat_stream(self.base_url, self.model_id, prompt, max_tokens)
