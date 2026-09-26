@@ -55,3 +55,6 @@ speed-bench/fp8-flat-gate/
 speed-bench/ornith/*/ds4/
 speed-bench/ornith/*/logs/
 speed-bench/ornith/oracle/ref-cpu/
+
+# Ornith M4 A/B: keep committed summaries only
+speed-bench/ornith/*/omlx/
