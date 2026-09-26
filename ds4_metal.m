@@ -2974,6 +2974,10 @@ static int ds4_gpu_mpp_available(void) {
     return g_metal4_tensor_api_enabled && !g_quality_mode;
 }
 
+int ds4_gpu_tensor_api_available(void) {
+    return ds4_gpu_mpp_available();
+}
+
 /*
  * Retained Metal4 defaults live here instead of behind user-visible options.
  * The public runtime has one automatic accelerated path plus the global
@@ -49529,6 +49533,18 @@ enum {
     QWEN4_K_QWEN35_MOE_DOWN,
     QWEN4_K_QWEN35_GDN_OUT,
     QWEN4_K_QWEN35_MTP_CONCAT,
+    QWEN4_K_QWEN35_MM_MID_Q5K,
+    QWEN4_K_QWEN35_MM_MID_Q5K_NT1,
+    QWEN4_K_QWEN35_MM_MID_Q5K_NT2,
+    QWEN4_K_QWEN35_MM_MID_Q5K_NT8,
+    QWEN4_K_QWEN35_MM_DOWN_Q5K,
+    QWEN4_K_QWEN35_MM_DOWN_Q5K_NT1,
+    QWEN4_K_QWEN35_MM_DOWN_Q5K_NT2,
+    QWEN4_K_QWEN35_MM_DOWN_Q5K_NT8,
+    QWEN4_K_QWEN35_MM_MID_Q5K_NAX,
+    QWEN4_K_QWEN35_MM_MID_Q5K_NAX64,
+    QWEN4_K_QWEN35_MM_DOWN_Q5K_NAX,
+    QWEN4_K_QWEN35_MM_DOWN_Q5K_NAX64,
     QWEN4_K_COUNT,
 };
 
@@ -49655,6 +49671,18 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_moe_down",
     "kernel_qwen35_gdn_out",
     "kernel_qwen35_mtp_concat",
+    "kernel_qwen35_moe_mm_mid_q5k",
+    "kernel_qwen35_moe_mm_mid_q5k_nt1",
+    "kernel_qwen35_moe_mm_mid_q5k_nt2",
+    "kernel_qwen35_moe_mm_mid_q5k_nt8",
+    "kernel_qwen35_moe_mm_down_q5k",
+    "kernel_qwen35_moe_mm_down_q5k_nt1",
+    "kernel_qwen35_moe_mm_down_q5k_nt2",
+    "kernel_qwen35_moe_mm_down_q5k_nt8",
+    "kernel_qwen35_moe_mm_mid_q5k_nax",
+    "kernel_qwen35_moe_mm_mid_q5k_nax64",
+    "kernel_qwen35_moe_mm_down_q5k_nax",
+    "kernel_qwen35_moe_mm_down_q5k_nax64",
 };
 
 typedef struct {
@@ -49768,7 +49796,8 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 }
                 [g_pipeline_cache setObject:pipeline forKey:key];
             }
-        } else if (kernel >= QWEN4_K_MOE_MM_MID && kernel <= QWEN4_K_MOE_MM_DOWN_NAXC64) {
+        } else if ((kernel >= QWEN4_K_MOE_MM_MID && kernel <= QWEN4_K_MOE_MM_DOWN_NAXC64) ||
+                   (kernel >= QWEN4_K_QWEN35_MM_MID_Q5K && kernel <= QWEN4_K_QWEN35_MM_DOWN_Q5K_NAX64)) {
             /* Keep each quantization's dequantizer constant through the K
              * loop. M3 Ultra and M5 have balanced full-model measurements;
              * other devices can opt in, and zero restores the generic kernel. */
@@ -53364,6 +53393,140 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         if (!qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NT1, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
         if (nt > 2u && !qwen4_dispatch(QWEN4_K_MOE_MM_DOWN_NT2, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
         if (nt > 4u && !qwen4_dispatch(QWEN4_K_MOE_MM_DOWN, &args, sizeof(args), b, 5, tail_grid, MTLSizeMake(128, 1, 1), 0)) return 0;
+    }
+    return 1;
+}
+
+/* Ornith Q5_K tiled prefill GEMM.  Own knob DS4_QWEN35_MOE_MM_NAX (default =
+ * the Q4_K policy: 2 = 64-token tensor tiles when the tensor API is available,
+ * 0 = simdgroup tiles).  Only the half / non-compensated tiles are built. */
+static uint32_t qwen35_moe_mm_nax(void) {
+    if (!ds4_gpu_mpp_available()) return 0u;
+    const char *v = getenv("DS4_QWEN35_MOE_MM_NAX");
+    const long n = (v && v[0]) ? strtol(v, NULL, 10) : 2;
+    if (n <= 0) return 0u;
+    return (n == 1) ? 32u : 64u;
+}
+
+int ds4_gpu_qwen35_moe_mm_mid_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+        uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap) {
+    if (weight_type != 13u) return 0;
+    const uint32_t row_bytes = qwen35_expert_row_bytes(weight_type, in_dim);
+    const uint64_t expert_bytes = (uint64_t)row_bytes * ff_dim;
+    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, true);
+    const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN35_MOE_MID_NT");
+    const int kernel = nt == 1u ? QWEN4_K_QWEN35_MM_MID_Q5K_NT1 :
+                       nt == 2u ? QWEN4_K_QWEN35_MM_MID_Q5K_NT2 :
+                       nt == 8u ? QWEN4_K_QWEN35_MM_MID_Q5K_NT8 : QWEN4_K_QWEN35_MM_MID_Q5K;
+    qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, in_dim, ff_dim, weight_type, row_bytes, list_cap,
+                               expert_bytes, n_expert, tiles, 0, qwen4_moe_mm_expert_major() };
+    const bool tails = qwen4_moe_mm_tails(weight_type, nt);   /* type 13 is not in the qwen4 tail set; false on M5 */
+    if (tails) args.tail_base = nt * 8u;
+    qwen4_bind b[8];
+    if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 || (in_dim % 64) != 0 ||
+        ff_dim == 0 || n_expert == 0 || n_expert > 512 ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert_bytes * n_expert, "moe gate experts") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert_bytes * n_expert, "moe up experts") ||
+        !qwen4_bind_tensor(&b[2], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||
+        !qwen4_bind_tensor(&b[3], counts, (uint64_t)n_expert * sizeof(int32_t), "moe counts") ||
+        !qwen4_bind_tensor(&b[4], x, (uint64_t)n_tokens * in_dim * sizeof(float), "moe input") ||
+        !qwen4_bind_tensor(&b[5], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid")) {
+        return 0;
+    }
+    const uint32_t nax = qwen35_moe_mm_nax();
+    if (nax) {
+        args.tail_base = 0;
+        const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;
+        ds4_gpu_tensor *xh = qwen4_nax_half_operand(&g_qwen4_nax_half_x, &g_qwen4_nax_half_x_bytes, x, (uint64_t)n_tokens * in_dim);
+        ds4_gpu_tensor *mh = qwen4_nax_scratch(&g_qwen4_nax_half_mid, &g_qwen4_nax_half_mid_bytes, mid_count * sizeof(uint16_t));
+        if (!xh || !mh || !qwen4_bind_tensor(&b[4], xh, (uint64_t)n_tokens * in_dim * sizeof(uint16_t), "moe input half") ||
+            !qwen4_bind_tensor(&b[6], mh, mid_count * sizeof(uint16_t), "moe mid half")) return 0;
+        g_qwen4_nax_half_mid_for = mid;
+        g_qwen4_nax_half_mid_count = mid_count;
+        const bool nax_tails = nax == 64u && qwen4_moe_mm_tails(weight_type, 8u);
+        if (nax_tails) args.tail_base = 64u;
+        const int nax_mid = nax == 64u ? QWEN4_K_QWEN35_MM_MID_Q5K_NAX64 : QWEN4_K_QWEN35_MM_MID_Q5K_NAX;
+        if (!qwen4_dispatch(nax_mid, &args, sizeof(args), b, 7,
+                            qwen4_moe_mm_grid((ff_dim + 63u) / 64u, n_expert, tiles, args.expert_major),
+                            MTLSizeMake(128, 1, 1), nax == 64u ? 16384u : 10240u)) return 0;
+        if (!nax_tails) return 1;
+        args.tiles_per_launch = 1;
+        return qwen4_dispatch(QWEN4_K_QWEN35_MM_MID_Q5K_NAX, &args, sizeof(args), b, 7,
+                              qwen4_moe_mm_grid((ff_dim + 63u) / 64u, n_expert, 1, args.expert_major),
+                              MTLSizeMake(128, 1, 1), 10240u);
+    }
+    if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 6,
+                        qwen4_moe_mm_grid((ff_dim + 31u) / 32u, n_expert, tiles, args.expert_major),
+                        MTLSizeMake(128, 1, 1), 0)) return 0;
+    if (tails) {
+        const MTLSize tg = MTLSizeMake((ff_dim + 31u) / 32u, n_expert, 1);
+        if (!qwen4_dispatch(QWEN4_K_QWEN35_MM_MID_Q5K_NT1, &args, sizeof(args), b, 6, tg, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 2u && !qwen4_dispatch(QWEN4_K_QWEN35_MM_MID_Q5K_NT2, &args, sizeof(args), b, 6, tg, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 4u && !qwen4_dispatch(QWEN4_K_QWEN35_MM_MID_Q5K, &args, sizeof(args), b, 6, tg, MTLSizeMake(128, 1, 1), 0)) return 0;
+    }
+    return 1;
+}
+
+int ds4_gpu_qwen35_moe_mm_down_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+        uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
+    if (weight_type != 13u) return 0;
+    const uint32_t row_bytes = qwen35_expert_row_bytes(weight_type, ff_dim);
+    const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
+    const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, false);
+    const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN35_MOE_DOWN_NT");
+    const int kernel = nt == 1u ? QWEN4_K_QWEN35_MM_DOWN_Q5K_NT1 :
+                       nt == 2u ? QWEN4_K_QWEN35_MM_DOWN_Q5K_NT2 :
+                       nt == 8u ? QWEN4_K_QWEN35_MM_DOWN_Q5K_NT8 : QWEN4_K_QWEN35_MM_DOWN_Q5K;
+    qwen4_moe_mm_args args = { n_tokens, n_slots, n_out, ff_dim, out_dim, weight_type, row_bytes, list_cap,
+                               expert_bytes, n_expert, tiles, 0, qwen4_moe_mm_expert_major() };
+    const bool tails = qwen4_moe_mm_tails(weight_type, nt);
+    if (tails) args.tail_base = nt * 8u;
+    qwen4_bind b[6];
+    if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 || (ff_dim % 64) != 0 ||
+        out_dim == 0 || n_expert == 0 || n_expert > 512 ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_expert, "moe down experts") ||
+        !qwen4_bind_tensor(&b[1], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||
+        !qwen4_bind_tensor(&b[2], counts, (uint64_t)n_expert * sizeof(int32_t), "moe counts") ||
+        !qwen4_bind_tensor(&b[3], mid, (uint64_t)n_tokens * n_out * ff_dim * sizeof(float), "moe mid") ||
+        !qwen4_bind_tensor(&b[4], part, (uint64_t)n_tokens * n_out * out_dim * sizeof(float), "moe partial")) {
+        return 0;
+    }
+    const uint32_t nax = qwen35_moe_mm_nax();
+    if (nax) {
+        args.tail_base = 0;
+        const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;
+        ds4_gpu_tensor *mh = g_qwen4_nax_half_mid_for == mid && g_qwen4_nax_half_mid_count == mid_count && g_qwen4_nax_half_mid
+                             ? g_qwen4_nax_half_mid
+                             : qwen4_nax_half_operand(&g_qwen4_nax_half_mid, &g_qwen4_nax_half_mid_bytes, mid, mid_count);
+        g_qwen4_nax_half_mid_for = NULL;
+        g_qwen4_nax_half_mid_count = 0;
+        if (!mh || !qwen4_bind_tensor(&b[3], mh, mid_count * sizeof(uint16_t), "moe mid half")) return 0;
+        const bool nax_tails = nax == 64u && qwen4_moe_mm_tails(weight_type, 8u);
+        if (nax_tails) args.tail_base = 64u;
+        const int nax_down = nax == 64u ? QWEN4_K_QWEN35_MM_DOWN_Q5K_NAX64 : QWEN4_K_QWEN35_MM_DOWN_Q5K_NAX;
+        if (!qwen4_dispatch(nax_down, &args, sizeof(args), b, 5,
+                            qwen4_moe_mm_grid((out_dim + 63u) / 64u, n_expert, tiles, args.expert_major),
+                            MTLSizeMake(128, 1, 1), nax == 64u ? 16384u : 8192u)) return 0;
+        if (!nax_tails) return 1;
+        args.tiles_per_launch = 1;
+        return qwen4_dispatch(QWEN4_K_QWEN35_MM_DOWN_Q5K_NAX, &args, sizeof(args), b, 5,
+                              qwen4_moe_mm_grid((out_dim + 63u) / 64u, n_expert, 1, args.expert_major),
+                              MTLSizeMake(128, 1, 1), 8192u);
+    }
+    if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
+                        qwen4_moe_mm_grid((out_dim + 31u) / 32u, n_expert, tiles, args.expert_major),
+                        MTLSizeMake(128, 1, 1), 0)) return 0;
+    if (tails) {
+        const MTLSize tg = MTLSizeMake((out_dim + 31u) / 32u, n_expert, 1);
+        if (!qwen4_dispatch(QWEN4_K_QWEN35_MM_DOWN_Q5K_NT1, &args, sizeof(args), b, 5, tg, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 2u && !qwen4_dispatch(QWEN4_K_QWEN35_MM_DOWN_Q5K_NT2, &args, sizeof(args), b, 5, tg, MTLSizeMake(128, 1, 1), 0)) return 0;
+        if (nt > 4u && !qwen4_dispatch(QWEN4_K_QWEN35_MM_DOWN_Q5K, &args, sizeof(args), b, 5, tg, MTLSizeMake(128, 1, 1), 0)) return 0;
     }
     return 1;
 }

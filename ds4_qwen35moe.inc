@@ -255,9 +255,9 @@ static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
 
 /* Router (softmax over 256, top 8, renormalized, sigmoid shared gate), the
  * routed experts and the shared expert, reduced into blk without a residual
- * (n_hc = 0); the caller adds blk to R.  Q4_K layers take the tiled expert
- * GEMMs above one tile of tokens, as qwen4 prefill does; Q5_K layers keep
- * the per-token row kernels.  Batches above 8 rows run the shared expert as
+ * (n_hc = 0); the caller adds blk to R.  Q4_K and Q5_K layers take the tiled
+ * expert GEMMs above one tile of tokens; single rows and verifies keep the
+ * per-token row kernels.  Batches above 8 rows run the shared expert as
  * dense projections, single rows and verifies keep it as an extra slot. */
 static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                              uint32_t T) {
@@ -267,7 +267,7 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
         ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                          l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                          E, g->sh_gate_logit, T, NE, K) != 0;
-    const bool mm = T > 64u && xt == DS4_TENSOR_Q4_K && dt == DS4_TENSOR_Q4_K;
+    const bool mm = T > 64u && xt == dt && (xt == DS4_TENSOR_Q4_K || xt == DS4_TENSOR_Q5_K);
     const bool shared_dense = mm || T > 8u;
     if (ok && shared_dense) {
         ok = qwen35_gemv(g, g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
@@ -277,12 +277,23 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
     }
     if (ok && mm) {
         ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, K, NE,
-                                                  g->cap_tokens) &&
-             ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
-                                             l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, xt,
-                                             NE, T, K, K, E, F, g->cap_tokens) &&
-             ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
-                                              l->ffn_down_exps->abs_offset, dt, NE, T, K, K, F, E, g->cap_tokens);
+                                                  g->cap_tokens);
+        if (ok) {
+            ok = (xt == DS4_TENSOR_Q5_K)
+                 ? ds4_gpu_qwen35_moe_mm_mid_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
+                                                    l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, xt,
+                                                    NE, T, K, K, E, F, g->cap_tokens)
+                 : ds4_gpu_qwen4_moe_mm_mid_tensor(g->mid, g->mixed, g->moe_lists, g->moe_counts, m->map, m->size,
+                                                   l->ffn_gate_exps->abs_offset, l->ffn_up_exps->abs_offset, xt,
+                                                   NE, T, K, K, E, F, g->cap_tokens);
+        }
+        if (ok) {
+            ok = (dt == DS4_TENSOR_Q5_K)
+                 ? ds4_gpu_qwen35_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
+                                                     l->ffn_down_exps->abs_offset, dt, NE, T, K, K, F, E, g->cap_tokens)
+                 : ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
+                                                    l->ffn_down_exps->abs_offset, dt, NE, T, K, K, F, E, g->cap_tokens);
+        }
     } else if (ok) {
         const uint64_t sg = shared_dense ? 0u : l->ffn_gate_shexp->abs_offset;
         const uint64_t su = shared_dense ? 0u : l->ffn_up_shexp->abs_offset;

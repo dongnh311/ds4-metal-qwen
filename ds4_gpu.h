@@ -44,6 +44,10 @@ typedef struct {
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+/* True when the Metal4 tensor-op API is enabled on this device/run (test
+ * support: lets a kernel test skip-and-label the tensor-tile case instead of
+ * relying on a dispatch fallback). */
+int ds4_gpu_tensor_api_available(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
@@ -3616,6 +3620,19 @@ int ds4_gpu_qwen35_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type);
+/* Q5_K tiled prefill GEMM (T > 64 tokens): same tile-batched semantics as the
+ * qwen4 Q4_K pair (ds4_gpu_qwen4_moe_mm_{mid,down}_tensor), fed by the shared
+ * ds4_gpu_qwen4_moe_build_lists_tensor lists/counts, weight_type 13 (Q5_K) only. */
+int ds4_gpu_qwen35_moe_mm_mid_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+        uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap);
+int ds4_gpu_qwen35_moe_mm_down_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+        uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
 /* Streamed decode lookahead: before a streamed layer's MoE, name the next
  * streamed layer so its gate can read the experts its router input predicts.
  * top == 0 disables it for that gate. */

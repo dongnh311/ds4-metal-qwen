@@ -460,6 +460,100 @@ static void test_mtp_concat(arena_t *a, uint32_t E, uint32_t T) {
     ds4_gpu_tensor_free(ge); ds4_gpu_tensor_free(gh); ds4_gpu_tensor_free(gc);
 }
 
+/* Q5_K routed experts through the tiled GEMM: the simdgroup tiles
+ * (DS4_QWEN35_MOE_MM_NAX=0) are the exact reference for the tensor tiles, and
+ * both are bounded against the double reference and against the M1 per-token
+ * row kernels.  T=65 exercises the first tile tail, T=641 the multi-tile,
+ * partial-expert and empty-expert cases (cf. test_moe_mm_tiles_exact). */
+static void test_moe_mm_q5k(arena_t *a, uint32_t T) {
+    const uint32_t E = 256, F = 256, NE = 4, slots = 2, n_out = slots, list_cap = T + 7, guard = 16;
+    const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * E;
+    const char *nax_env = "DS4_QWEN35_MOE_MM_NAX";
+    const char *saved_nax_v = getenv(nax_env);
+    char *saved_nax = saved_nax_v ? strdup(saved_nax_v) : NULL;
+    double *gate_w, *up_w, *down_w;
+    const uint64_t gate_off = arena_q5_K(a, (uint64_t)NE * F, E, &gate_w, 0.05f);
+    const uint64_t up_off = arena_q5_K(a, (uint64_t)NE * F, E, &up_w, 0.05f);
+    const uint64_t down_off = arena_q5_K(a, (uint64_t)NE * E, F, &down_w, 0.05f);
+    float *x = rand_vec((uint64_t)T * E, 2.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * sizeof(int32_t));
+    for (uint32_t t = 0; t < T; t++) { sel[t * slots] = 0; sel[t * slots + 1] = (int32_t)(1u + t % 2u); }
+    double *mid_ex = malloc(mid_n * sizeof(double)), *part_ex = malloc(part_n * sizeof(double));
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < slots; s++) {
+            const uint32_t e = (uint32_t)sel[t * slots + s];
+            for (uint32_t f = 0; f < F; f++) {
+                double g = 0.0, u = 0.0;
+                for (uint32_t k = 0; k < E; k++) {
+                    g += gate_w[((uint64_t)e * F + f) * E + k] * (double)x[(uint64_t)t * E + k];
+                    u += up_w[((uint64_t)e * F + f) * E + k] * (double)x[(uint64_t)t * E + k];
+                }
+                mid_ex[((uint64_t)t * n_out + s) * F + f] = silu_d(g) * u;
+            }
+            for (uint32_t d = 0; d < E; d++) {
+                double p = 0.0;
+                for (uint32_t k = 0; k < F; k++) p += down_w[((uint64_t)e * E + d) * F + k] * mid_ex[((uint64_t)t * n_out + s) * F + k];
+                part_ex[((uint64_t)t * n_out + s) * E + d] = p;
+            }
+        }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * list_cap * 4);
+    ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc(NE * 4);
+    require_ok(gsel && glists && gcounts && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "q5k sel");
+    require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, list_cap), "q5k lists");
+    ds4_gpu_tensor *gmid = upload(NULL, mid_n + guard), *gpart = upload(NULL, part_n + guard);
+    const uint32_t levels[] = {0u, 64u};   /* 0 = simdgroup tiles; 64 = tensor tiles */
+    float *ref_mid = NULL, *ref_part = NULL;
+    const float sentinel = -1234.5f;
+    for (uint32_t li = 0; li < 2u; li++) {
+        if (levels[li] && !ds4_gpu_tensor_api_available()) {
+            printf("  q5k tiles nax=%u skipped (tensor API unavailable)\n", levels[li]);
+            continue;
+        }
+        char lv[4]; snprintf(lv, sizeof(lv), "%u", levels[li] ? 2u : 0u);   /* NAX level 2 => 64-tok tiles */
+        setenv(nax_env, lv, 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gmid, sentinel, mid_n + guard) &&
+                   ds4_gpu_tensor_fill_f32(gpart, sentinel, part_n + guard), "q5k sentinels");
+        require_ok(ds4_gpu_qwen35_moe_mm_mid_tensor(gmid, gx, glists, gcounts, a->base, a->size,
+                                gate_off, up_off, 13u, NE, T, slots, n_out, E, F, list_cap), "q5k mm mid");
+        require_ok(ds4_gpu_qwen35_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size,
+                                down_off, 13u, NE, T, slots, n_out, F, E, list_cap), "q5k mm down");
+        float *gm = download(gmid, mid_n + guard), *gp = download(gpart, part_n + guard);
+        for (uint64_t i = mid_n; i < mid_n + guard; i++) require_ok(gm[i] == sentinel, "q5k mid tail guard");
+        for (uint64_t i = part_n; i < part_n + guard; i++) require_ok(gp[i] == sentinel, "q5k down tail guard");
+        double ew = 0.0, sc = 1e-6;
+        for (uint64_t i = 0; i < part_n; i++) { double d = fabs((double)gp[i] - part_ex[i]); if (d > ew) ew = d; if (fabs(part_ex[i]) > sc) sc = fabs(part_ex[i]); }
+        char what[64]; snprintf(what, sizeof(what), "q5k tiles nax=%u down vs exact T=%u", levels[li], T);
+        printf("  %-40s max|d|=%.3e (rel %.3e)\n", what, ew, ew / sc);
+        require_ok(ew <= 3e-3 * sc, what);
+        if (levels[li] == 0u) { ref_mid = gm; ref_part = gp; }   /* simdgroup = exact reference */
+        else {
+            double wm = 0.0, sm = 1e-6;
+            for (uint64_t i = 0; i < mid_n; i++) { if (ref_mid[i] == sentinel) continue; double d = fabs((double)gm[i] - ref_mid[i]); if (d > wm) wm = d; if (fabs(ref_mid[i]) > sm) sm = fabs(ref_mid[i]); }
+            require_ok(wm <= 2e-3 * sm, "q5k tensor mid within 2e-3 of simdgroup");
+            free(gm); free(gp);
+        }
+    }
+    /* cross-check the simdgroup tiles against the M1 per-token row kernels (no shared slot). */
+    setenv(nax_env, "0", 1);
+    ds4_gpu_tensor *rmid = upload(NULL, mid_n), *rpart = upload(NULL, part_n);
+    require_ok(ds4_gpu_qwen35_moe_mid_tensor(rmid, gx, gsel, a->base, a->size, gate_off, up_off, 13u,
+                                             NE, T, slots, E, F, 0, 0, UINT32_MAX), "q5k row mid");
+    require_ok(ds4_gpu_qwen35_moe_down_tensor(rpart, rmid, gsel, a->base, a->size, down_off, 13u,
+                                              NE, T, slots, F, E, 0, UINT32_MAX), "q5k row down");
+    float *rp = download(rpart, part_n);
+    double rw = 0.0, rs = 1e-6;
+    for (uint64_t i = 0; i < part_n; i++) { double d = fabs((double)rp[i] - ref_part[i]); if (d > rw) rw = d; if (fabs(ref_part[i]) > rs) rs = fabs(ref_part[i]); }
+    printf("  q5k tiles vs row kernels down T=%u: max|d|=%.3e (rel %.3e)\n", T, rw, rw / rs);
+    require_ok(rw <= 2e-3 * rs, "q5k tiles match row kernels");
+    if (saved_nax) { setenv(nax_env, saved_nax, 1); free(saved_nax); } else unsetenv(nax_env);
+    free(x); free(sel); free(mid_ex); free(part_ex); free(gate_w); free(up_w); free(down_w);
+    free(ref_mid); free(ref_part); free(rp);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gcounts);
+    ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart); ds4_gpu_tensor_free(rmid); ds4_gpu_tensor_free(rpart);
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)512 << 20;
@@ -473,6 +567,10 @@ int main(void) {
     test_moe_q5k(&arena, 16, 8, 512, 256, 1);
     test_moe_q5k(&arena, 16, 8, 512, 256, 2);
     test_moe_q5k(&arena, 16, 8, 512, 512, 5);
+    printf("qwen35 moe q5_K tiled GEMM (simdgroup + tensor tiles)\n");
+    test_moe_mm_q5k(&arena, 65);
+    test_moe_mm_q5k(&arena, 200);
+    test_moe_mm_q5k(&arena, 641);
     printf("qwen35 gdn out (silu gate)\n");
     test_gdn_out_silu(&arena, 32, 128, 3);
     printf("qwen35 attention prep (no indexer)\n");
