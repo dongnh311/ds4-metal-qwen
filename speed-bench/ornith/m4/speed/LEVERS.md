@@ -24,3 +24,11 @@ grows to 96% of a 128K prefill and decode attention is ~32 ms/token at 128K (3x 
 of the planned levers touch the attention kernels' efficiency; the shared qwen4 FP8/4-bit K/V attention paths are
 slower than the F16 path for Ornith's 2-KV-head x 256-dim shape. A faster Ornith attention (flash-style prefill,
 a decode kernel near the bandwidth floor) is the lever that remains.
+
+Notes added after the final runs:
+- The L12/fp8/q4 32K A/Bs and the 128K CLI pair used a base env with L1+L2+L8 on (L2 was rejected afterwards; it is
+  exact, so it does not change outputs, and its speed effect is small).
+- L12 without `--mtp` (plain CLI decode, `DS4_QWEN35_ATTN_DECODE2=0` vs `1`, snapshot of `46faf94`): 2K 65.6 -> 68.3
+  t/s, 32K 46.6 -> 47.3 t/s.
+- The final gate-3 run (`GATE3.md`, L1 + L8 + L12 + vocabulary, F16 K/V) measured 22.0 t/s decode at 128K with
+  `--mtp` (baseline 20.4).

@@ -1,0 +1,502 @@
+{
+  "target": "http://127.0.0.1:18296",
+  "model": "ornith-1.5-35b-a3b",
+  "ts": 1790461359.31301,
+  "benchmarks": {
+    "humaneval": {
+      "n": 17,
+      "passed": 17,
+      "pass_rate": 1.0,
+      "graded": 17,
+      "truncated": 0,
+      "errored": 0,
+      "ungradable_rate": 0.0,
+      "cases": [
+        {
+          "id": "HE/add",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.7,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 91
+        },
+        {
+          "id": "HE/strlen",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.4,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 84
+        },
+        {
+          "id": "HE/gcd",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.7,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 102
+        },
+        {
+          "id": "HE/is_prime",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.4,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 160
+        },
+        {
+          "id": "HE/truncate_number",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.8,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 101
+        },
+        {
+          "id": "HE/below_zero",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.8,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 162
+        },
+        {
+          "id": "HE/largest_divisor",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 3.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 157
+        },
+        {
+          "id": "HE/string_xor",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 6.7,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 395
+        },
+        {
+          "id": "HE/rolling_max",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 3.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 168
+        },
+        {
+          "id": "HE/all_prefixes",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.8,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 155
+        },
+        {
+          "id": "HE/filter_by_substring",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.3,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 128
+        },
+        {
+          "id": "HE/longest",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.5,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 73
+        },
+        {
+          "id": "HE/count_distinct_characters",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.1,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 118
+        },
+        {
+          "id": "HE/triples_sum_to_zero",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 3.7,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 219
+        },
+        {
+          "id": "HE/has_close_elements",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 3.5,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 206
+        },
+        {
+          "id": "HE/separate_paren_groups",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 15.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 913
+        },
+        {
+          "id": "HE/sort_even",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 3.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 162
+        }
+      ]
+    },
+    "gsm8k": {
+      "n": 16,
+      "passed": 16,
+      "pass_rate": 1.0,
+      "graded": 16,
+      "truncated": 0,
+      "errored": 0,
+      "ungradable_rate": 0.0,
+      "cases": [
+        {
+          "id": "gsm/0",
+          "passed": true,
+          "detail": "got=72 gold=72",
+          "latency": 1.9,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 94
+        },
+        {
+          "id": "gsm/1",
+          "passed": true,
+          "detail": "got=10 gold=10",
+          "latency": 2.2,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 119
+        },
+        {
+          "id": "gsm/2",
+          "passed": true,
+          "detail": "got=5 gold=5",
+          "latency": 2.7,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 152
+        },
+        {
+          "id": "gsm/3",
+          "passed": true,
+          "detail": "got=3 gold=3",
+          "latency": 1.6,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 77
+        },
+        {
+          "id": "gsm/4",
+          "passed": true,
+          "detail": "got=624 gold=624",
+          "latency": 2.1,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 110
+        },
+        {
+          "id": "gsm/5",
+          "passed": true,
+          "detail": "got=42 gold=42",
+          "latency": 2.6,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 142
+        },
+        {
+          "id": "gsm/6",
+          "passed": true,
+          "detail": "got=18 gold=18",
+          "latency": 1.5,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 73
+        },
+        {
+          "id": "gsm/7",
+          "passed": true,
+          "detail": "got=105 gold=105",
+          "latency": 1.2,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 53
+        },
+        {
+          "id": "gsm/8",
+          "passed": true,
+          "detail": "got=5 gold=5",
+          "latency": 0.8,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 29
+        },
+        {
+          "id": "gsm/9",
+          "passed": true,
+          "detail": "got=150 gold=150",
+          "latency": 1.2,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 54
+        },
+        {
+          "id": "gsm/10",
+          "passed": true,
+          "detail": "got=336 gold=336",
+          "latency": 1.5,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 78
+        },
+        {
+          "id": "gsm/11",
+          "passed": true,
+          "detail": "got=26 gold=26",
+          "latency": 2.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 102
+        },
+        {
+          "id": "gsm/12",
+          "passed": true,
+          "detail": "got=3 gold=3",
+          "latency": 1.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 42
+        },
+        {
+          "id": "gsm/13",
+          "passed": true,
+          "detail": "got=9 gold=9",
+          "latency": 2.3,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 126
+        },
+        {
+          "id": "gsm/14",
+          "passed": true,
+          "detail": "got=20 gold=20",
+          "latency": 2.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 103
+        },
+        {
+          "id": "gsm/15",
+          "passed": true,
+          "detail": "got=40 gold=40",
+          "latency": 2.2,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 118
+        }
+      ]
+    }
+  },
+  "code_bench": {
+    "model": "",
+    "fix_bug": {
+      "factorial": {
+        "passed": true,
+        "detail": "PASS",
+        "answer": "def factorial(n):\n    r = 1\n    for i in range(1, n + 1):\n        r *= i\n    return r",
+        "completion_tokens": 38,
+        "finish_reason": "stop"
+      },
+      "dedupe": {
+        "passed": true,
+        "detail": "PASS",
+        "answer": "def dedupe(xs):\n    seen = set()\n    result = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            result.append(x)\n    return result",
+        "completion_tokens": 52,
+        "finish_reason": "stop"
+      },
+      "clamp": {
+        "passed": true,
+        "detail": "PASS",
+        "answer": "def clamp(x, lo, hi):\n    if x < lo:\n        return lo\n    if x > hi:\n        return hi\n    return x",
+        "completion_tokens": 39,
+        "finish_reason": "stop"
+      }
+    },
+    "generate_testcase": {
+      "slugify": {
+        "passed": false,
+        "detail": "FAIL: over-constrained rc=1 6m/7tbx3cw94z1gc63lwcqv_0lm0000gn/T/tmp12oi6wxs/m.py\", line ",
+        "catches_bug": true,
+        "valid_on_fix": false,
+        "answer": "def test():\n    assert slugify(' Hi  There ') == 'hi-there'\n    assert slugify('Hello, World!') == 'hello-world'\n    assert slugify('  Multiple   Spaces  ') == 'multiple-spaces'\n    assert slugify('Tabs\\tAnd\\nNewlines') == 'tabs-and-newlines'\n    assert slugify('UPPERCASE') == 'uppercase'\n    assert slugify('MixedCase') == 'mixedcase'\n    assert slugify('') == ''\n    assert slugify('   ') == ''\n    assert slugify('Trailing---Dashes') == 'trailing-dashes'\n    assert slugify('a---b') == 'a-b'\n    assert slugify('  Leading') == 'leading'\n    assert slugify('Trailing') == 'trailing'",
+        "completion_tokens": 186,
+        "finish_reason": "stop"
+      },
+      "chunk": {
+        "passed": false,
+        "detail": "FAIL: over-constrained rc=1   File \"/var/folders/6m/7tbx3cw94z1gc63lwcqv_0lm0000gn/T/tmp",
+        "catches_bug": true,
+        "valid_on_fix": false,
+        "answer": "```python\ndef test():\n    assert chunk([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]\n    assert chunk([1, 2, 3, 4, 5, 6], 2) == [[1, 2], [3, 4], [5, 6]]\n    assert chunk([1, 2, 3, 4, 5], 3) == [[1, 2, 3], [4, 5]]\n    assert chunk([], 3) == []\n    assert chunk([1], 3) == [[1]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7], 1) == [[1], [2], [3], [4], [5], [6], [7]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 4) == [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10]]\n    assert chunk([1, 2, 3], 0) == []\n    assert chunk([1, 2, 3, 4], 5) == [[1, 2, 3, 4]]\n    assert chunk([1, 2, 3, 4, 5, 6], 6) == [[1, 2, 3, 4, 5, 6]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], 3) == [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 4) == [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10, 11, 12]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], 5) == [[1, 2, 3, 4, 5], [6, 7, 8, 9, 10], [11, 12, 13]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14], 6) == [[1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12], [13, 14]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], 7) == [[1, 2, 3, 4, 5, 6, 7], [8, 9, 10, 11, 12, 13, 14], [15]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], 8) == [[1, 2, 3, 4, 5, 6, 7, 8], [9, 10, 11, 12, 13, 14, 15, 16]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], 9) == [[1, 2, 3, 4, 5, 6, 7, 8, 9], [10, 11, 12, 13, 14, 15, 16, 17]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18], 10) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10], [11, 12, 13, 14, 15, 16, 17, 18]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19], 11) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], [12, 13, 14, 15, 16, 17, 18, 19]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], 12) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], [13, 14, 15, 16, 17, 18, 19, 20]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21], 13) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13], [14, 15, 16, 17, 18, 19, 20, 21]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22], 14) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14], [15, 16, 17, 18, 19, 20, 21, 22]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23], 15) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15], [16, 17, 18, 19, 20, 21, 22, 23]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24], 16) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16], [17, 18, 19, 20, 21, 22, 23, 24]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25], 17) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17], [18, 19, 20, 21, 22, 23, 24, 25]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26], 18) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18], [19, 20, 21, 22, 23, 24, 25, 26]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27], 19) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19], [20, 21, 22, 23, 24, 25, 26, 27]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28], 20) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20], [21, 22, 23, 24, 25, 26, 27, 28]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29], 21) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21], [22, 23, 24, 25, 26, 27, 28, 29]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30], 22) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22], [23, 24, 25, 26, 27, 28, 29, 30]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31], 23) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23], [24, 25, 26, 27, 28, 29, 30, 31]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32], 24) == [[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24], [25, 26, 27, 28, 29, 30, 31, 32]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33], 25) == [[1, 2, 3, 4, 5, 6, 7,",
+        "completion_tokens": 4096,
+        "finish_reason": "length"
+      },
+      "median": {
+        "passed": false,
+        "detail": "FAIL: over-constrained rc=1 ost recent call last):\n  File \"/var/folders/6m/7tbx3cw94z1gc",
+        "catches_bug": true,
+        "valid_on_fix": false,
+        "answer": "def test():\n    assert median([1, 3, 2]) == 2\n    assert median([1, 2, 3, 4]) == 2.5\n    assert median([5]) == 5\n    assert median([2, 1]) == 2\n    assert median([10, 2, 8, 6, 4]) == 6\n    assert median([-1, -5, -3]) == -3\n    assert median([1, 1, 1, 1]) == 1.0\n    assert median([3, 1, 2, 5, 4, 6]) == 3.5",
+        "completion_tokens": 155,
+        "finish_reason": "stop"
+      }
+    },
+    "refactor": {
+      "letter_grade": {
+        "passed": true,
+        "behaves": true,
+        "improved": true,
+        "expected": "flatten the nested if/else chain (block nesting <= 3; the given code is 4)",
+        "detail": "PASS",
+        "answer": "def letter_grade(s):\n    if s >= 90:\n        return 'A'\n    if s >= 80:\n        return 'B'\n    if s >= 70:\n        return 'C'\n    return 'F'",
+        "completion_tokens": 61,
+        "finish_reason": "stop"
+      },
+      "count_true": {
+        "passed": true,
+        "behaves": true,
+        "improved": true,
+        "expected": "drop the dead `else` branch (no `n = n` self-assignment left)",
+        "detail": "PASS",
+        "answer": "def count_true(flags):\n    return sum(1 for f in flags if f)",
+        "completion_tokens": 23,
+        "finish_reason": "stop"
+      },
+      "is_leap": {
+        "passed": true,
+        "behaves": true,
+        "improved": true,
+        "expected": "flatten the nested if/else chain (block nesting <= 3; the given code is 4)",
+        "detail": "PASS",
+        "answer": "def is_leap(y):\n    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)",
+        "completion_tokens": 43,
+        "finish_reason": "stop"
+      }
+    },
+    "fix_bug_rate": 1.0,
+    "gen_test_rate": 0.0,
+    "refactor_rate": 1.0,
+    "fix_bug_counts": {
+      "truncated": 0,
+      "errored": 0,
+      "graded": 3,
+      "n": 3
+    },
+    "gen_test_counts": {
+      "truncated": 0,
+      "errored": 0,
+      "graded": 3,
+      "n": 3
+    },
+    "refactor_counts": {
+      "truncated": 0,
+      "errored": 0,
+      "graded": 3,
+      "n": 3
+    }
+  },
+  "review": {
+    "model": "",
+    "samples": {
+      "auth_db.py": {
+        "planted": 6,
+        "caught": 4,
+        "matched": 4,
+        "raised": 6,
+        "recall": 0.667,
+        "precision": 0.667,
+        "f1": 0.667,
+        "answer": "[\n  {\"line\": 11, \"category\": \"security\", \"issue\": \"SQL injection via string formatting of username into query instead of parameterized query\"},\n  {\"line\": 13, \"category\": \"reliability\", \"issue\": \"Connection never closed, leaking database resources\"},\n  {\"line\": 14, \"category\": \"correctness\", \"issue\": \"fetchone returns None if no user found, causing TypeError on row[0]\"},\n  {\"line\": 18, \"category\": \"correctness\", \"issue\": \"Function returns None instead of False when password does not match\"},\n  {\"line\": 22, \"category\": \"correctness\", \"issue\": \"Off-by-one slice index returns wrong recent items\"},\n  {\"line\": 25, \"category\": \"correctness\", \"issue\": \"Always returns True due to 'or True', ignoring role check\"}\n]",
+        "completion_tokens": 198,
+        "finish_reason": "stop"
+      },
+      "stats.py": {
+        "planted": 5,
+        "caught": 5,
+        "matched": 5,
+        "raised": 8,
+        "recall": 1.0,
+        "precision": 0.625,
+        "f1": 0.769,
+        "answer": "[\n  {\"line\": 2, \"category\": \"correctness\", \"issue\": \"Mutable default argument cache={} persists across calls, causing stale results and unbounded memory growth\"},\n  {\"line\": 3, \"category\": \"correctness\", \"issue\": \"Using id(xs) as cache key is unsafe: id can be reused after an object is garbage collected, returning stale cached results\"},\n  {\"line\": 8, \"category\": \"correctness\", \"issue\": \"Moving average divides by len(chunk) which is < window for trailing elements, so it computes a partial average rather than a true windowed average\"},\n  {\"line\": 14, \"category\": \"correctness\", \"issue\": \"percentile indexes xs[idx] without clamping; idx can equal len(xs) when p=100, raising IndexError\"},\n  {\"line\": 14, \"category\": \"correctness\", \"issue\": \"percentile does not handle empty input; int(0*p/100)=0 raises IndexError on empty list\"},\n  {\"line\": 19, \"category\": \"correctness\", \"issue\": \"safe_div catches all exceptions but returns None implicitly on error (e.g. ZeroDivisionError), silently masking failures\"},\n  {\"line\": 19, \"category\": \"security\", \"issue\": \"Bare except catches everything including KeyboardInterrupt/SystemExit, hiding errors and preventing proper interruption\"},\n  {\"line\": 25, \"category\": \"correctness\", \"issue\": \"first_even returns None on the first iteration unconditionally due to incorrect indentation, never checking beyond the first element\"}\n]",
+        "completion_tokens": 344,
+        "finish_reason": "stop"
+      }
+    },
+    "aggregate": {
+      "recall": 0.818,
+      "precision": 0.643,
+      "f1": 0.72,
+      "planted": 11,
+      "caught": 9,
+      "raised": 14
+    }
+  },
+  "axes": {
+    "humaneval": 1.0,
+    "gsm8k": 1.0,
+    "code_bench_mean": 0.667,
+    "code_bench_sub": {
+      "fix_bug": 1.0,
+      "gen_test": 0.0,
+      "refactor": 1.0
+    },
+    "review_f1": 0.72
+  },
+  "INDEX": 84.7,
+  "truncated_total": 0,
+  "errored_total": 0,
+  "truncated_by_axis": {
+    "humaneval": 0,
+    "gsm8k": 0,
+    "fix_bug": 0,
+    "gen_test": 0,
+    "refactor": 0,
+    "review": 0
+  },
+  "errored_by_axis": {
+    "humaneval": 0,
+    "gsm8k": 0,
+    "fix_bug": 0,
+    "gen_test": 0,
+    "refactor": 0,
+    "review": 0
+  },
+  "gate2_pass": false
+}

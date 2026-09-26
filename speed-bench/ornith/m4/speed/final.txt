@@ -1,0 +1,12 @@
+m4_ab: 2048     ds4 decode 65.0 / oMLX 81.2  ds4 prefill 1656 / oMLX 1737
+m4_ab: 32768    ds4 decode 47.1 / oMLX 64.4  ds4 prefill 650 / oMLX 1697
+m4_ab: 131072   ds4 decode 22.0 / oMLX 38.1  ds4 prefill 187 / oMLX 713
+m4_ab: cold31k  ds4 decode 43.0 / oMLX 63.9  ds4 prefill 626 / oMLX 1413
+m4_ab: FAIL 2048: ds4 decode 65.0 < oMLX 81.2 t/s
+m4_ab: FAIL 2048: ds4 prefill 1656 < oMLX 1737 t/s
+m4_ab: FAIL 32768: ds4 decode 47.1 < oMLX 64.4 t/s
+m4_ab: FAIL 32768: ds4 prefill 650 < oMLX 1697 t/s
+m4_ab: FAIL 131072: ds4 decode 22.0 < oMLX 38.1 t/s
+m4_ab: FAIL 131072: ds4 prefill 187 < oMLX 713 t/s
+m4_ab: FAIL cold31k: ds4 TTFT 49.63s > oMLX 22.47s
+m4_ab: FAIL
