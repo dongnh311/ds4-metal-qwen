@@ -19,14 +19,18 @@ says is a soft check (WARN, see serverlib).
 3. OpenAI tool round trip (--mtp): get_weather is called with an arguments
    object; the tool result goes back, and the answer ends with stop and
    reuses the live prefix.
-4. Anthropic /v1/messages tool round trip: tool_use, then a tool_result
+4. /v1/responses tool round trip (--mtp): get_weather is called and returns a
+   function_call output item with a JSON arguments object; a second request
+   carrying that function_call plus a function_call_output item ends with a
+   completed text answer and reuses the live prefix (cached_tokens > 0).
+5. Anthropic /v1/messages tool round trip: tool_use, then a tool_result
    block plus a text block in one user message; the answer ends the turn and
    reads the whole first prompt from the cache.
-5. Think-cap replay as the gateway sends it: a conversation with tools and
+6. Think-cap replay as the gateway sends it: a conversation with tools and
    historical reasoning_content, first with thinking on and a 64-token cap,
    then with enable_thinking=false and preserve_thinking removed; the replay
    returns no reasoning.
-6. Think budget: with --think-budget 64 the reasoning ends with the budget
+7. Think budget: with --think-budget 64 the reasoning ends with the budget
    sentence and an answer follows.
 """
 import copy
@@ -44,6 +48,11 @@ WEATHER = {"type": "function", "function": {
 ANTHROPIC_WEATHER = {"name": "get_weather", "description": "Get the current weather for a city.",
                      "input_schema": {"type": "object", "properties": {"city": {"type": "string"}},
                                       "required": ["city"]}}
+# Responses API tools are flat (no nested "function" wrapper).
+RESPONSES_WEATHER = {"type": "function", "name": "get_weather",
+                     "description": "Get the current weather for a city.",
+                     "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                                    "required": ["city"]}}
 WEATHER_RESULT = '{"temp_c": 18, "sky": "cloudy"}'
 ASK_WEATHER = "What's the weather in Paris right now? Use the tool."
 IDENTITY = [
@@ -74,6 +83,23 @@ def chat(messages, tools=None, save=None, **extra):
         body["tools"] = tools
     body.update(extra)
     return sl.post("/v1/chat/completions", body, save=save)
+
+
+def responses(input_items, tools=None, save=None, **extra):
+    body = {"input": input_items, "temperature": 0, "max_tokens": 1024, "stream": False}
+    if tools:
+        body["tools"] = tools
+    body.update(extra)
+    return sl.post("/v1/responses", body, save=save)
+
+
+def responses_items(result, item_type):
+    return [it for it in result.get("output", []) if it.get("type") == item_type]
+
+
+def responses_output_text(result):
+    return "".join(part.get("text", "") for it in responses_items(result, "message")
+                   for part in it.get("content", []) if part.get("type") == "output_text")
 
 
 def reply_key(result):
@@ -152,7 +178,38 @@ def main(argv):
         sl.check(cached_tokens(second) >= first["usage"]["prompt_tokens"],
                  f"the tool turn reuses the live prefix ({cached_tokens(second)} cached)")
 
-        # 4. Anthropic tool round trip
+        # 4. /v1/responses tool round trip
+        r_input = [{"type": "message", "role": "user", "content": ASK_WEATHER}]
+        r_first = responses(r_input, [RESPONSES_WEATHER], save=out / "responses-tool-1")
+        fn_calls = responses_items(r_first, "function_call")
+        r_args = None
+        if fn_calls:
+            try:
+                parsed = json.loads(fn_calls[0].get("arguments") or "")
+            except (TypeError, ValueError):
+                parsed = None
+            r_args = parsed if isinstance(parsed, dict) else None
+        sl.check(bool(fn_calls) and fn_calls[0].get("name") == "get_weather" and
+                 r_args is not None and "city" in r_args,
+                 "responses: the model calls get_weather with a JSON object argument")
+        sl.soft_check(bool(r_args) and "paris" in str(r_args.get("city", "")).lower(),
+                      "responses: the call asks for Paris", f"{out / 'responses-tool-1'}.request.json")
+        r_input2 = r_input + [
+            {"type": "function_call", "call_id": fn_calls[0].get("call_id"),
+             "name": "get_weather", "arguments": fn_calls[0].get("arguments")},
+            {"type": "function_call_output", "call_id": fn_calls[0].get("call_id"),
+             "output": WEATHER_RESULT},
+        ]
+        r_second = responses(r_input2, [RESPONSES_WEATHER], save=out / "responses-tool-2")
+        r_text = responses_output_text(r_second)
+        sl.check(r_second.get("status") == "completed" and bool(responses_items(r_second, "message")) and
+                 r_text.strip() != "", "responses: the tool turn ends with a text answer")
+        sl.soft_check("18" in r_text, "responses: the answer uses the tool result (18)",
+                      f"{out / 'responses-tool-2'}.request.json")
+        r_cached = (r_second.get("usage") or {}).get("input_tokens_details", {}).get("cached_tokens", 0)
+        sl.check(r_cached > 0, f"responses: the tool turn reuses the live prefix ({r_cached} cached)")
+
+        # 5. Anthropic tool round trip
         amsgs = [{"role": "user", "content": ASK_WEATHER}]
         a1 = sl.post("/v1/messages", {"max_tokens": 1024, "temperature": 0, "tools": [ANTHROPIC_WEATHER],
                                       "messages": amsgs}, save=out / "anthropic-tool-1")
@@ -177,7 +234,7 @@ def main(argv):
         sl.check(a2["usage"].get("cache_read_input_tokens", 0) >= a1_prompt,
                  f"anthropic: the tool turn reads the whole first prompt ({a1_prompt} tokens) from the cache")
 
-        # 5. think-cap replay, as the gateway builds it
+        # 6. think-cap replay, as the gateway builds it
         base = {"messages": REPLAY_HISTORY, "tools": [WEATHER], "temperature": 0, "stream": False,
                 "chat_template_kwargs": {"enable_thinking": True, "preserve_thinking": True}}
         capped = sl.post("/v1/chat/completions", dict(base, max_tokens=64), save=out / "think-cap-1")
@@ -202,7 +259,7 @@ def main(argv):
     print(f"INFO speculative-boundary rewinds in the --mtp trace: {trace_text.count('speculative boundary: kept=')}",
           flush=True)
 
-    # 6. think budget
+    # 7. think budget
     srv = sl.Server(log, ["--mtp", "-c", "32768", "--think-budget", "64"])
     try:
         r = chat([{"role": "user", "content": "Prove that there are infinitely many prime numbers, "
