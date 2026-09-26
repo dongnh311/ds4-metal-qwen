@@ -51391,12 +51391,12 @@ static uint32_t qwen35_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     return qwen4_expert_row_bytes(weight_type, in_dim);
 }
 
-/* L8 default NR: the M1 2-row kernel (0) until the controller's A/B
- * (speed-bench/ornith/m4/speed/l8) picks the NR kernels as default on M5.
- * Flip by changing the return value here (mid -> 1u, down -> 4u); this is
- * the single place the controller edits/reverts. */
-static uint32_t qwen35_moe_mr_default_mid(void) { return 0u; }
-static uint32_t qwen35_moe_mr_default_down(void) { return 0u; }
+/* L8 default NR on M5: the 1-row mid / 4-row down kernels, picked by the M4
+ * A/B on an M5 Pro (speed-bench/ornith/m4/speed/LEVERS.md: +3.8% decode at 2K,
+ * flat at 32K; bit-identical to the M1 2-row kernels).  Other devices keep the
+ * M1 kernel until measured.  Revert by returning 0u here. */
+static uint32_t qwen35_moe_mr_default_mid(void) { return ds4_gpu_device_is_m5_apple_silicon() ? 1u : 0u; }
+static uint32_t qwen35_moe_mr_default_down(void) { return ds4_gpu_device_is_m5_apple_silicon() ? 4u : 0u; }
 
 /* L8 Q5_K decode split: mid default 1 row / 4 groups, down default 4 rows /
  * 8 groups on M5; 0 (or 2) keeps the M1 2-row / 4-group kernel.  Each row's
