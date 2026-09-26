@@ -378,7 +378,7 @@ static void test_attn_prep_noindexer(arena_t *a) {
     require_ok(kc && vc && gpos && ds4_gpu_tensor_write(gpos, 0, pos3, sizeof(pos3)), "prep buffers");
     require_ok(ds4_gpu_qwen35_attn_prep_tensor(gq_out, ggate, kc, vc, gqg, gkp, gvp, gpos, a->base, a->size,
                                                gq_off, gk_off, T, H, Hkv, D, n_rot, pos0, cap,
-                                               (float)base, 1e-6f), "qwen35 attn prep");
+                                               (float)base, 1e-6f, kc, vc, kc, vc, 0u), "qwen35 attn prep");
     float *got = download(gq_out, (uint64_t)T * H * D);
     check_close("attn prep q", got, q_ref, (uint64_t)T * H * D, 2e-5);
     free(got);
@@ -606,6 +606,67 @@ static void test_moe_q5k_rows(arena_t *a) {
     ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart);
 }
 
+/* Ornith attention prep in an FP8/4-bit KV mode: the packed K/V a decode
+ * reads.  Prep + decode in mode m must match the F16 prep + decode within the
+ * quant's tolerance; the shared decode kernel is the reader, so no per-block
+ * packing is reproduced here.  Tolerances (1e-1 fp8, 2.5e-1 q4) are calibrated
+ * against a host dequantization of the packed cache (exact to fp8 rel 1.5e-7,
+ * q4 rel 5.2e-4); the intrinsic quantization error vs the F16 reference
+ * itself measures fp8 rel ~4.4e-2, q4 rel ~1.1e-1. */
+static void test_attn_prep_kv_modes(arena_t *a, uint32_t mode) {
+    const uint32_t T = 4, H = 16, Hkv = 2, D = 256, n_rot = 64, pos0 = 5, cap = 16;
+    const double base = 1.0e7;
+    const float scale = 1.0f / sqrtf((float)D);
+    double *gq, *gk;
+    const uint64_t gq_off = arena_f32(a, D, &gq, 0.5f, 1.5f);
+    const uint64_t gk_off = arena_f32(a, D, &gk, 0.5f, 1.5f);
+    float *qg = rand_vec((uint64_t)T * H * 2 * D, 1.0f);
+    float *kp = rand_vec((uint64_t)T * Hkv * D, 1.0f), *vp = rand_vec((uint64_t)T * Hkv * D, 1.0f);
+    uint32_t pos3[16 * 4];
+    for (uint32_t p = 0; p < cap; p++) { pos3[p * 4] = pos3[p * 4 + 1] = pos3[p * 4 + 2] = p; pos3[p * 4 + 3] = 0; }
+    ds4_gpu_tensor *gqg = upload(qg, (uint64_t)T * H * 2 * D);
+    ds4_gpu_tensor *gkp = upload(kp, (uint64_t)T * Hkv * D), *gvp = upload(vp, (uint64_t)T * Hkv * D);
+    ds4_gpu_tensor *gpos = ds4_gpu_tensor_alloc(sizeof(pos3));
+    require_ok(gpos && ds4_gpu_tensor_write(gpos, 0, pos3, sizeof(pos3)), "kv-mode pos");
+    /* F16 reference: prep into F16 caches, decode into ref */
+    ds4_gpu_tensor *gq0 = upload(NULL, (uint64_t)T * H * D), *ggate0 = upload(NULL, (uint64_t)T * H * D);
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *o_ref = upload(NULL, (uint64_t)T * H * D);
+    require_ok(kc && vc && ds4_gpu_qwen35_attn_prep_tensor(gq0, ggate0, kc, vc, gqg, gkp, gvp, gpos,
+                   a->base, a->size, gq_off, gk_off, T, H, Hkv, D, n_rot, pos0, cap, (float)base, 1e-6f,
+                   kc, vc, kc, vc, 0u), "prep f16");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(o_ref, gq0, ggate0, kc, vc, NULL, NULL, NULL, T,
+                   H, Hkv, D, pos0, 0u, 0u, scale, NULL, NULL, NULL, NULL, 0u), "decode f16");
+    float *ref = download(o_ref, (uint64_t)T * H * D);
+    /* mode m: prep into packed caches + scales, decode with the same query */
+    const uint64_t kv_elems = (uint64_t)cap * Hkv * D;
+    ds4_gpu_tensor *gq1 = upload(NULL, (uint64_t)T * H * D), *ggate1 = upload(NULL, (uint64_t)T * H * D);
+    ds4_gpu_tensor *kf = ds4_gpu_tensor_alloc(mode == 2u ? kv_elems / 2u : kv_elems);
+    ds4_gpu_tensor *vf = ds4_gpu_tensor_alloc(mode == 2u ? kv_elems / 2u : kv_elems);
+    ds4_gpu_tensor *ksb = ds4_gpu_tensor_alloc((uint64_t)cap * (Hkv * D / 64u) * 2u);
+    ds4_gpu_tensor *vsb = ds4_gpu_tensor_alloc((uint64_t)cap * (Hkv * D / 64u) * 2u);
+    ds4_gpu_tensor *o_m = upload(NULL, (uint64_t)T * H * D);
+    require_ok(kf && vf && ksb && vsb && ds4_gpu_qwen35_attn_prep_tensor(gq1, ggate1, kf, vf, gqg, gkp, gvp,
+                   gpos, a->base, a->size, gq_off, gk_off, T, H, Hkv, D, n_rot, pos0, cap, (float)base, 1e-6f,
+                   kf, vf, ksb, vsb, mode), "prep kv mode");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(o_m, gq1, ggate1, kf, vf, NULL, NULL, NULL, T,
+                   H, Hkv, D, pos0, 0u, 0u, scale, kf, vf, ksb, vsb, mode), "decode kv mode");
+    float *got = download(o_m, (uint64_t)T * H * D);
+    double worst = 0.0, sc = 1e-6;
+    for (uint64_t i = 0; i < (uint64_t)T * H * D; i++) {
+        if (fabs(ref[i]) > sc) sc = fabs(ref[i]);
+        if (fabs((double)got[i] - ref[i]) > worst) worst = fabs((double)got[i] - ref[i]);
+    }
+    printf("  attn prep+decode kv mode %u: attn out max|d| %.3e (rel %.3e)\n", mode, worst, worst / sc);
+    require_ok(worst <= (mode == 2u ? 2.5e-1 : 1e-1) * sc, "kv-mode attention within tolerance");
+    free(ref); free(got); free(qg); free(kp); free(vp); free(gq); free(gk);
+    ds4_gpu_tensor_free(gqg); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(gpos);
+    ds4_gpu_tensor_free(gq0); ds4_gpu_tensor_free(ggate0); ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc);
+    ds4_gpu_tensor_free(o_ref); ds4_gpu_tensor_free(gq1); ds4_gpu_tensor_free(ggate1); ds4_gpu_tensor_free(kf);
+    ds4_gpu_tensor_free(vf); ds4_gpu_tensor_free(ksb); ds4_gpu_tensor_free(vsb); ds4_gpu_tensor_free(o_m);
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)512 << 20;
@@ -628,6 +689,9 @@ int main(void) {
     test_gdn_out_silu(&arena, 32, 128, 3);
     printf("qwen35 attention prep (no indexer)\n");
     test_attn_prep_noindexer(&arena);
+    printf("qwen35 attention prep + decode (KV modes)\n");
+    test_attn_prep_kv_modes(&arena, 1u);
+    test_attn_prep_kv_modes(&arena, 2u);
     printf("qwen4 moe reduce without residual (as Ornith calls it)\n");
     test_reduce_nohc(1, 8, 2048, true);
     test_reduce_nohc(12, 8, 2048, false);

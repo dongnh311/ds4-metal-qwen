@@ -45,6 +45,7 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
     g->n_logit_rows = mtp ? 2u : 1u;
     g->owns_scratch = true;
     g->gdn_silu = true;
+    qwen35_kv_mode_env(&g->kv_fp8, &g->kv_q4);
     bool ok = true;
 #define QWEN35_ALLOC(field_, n_) do { g->field_ = qwen4_graph_alloc_f32(n_); ok = ok && g->field_; } while (0)
     QWEN35_ALLOC(R, T * E);
@@ -89,14 +90,25 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
      * recurrent state and conv history per GDN layer, and with MTP the
      * copy a verify takes after its first row. */
     const uint64_t kv_bytes = (uint64_t)ctx_cap * kv_dim * 2u;
+    const uint64_t kv_fp8_bytes = g->kv_q4 ? (uint64_t)ctx_cap * kv_dim / 2u : (uint64_t)ctx_cap * kv_dim;
+    const uint64_t scale_bytes = (uint64_t)ctx_cap * (kv_dim / 64u) * 2u;
     const uint64_t state_n = v_dim * DS4_N_LIN_HEAD_DIM;
     const uint64_t hist_n = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim;
     const uint32_t n_layers = mtp ? DS4_N_LAYER : DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
     for (uint32_t il = 0; il < n_layers && ok; il++) {
         if (ds4_qwen35_layer_is_attention(il)) {
-            g->layer_k_cache[il] = ds4_gpu_tensor_alloc(kv_bytes);
-            g->layer_v_cache[il] = ds4_gpu_tensor_alloc(kv_bytes);
-            ok = g->layer_k_cache[il] && g->layer_v_cache[il];
+            if (g->kv_fp8) {
+                g->layer_k_cache_fp8[il] = ds4_gpu_tensor_alloc(kv_fp8_bytes);
+                g->layer_v_cache_fp8[il] = ds4_gpu_tensor_alloc(kv_fp8_bytes);
+                g->layer_k_scale[il] = ds4_gpu_tensor_alloc(scale_bytes);
+                g->layer_v_scale[il] = ds4_gpu_tensor_alloc(scale_bytes);
+                ok = g->layer_k_cache_fp8[il] && g->layer_v_cache_fp8[il] &&
+                     g->layer_k_scale[il] && g->layer_v_scale[il];
+            } else {
+                g->layer_k_cache[il] = ds4_gpu_tensor_alloc(kv_bytes);
+                g->layer_v_cache[il] = ds4_gpu_tensor_alloc(kv_bytes);
+                ok = g->layer_k_cache[il] && g->layer_v_cache[il];
+            }
         } else {
             g->layer_lin_state[il] = qwen4_graph_alloc_f32(state_n);
             g->layer_lin_hist[il] = qwen4_graph_alloc_f32(hist_n);
@@ -252,11 +264,13 @@ static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model 
                qwen35_gemv(g, g->vp, m, l->attn_v, g->mixed, T);
     }
     return proj &&
-           ds4_gpu_qwen35_attn_prep_tensor(g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il],
+           ds4_gpu_qwen35_attn_prep_tensor(g->q, g->gate, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                            g->qg, g->kp, g->vp, g->pos3, m->map, m->size,
                                            l->attn_q_norm->abs_offset, l->attn_k_norm->abs_offset,
                                            T, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, DS4_N_ROT,
-                                           pos0, g->alloc_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS) != 0;
+                                           pos0, g->alloc_cap, DS4_ROPE_FREQ_BASE, DS4_RMS_EPS,
+                                           g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                                           g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
 }
 
 /* Dense attention (the qwen4 kernels apply sigmoid(gate)) of rows
@@ -268,10 +282,11 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
                                 uint32_t r0, uint32_t n, bool per_row) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     if (r0 == 0 && !per_row) {
-        return ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, g->layer_k_cache[il], g->layer_v_cache[il],
+        return ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                                 NULL, NULL, n <= 2u ? g->attn_part : NULL, n,
                                                 DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 0u, 0u, scale,
-                                                NULL, NULL, NULL, NULL, 0u) != 0;
+                                                g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                                                g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
     }
     const uint64_t qrow = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
     const uint32_t step = per_row ? 1u : n;
@@ -282,10 +297,11 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
         ds4_gpu_tensor *gt = ds4_gpu_tensor_view(g->gate, off, bytes);
         ds4_gpu_tensor *o = ds4_gpu_tensor_view(g->attn_o, off, bytes);
         ok = q && gt && o &&
-             ds4_gpu_qwen4_attn_decode_tensor(o, q, gt, g->layer_k_cache[il], g->layer_v_cache[il],
+             ds4_gpu_qwen4_attn_decode_tensor(o, q, gt, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                               NULL, NULL, step <= 2u ? g->attn_part : NULL, step,
                                               DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0 + t, 0u, 0u, scale,
-                                              NULL, NULL, NULL, NULL, 0u) != 0;
+                                              g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                                              g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
         ds4_gpu_tensor_free(q);
         ds4_gpu_tensor_free(gt);
         ds4_gpu_tensor_free(o);

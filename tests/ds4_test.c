@@ -519,12 +519,11 @@ cleanup:
  * from the session's are refused before anything is written; a truncated
  * payload leaves no sampleable checkpoint.  Run it with DS4_TEST_GLM_MTP=1
  * too: the MTP rows and the hidden-state carry travel with the payload. */
-static void test_qwen35_payloads(void) {
-    ds4_engine *engine = test_get_engine(false);
-    if (!engine || !ds4_engine_is_qwen35moe(engine)) {
-        puts("qwen35-payloads: Ornith model required, skipped");
-        return;
-    }
+static void test_qwen35_payloads_mode(ds4_engine *engine, const char *kv_mode) {
+    /* DS4_QWEN35_KV is read when the session's graph is allocated */
+    char *saved_kv = test_save_env("DS4_QWEN35_KV");
+    setenv("DS4_QWEN35_KV", kv_mode, 1);
+    const bool f16 = !strcmp(kv_mode, "f16");
     char *saved_chunk = test_save_env("DS4_QWEN35_PREFILL_CHUNK");
     setenv("DS4_QWEN35_PREFILL_CHUNK", "128", 1);
     ds4_session *live = NULL, *reference = NULL, *restored = NULL;
@@ -593,15 +592,16 @@ static void test_qwen35_payloads(void) {
     TEST_ASSERT(snap.len == ds4_session_payload_bytes(reference));
     const int before = ds4_session_argmax(restored);
     TEST_ASSERT(before >= 0);
-    for (int variant = 0; variant < 2; variant++) {
+    for (int variant = 0; variant < 3; variant++) {
         uint8_t *copy = malloc(snap.len);
         TEST_ASSERT(copy != NULL);
         if (!copy) break;
         memcpy(copy, snap.ptr, snap.len);
-        const size_t off = (variant == 0 ? 12u : 10u) * sizeof(uint32_t);
+        const size_t off = (variant == 1 ? 10u : 12u) * sizeof(uint32_t);
         uint32_t word;
         memcpy(&word, copy + off, sizeof(word));
-        word = variant == 0 ? 0x51573802u : (word ^ 1u);   /* a Qwen3.8 tag; the other MTP presence */
+        /* a Qwen3.8 tag; the other MTP presence; another Ornith KV mode's tag */
+        word = variant == 0 ? 0x51573802u : variant == 1 ? (word ^ 1u) : f16 ? 0x51573502u : 0x51573501u;
         memcpy(copy + off, &word, sizeof(word));
         FILE *fp = tmpfile();
         TEST_ASSERT(fp != NULL);
@@ -611,7 +611,8 @@ static void test_qwen35_payloads(void) {
             TEST_ASSERT(ds4_session_load_payload(restored, fp, snap.len, err, sizeof(err)) != 0);
             fclose(fp);
             fprintf(stderr, "ds4-test: refused variant %d: %s\n", variant, err);
-            TEST_ASSERT(strstr(err, variant == 0 ? "different model family" : "--mtp") != NULL);
+            TEST_ASSERT(strstr(err, variant == 0 ? "different model family" :
+                                    variant == 1 ? "--mtp" : "different KV cache mode") != NULL);
             TEST_ASSERT(ds4_session_argmax(restored) == before);
         }
         free(copy);
@@ -638,6 +639,19 @@ cleanup:
     ds4_session_free(live);
     ds4_tokens_free(&prompt);
     test_restore_env("DS4_QWEN35_PREFILL_CHUNK", saved_chunk);
+    test_restore_env("DS4_QWEN35_KV", saved_kv);
+}
+
+/* The payload round trip and refusals in every Ornith KV mode (M4): each
+ * mode writes its own tag, and a checkpoint never loads into another mode. */
+static void test_qwen35_payloads(void) {
+    ds4_engine *engine = test_get_engine(false);
+    if (!engine || !ds4_engine_is_qwen35moe(engine)) {
+        puts("qwen35-payloads: Ornith model required, skipped");
+        return;
+    }
+    static const char *const modes[] = {"f16", "fp8", "q4"};
+    for (size_t i = 0; i < sizeof(modes) / sizeof(modes[0]); i++) test_qwen35_payloads_mode(engine, modes[i]);
 }
 
 /* Ornith rewind (M3).  One token back right after an accepted verify

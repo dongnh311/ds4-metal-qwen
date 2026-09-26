@@ -50603,24 +50603,32 @@ int ds4_gpu_qwen4_attn_prep_tensor(
 }
 
 /* Ornith attention prep: the qwen4 prep kernel with only its query and KV
- * slots dispatched (grid.x = n_head + n_head_kv), so the QSA indexer slots
- * never run and their buffers can alias bound ones.  F16 KV only. */
+ * slots dispatched (grid.x = n_head + n_head_kv), no QSA indexer.  kv_mode 0
+ * F16, 1 E4M3, 2 4-bit: the kernel's K/V slot packs the chosen mode. */
 int ds4_gpu_qwen35_attn_prep_tensor(
         ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
         const ds4_gpu_tensor *pos3, const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
-        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps) {
+        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps,
+        ds4_gpu_tensor *k_cache_fp8, ds4_gpu_tensor *v_cache_fp8,
+        ds4_gpu_tensor *k_scale, ds4_gpu_tensor *v_scale, uint32_t kv_mode) {
     struct {
         uint32_t n_tokens, n_head, n_head_kv, head_dim, n_rot, n_idx_head, idx_dim, pos0, cache_cap;
         float rope_base, eps; uint32_t fp8; float rope_mscale; float rope_freq[32]; uint32_t ik_ring, kv_simq;
     } args = { n_tokens, n_head, n_head_kv, head_dim, n_rot, 0u, 0u, pos0, cache_cap,
-               rope_base, eps, 0u, 1.0f, { 0 }, 0u, 0u };
+               rope_base, eps, kv_mode, 1.0f, { 0 }, 0u, 0u };
     qwen4_rope_fill(args.rope_freq, &args.rope_mscale, n_rot, rope_base);
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t kv_bytes = (uint64_t)n_tokens * n_head_kv * head_dim * sizeof(float);
-    const uint64_t cache_bytes = (uint64_t)cache_cap * n_head_kv * head_dim * 2u;
+    const uint64_t kv_elems = (uint64_t)cache_cap * n_head_kv * head_dim;
+    const uint64_t cache_bytes = kv_mode == 2u ? kv_elems / 2u : kv_elems * (kv_mode ? 1u : 2u);
+    const uint64_t scale_bytes = kv_mode ? (uint64_t)cache_cap * (n_head_kv * head_dim / 64u) * 2u : cache_bytes;
+    ds4_gpu_tensor *kf  = kv_mode ? k_cache_fp8 : k_cache;
+    ds4_gpu_tensor *vf  = kv_mode ? v_cache_fp8 : v_cache;
+    ds4_gpu_tensor *ksc = kv_mode ? k_scale     : k_cache;
+    ds4_gpu_tensor *vsc = kv_mode ? v_scale     : v_cache;
     qwen4_bind b[19];
     if (n_tokens == 0 || head_dim < 32 || head_dim > 256 || (head_dim % 32) != 0 || n_rot > 64 ||
         (n_rot % 2) != 0 || (uint64_t)pos0 + n_tokens > cache_cap || n_head_kv == 0 || (n_head % n_head_kv) != 0 ||
@@ -50635,12 +50643,15 @@ int ds4_gpu_qwen35_attn_prep_tensor(
         !qwen4_bind_tensor(&b[9], gate_out, q_bytes, "attn gate") ||
         !qwen4_bind_tensor(&b[10], k_cache, cache_bytes, "k cache") ||
         !qwen4_bind_tensor(&b[11], v_cache, cache_bytes, "v cache") ||
-        !qwen4_bind_tensor(&b[14], pos3, (uint64_t)cache_cap * 16u, "rope positions")) {
+        !qwen4_bind_tensor(&b[14], pos3, (uint64_t)cache_cap * 16u, "rope positions") ||
+        !qwen4_bind_tensor(&b[15], kf, cache_bytes, "k cache fp8") ||
+        !qwen4_bind_tensor(&b[16], vf, cache_bytes, "v cache fp8") ||
+        !qwen4_bind_tensor(&b[17], ksc, scale_bytes, "k scale") ||
+        !qwen4_bind_tensor(&b[18], vsc, scale_bytes, "v scale")) {
         return 0;
     }
     b[3] = b[0];  b[4] = b[0];  b[7] = b[5];              /* indexer inputs, never read */
     b[12] = b[8]; b[13] = b[8];                           /* indexer outputs, never written */
-    b[15] = b[10]; b[16] = b[11]; b[17] = b[10]; b[18] = b[11];   /* FP8 slots, fp8 = 0 */
     return qwen4_dispatch(QWEN4_K_ATTN_PREP, &args, sizeof(args), b, 19,
                           MTLSizeMake(n_head + n_head_kv, n_tokens, 1), MTLSizeMake(32, 1, 1), 0);
 }

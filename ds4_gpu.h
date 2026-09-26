@@ -3549,14 +3549,17 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         float rope_base, float eps,
         ds4_gpu_tensor *k_cache_fp8, ds4_gpu_tensor *v_cache_fp8,
         ds4_gpu_tensor *k_scale, ds4_gpu_tensor *v_scale, uint32_t fp8, uint32_t ik_ring);
-/* q/k RMSNorm, NEOX RoPE on n_rot dims, F16 KV append; no indexer. */
+/* q/k RMSNorm, NEOX RoPE on n_rot dims, KV append; no indexer.  kv_mode 0
+ * F16, 1 E4M3, 2 4-bit. */
 int ds4_gpu_qwen35_attn_prep_tensor(
         ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
         const ds4_gpu_tensor *pos3, const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
-        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps);
+        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps,
+        ds4_gpu_tensor *k_cache_fp8, ds4_gpu_tensor *v_cache_fp8,
+        ds4_gpu_tensor *k_scale, ds4_gpu_tensor *v_scale, uint32_t kv_mode);
 /* ik_ring != 0: ik_cache keeps only the last ik_ring raw indexer keys, row pos % ik_ring. */
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,

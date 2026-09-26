@@ -40138,6 +40138,17 @@ static DS4_MAYBE_UNUSED uint32_t qwen35_prefill_chunk_tokens(uint32_t ctx) {
     return chunk > ctx ? ctx : chunk;
 }
 
+/* Ornith KV storage: f16 (default) | fp8 (E4M3) | q4 (4-bit). Own knob per
+ * §7.3.  4-bit needs head dim 256 (the qwen4 4-bit KV path's constraint). */
+static DS4_MAYBE_UNUSED void qwen35_kv_mode_env(bool *fp8, bool *q4) {
+    const char *e = getenv("DS4_QWEN35_KV");
+    *fp8 = *q4 = false;
+    if (!e || !e[0] || !strcmp(e, "f16")) return;
+    if (!strcmp(e, "fp8")) *fp8 = true;
+    else if (!strcmp(e, "q4") && DS4_N_HEAD_DIM == 256u) { *fp8 = true; *q4 = true; }
+    else fprintf(stderr, "ds4: DS4_QWEN35_KV=%s ignored (use f16|fp8|q4)\n", e);
+}
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
         int         ctx_size,
@@ -40181,7 +40192,14 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
          * reserves the MTP share (2 KiB per context token plus ~66 MB),
          * as the Qwen3.8 estimate reserves its snapshots. */
         const uint64_t T = prefill_chunk ? prefill_chunk : qwen35_prefill_chunk_tokens(ctx);
-        const uint64_t E = DS4_N_EMBD, kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+        const uint64_t E = DS4_N_EMBD;
+        bool kv_fp8 = false, kv_q4 = false;
+        qwen35_kv_mode_env(&kv_fp8, &kv_q4);
+        const uint64_t kv_row = kv_fp8
+            ? (kv_q4 ? (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM            /* K+V 4-bit: 2 * (Hkv*D/2) */
+                     : 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM)             /* K+V E4M3: 2 * (Hkv*D) */
+              + 2ull * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u) * 2u        /* K and V per-64-block fp16 scales */
+            : 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;                 /* F16 K+V */
         uint32_t n_attn = 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) n_attn += ds4_qwen35_layer_is_attention(il);
         const uint32_t n_lin = DS4_N_LAYER - n_attn;
@@ -64998,20 +65016,19 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool fp8, bool q4);
 #endif
 #ifdef DS4_HAS_QWEN4_METAL
-static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp);
+static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp, bool fp8, bool q4);
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #ifdef DS4_HAS_QWEN4_METAL
     if (s && !s->distributed && ds4_session_is_qwen35(s)) {
         const ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
-        if (!s->qwen35_graph_ready || !s->checkpoint_valid || g->pos != (uint32_t)s->checkpoint.len ||
-            g->kv_fp8 || g->kv_q4) return 0;
+        if (!s->qwen35_graph_ready || !s->checkpoint_valid || g->pos != (uint32_t)s->checkpoint.len) return 0;
         const uint32_t rows = (uint32_t)s->checkpoint.len;
         const bool mtp = g->mtp_h != NULL;
         const uint32_t mtp_rows = mtp ? (g->mtp_pos < rows ? g->mtp_pos : rows) : 0u;
         return (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
-               qwen35_payload_body_bytes(rows, mtp_rows, mtp);
+               qwen35_payload_body_bytes(rows, mtp_rows, mtp, g->kv_fp8, g->kv_q4);
     }
 #endif
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
@@ -65503,18 +65520,26 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
  * the trunk hidden-state carry h_{rows-1} (E floats); per layer the GDN state
  * and conv history, the trunk attention K/V rows [0, rows), with MTP the MTP
  * block's K/V rows [0, mtp_rows); last the rope positions of the rows
- * (16 bytes each), which a later MTP pass below g->pos may read.  F16 KV
- * only: an FP8/Q4 KV mode needs its own layout before it saves. */
+ * (16 bytes each), which a later MTP pass below g->pos may read.  A
+ * mode-specific tag (F16/FP8/Q4) so a checkpoint never cross-loads into a
+ * session in a different KV mode. */
 #define DS4_QWEN35_PAYLOAD_TAG 0x51573501u
+#define DS4_QWEN35_PAYLOAD_TAG_FP8 0x51573502u   /* E4M3 KV */
+#define DS4_QWEN35_PAYLOAD_TAG_Q4  0x51573503u   /* 4-bit KV */
 
-static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp) {
+static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp, bool fp8, bool q4) {
     uint64_t bytes = (uint64_t)rows * sizeof(uint32_t) + (uint64_t)DS4_N_VOCAB * sizeof(float);
     bytes += sizeof(uint32_t);
     if (mtp) bytes += (uint64_t)DS4_N_EMBD * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (ds4_qwen35_layer_is_nextn(il) && !mtp) continue;
         if (ds4_qwen35_layer_is_attention(il)) {
-            bytes += 2u * qwen4_payload_kv_bytes(ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows);
+            const uint32_t r = ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows;
+            if (fp8)
+                bytes += 2u * qwen4_payload_kv_fp8_bytes(r, q4)
+                       + 4ull * (uint64_t)r * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u);   /* K,V fp16 block scales */
+            else
+                bytes += 2u * qwen4_payload_kv_bytes(r);
         } else {
             bytes += qwen4_payload_lin_state_bytes() + qwen4_payload_lin_hist_bytes();
         }
@@ -65527,10 +65552,6 @@ static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size
     const uint32_t rows = (uint32_t)s->checkpoint.len;
     if (!s->qwen35_graph_ready || g->pos != rows) {
         payload_set_err(err, errlen, "Ornith snapshot requires a synchronized session");
-        return 1;
-    }
-    if (g->kv_fp8 || g->kv_q4) {
-        payload_set_err(err, errlen, "Ornith checkpoints support the F16 KV cache only");
         return 1;
     }
     if (ds4_gpu_synchronize() == 0) {
@@ -65561,7 +65582,7 @@ static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size
         DS4_N_HEAD_DIM,
         mtp ? 1u : 0u,
         DS4_N_VOCAB,
-        DS4_QWEN35_PAYLOAD_TAG,
+        g->kv_q4 ? DS4_QWEN35_PAYLOAD_TAG_Q4 : g->kv_fp8 ? DS4_QWEN35_PAYLOAD_TAG_FP8 : DS4_QWEN35_PAYLOAD_TAG,
     };
     int rc = 0;
     for (uint32_t i = 0; rc == 0 && i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
@@ -65576,10 +65597,19 @@ static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         if (ds4_qwen35_layer_is_nextn(il) && !mtp) continue;
         if (ds4_qwen35_layer_is_attention(il)) {
-            const uint64_t kvb = qwen4_payload_kv_bytes(ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows);
-            rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
-            if (rc == 0)
-                rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            const uint32_t r = ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows;
+            if (g->kv_fp8) {
+                const uint64_t kvb = qwen4_payload_kv_fp8_bytes(r, g->kv_q4);
+                const uint64_t scb = (uint64_t)r * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u) * 2u;
+                rc = payload_write_tensor_span(fp, g->layer_k_cache_fp8[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache_fp8[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_k_scale[il], 0, scb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_scale[il], 0, scb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            } else {
+                const uint64_t kvb = qwen4_payload_kv_bytes(r);
+                rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
         } else {
             rc = payload_write_tensor_span(fp, g->layer_lin_state[il], 0, qwen4_payload_lin_state_bytes(),
                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
@@ -65603,19 +65633,21 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
     }
     const bool mtp = g->mtp_h != NULL;
     const uint32_t rows = h[7];
-    if (h[12] != DS4_QWEN35_PAYLOAD_TAG || h[6] != DS4_N_EMBD || h[8] != DS4_N_LAYER ||
-        h[9] != DS4_N_HEAD_DIM || h[10] > 1u || h[11] != DS4_N_VOCAB) {
+    const uint32_t want_tag = g->kv_q4 ? DS4_QWEN35_PAYLOAD_TAG_Q4
+                            : g->kv_fp8 ? DS4_QWEN35_PAYLOAD_TAG_FP8 : DS4_QWEN35_PAYLOAD_TAG;
+    if (h[6] != DS4_N_EMBD || h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM || h[10] > 1u || h[11] != DS4_N_VOCAB ||
+        (h[12] != DS4_QWEN35_PAYLOAD_TAG && h[12] != DS4_QWEN35_PAYLOAD_TAG_FP8 && h[12] != DS4_QWEN35_PAYLOAD_TAG_Q4)) {
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
+        return 1;
+    }
+    if (h[12] != want_tag) {
+        payload_set_err(err, errlen, "KV checkpoint uses a different KV cache mode than this session");
         return 1;
     }
     if (h[10] != (mtp ? 1u : 0u)) {
         payload_set_err(err, errlen, mtp ?
             "KV checkpoint was saved without --mtp; this Ornith session keeps MTP state" :
             "KV checkpoint was saved with --mtp; this Ornith session has no MTP state");
-        return 1;
-    }
-    if (g->kv_fp8 || g->kv_q4) {
-        payload_set_err(err, errlen, "Ornith checkpoints support the F16 KV cache only");
         return 1;
     }
     if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {
@@ -65661,12 +65693,25 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         if (ds4_qwen35_layer_is_nextn(il) && !mtp) continue;
         if (ds4_qwen35_layer_is_attention(il)) {
-            const uint64_t kvb = qwen4_payload_kv_bytes(ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows);
-            rc = payload_read_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
-                                          remaining, err, errlen);
-            if (rc == 0)
-                rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+            const uint32_t r = ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows;
+            if (g->kv_fp8) {
+                const uint64_t kvb = qwen4_payload_kv_fp8_bytes(r, g->kv_q4);
+                const uint64_t scb = (uint64_t)r * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u) * 2u;
+                rc = payload_read_tensor_span(fp, g->layer_k_cache_fp8[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
                                               remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache_fp8[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+                                                           remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_k_scale[il], 0, scb, buf, DS4_SESSION_IO_CHUNK,
+                                                           remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_scale[il], 0, scb, buf, DS4_SESSION_IO_CHUNK,
+                                                           remaining, err, errlen);
+            } else {
+                const uint64_t kvb = qwen4_payload_kv_bytes(r);
+                rc = payload_read_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+                                              remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+                                                           remaining, err, errlen);
+            }
         } else {
             rc = payload_read_tensor_span(fp, g->layer_lin_state[il], 0, qwen4_payload_lin_state_bytes(),
                                           buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
