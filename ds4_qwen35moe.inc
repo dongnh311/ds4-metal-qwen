@@ -62,7 +62,12 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
     QWEN35_ALLOC(q, T * q_dim);
     QWEN35_ALLOC(gate, T * q_dim);
     QWEN35_ALLOC(attn_o, T * q_dim);
-    QWEN35_ALLOC(attn_part, ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM));
+    /* decode2's rows==3 need vs. decode3's rows==2 split-cap-256 need; decode3's
+     * is the larger (2 x 16 x 256 x 258 x 4 B ~ 8.5 MB), so this covers both
+     * kernels regardless of which DS4_QWEN35_ATTN_DECODE selects. */
+    const uint64_t attn_part_decode2 = ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM);
+    const uint64_t attn_part_decode3 = ds4_gpu_qwen35_attn_part3_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM);
+    QWEN35_ALLOC(attn_part, attn_part_decode2 > attn_part_decode3 ? attn_part_decode2 : attn_part_decode3);
     QWEN35_ALLOC(router, T * DS4_N_EXPERT);
     QWEN35_ALLOC(selected, T * DS4_N_EXPERT_USED);
     QWEN35_ALLOC(weights, T * DS4_N_EXPERT_USED);
@@ -283,7 +288,15 @@ static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model 
  * kernel_qwen35_attn_decode2 -- the verify's two rows in ONE call sharing
  * their K/V reads, plain decode as a lone rows==1 call of the SAME kernel --
  * so decode-with-MTP and plain decoding read identical instructions at
- * identical split geometry per row and stay bit for bit exact. */
+ * identical split geometry per row and stay bit for bit exact.
+ *
+ * M5 (DS4_QWEN35_ATTN_DECODE): on top of the DECODE2 gate above, chooses
+ * which shared-KV kernel generation runs: 2 (default) is L12's decode2, 3
+ * selects decode3 (simdgroup-matrix tiles, F16 K/V only -- fp8/q4 K/V and
+ * DS4_QWEN35_ATTN_DECODE2=0 always keep today's paths).  Plain decode and
+ * the verify read the same qwen35_attn_decode_env()/qwen4_kv_mode() pair,
+ * so they always pick the same kernel generation and stay bit for bit
+ * exact with each other. */
 static int qwen35_attn_decode2_env(void) {
     static int on = -1;
     if (on < 0) {
@@ -296,11 +309,30 @@ static int qwen35_attn_decode2_env(void) {
     return on;
 }
 
+/* M5 (DS4_QWEN35_ATTN_DECODE): picks the shared-KV decode kernel generation,
+ * read once.  2 (default) is L12's decode2; 3 selects decode3, the
+ * simdgroup-matrix successor (F16 K/V only).  Any value other than "3"
+ * (including unset or malformed) means 2. */
+static int qwen35_attn_decode_env(void) {
+    static int gen = -1;
+    if (gen < 0) {
+        const char *e = getenv("DS4_QWEN35_ATTN_DECODE");
+        gen = (e && strcmp(e, "3") == 0) ? 3 : 2;
+    }
+    return gen;
+}
+
 static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t pos0,
                                 uint32_t r0, uint32_t n, bool per_row) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
+    const bool decode3 = qwen35_attn_decode_env() == 3 && !qwen4_kv_mode(g);
     if (r0 == 0 && !per_row) {
         if (n == 1u && qwen35_attn_decode2_env()) {
+            if (decode3) {
+                return ds4_gpu_qwen35_attn_decode3_tensor(g->attn_o, g->q, g->gate,
+                            qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
+                            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 1u, scale) != 0;
+            }
             return ds4_gpu_qwen35_attn_decode2_tensor(g->attn_o, g->q, g->gate,
                         qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
                         DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 1u, scale,
@@ -314,6 +346,11 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
                                                 g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
     }
     if (per_row && r0 == 0u && n == 2u && qwen35_attn_decode2_env()) {
+        if (decode3) {
+            return ds4_gpu_qwen35_attn_decode3_tensor(g->attn_o, g->q, g->gate,
+                        qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
+                        DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 2u, scale) != 0;
+        }
         return ds4_gpu_qwen35_attn_decode2_tensor(g->attn_o, g->q, g->gate,
                     qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
                     DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 2u, scale,
