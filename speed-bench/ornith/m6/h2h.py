@@ -132,6 +132,8 @@ def run_arm(role, arm, contexts, reps_short, max_tokens, swap_guard):
                                     "finish_reason": timing.get("finish_reason")})
                     except Exception as e:   # HTTP error, reset connection, server death
                         row["error"] = "%s: %s" % (type(e).__name__, str(e)[:300])
+                if "error" not in row and not row.get("completion_tokens"):
+                    row["error"] = "no tokens returned (the server closed the stream without a completion)"
                 row["peak_footprint_gib"] = round(s.peak, 2) if s.peak else None
                 row["idle_footprint_gib"] = round(idle, 2) if idle else None
                 row["wall_s"] = round(time.time() - t0, 1)

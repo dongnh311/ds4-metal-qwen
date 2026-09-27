@@ -1,0 +1,4 @@
+ds4: Metal model views created in 0.547 ms, residency requested in 2329.226 ms, warmup 2.328 ms (mapped 21768.11 MiB from offset 10.50 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: memory: KV 5.50 GiB (raw 5.50 + compressed 0.00) + buffers 1.00 GiB + resident model 21.26 GiB = 27.76 GiB planned
+ds4: memory detail: ctx=262144 prefill_cap=2048 raw_kv_rows=262144 compressed_kv_rows=0 backend=metal

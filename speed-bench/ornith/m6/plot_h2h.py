@@ -19,18 +19,27 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent
+# ds4 memory-maps the GGUF and makes it resident through Metal, so the model's
+# 21.26 GiB never shows in the process footprint (h2h-logs/ds4-memory.txt:
+# "KV 5.50 GiB + buffers 1.00 GiB + resident model 21.26 GiB"); oMLX loads the
+# weights into its own process memory. total_gib puts both on the same basis.
+DS4_RESIDENT_MODEL_GIB = 21.26
 STYLE = {"ds4": ("ds4 (Ornith 23G, M6)", "#2563eb", "o"), "omlx": ("oMLX 0.6.4 (live)", "#64748b", "s")}
 plt.rcParams.update({"font.size": 11, "svg.fonttype": "none"})
 
 
 def load(path):
-    data = json.load(open(path))
-    return data["rows"]
+    rows = json.load(open(path))["rows"]
+    for r in rows:
+        if r.get("peak_footprint_gib"):
+            extra = DS4_RESIDENT_MODEL_GIB if r["runtime"] == "ds4" else 0.0
+            r["total_gib"] = round(r["peak_footprint_gib"] + extra, 2)
+    return rows
 
 
 def write_csv(rows):
     keys = ["runtime", "context", "rep", "prompt_tokens", "ttft_s", "prefill_tps", "decode_tps",
-            "completion_tokens", "peak_footprint_gib", "idle_footprint_gib", "finish_reason", "error"]
+            "completion_tokens", "peak_footprint_gib", "total_gib", "idle_footprint_gib", "finish_reason", "error"]
     with (ROOT / "h2h.csv").open("w", newline="") as fp:
         w = csv.DictWriter(fp, fieldnames=keys, extrasaction="ignore")
         w.writeheader()
@@ -68,7 +77,8 @@ def panel(ax, rows, metric, title, ylabel, fmt, log=False):
     ax.set_xscale("log", base=2)
     ctxs = sorted({r["context"] for r in rows})
     ax.set_xticks(ctxs)
-    ax.set_xticklabels(["%dK" % round(c / 1024) for c in ctxs])
+    ax.set_xticklabels(["%dK" % (c // 1024 if c % 1024 == 0 else round(c / 1000)) for c in ctxs],
+                       rotation=30)
     if log:
         ax.set_yscale("log")
     else:
@@ -79,24 +89,31 @@ def panel(ax, rows, metric, title, ylabel, fmt, log=False):
     ax.legend(frameon=False, fontsize=9)
 
 
-def chart(name, rows, panels):
+def chart(name, rows, panels, png_dir=None):
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
     for ax, args in zip(axes, panels):
         panel(ax, rows, *args)
     fig.tight_layout()
     fig.savefig(ROOT / name)
+    if png_dir:
+        fig.savefig(Path(png_dir) / name.replace(".svg", ".png"), dpi=110)
     plt.close(fig)
 
 
 def main(argv):
+    png_dir = None
+    if "--png-dir" in argv:
+        i = argv.index("--png-dir")
+        png_dir = argv[i + 1]
+        argv = argv[:i] + argv[i + 2:]
     rows = load(argv[0] if argv else ROOT / "h2h.json")
     write_csv(rows)
     chart("h2h-throughput.svg", rows, [
         ("prefill_tps", "Prefill", "Tokens / second", lambda v: "%.0f" % v),
-        ("decode_tps", "Decode (MTP on both)", "Tokens / second", lambda v: "%.1f" % v)])
+        ("decode_tps", "Decode (MTP on both)", "Tokens / second", lambda v: "%.1f" % v)], png_dir)
     chart("h2h-ttft-memory.svg", rows, [
         ("ttft_s", "Time to first token (lower is better)", "Seconds", lambda v: "%.1f" % v, True),
-        ("peak_footprint_gib", "Peak process footprint", "GiB", lambda v: "%.1f" % v)])
+        ("total_gib", "Peak memory (weights + KV + buffers)", "GiB", lambda v: "%.1f" % v)], png_dir)
     return 0
 
 
