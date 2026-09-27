@@ -92,6 +92,11 @@ static int run_prefill_mm(void *p) {       /* today's prefill: kernel_qwen4_attn
                                             c->T, H, HKV, D, c->pos0, 0u, 0u, c->scale,
                                             NULL, NULL, NULL, NULL, 0u);
 }
+static int run_flash(void *p) {            /* M5 successor for T>8 prefill: flash (query-token tiles) */
+    bench_ctx *c = p;
+    return ds4_gpu_qwen35_attn_flash_tensor(c->out, c->q, c->gate, c->kc, c->vc, NULL,
+                                            c->T, H, HKV, D, c->pos0, c->scale);
+}
 static int run_decode2(void *p) {          /* today's decode / verify: L12 */
     bench_ctx *c = p;
     return ds4_gpu_qwen35_attn_decode2_tensor(c->out, c->q, c->gate, c->kc, c->vc, c->part,
@@ -136,6 +141,10 @@ int main(int argc, char **argv) {
         for (int i = 0; i < 3; i++) {
             c.pos0 = pos[i]; c.T = 2048u; c.rows = 0;
             report("qwen4_attn_mm", "prefill", c.pos0, c.T, 0, time_ms(run_prefill_mm, &c, 1, 3));
+            setenv("DS4_QWEN35_ATTN_FLASH_TOK", "2", 1);
+            report("attn_flash_tok2", "prefill", c.pos0, c.T, 0, time_ms(run_flash, &c, 1, 3));
+            setenv("DS4_QWEN35_ATTN_FLASH_TOK", "4", 1);
+            report("attn_flash_tok4", "prefill", c.pos0, c.T, 0, time_ms(run_flash, &c, 1, 3));
         }
     }
     if (do_decode) {

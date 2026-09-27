@@ -49553,6 +49553,8 @@ enum {
     QWEN4_K_QWEN35_ATTN_DECODE3_R1,
     QWEN4_K_QWEN35_ATTN_DECODE3_R2,
     QWEN4_K_QWEN35_ATTN_MERGE3,
+    QWEN4_K_QWEN35_ATTN_FLASH_TOK2,
+    QWEN4_K_QWEN35_ATTN_FLASH_TOK4,
     QWEN4_K_COUNT,
 };
 
@@ -49699,6 +49701,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_attn_decode3_r1",
     "kernel_qwen35_attn_decode3_r2",
     "kernel_qwen35_attn_merge3",
+    "kernel_qwen35_attn_flash_tok2_kt16",
+    "kernel_qwen35_attn_flash_tok4_kt8",
 };
 
 typedef struct {
@@ -51216,6 +51220,91 @@ int ds4_gpu_qwen35_attn_decode3_tensor(
     ds4_gpu_tensor_free(q1); ds4_gpu_tensor_free(g1); ds4_gpu_tensor_free(o1);
     ds4_gpu_tensor_free(p0); ds4_gpu_tensor_free(p1);
     return ok ? 1 : 0;
+}
+
+/* Mirrors metal/qwen35.metal's ds4_metal_args_qwen35_attn_flash field for
+ * field. */
+struct ds4_qwen35_attn_flash_args {
+    uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0;
+    float scale;
+};
+
+/* Query tokens per threadgroup for the flash kernel (DS4_QWEN35_ATTN_FLASH_TOK
+ * overrides). Read fresh on every call, never cached, so a paired A/B harness
+ * or a mid-process setenv (Task 4's knob switches) always takes effect.
+ * Invalid or any value other than 2/4 falls back to 2. */
+static uint32_t qwen35_attn_flash_tok(void) {
+    const char *env = getenv("DS4_QWEN35_ATTN_FLASH_TOK");
+    const int v = env ? atoi(env) : 0;
+    return v == 4 ? 4u : 2u;
+}
+
+/* Host cap used only to size the (not yet implemented) key-split scratch;
+ * see ds4_gpu_qwen35_attn_flash_part_floats. Read fresh on every call.
+ * Invalid or < 1 falls back to 256. */
+static uint32_t qwen35_attn_flash_min_tg(void) {
+    const char *env = getenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+    const int v = env ? atoi(env) : 0;
+    return v > 0 ? (uint32_t)v : 256u;
+}
+
+/* Upper bound on the key-split scratch a future flash key split (Task 4)
+ * will need, over both TOK instances and every pos0, given the split rule
+ * Ks = min(QWEN35_ATTN_MAX_SPLITS, ceil(min_tg / (Hkv * ceil(T/TOK)))) with
+ * min_tg = DS4_QWEN35_ATTN_FLASH_MIN_TG (default 256). n_head_kv is not a
+ * parameter of this function, so it bounds with Hkv = 1 (the smallest
+ * possible, hence the largest Ks) and TOK = 4 (the largest instance, so
+ * ceil(T/TOK) is the smallest denominator among the two instances, again
+ * the largest Ks): about 17 MB at worst for T in 9..255 with the default. */
+uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
+    const uint32_t min_tg = qwen35_attn_flash_min_tg();
+    const uint32_t blocks = (n_tokens + 3u) / 4u;   /* ceil(T / 4) */
+    uint32_t ks = blocks > 0u ? (min_tg + blocks - 1u) / blocks : min_tg;   /* ceil(min_tg / blocks) */
+    if (ks < 1u) ks = 1u;
+    if (ks > QWEN35_ATTN_MAX_SPLITS) ks = QWEN35_ATTN_MAX_SPLITS;
+    return (uint64_t)n_tokens * n_head * ks * (2u + head_dim);
+}
+
+/* M5 flash prefill attention (rework ruling R6/R7's successor to attn_mm for
+ * long prefills): TOK query tokens (x 8 query heads, Ornith's group) share
+ * every K/V tile instead of kernel_qwen4_attn_mm's one (kv head, token)
+ * threadgroup with its 8-of-16 padded rows.  T tokens at positions
+ * pos0..pos0+T-1 (their K/V already written), causal, F16 K/V only,
+ * head_dim must be 256 and n_head/n_head_kv must be 8.  `part` is not yet
+ * implemented (a future task adds the key split); this wrapper refuses a
+ * non-NULL part. T <= 8 is refused too -- attn_decode_tensor's own cutover
+ * keeps short prefill tails on the decode/attn_mm arithmetic. */
+int ds4_gpu_qwen35_attn_flash_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, float scale) {
+    if (head_dim != 256u || n_head_kv == 0u || (n_head % n_head_kv) != 0u || n_head / n_head_kv != 8u ||
+        n_tokens <= 8u) {
+        fprintf(stderr, "ds4: qwen35 attn flash refuses head_dim=%u n_head=%u n_head_kv=%u n_tokens=%u\n",
+                head_dim, n_head, n_head_kv, n_tokens);
+        return 0;
+    }
+    if (part) {
+        fprintf(stderr, "ds4: qwen35 attn flash key split not implemented\n");
+        return 0;
+    }
+    const uint32_t tok = qwen35_attn_flash_tok();
+    struct ds4_qwen35_attn_flash_args args = { n_tokens, n_head, n_head_kv, head_dim, pos0, scale };
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
+    qwen4_bind b[5];
+    if (!qwen4_bind_tensor(&b[0], q, q_bytes, "flash q") ||
+        !qwen4_bind_tensor(&b[1], gate, q_bytes, "flash gate") ||
+        !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "flash k cache") ||
+        !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "flash v cache") ||
+        !qwen4_bind_tensor(&b[4], out, q_bytes, "flash out")) {
+        return 0;
+    }
+    const uint32_t blocks = (n_tokens + tok - 1u) / tok;
+    const int kernel = tok == 4u ? QWEN4_K_QWEN35_ATTN_FLASH_TOK4 : QWEN4_K_QWEN35_ATTN_FLASH_TOK2;
+    return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
+                          MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(32u * 2u * tok, 1, 1), 0)
+           ? 1 : 0;
 }
 
 /* ---- decode batch: attention over rows ----

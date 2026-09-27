@@ -1318,3 +1318,269 @@ kernel void kernel_qwen35_attn_merge3(
     const uint64_t at = ((uint64_t)r * H + h) * D + tid;
     out[at] = oo[0] * inv * qwen4_sigmoid(gate[at]);
 }
+
+/* --- M5: flash prefill (query-token tiles, causal, no key split) -------- */
+
+struct ds4_metal_args_qwen35_attn_flash {
+    uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0;
+    float scale;
+};
+
+/* Prefill attention that shares every K/V tile across TOK query tokens
+ * instead of kernel_qwen4_attn_mm's one (kv head, token) threadgroup, which
+ * pads the 8 query heads of its single token to 16 rows and re-reads the
+ * whole K/V range once per token.  Grid (Hkv, ceil(T/TOK)): threadgroup blk
+ * covers query tokens blk*TOK .. blk*TOK+TOK-1 (consecutive positions, like
+ * decode3's verify rows), each contributing a full 8-row tile (Ornith's
+ * group is exactly 8, so -- as in decode3 -- a row tile is never padded).
+ * The threadgroup has 2*TOK simdgroups; simdgroup sg owns row tile rt =
+ * sg % TOK and half dh = sg / TOK, matching kernel_qwen4_attn_mm's own
+ * sgitg&1 / sgitg>>1 split when TOK==2.
+ *
+ * Two instances, selected by KT (keys per staged tile):
+ *
+ * - KT==16 (TOK==2, 4 simdgroups/128 threads): dh is a KEY half, exactly
+ *   kernel_qwen4_attn_mm's own scoring -- each simdgroup of a row tile
+ *   contracts the query tile against its own 8-key half over the full 256
+ *   dims, the two halves' 8x8 scores land in Sx[rt][dh], and (after a
+ *   barrier) both simdgroups of the row tile independently read *both*
+ *   halves of Sx[rt] to run the same 16-key online softmax and hold their
+ *   own copy of the resulting probabilities -- the padding tile attn_mm
+ *   used for a lone token's second half is simply the second query token
+ *   here, everything else unchanged.
+ *
+ * - KT==8 (TOK==4, 8 simdgroups/256 threads): with only 8 keys per tile, a
+ *   key-half split has nothing left to divide, so dh instead splits the 256
+ *   head dims in half for *scoring*: each simdgroup contracts the query
+ *   tile against all 8 keys but only its own 128-dim half, storing that
+ *   partial 8x8 score in Sx[rt][dh]; after the barrier both simdgroups of
+ *   the row tile *sum* Sx[rt][0] + Sx[rt][1] (rather than attn_mm's
+ *   key-half select) to get the full-dim score before running the same
+ *   8-key online softmax.  Output accumulation still splits by dh (each
+ *   simdgroup owns 128 of the 256 output dims, summed over all 8 keys with
+ *   one 8x8 x 8x8 multiply instead of attn_mm's two).
+ *
+ * No key split: `part` is unused by this task (the wrapper refuses a
+ * non-NULL part), so every row tile normalises and writes its own gated
+ * output directly, one token at a time through the (reused) KV scratch --
+ * that scratch is only G*D floats (one token's [8 head][256 dim] tile), the
+ * smallest of the two instances' K/V tile areas, so writing all TOK tokens
+ * at once would overflow it for KT==8; both instances therefore share this
+ * same sequential per-token epilogue (KT==16 has room to spare there). */
+template <uint TOK, uint KT>
+kernel void kernel_qwen35_attn_flash(
+        constant ds4_metal_args_qwen35_attn_flash & args,
+        device const float   *q,          /* [n_tokens][H*D] */
+        device const float   *gate,       /* [n_tokens][H*D] */
+        device const half    *k_cache,    /* [cap][Hkv*D] */
+        device const half    *v_cache,    /* [cap][Hkv*D] */
+        device float         *out,        /* [n_tokens][H*D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint kvh = tgpig.x, blk = tgpig.y;
+    const uint H = args.n_head, Hkv = args.n_head_kv;
+    if (kvh >= Hkv) return;
+    constexpr uint D = 256u, G = QWEN35_ATTN_GROUP, NSG = 2u * TOK, NTHREADS = 32u * NSG;
+    const uint rt = sgitg % TOK, dh = sgitg / TOK;
+
+    uint hi_r[TOK];
+    uint hi_max = 0u;
+#pragma unroll
+    for (uint r = 0; r < TOK; r++) {
+        const uint tok_r = blk * TOK + r;
+        hi_r[r] = tok_r < args.n_tokens ? args.pos0 + tok_r + 1u : 0u;
+        hi_max = max(hi_max, hi_r[r]);
+    }
+    if (hi_max == 0u) return;   /* whole block past n_tokens; the host sizes the grid so this never fires */
+
+    threadgroup half KV[2u * KT * D];             /* keys, then values; epilogue reuses it as one token's floats */
+    threadgroup half *Ks = KV, *Vs = KV + KT * D;
+    threadgroup half Qs[TOK * G * D];              /* scaled queries as half, one 8-row tile per token in the block */
+    threadgroup float Sx[TOK][2][64];              /* [row tile][half] partial/selectable 8x8 scores */
+    threadgroup half  Ps[NSG][8u * KT];             /* per simdgroup 8 x KT probabilities */
+    threadgroup float Dg[NSG][64];                 /* per simdgroup diagonal factors */
+    threadgroup float Id[64];
+
+    for (uint i = tid; i < TOK * G * D; i += NTHREADS) {
+        const uint r = i / (G * D), rem = i % (G * D), g = rem / D, d = rem % D;
+        const uint tok_r = blk * TOK + r;
+        const uint h = kvh * G + g;
+        Qs[i] = hi_r[r] > 0u ? (half)(q[((uint64_t)tok_r * H + h) * D + d] * args.scale) : (half)0.0h;
+    }
+    if (tid < 64) Id[tid] = (tid >> 3) == (tid & 7u) ? 1.0f : 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    simdgroup_float8x8 I;
+    simdgroup_load(I, Id, 8, 0, false);
+    simdgroup_float8x8 O[16];
+#pragma unroll
+    for (uint j = 0; j < 16; j++) O[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    float m_row = -3.0e38f, l_row = 0.0f;
+
+    for (uint t0 = 0; t0 < hi_max; t0 += KT) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        {   /* stage up to KT keys/values, shared by every active row tile;
+             * a key at or beyond hi_max is beyond every row's own range this
+             * tile and loads as zero (masked below regardless of row). */
+            constexpr uint UNITS = KT * 8u;
+            for (uint i = tid; i < UNITS; i += NTHREADS) {
+                const uint key = i >> 3, seg = i & 7u;
+                const uint idx = t0 + key;
+                const bool present = idx < hi_max;
+                const uint64_t row = ((uint64_t)(present ? idx : 0u) * Hkv + kvh) * D;
+                device const uint4 *kr = (device const uint4 *)(k_cache + row) + seg * 4;
+                device const uint4 *vr = (device const uint4 *)(v_cache + row) + seg * 4;
+                threadgroup uint4 *kd = (threadgroup uint4 *)(Ks + key * D) + seg * 4;
+                threadgroup uint4 *vd = (threadgroup uint4 *)(Vs + key * D) + seg * 4;
+#pragma unroll
+                for (uint u = 0; u < 4; u++) { kd[u] = present ? kr[u] : uint4(0u); vd[u] = present ? vr[u] : uint4(0u); }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const bool active = t0 < hi_r[rt];
+        simdgroup_float8x8 S[4];
+#pragma unroll
+        for (uint i = 0; i < 4; i++) S[i] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        if (active) {
+            if constexpr (KT == 16u) {
+                /* dh = key half: contract the row tile's full 256 dims against
+                 * this half's 8 keys, exactly kernel_qwen4_attn_mm. */
+#pragma unroll
+                for (uint kk = 0; kk < 8; kk++) {
+#pragma unroll
+                    for (uint i = 0; i < 4; i++) {
+                        simdgroup_half8x8 Qt, Kt;
+                        simdgroup_load(Qt, Qs + (rt * G) * D + (kk * 4 + i) * 8, D, 0, false);
+                        simdgroup_load(Kt, Ks + (dh * 8) * D + (kk * 4 + i) * 8, D, 0, true);
+                        simdgroup_multiply_accumulate(S[i], Qt, Kt, S[i]);
+                    }
+                }
+            } else {
+                /* dh = dim half: contract the row tile's own 128-dim half
+                 * against all KT keys; the two halves are summed below. */
+#pragma unroll
+                for (uint kk = 0; kk < 4; kk++) {
+#pragma unroll
+                    for (uint i = 0; i < 4; i++) {
+                        simdgroup_half8x8 Qt, Kt;
+                        simdgroup_load(Qt, Qs + (rt * G) * D + dh * 128 + (kk * 4 + i) * 8, D, 0, false);
+                        simdgroup_load(Kt, Ks + dh * 128 + (kk * 4 + i) * 8, D, 0, true);
+                        simdgroup_multiply_accumulate(S[i], Qt, Kt, S[i]);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (uint i = 1; i < 4; i++) simdgroup_multiply_accumulate(S[0], I, S[i], S[0]);
+        simdgroup_store(S[0], Sx[rt][dh], 8, 0, false);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint lr = tiisg >> 2;
+        const uint lanes_per_group = KT / 4u;          /* KT==16 -> 4 keys/lane, KT==8 -> 2 keys/lane */
+        const uint lc = (tiisg & 3u) * lanes_per_group;
+        float sv[4], pv[4];
+        bool valid[4];
+        float mx = -3.0e38f;
+#pragma unroll
+        for (uint c = 0; c < 4; c++) {
+            if (c >= lanes_per_group) { valid[c] = false; sv[c] = -3.0e38f; continue; }
+            const uint key = lc + c;
+            const uint idx = t0 + key;
+            valid[c] = active && idx < hi_r[rt];
+            const float raw = KT == 16u ? Sx[rt][key >> 3][lr * 8 + (key & 7u)]
+                                        : Sx[rt][0][lr * 8 + key] + Sx[rt][1][lr * 8 + key];
+            sv[c] = valid[c] ? raw : -3.0e38f;
+            mx = max(mx, sv[c]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        const float m_new = max(m_row, mx);
+        const float corr = exp(m_row - m_new);
+        float rs = 0.0f;
+#pragma unroll
+        for (uint c = 0; c < 4; c++) {
+            if (c >= lanes_per_group) continue;
+            pv[c] = valid[c] ? exp(sv[c] - m_new) : 0.0f;
+            rs += pv[c];
+            Ps[sgitg][lr * KT + lc + c] = (half)pv[c];
+        }
+        rs += simd_shuffle_xor(rs, 1);
+        rs += simd_shuffle_xor(rs, 2);
+        l_row = l_row * corr + rs;
+        m_row = m_new;
+        const bool rescale = simd_any(corr != 1.0f);
+        if (rescale) {
+            for (uint i = tiisg; i < 64; i += 32) Dg[sgitg][i] = (i >> 3) == (i & 7u) ? simd_shuffle(corr, (ushort)((i >> 3) * 4)) : 0.0f;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (rescale) {
+            simdgroup_float8x8 Dm;
+            simdgroup_load(Dm, Dg[sgitg], 8, 0, false);
+#pragma unroll
+            for (uint j = 0; j < 16; j++) { simdgroup_float8x8 t; simdgroup_multiply(t, Dm, O[j]); O[j] = t; }
+        }
+        if constexpr (KT == 16u) {
+            simdgroup_half8x8 P0, P1;
+            simdgroup_load(P0, Ps[sgitg], 16, 0, false);
+            simdgroup_load(P1, Ps[sgitg] + 8, 16, 0, false);
+#pragma unroll
+            for (uint j = 0; j < 16; j++) {
+                simdgroup_half8x8 V0, V1;
+                simdgroup_load(V0, Vs + dh * 128 + j * 8, D, 0, false);
+                simdgroup_load(V1, Vs + 8 * D + dh * 128 + j * 8, D, 0, false);
+                simdgroup_multiply_accumulate(O[j], P0, V0, O[j]);
+                simdgroup_multiply_accumulate(O[j], P1, V1, O[j]);
+            }
+        } else {
+            simdgroup_half8x8 P;
+            simdgroup_load(P, Ps[sgitg], KT, 0, false);
+#pragma unroll
+            for (uint j = 0; j < 16; j++) {
+                simdgroup_half8x8 V;
+                simdgroup_load(V, Vs + dh * 128 + j * 8, D, 0, false);
+                simdgroup_multiply_accumulate(O[j], P, V, O[j]);
+            }
+        }
+    }
+
+    /* Sequential per-token epilogue: KV reused as one token's [G][D] floats
+     * (2048 floats -- the KT==8 instance's actual K/V tile size, the smaller
+     * of the two), so only one row tile's output is staged at a time. */
+#pragma unroll
+    for (uint r = 0; r < TOK; r++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (rt == r) {
+            const float inv = l_row > 0.0f ? 1.0f / l_row : 0.0f;
+            for (uint i = tiisg; i < 64; i += 32) Dg[sgitg][i] = (i >> 3) == (i & 7u) ? simd_shuffle(inv, (ushort)((i >> 3) * 4)) : 0.0f;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            simdgroup_float8x8 Dm;
+            simdgroup_load(Dm, Dg[sgitg], 8, 0, false);
+            threadgroup float *Osc = (threadgroup float *)KV + dh * 128;
+#pragma unroll
+            for (uint j = 0; j < 16; j++) {
+                simdgroup_float8x8 t;
+                simdgroup_multiply(t, Dm, O[j]);
+                simdgroup_store(t, Osc + j * 8, D, 0, false);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const uint tok_r = blk * TOK + r;
+        if (hi_r[r] > 0u) {
+            for (uint i = tid; i < G * D; i += NTHREADS) {
+                const uint g = i / D, d = i % D;
+                const uint64_t o = ((uint64_t)tok_r * H + kvh * G + g) * D + d;
+                out[o] = ((threadgroup float *)KV)[i] * qwen4_sigmoid(gate[o]);
+            }
+        }
+    }
+}
+template [[host_name("kernel_qwen35_attn_flash_tok2_kt16")]]
+kernel void kernel_qwen35_attn_flash<2u, 16u>(
+        constant ds4_metal_args_qwen35_attn_flash &, device const float *, device const float *,
+        device const half *, device const half *, device float *, uint3, ushort, ushort, ushort);
+template [[host_name("kernel_qwen35_attn_flash_tok4_kt8")]]
+kernel void kernel_qwen35_attn_flash<4u, 8u>(
+        constant ds4_metal_args_qwen35_attn_flash &, device const float *, device const float *,
+        device const half *, device const half *, device float *, uint3, ushort, ushort, ushort);
