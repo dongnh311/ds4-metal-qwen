@@ -81,7 +81,7 @@ static double time_ms(bench_fn fn, void *ctx, int warm, int reps) {
 }
 
 typedef struct {
-    ds4_gpu_tensor *q, *gate, *out, *part, *kc, *vc;
+    ds4_gpu_tensor *q, *gate, *out, *part, *part3, *kc, *vc;
     uint32_t pos0, T, rows;
     float scale;
 } bench_ctx;
@@ -96,6 +96,11 @@ static int run_decode2(void *p) {          /* today's decode / verify: L12 */
     bench_ctx *c = p;
     return ds4_gpu_qwen35_attn_decode2_tensor(c->out, c->q, c->gate, c->kc, c->vc, c->part,
                                               H, HKV, D, c->pos0, c->rows, c->scale, NULL, NULL, NULL, NULL, 0u);
+}
+static int run_decode3(void *p) {          /* M5 successor: decode3 */
+    bench_ctx *c = p;
+    return ds4_gpu_qwen35_attn_decode3_tensor(c->out, c->q, c->gate, c->kc, c->vc, c->part3,
+                                              H, HKV, D, c->pos0, c->rows, c->scale);
 }
 
 /* K/V bytes a kernel must read at least once: every key <= the last query's
@@ -123,7 +128,8 @@ int main(int argc, char **argv) {
     c.gate = rand_f32(2048ull * H * D, 1.0f);
     c.out = ds4_gpu_tensor_alloc(2048ull * H * D * sizeof(float));
     c.part = ds4_gpu_tensor_alloc(ds4_gpu_qwen4_attn_part_floats(2048u, H, D) * sizeof(float));
-    need(c.out && c.part, "output buffers");
+    c.part3 = ds4_gpu_tensor_alloc(ds4_gpu_qwen35_attn_part3_floats(2u, H, D) * sizeof(float));
+    need(c.out && c.part && c.part3, "output buffers");
 
     if (do_prefill) {
         const uint32_t pos[3] = { 0u, 30720u, 122880u };
@@ -138,9 +144,11 @@ int main(int argc, char **argv) {
             for (uint32_t rows = 1; rows <= 2; rows++) {
                 c.pos0 = pos[i]; c.T = rows; c.rows = rows;
                 report("decode2", "decode", c.pos0, c.T, rows, time_ms(run_decode2, &c, 3, 9));
+                report("decode3", "decode", c.pos0, c.T, rows, time_ms(run_decode3, &c, 3, 9));
             }
     }
     ds4_gpu_tensor_free(c.kc); ds4_gpu_tensor_free(c.vc); ds4_gpu_tensor_free(c.q);
     ds4_gpu_tensor_free(c.gate); ds4_gpu_tensor_free(c.out); ds4_gpu_tensor_free(c.part);
+    ds4_gpu_tensor_free(c.part3);
     return 0;
 }

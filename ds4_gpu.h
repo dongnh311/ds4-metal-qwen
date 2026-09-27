@@ -3572,6 +3572,20 @@ int ds4_gpu_qwen35_attn_decode2_tensor(
         uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, uint32_t rows, float scale,
         const ds4_gpu_tensor *k_cache_fp8, const ds4_gpu_tensor *v_cache_fp8,
         const ds4_gpu_tensor *k_scale, const ds4_gpu_tensor *v_scale, uint32_t fp8);
+/* M5 successor to decode2 above: more splits (cap 256), keys spread across
+ * the 4 simdgroups instead of scanned serially by every simdgroup, and the
+ * two rows' merges run in one parallel kernel_qwen35_attn_merge3 dispatch.
+ * Same rows contract as decode2: rows==1 a lone decode at pos0, rows==2 the
+ * MTP verify's two rows (pos0, pos0+1); each row's own split geometry never
+ * depends on the other row, so output row r matches a lone rows==1 call at
+ * that row's position bit for bit. F16 K/V only, head_dim must be 256. part
+ * needs ds4_gpu_qwen35_attn_part3_floats(rows, n_head, head_dim) floats. */
+int ds4_gpu_qwen35_attn_decode3_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, uint32_t rows, float scale);
+/* Scratch floats for `rows` rows at decode3's split cap (256). */
+uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32_t head_dim);
 /* ik_ring != 0: ik_cache keeps only the last ik_ring raw indexer keys, row pos % ik_ring. */
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,

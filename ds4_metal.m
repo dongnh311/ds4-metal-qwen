@@ -49550,6 +49550,8 @@ enum {
     QWEN4_K_QWEN35_MOE_MID_Q5K_NR4,
     QWEN4_K_QWEN35_MOE_DOWN_Q5K_NR1,
     QWEN4_K_QWEN35_MOE_DOWN_Q5K_NR4,
+    QWEN4_K_QWEN35_ATTN_DECODE3,
+    QWEN4_K_QWEN35_ATTN_MERGE3,
     QWEN4_K_COUNT,
 };
 
@@ -49693,6 +49695,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_moe_mid_q5k_nr4",
     "kernel_qwen35_moe_down_q5k_nr1",
     "kernel_qwen35_moe_down_q5k_nr4",
+    "kernel_qwen35_attn_decode3_npt8",
+    "kernel_qwen35_attn_merge3",
 };
 
 typedef struct {
@@ -51026,6 +51030,97 @@ int ds4_gpu_qwen35_attn_decode2_tensor(
         ds4_gpu_tensor_free(orr);
     }
     return ok ? 1 : 0;
+}
+
+/* Cap on decode3's own split count (vs QWEN4_ATTN_MAX_SPLITS 64 for the older
+ * per-row/decode2 path); must match QWEN35_ATTN_MAX_SPLITS in metal/qwen35.metal. */
+#define QWEN35_ATTN_MAX_SPLITS 256u
+
+/* Keys per split for decode3 (DS4_QWEN35_ATTN_SPLIT_KEYS overrides). Read
+ * fresh on every call, never cached, so a paired A/B harness can switch it
+ * mid-run. Invalid or < 1 values fall back to 64. */
+static uint32_t qwen35_attn_split_keys3(void) {
+    const char *env = getenv("DS4_QWEN35_ATTN_SPLIT_KEYS");
+    const int v = env ? atoi(env) : 0;
+    return v > 0 ? (uint32_t)v : 64u;
+}
+
+/* Row split geometry for decode3: like qwen4_attn_row_splits_host, but the
+ * split count is re-derived from the rounded-up keys-per-split so no split
+ * is ever empty (e.g. n=4201, split_keys=16 -> kps=17, ns=248, not the raw
+ * ceil(4201/16)=263 capped to 256). The kernel derives the same kps from the
+ * n_splits it is handed, so host and kernel geometry always agree. */
+static void qwen35_attn_row_splits3(uint32_t n_keys, uint32_t split_keys,
+                                    uint32_t *n_splits, uint32_t *keys_per_split) {
+    uint32_t ns = (n_keys + split_keys - 1u) / split_keys;
+    if (ns < 1u) ns = 1u;
+    if (ns > QWEN35_ATTN_MAX_SPLITS) ns = QWEN35_ATTN_MAX_SPLITS;
+    const uint32_t kps = (n_keys + ns - 1u) / ns;
+    ns = (n_keys + kps - 1u) / kps;
+    *n_splits = ns;
+    *keys_per_split = kps;
+}
+
+uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32_t head_dim) {
+    return (uint64_t)rows * n_head * QWEN35_ATTN_MAX_SPLITS * (2u + head_dim);
+}
+
+/* M5 successor to decode2 (see ds4_gpu_qwen35_attn_decode2_tensor above):
+ * up to 256 splits per row (vs 64), keys spread across the 4 simdgroups of a
+ * threadgroup instead of scanned serially by every simdgroup (kernel
+ * kernel_qwen35_attn_decode3), and both rows' partial merges run in one
+ * parallel kernel_qwen35_attn_merge3 dispatch (grid n_head x rows) instead of
+ * decode2's per-row host loop. Same rows contract: rows==1 a lone decode at
+ * pos0, rows==2 the MTP verify's two rows (pos0, pos0+1); each row's own key
+ * assignment and merge tree depend only on that row's own key count, so a
+ * rows==2 call matches two rows==1 calls bit for bit. F16 K/V only. */
+int ds4_gpu_qwen35_attn_decode3_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, uint32_t rows, float scale) {
+    if (head_dim != 256u || n_head_kv == 0 || (n_head % n_head_kv) != 0 || n_head / n_head_kv > 12 ||
+        (rows != 1u && rows != 2u)) {
+        fprintf(stderr, "ds4: qwen35 attn decode3 refuses head_dim=%u n_head=%u n_head_kv=%u rows=%u\n",
+                head_dim, n_head, n_head_kv, rows);
+        return 0;
+    }
+    const uint32_t split_keys = qwen35_attn_split_keys3();
+    const uint32_t n0 = pos0 + 1u, n1 = pos0 + 2u;
+    uint32_t ns0, kps0, ns1 = 1u, kps1 = 0u;
+    qwen35_attn_row_splits3(n0, split_keys, &ns0, &kps0);
+    if (rows > 1u) qwen35_attn_row_splits3(n1, split_keys, &ns1, &kps1);
+    (void)kps0; (void)kps1;   /* the kernel re-derives kps from ns and its own n_r */
+    struct { uint32_t n_head, n_head_kv, head_dim, pos0, rows, ns0, ns1; float scale; } args =
+        { n_head, n_head_kv, head_dim, pos0, rows, ns0, ns1, scale };
+    const uint64_t row_bytes = (uint64_t)n_head * head_dim * sizeof(float);
+    const uint64_t q_bytes = (uint64_t)rows * row_bytes;
+    const uint64_t n_keys = rows > 1u ? n1 : n0;
+    const uint64_t cache_bytes = n_keys * n_head_kv * head_dim * 2u;
+    const uint64_t part_stride = (uint64_t)n_head * (2u + head_dim);
+    const uint64_t row0_part_floats = part_stride * ns0;
+    const bool need_part = (ns0 > 1u) || (rows > 1u && ns1 > 1u);
+    const uint64_t part_floats = need_part
+        ? row0_part_floats + (rows > 1u ? part_stride * ns1 : 0u) : 0u;
+    qwen4_bind b[6];
+    if (!qwen4_bind_tensor(&b[0], q, q_bytes, "attn3 q") ||
+        !qwen4_bind_tensor(&b[1], gate, q_bytes, "attn3 gate") ||
+        !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "attn3 k cache") ||
+        !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "attn3 v cache") ||
+        !qwen4_bind_tensor(&b[4], out, q_bytes, "attn3 out") ||
+        !qwen4_bind_tensor(&b[5], need_part ? part : out,
+                           need_part ? part_floats * sizeof(float) : q_bytes, "attn3 part")) {
+        return 0;
+    }
+    const uint32_t grid_splits = rows > 1u ? (ns0 > ns1 ? ns0 : ns1) : ns0;
+    if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_DECODE3, &args, sizeof(args), b, 6,
+                        MTLSizeMake(grid_splits, n_head_kv, 1), MTLSizeMake(32 * QWEN4_ATTN_NSG, 1, 1), 0)) {
+        return 0;
+    }
+    if (!need_part) return 1;   /* every row's own split count was 1: wrote out directly */
+    qwen4_bind mb[3] = { b[5], b[1], b[4] };
+    return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_MERGE3, &args, sizeof(args), mb, 3,
+                          MTLSizeMake(n_head, rows, 1), MTLSizeMake(256, 1, 1), 0)
+           ? 1 : 0;
 }
 
 /* ---- decode batch: attention over rows ----

@@ -988,3 +988,230 @@ kernel void kernel_qwen35_attn_decode2<8>(
         device const half *, device const half *, device float *, device float *,
         device const uchar *, device const uchar *, device const half *, device const half *,
         uint3, ushort, ushort);
+
+/* --- M5: decode3, decode2's successor (more splits, keys across simdgroups,
+ * parallel merge) ---------------------------------------------------------- */
+
+/* Must match QWEN35_ATTN_MAX_SPLITS in ds4_metal.m (the host cap on a row's
+ * own split count) and QWEN4_ATTN_NSG (the simdgroups-per-threadgroup used
+ * for the dispatch's threadgroup size). */
+#define QWEN35_ATTN_MAX_SPLITS 256u
+#define QWEN35_ATTN_GROUP_MAX 8u   /* Ornith: 16 query heads / 2 KV heads */
+
+struct ds4_metal_args_qwen35_attn_decode3 {
+    uint32_t n_head, n_head_kv, head_dim, pos0;
+    uint32_t rows, ns0, ns1;
+    float scale;
+};
+
+/* decode2's successor: instead of dividing the KV head's query-head group
+ * across the threadgroup's 4 simdgroups (decode2), every simdgroup here
+ * serves the WHOLE group (up to 8 heads) and instead divides the row's OWN
+ * key range across the 4 simdgroups, so a 128-thread threadgroup reads keys
+ * in parallel rather than scanning them serially.  Row r's own [lo,hi) split
+ * geometry (from its own key count via qwen35_attn_row_splits3, host side)
+ * and its key-to-simdgroup assignment (lo_r + sg + NSG*j, strided off THE
+ * ROW'S OWN lo_r) depend only on that row's own key count, so a rows==2 call
+ * visits exactly the keys, in exactly the order, a lone rows==1 call would
+ * visit for each row: bit-identical by construction (both rows run this
+ * exact same per-row code path, one after the other, so there is nothing
+ * for the other row to perturb).  The NSG simdgroup partial states of a row
+ * (for this split) are combined in threadgroup memory in the fixed order
+ * sg=0,1,2,3 (the standard online-softmax merge), GCHUNK query heads at a
+ * time to keep the threadgroup memory footprint under the 32KB per-
+ * threadgroup limit.  A row whose own split count is 1 then writes its
+ * gated output directly; otherwise the split's combined (m,l,acc) is written
+ * to `part` ([Hkv][own n_splits][group][2+D], row 0's block first, row 1's
+ * block starting after it) for kernel_qwen35_attn_merge3. */
+template <uint NPT>
+kernel void kernel_qwen35_attn_decode3(
+        constant ds4_metal_args_qwen35_attn_decode3 & args,
+        device const float   *q,          /* [rows][H*D] */
+        device const float   *gate,       /* [rows][H*D] */
+        device const half    *k_cache,
+        device const half    *v_cache,
+        device float         *out,        /* [rows][H*D] */
+        device float         *part,       /* row0 block, then row1 block if rows==2 */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint split = tgpig.x, kvh = tgpig.y;
+    const uint H = args.n_head, Hkv = args.n_head_kv;
+    if (kvh >= Hkv) return;
+    constexpr uint D = NPT * 32;
+    constexpr uint NSG = 4;
+    constexpr uint GMAX = QWEN35_ATTN_GROUP_MAX;
+    constexpr uint GCHUNK = 4u;
+    const uint group = H / Hkv;
+    const uint rows = args.rows;
+    const uint n0 = args.pos0 + 1u, n1 = args.pos0 + 2u;
+    const uint ns0 = args.ns0, ns1 = args.ns1;
+    const uint kps0 = (n0 + ns0 - 1u) / ns0;
+    const uint kps1 = rows > 1u ? (n1 + ns1 - 1u) / ns1 : 0u;
+    const bool v0 = split < ns0;
+    const bool v1 = rows > 1u && split < ns1;
+    if (!v0 && !v1) return;
+    const uint lo0 = split * kps0, hi0 = v0 ? min(n0, lo0 + kps0) : lo0;
+    const uint lo1 = split * kps1, hi1 = v1 ? min(n1, lo1 + kps1) : lo1;
+
+    /* One thread's live state for a single row/head-chunk pass: keeping this
+     * to one row at a time (instead of tracking both rows' [8] head arrays
+     * live throughout the whole key scan) roughly halves live registers,
+     * which is what actually bounded occupancy here -- not the merge. */
+    threadgroup float tg_m[NSG][GCHUNK];
+    threadgroup float tg_l[NSG][GCHUNK];
+    threadgroup float tg_acc[NSG][GCHUNK][D];
+    for (uint r = 0; r < rows; r++) {
+        if ((r == 0u && !v0) || (r == 1u && !v1)) continue;
+        const uint ns_r = r == 0u ? ns0 : ns1;
+        const uint lo = r == 0u ? lo0 : lo1, hi = r == 0u ? hi0 : hi1;
+
+        float qv[GMAX][NPT], m[GMAX], l[GMAX], acc[GMAX][NPT];
+#pragma unroll
+        for (uint g = 0; g < GMAX; g++) {
+            if (g >= group) break;
+            const uint h = kvh * group + g;
+            device const float *qh = q + ((uint64_t)r * H + h) * D + tiisg * NPT;
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) qv[g][i] = qh[i] * args.scale;
+            m[g] = -3.0e38f;
+            l[g] = 0.0f;
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) acc[g][i] = 0.0f;
+        }
+        for (uint idx = lo + sgitg; idx < hi; idx += NSG) {
+            const uint64_t kvbase = ((uint64_t)idx * Hkv + kvh) * D + tiisg * NPT;
+            device const half *kr = k_cache + kvbase, *vr = v_cache + kvbase;
+            float kv[NPT], vv[NPT];
+#pragma unroll
+            for (uint i = 0; i < NPT; i++) { kv[i] = (float)kr[i]; vv[i] = (float)vr[i]; }
+#pragma unroll
+            for (uint g = 0; g < GMAX; g++) {
+                if (g >= group) break;
+                float s = 0.0f;
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) s += qv[g][i] * kv[i];
+                s = simd_sum(s);   /* each thread holds NPT of the 256 dims: sum across the simdgroup's 32 lanes */
+                const float mn = max(m[g], s), corr = exp(m[g] - mn), w = exp(s - mn);
+                l[g] = l[g] * corr + w;
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) acc[g][i] = acc[g][i] * corr + w * vv[i];
+                m[g] = mn;
+            }
+        }
+
+        /* One barrier round per chunk of GCHUNK heads (not per head): every
+         * simdgroup's state for the chunk goes to threadgroup memory in one
+         * shot, then the NSG partials are combined per head -- spread across
+         * all NSG simdgroups (simdgroup sg merges chunk-relative heads
+         * sg, sg+NSG, ...) instead of leaving 3 of 4 simdgroups idle. */
+        for (uint g0 = 0; g0 < group; g0 += GCHUNK) {
+            const uint gn = min(GCHUNK, group - g0);
+            for (uint gc = 0; gc < gn; gc++) {
+                const uint g = g0 + gc;
+                if (tiisg == 0) { tg_m[sgitg][gc] = m[g]; tg_l[sgitg][gc] = l[g]; }
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) tg_acc[sgitg][gc][tiisg * NPT + i] = acc[g][i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint gc = sgitg; gc < gn; gc += NSG) {
+                const uint g = g0 + gc;
+                float mm = -3.0e38f;
+                for (uint s = 0; s < NSG; s++) mm = max(mm, tg_m[s][gc]);
+                float ll = 0.0f, o[NPT];
+#pragma unroll
+                for (uint i = 0; i < NPT; i++) o[i] = 0.0f;
+                for (uint s = 0; s < NSG; s++) {
+                    const float c = tg_l[s][gc] > 0.0f ? exp(tg_m[s][gc] - mm) : 0.0f;
+                    ll += tg_l[s][gc] * c;
+#pragma unroll
+                    for (uint i = 0; i < NPT; i++) o[i] += tg_acc[s][gc][tiisg * NPT + i] * c;
+                }
+                const uint h = kvh * group + g;
+                if (ns_r == 1u) {
+                    device float *dst = out + ((uint64_t)r * H + h) * D + tiisg * NPT;
+                    device const float *gt = gate + ((uint64_t)r * H + h) * D + tiisg * NPT;
+                    const float inv = ll > 0.0f ? 1.0f / ll : 0.0f;
+#pragma unroll
+                    for (uint i = 0; i < NPT; i++) dst[i] = o[i] * inv * qwen4_sigmoid(gt[i]);
+                } else {
+                    const uint64_t row_base = (r == 0u ? 0u : (uint64_t)ns0 + (uint64_t)(r - 1u) * ns1) *
+                                               H * (2u + D);
+                    device float *dst = part + row_base + (((uint64_t)kvh * ns_r + split) * group + g) * (2u + D);
+                    if (tiisg == 0) { dst[0] = mm; dst[1] = ll; }
+#pragma unroll
+                    for (uint i = 0; i < NPT; i++) dst[2u + tiisg * NPT + i] = o[i];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+template [[host_name("kernel_qwen35_attn_decode3_npt8")]]
+kernel void kernel_qwen35_attn_decode3<8>(
+        constant ds4_metal_args_qwen35_attn_decode3 &, device const float *, device const float *,
+        device const half *, device const half *, device float *, device float *,
+        uint3, ushort, ushort);
+
+/* Parallel merge of decode3's split partials: one thread per head dim (256
+ * threads, head_dim is always 256 here), one threadgroup per (head, row).
+ * Folds the row's own ns_r partials with a fixed binary tree (pairs
+ * (0,1),(2,3),... then pairs of pairs, padded with neutral elements up to
+ * the next power of two): the shape depends only on ns_r, never on how many
+ * were live at the source split's dispatch, so it matches decode3's own
+ * direct-write path (ns_r==1) and any other ns_r bit for bit.  A neutral pad
+ * slot has l==0 (m finite, no infinities -- this file builds under fast
+ * math) so it contributes exactly zero to both l and the accumulator, ready
+ * for a future caller that fills a real "no keys landed here" partial the
+ * same way.  Rows whose own split count is 1 were written directly by
+ * decode3 and are skipped here; the host dispatches this kernel only when at
+ * least one row needs it. */
+kernel void kernel_qwen35_attn_merge3(
+        constant ds4_metal_args_qwen35_attn_decode3 & args,
+        device const float *part,
+        device const float *gate,
+        device float       *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    const uint h = tgpig.x, r = tgpig.y;
+    if (h >= args.n_head || r >= args.rows) return;
+    const uint ns = r == 0u ? args.ns0 : args.ns1;
+    if (ns <= 1u) return;
+    constexpr uint D = 256u;
+    const uint H = args.n_head, Hkv = args.n_head_kv;
+    const uint group = H / Hkv;
+    const uint kvh = h / group, g = h % group;
+    const uint64_t row_base = (r == 0u ? 0u : (uint64_t)args.ns0 + (uint64_t)(r - 1u) * args.ns1) * H * (2u + D);
+    const uint64_t stride = (uint64_t)group * (2u + D);
+    device const float *base = part + row_base + ((uint64_t)kvh * ns * group + g) * (2u + D);
+
+    float mm[QWEN35_ATTN_MAX_SPLITS];
+    float ll[QWEN35_ATTN_MAX_SPLITS];
+    float oo[QWEN35_ATTN_MAX_SPLITS];
+    uint p = 1u;
+    while (p < ns) p <<= 1u;
+    for (uint s = 0; s < p; s++) {
+        if (s < ns) {
+            device const float *ps = base + s * stride;
+            mm[s] = ps[0]; ll[s] = ps[1]; oo[s] = ps[2u + tid];
+        } else {
+            mm[s] = -3.0e38f; ll[s] = 0.0f; oo[s] = 0.0f;   /* neutral pad */
+        }
+    }
+    uint n = p;
+    while (n > 1u) {
+        const uint half_n = n >> 1u;
+        for (uint i = 0; i < half_n; i++) {
+            const uint s0 = 2u * i, s1 = 2u * i + 1u;
+            const float m0 = mm[s0], m1 = mm[s1], l0 = ll[s0], l1 = ll[s1], o0 = oo[s0], o1 = oo[s1];
+            const float nm = max(m0, m1);
+            const float c0 = l0 > 0.0f ? exp(m0 - nm) : 0.0f;
+            const float c1 = l1 > 0.0f ? exp(m1 - nm) : 0.0f;
+            mm[i] = nm; ll[i] = l0 * c0 + l1 * c1; oo[i] = o0 * c0 + o1 * c1;
+        }
+        n = half_n;
+    }
+    const float inv = ll[0] > 0.0f ? 1.0f / ll[0] : 0.0f;
+    const uint64_t at = ((uint64_t)r * H + h) * D + tid;
+    out[at] = oo[0] * inv * qwen4_sigmoid(gate[at]);
+}
