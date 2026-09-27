@@ -57,8 +57,11 @@ Reference designs: MLX's fused accelerator attention (MIT licence, on this machi
 The query buffer is F32 laid out `[t][H][D]`, so the 16 rows of one 8-head x 2-token fragment are not evenly
 strided and cannot feed an accelerator tile load directly. A small kernel writes `q * scale` as F16 into a scratch
 laid out `[kvh][t][g][D]` (g = query head within the KV group, 0..7): the 8·T rows of one KV head are then
-contiguous with row stride D, which is the shape MLX loads directly from device memory. Scratch size
-`T * H * D * 2` bytes (16.8 MB at T = 2048); one buffer serves every layer.
+contiguous with row stride D, which is the shape MLX loads directly from device memory. The token count is
+padded to a multiple of 8 and the padding tokens are written as zero, so the 8-token blocks need no row guards.
+Scratch size `Hkv * ceil8(T) * 8 * 256 * 2` bytes (16.8 MB at T = 2048), held in a `ds4_metal.m` scratch slot
+grown on first use, like the MoE accelerator kernels' half operands (`qwen4_nax_scratch`); one buffer serves every
+layer.
 
 ### 2.2 `kernel_qwen35_attn_flash_nax` — prefill, T > 8
 
@@ -67,7 +70,7 @@ contiguous with row stride D, which is the shape MLX loads directly from device 
   heads. The grid is `Hkv x ceil(T/8) x Ks`.
 - **Matrix work.** K and V are read directly from the F16 cache (row stride `Hkv*D`) in blocks of 32 keys.
   S = Q Kᵀ and O += P V use `matmul2d` through 16x32x16 fragments, as MLX does; S, O, the running max and the
-  running sum are F32.
+  running sum are F32, and P is converted to F16 for the P V product (as the M5 flash stages it).
 - **Softmax.** Online softmax in registers with `exp2` and the scale folded into the packed queries (log2e folded
   as MLX does). Causal mask: query token t (absolute position pos0 + t) attends to keys [0, pos0 + t]; only blocks
   that straddle the diagonal are masked, and blocks entirely past a fragment's last query are skipped.
@@ -90,19 +93,21 @@ contiguous with row stride D, which is the shape MLX loads directly from device 
   `ds4_gpu_tensor_api_available()` is true (false under `--quality`, before M5/A19 and with
   `DS4_METAL_DISABLE_METAL4=1`) and the accelerator pipelines exist. Otherwise the M5 simdgroup flash runs,
   unchanged.
-- New knob `DS4_QWEN35_ATTN_NAX`: default on, `0` selects the M5 simdgroup flash. Parsed per call; an
-  unrecognised value warns once and keeps the default (the M5 knob convention).
+- New knob `DS4_QWEN35_ATTN_NAX`: `0` selects the M5 simdgroup flash. Read once, like `DS4_QWEN35_ATTN_FLASH`; an
+  unrecognised value warns and keeps the default. It starts off and flips to on after the adoption checks (M4
+  rule: gate 1, the MTP identity tests and a lever A/B that shows a gain).
 - If the micro-benchmark shows the accelerator kernel losing on short chunks, a minimum T is added to the dispatch
   rule with the measured crossover as its value (a constant, not a new knob).
-- The packed-query scratch is allocated with the graph (sized for the largest prefill chunk) and counted in the
-  Ornith memory estimate in `ds4.c`. No silent fallback inside a forward: a failed dispatch returns false.
+- The packed-query scratch (2.1) is counted in the Ornith memory estimate in `ds4.c`. The key split keeps the
+  graph's `attn_flash_part`; its bound `ds4_gpu_qwen35_attn_flash_part_floats` grows to cover 8-token blocks
+  (worst case ~34 MB instead of ~17 MB). No silent fallback inside a forward: a failed dispatch returns false.
 
 ## 3. Data flow and exactness
 
 - K/V are written by the attention prep exactly as today; the cache layout (`[pos][kv_head][256]` F16) and the
   disk-KV payload are unchanged, so rewind, snapshot and restore are unaffected.
-- The accelerator kernel is not bit-identical to the simdgroup flash (different accumulation order and F32 P in the
-  P V product). `--mtp` and plain runs prefill identically (same chunking, same kernels), so prefill numerics only
+- The accelerator kernel is not bit-identical to the simdgroup flash (different accumulation order inside the
+  accelerator's products). `--mtp` and plain runs prefill identically (same chunking, same kernels), so prefill numerics only
   need gate 1's tolerance; decode exactness rests on `decode3`, which M6 does not touch.
 - The MTP layer's own attention uses the same prefill kernels; it only shapes drafts, never output.
 - Known risk: on M5 the `matmul2d` accumulate path has been observed to drift with context length (memory note
