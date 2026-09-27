@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <unistd.h>
 
 #include "ds4.h"
 #include "ds4_gpu.h"
@@ -1048,6 +1049,53 @@ static uint32_t test_attn_flash_nax(uint32_t pos0, uint32_t T, int use_part, int
     return splits;
 }
 
+/* Runs fn with stderr captured into buf (NUL-terminated, truncated to cap). */
+static void capture_stderr(void (*fn)(void *), void *ctx, char *buf, size_t cap) {
+    char path[] = "/tmp/qwen35_kernels_stderr_XXXXXX";
+    const int fd = mkstemp(path);
+    require_ok(fd >= 0, "stderr capture file");
+    fflush(stderr);
+    const int saved = dup(2);
+    dup2(fd, 2);
+    fn(ctx);
+    fflush(stderr);
+    dup2(saved, 2);
+    close(saved);
+    lseek(fd, 0, SEEK_SET);
+    const ssize_t n = read(fd, buf, cap - 1);
+    buf[n > 0 ? n : 0] = 0;
+    close(fd);
+    unlink(path);
+    if (n > 0) fputs(buf, stderr);
+}
+
+static void run_gpu_cleanup(void *ctx) { (void)ctx; ds4_gpu_cleanup(); }
+static void run_nax_2056(void *ctx) { (void)ctx; test_attn_flash_nax(0u, 2056u, 0, 0); }
+
+/* The accelerator flash's packed-query scratch belongs to the Metal teardown
+ * like the other accelerator scratch slots: a cleanup (an engine closed in a
+ * process that keeps running) must not leave it behind as a live handle, and
+ * after init the next call that grows the slot must not free a handle the new
+ * tracking table never saw. */
+static void test_attn_flash_nax_reinit(arena_t *a) {
+    if (!ds4_gpu_tensor_api_available()) {
+        printf("  attn flash nax reinit skipped (tensor API unavailable)\n");
+        return;
+    }
+    char buf[8192];
+    test_attn_flash_nax(0u, 9u, 0, 0);             /* the slot exists */
+    capture_stderr(run_gpu_cleanup, NULL, buf, sizeof(buf));
+    const bool leaked = strstr(buf, "discarded") != NULL;
+    require_ok(ds4_gpu_init(), "GPU re-initialization");
+    require_ok(ds4_gpu_set_model_map(a->base, a->size), "model map re-registration");
+    capture_stderr(run_nax_2056, NULL, buf, sizeof(buf));   /* larger than any earlier call: grows the slot */
+    const bool stale = strstr(buf, "unknown handle") != NULL;
+    printf("  attn flash nax cleanup/init: teardown %s, slot %s\n", leaked ? "LEAKED a live handle" : "clean",
+           stale ? "STALE" : "fresh");
+    require_ok(!leaked, "flash nax scratch released by the Metal teardown");
+    require_ok(!stale, "flash nax scratch slot fresh after init");
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)512 << 20;
@@ -1123,6 +1171,7 @@ int main(void) {
     require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(1000u, 1100u, 1, 1) > 1,
                "flash nax key split taken (T=1100, neutral partials)");
     unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+    test_attn_flash_nax_reinit(&arena);
     printf("qwen35 kernels: ok\n");
     return 0;
 }

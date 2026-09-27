@@ -53852,6 +53852,9 @@ static void qwen4_nax_release_scratch(void) {
     g_qwen4_nax_half_x_bytes = g_qwen4_nax_half_mid_bytes = g_qwen4_nax_half_midr_bytes = 0;
     g_qwen4_nax_half_mid_for = NULL;
     g_qwen4_nax_half_mid_count = 0;
+    if (g_qwen35_attn_qh) ds4_gpu_tensor_free(g_qwen35_attn_qh);
+    g_qwen35_attn_qh = NULL;
+    g_qwen35_attn_qh_bytes = 0;
 }
 static ds4_gpu_tensor *qwen4_nax_scratch(ds4_gpu_tensor **slot, uint64_t *slot_bytes, uint64_t bytes) {
     if (!*slot || *slot_bytes < bytes) {
