@@ -456,9 +456,13 @@ PPL of the tier: 2.194208 x 1.0018 = 2.1982 for 23G.
 ### Gate 2: quality (B)
 
 - ds4-server on a staging port, never the live stack; 23G and 25G tiers.
-- Pass rule: the gateway intelligence harness (`run_ab.py`) scores index
-  >= 86.6 AND truncated = errored = 0, on both tiers.
-- The 7-case agentic matrix passes 7/7 with no guard movement.
+- Pass rule (user decision 2026-09-27, replacing the fixed 86.6 bar that the
+  live oMLX itself no longer reaches on this harness): on each tier the ds4
+  index is at least the live oMLX's index minus 3.0 points, both measured on
+  the same harness the same day, AND truncated = errored = 0. M4: ds4 23G
+  78.0, 25G 84.7, live oMLX 78.8 (`speed-bench/ornith/m4/quality/GATE2.md`).
+- The 7-case agentic matrix shows no quality failure (a turn timeout is a
+  speed result, reported under gate 3) and no guard movement.
 - The abliteration smoke probes match a first-captured oMLX baseline.
 
 ### Gate 3: speed (A)
@@ -493,6 +497,9 @@ tests and the Qwen gate before the next starts:
   disk KV payload, chat rendering, server ids. Passes gate 1 items 4-5.
 - **M4: acceptance.** Gate 2 and gate 3 measurements; FP8 KV only if gate 3
   needs it; report.
+- **M5: attention kernels.** Ornith-only flash prefill attention and a faster
+  decode/verify attention to close the long-context gap to the live oMLX
+  (`docs/superpowers/specs/2026-09-27-ornith-m5-attention-design.md`).
 
 v2 (vision) and the gateway switch get their own spec and plan after M4.
 
