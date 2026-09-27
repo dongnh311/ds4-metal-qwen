@@ -222,14 +222,15 @@ and `ds4_gpu_add_tensor`.
      8 GQA heads of each verify row as one simdgroup-matrix tile, up to 256
      key splits per row, merge3 for the partials. T <= 8 tails, fp8/q4 K/V
      and `DS4_QWEN35_ATTN_DECODE2=0` keep the older kernels. Since M6
-     (opt-in, `DS4_QWEN35_ATTN_NAX=1`, needs the Metal 4 tensor API): the
-     flash chunks run `kernel_qwen35_attn_flash_nax` on the M5 neural
-     accelerators instead — a query pack to half, then Q Kᵀ and P V on
-     `matmul2d` fragments with the 256 head dims split across simdgroup
-     pairs, same key split and merge; ~3.6x the simdgroup flash per layer.
-     It stays off by default because one cross-path check (the MTP rewind
-     test) can see an MoE routing near-tie flip between it and decode3
-     (`speed-bench/ornith/m6/LEVERS.md`). See the decode
+     (`DS4_QWEN35_ATTN_NAX`, default on; `=0` restores the simdgroup flash;
+     needs the Metal 4 tensor API): the flash chunks run
+     `kernel_qwen35_attn_flash_nax` on the M5 neural accelerators instead —
+     a query pack to half, then Q Kᵀ and P V on `matmul2d` fragments with
+     the 256 head dims split across simdgroup pairs, same key split and
+     merge; ~3.6x the simdgroup flash per layer. Its rounding differs from
+     decode3's, so a state built by decode steps is compared against a
+     reference built the same way (an MoE top-8 near-tie can flip between
+     the two kernels; `speed-bench/ornith/m6/LEVERS.md`). See the decode
      section below for why the verify rows are bit-exact against plain
      decode.
   4. `o *= sigmoid(gate)`, then the `attn_output` GEMV into `blk`.
@@ -436,8 +437,9 @@ A/B shows a gain.
      query tokens per threadgroup (2 default, or 4) and the threadgroup count
      below which flash splits the key range (default 256); tuning/test.
    - `DS4_QWEN35_ATTN_NAX` — flash prefill on the M5 neural accelerators
-     (M6; default 0, 1 = on); needs `DS4_QWEN35_ATTN_FLASH` on, F16 K/V and
-     the Metal 4 tensor API, otherwise the simdgroup flash runs.
+     (M6; default 1 since 2026-09-28, 0 = the simdgroup flash); needs
+     `DS4_QWEN35_ATTN_FLASH` on, F16 K/V and the Metal 4 tensor API,
+     otherwise the simdgroup flash runs.
    - `DS4_QWEN35_KV` — KV cache payload mode: f16 (default), fp8 or q4.
    - `DS4_QWEN35_PREFILL_CHUNK` — prefill chunk size override.
 4. **Qwen gate.** Every commit that touches a shared file (`ds4.c` outside the

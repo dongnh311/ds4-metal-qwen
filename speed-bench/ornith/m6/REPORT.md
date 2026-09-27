@@ -7,7 +7,8 @@ Not merged, not pushed, not deployed. Spec: `docs/superpowers/specs/2026-09-27-o
 
 ## TL;DR
 
-ds4 now runs Ornith's prefill attention on the M5 Pro's neural accelerators (`DS4_QWEN35_ATTN_NAX=1`). With it:
+ds4 now runs Ornith's prefill attention on the M5 Pro's neural accelerators (`DS4_QWEN35_ATTN_NAX`, on by default
+since 2026-09-28). With it:
 
 - **Long context: ds4 wins decisively.** At 128K the first token arrives 1.3-2.2x sooner than on the live oMLX
   (146-170 s vs 184-372 s), at 250K 2.3x sooner (8.5 min vs 20 min) with 15% faster decode (28.6 vs 24.9 t/s).
@@ -96,7 +97,10 @@ With `clang loop unroll(full)`, the dims-split variant (A2) reached 3.6x.
 
 ## Decisions for you
 
-1. **Turn the accelerator prefill on by default?** Everything passes with it on except one existing check,
+1. **Done (2026-09-28, your decision): the accelerator prefill is on by default**, and the MTP rewind check now
+   builds its fresh reference from the prompt prefill plus decode steps, like the rewound session (old check RED with
+   14 failures, new check GREEN in both MTP modes). The original analysis:
+   **Turn the accelerator prefill on by default?** Everything passes with it on except one existing check,
    `ds4_test --qwen35-rewind` under MTP, which requires a session rewound through the verify snapshot (state built by
    the decode kernel) to match a fresh prefill within 2e-3 log-probability. With the accelerator prefill it misses by
    0.16: at the first decode step an MoE top-8 near-tie in layer 13 flips (expert 241 vs 138) under a ~3e-4 numeric

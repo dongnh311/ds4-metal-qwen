@@ -367,18 +367,19 @@ static int qwen35_attn_flash_env(void) {
 }
 
 /* M6 (DS4_QWEN35_ATTN_NAX): runs flash prefill on the M5 neural accelerators
- * (kernel_qwen35_attn_flash_nax), read once.  Off until the M6 adoption
- * checks pass; "1" turns it on, "0" keeps the M5 simdgroup flash.  Takes
- * effect only with DS4_QWEN35_ATTN_FLASH on and the Metal 4 tensor API
- * available (not under --quality, before M5/A19, or with
+ * (kernel_qwen35_attn_flash_nax), read once.  On by default since the M6
+ * gates (prefill +68% at 32K and +152% at 128K in the lever A/B, gate 1 and
+ * the MTP identity tests pass); "0" keeps the M5 simdgroup flash, any other
+ * value means on.  Takes effect only with DS4_QWEN35_ATTN_FLASH on and the
+ * Metal 4 tensor API available (not under --quality, before M5/A19, or with
  * DS4_METAL_DISABLE_METAL4=1), where the M5 flash keeps running. */
 static int qwen35_attn_nax_env(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("DS4_QWEN35_ATTN_NAX");
         if (e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "1") != 0)
-            fprintf(stderr, "ds4: DS4_QWEN35_ATTN_NAX=%s not recognised (0 or 1); using off\n", e);
-        on = (e && strcmp(e, "1") == 0) ? 1 : 0;
+            fprintf(stderr, "ds4: DS4_QWEN35_ATTN_NAX=%s not recognised (0 or 1); using on\n", e);
+        on = (e && strcmp(e, "0") == 0) ? 0 : 1;
     }
     return on;
 }

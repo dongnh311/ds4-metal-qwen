@@ -87,3 +87,11 @@ check fails with it on: `qwen35-rewind` under MTP (cross-path log-probability bo
 tests are not edited without the user's decision, so **`DS4_QWEN35_ATTN_NAX` stays off by default**; the final gates
 run with it on explicitly. Turning it on by default needs the user to accept changing that check (for example,
 comparing the rewound session against a fresh one on the top-1 token only, or running the check with the knob off).
+
+## Addendum (2026-09-28): default on
+
+The user chose to turn the accelerator flash on by default. The `qwen35-rewind` check under MTP now builds its fresh
+reference the way the rewound session was built (prompt prefill, then one decode step per generated token), so it
+checks the snapshot rewind itself rather than prefill-vs-decode kernel parity: the old check fails with the new
+default (14 assertions, RED), the new one passes with and without MTP together with `--session-snapshot` and
+`--qwen35-payloads` (window `naxdef`, 2026-09-28 06:43-06:46).
