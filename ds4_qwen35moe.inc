@@ -68,7 +68,8 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
     const uint64_t attn_part_decode2 = ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM);
     const uint64_t attn_part_decode3 = ds4_gpu_qwen35_attn_part3_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM);
     QWEN35_ALLOC(attn_part, attn_part_decode2 > attn_part_decode3 ? attn_part_decode2 : attn_part_decode3);
-    /* M5 flash prefill split scratch (DS4_QWEN35_ATTN_FLASH): the split
+    /* Flash prefill split scratch (DS4_QWEN35_ATTN_FLASH; the M5 simdgroup
+     * flash and the M6 accelerator flash share it): the split
      * shrinks as T grows, so the smallest attended chunk (T = 9) is the
      * worst case; scan every T the graph can ever call flash with (9..T)
      * to stay exact rather than trust that monotonicity.  T <= 8 never
@@ -77,8 +78,9 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
      * T that never splits; when every T in range comes out at 0, no split
      * ever happens for this graph and attn_flash_part is left NULL, which
      * attn_flash_tensor treats the same as an allocated part that Ks == 1
-     * never touches.  ~17 MB at the default DS4_QWEN35_ATTN_FLASH_MIN_TG
-     * (256) for a 2048-token prefill chunk. */
+     * never touches.  ~34 MB at the default DS4_QWEN35_ATTN_FLASH_MIN_TG
+     * (256) for a 2048-token prefill chunk (the bound covers the
+     * accelerator kernel's 8-token blocks). */
     if (T > 8u) {
         uint64_t attn_flash_part_floats = 0;
         for (uint64_t t = 9u; t <= T; t++) {

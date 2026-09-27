@@ -1115,6 +1115,14 @@ int main(void) {
     test_attn_flash_nax(37u, 200u, 0, 1);
     test_attn_flash_nax(4096u, 64u, 0, 1);
     test_attn_flash_nax(30720u, 2048u, 0, 0);   /* long context: accelerator drift vs the simdgroup flash */
+    setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", "4096", 1);   /* force key splits on short caches */
+    require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(4096u, 64u, 1, 1) > 1,
+               "flash nax key split taken (T=64)");
+    require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(8000u, 200u, 1, 1) > 1,
+               "flash nax key split taken (T=200)");
+    require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(1000u, 1100u, 1, 1) > 1,
+               "flash nax key split taken (T=1100, neutral partials)");
+    unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
     printf("qwen35 kernels: ok\n");
     return 0;
 }

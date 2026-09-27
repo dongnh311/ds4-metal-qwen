@@ -40222,7 +40222,7 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
                           2ull * n_lin * ((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM +
                                           (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM) * sizeof(float);
         /* attn_part (decode2/decode3 merge scratch, whichever is larger) and
-         * attn_flash_part (the flash key-split scratch, scanned the same way
+         * attn_flash_part (the key-split scratch of both flash kernels, scanned the same way
          * the graph itself sizes it -- see ds4_qwen35moe.inc's alloc). */
         const uint64_t attn_part_decode2 = ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM);
         const uint64_t attn_part_decode3 = ds4_gpu_qwen35_attn_part3_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM);

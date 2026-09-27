@@ -2144,5 +2144,9 @@ template [[host_name("kernel_qwen35_attn_flash_nax")]]
 kernel void kernel_qwen35_attn_flash_nax<false>(
         constant ds4_metal_args_qwen35_attn_flash_nax &, device const half *, device const float *,
         device const half *, device const half *, device float *, uint3, ushort, ushort);
+template [[host_name("kernel_qwen35_attn_flash_nax_split")]]
+kernel void kernel_qwen35_attn_flash_nax<true>(
+        constant ds4_metal_args_qwen35_attn_flash_nax &, device const half *, device const float *,
+        device const half *, device const half *, device float *, uint3, ushort, ushort);
 
 #endif /* DS4_METAL_HAS_TENSOR */
