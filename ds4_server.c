@@ -6406,6 +6406,33 @@ static bool send_all(int fd, const void *p, size_t n) {
     return true;
 }
 
+/* Length of the well-formed UTF-8 sequence at s (1..4), or 0 when the bytes at
+ * s do not start one; *skip is then the length of the maximal ill-formed
+ * subpart (at least 1), which becomes a single U+FFFD.  A NUL terminator ends
+ * a truncated sequence like any other non-continuation byte. */
+static size_t json_utf8_len(const unsigned char *s, size_t *skip) {
+    const unsigned char c = s[0];
+    size_t need;
+    unsigned char lo = 0x80, hi = 0xbf;
+    if (c < 0x80) return 1;
+    if (c >= 0xc2 && c <= 0xdf) need = 2;
+    else if (c == 0xe0) { need = 3; lo = 0xa0; }
+    else if (c == 0xed) { need = 3; hi = 0x9f; }
+    else if (c >= 0xe1 && c <= 0xef) need = 3;
+    else if (c == 0xf0) { need = 4; lo = 0x90; }
+    else if (c == 0xf4) { need = 4; hi = 0x8f; }
+    else if (c >= 0xf1 && c <= 0xf3) need = 4;
+    else { *skip = 1; return 0; }
+    for (size_t i = 1; i < need; i++) {
+        const unsigned char n = s[i];
+        if (n < (i == 1 ? lo : 0x80) || n > (i == 1 ? hi : 0xbf)) { *skip = i; return 0; }
+    }
+    return need;
+}
+
+/* JSON string literal of s.  Replies must be valid UTF-8 even when the text
+ * was cut inside a multi-byte character, so ill-formed sequences become
+ * U+FFFD; well-formed text is copied unchanged. */
 static void json_escape(buf *b, const char *s) {
     buf_putc(b, '"');
     for (; *s; s++) {
@@ -6421,8 +6448,18 @@ static void json_escape(buf *b, const char *s) {
             buf_puts(b, "\\t");
         } else if (c < 0x20) {
             buf_printf(b, "\\u%04x", (unsigned)c);
-        } else {
+        } else if (c < 0x80) {
             buf_putc(b, (char)c);
+        } else {
+            size_t skip = 1;
+            const size_t n = json_utf8_len((const unsigned char *)s, &skip);
+            if (n) {
+                buf_append(b, s, n);
+                s += n - 1;
+            } else {
+                buf_puts(b, "\xef\xbf\xbd");
+                s += skip - 1;
+            }
         }
     }
     buf_putc(b, '"');
@@ -18752,6 +18789,39 @@ static void test_openai_tool_stream_preserves_literal_entities(void) {
     close(sv[1]);
 }
 
+/* Non-streaming replies JSON-escape whole strings.  A completion cut inside a
+ * multi-byte character (max_tokens, a forced think-budget close) must still
+ * produce valid UTF-8 JSON: each invalid or truncated sequence becomes one
+ * U+FFFD, valid characters pass through unchanged. */
+static void test_json_escape_replaces_invalid_utf8(void) {
+    const char in[] = {'a', (char)0xc3, (char)0xa9,                       /* e acute */
+                       (char)0xe2, (char)0x82, (char)0xac,                /* euro */
+                       (char)0xf0, (char)0x9f, (char)0x9a, (char)0xa9,    /* flag */
+                       (char)0xe4, (char)0xbd,                            /* 3-byte sequence cut after 2 */
+                       'b', (char)0xff, 'c', (char)0x80,                  /* invalid lead, stray continuation */
+                       (char)0xed, (char)0xa0, (char)0x80,                /* UTF-16 surrogate: not UTF-8 */
+                       (char)0xc3, 0};                                    /* cut at the very end */
+    const char fffd[] = {(char)0xef, (char)0xbf, (char)0xbd, 0};
+    buf want = {0};
+    buf_putc(&want, '"');
+    buf_append(&want, in, 10);
+    buf_puts(&want, fffd);
+    buf_putc(&want, 'b');
+    buf_puts(&want, fffd);
+    buf_putc(&want, 'c');
+    buf_puts(&want, fffd);
+    buf_puts(&want, fffd);
+    buf_puts(&want, fffd);
+    buf_puts(&want, fffd);
+    buf_puts(&want, fffd);
+    buf_putc(&want, '"');
+    buf got = {0};
+    json_escape(&got, in);
+    TEST_ASSERT(got.len == want.len && memcmp(got.ptr, want.ptr, got.len) == 0);
+    buf_free(&got);
+    buf_free(&want);
+}
+
 static void test_openai_tool_stream_holds_partial_utf8_arguments(void) {
     int sv[2];
     TEST_ASSERT(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
@@ -24497,6 +24567,7 @@ static void ds4_server_unit_tests_run(void) {
     test_openai_tool_stream_waits_for_incomplete_tool_tags();
     test_openai_tool_stream_sends_partial_raw_arguments();
     test_openai_tool_stream_preserves_literal_entities();
+    test_json_escape_replaces_invalid_utf8();
     test_openai_tool_stream_holds_partial_utf8_arguments();
     test_openai_tool_stream_handles_multiple_calls();
     test_streaming_holds_partial_utf8();
