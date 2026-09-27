@@ -68,6 +68,21 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
     const uint64_t attn_part_decode2 = ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM);
     const uint64_t attn_part_decode3 = ds4_gpu_qwen35_attn_part3_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM);
     QWEN35_ALLOC(attn_part, attn_part_decode2 > attn_part_decode3 ? attn_part_decode2 : attn_part_decode3);
+    /* M5 flash prefill split scratch (DS4_QWEN35_ATTN_FLASH): the split
+     * shrinks as T grows, so the smallest attended chunk (T = 9) is the
+     * worst case; scan every T the graph can ever call flash with (9..T)
+     * to stay exact rather than trust that monotonicity.  T <= 8 never
+     * dispatches flash (attn_flash_tensor refuses T <= 8), so no scratch is
+     * allocated then.  ~17 MB at the default DS4_QWEN35_ATTN_FLASH_MIN_TG
+     * (256) for a 2048-token prefill chunk. */
+    if (T > 8u) {
+        uint64_t attn_flash_part_floats = 0;
+        for (uint64_t t = 9u; t <= T; t++) {
+            const uint64_t need = ds4_gpu_qwen35_attn_flash_part_floats((uint32_t)t, DS4_N_HEAD, DS4_N_HEAD_DIM);
+            if (need > attn_flash_part_floats) attn_flash_part_floats = need;
+        }
+        QWEN35_ALLOC(attn_flash_part, attn_flash_part_floats);
+    }
     QWEN35_ALLOC(router, T * DS4_N_EXPERT);
     QWEN35_ALLOC(selected, T * DS4_N_EXPERT_USED);
     QWEN35_ALLOC(weights, T * DS4_N_EXPERT_USED);
@@ -296,7 +311,12 @@ static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model 
  * DS4_QWEN35_ATTN_DECODE2=0 always keep today's paths).  Plain decode and
  * the verify read the same qwen35_attn_decode_env()/qwen4_kv_mode() pair,
  * so they always pick the same kernel generation and stay bit for bit
- * exact with each other. */
+ * exact with each other.
+ *
+ * M5 (DS4_QWEN35_ATTN_FLASH): gates the flash prefill kernel for chunks with
+ * more than 8 tokens (the verify's per_row path, the MTP draft tail, T <= 8
+ * tails and fp8/q4 K/V always keep today's attn_mm dispatch).  F16 K/V only;
+ * default off until the controller's gates and A/B pass. */
 static int qwen35_attn_decode2_env(void) {
     static int on = -1;
     if (on < 0) {
@@ -322,6 +342,19 @@ static int qwen35_attn_decode_env(void) {
     return gen;
 }
 
+/* M5 (DS4_QWEN35_ATTN_FLASH): selects the flash prefill kernel for chunks
+ * above the T <= 8 tail cutover, read once.  1 turns it on; unset or any
+ * other value keeps today's attn_mm dispatch.  Default off until the
+ * controller's gates and A/B pass. */
+static int qwen35_attn_flash_env(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DS4_QWEN35_ATTN_FLASH");
+        on = (e && strcmp(e, "1") == 0) ? 1 : 0;
+    }
+    return on;
+}
+
 static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t pos0,
                                 uint32_t r0, uint32_t n, bool per_row) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
@@ -338,6 +371,11 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
                         DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 1u, scale,
                         g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
                         g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+        }
+        if (n > 8u && qwen35_attn_flash_env() && !qwen4_kv_mode(g)) {
+            return ds4_gpu_qwen35_attn_flash_tensor(g->attn_o, g->q, g->gate,
+                        qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_flash_part, n,
+                        DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale) != 0;
         }
         return ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                                 NULL, NULL, n <= 2u ? g->attn_part : NULL, n,

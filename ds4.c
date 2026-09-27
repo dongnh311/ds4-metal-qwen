@@ -59330,7 +59330,7 @@ uint32_t ds4_qwen4_kv_shrink_target(uint32_t alloc, uint32_t need, uint32_t init
     X(R) X(xn) X(lo) X(inj) X(inj_alt) X(mixed) X(blk) X(qkv) X(z) X(ga) \
     X(gb) X(lin_o) X(ple_emb) X(ple_key) X(ple_val) X(ple_gated) X(ple_normed) \
     X(qg) X(kp) X(vp) X(iq) X(ik) X(q) X(gate) X(iqn) X(attn_o) \
-    X(score) X(tile_max) X(sel_blocks) X(sel_tokens) X(n_sel) X(attn_part) \
+    X(score) X(tile_max) X(sel_blocks) X(sel_tokens) X(n_sel) X(attn_part) X(attn_flash_part) \
     X(router) X(selected) X(weights) X(mid) X(part) X(sh_gate_logit) \
     X(moe_lists) X(moe_counts) X(sh_gate) X(sh_up) X(sh_mid) X(sh_out) \
     X(hc_u) X(hc_lo_act) \
@@ -59361,6 +59361,9 @@ typedef struct ds4_qwen4_gpu_graph {
     int ple_prev[DS4_MAX_PLE_NGRAM];
     ds4_gpu_tensor *qg, *kp, *vp, *iq, *ik, *q, *gate, *iqn, *attn_o;
     ds4_gpu_tensor *score, *tile_max, *sel_blocks, *sel_tokens, *n_sel, *attn_part;
+    /* Ornith M5 flash prefill split scratch (DS4_QWEN35_ATTN_FLASH); NULL
+     * (and unused) on the Qwen3.8 graph, which never allocates it. */
+    ds4_gpu_tensor *attn_flash_part;
     ds4_gpu_tensor *kc_g, *vc_g;  /* P1 gathered selected K/V (contiguous) */
     ds4_gpu_tensor *router, *selected, *weights, *mid, *part, *sh_gate_logit;
     ds4_gpu_tensor *moe_lists, *moe_counts, *sh_gate, *sh_up, *sh_mid, *sh_out, *hc_u, *hc_lo_act;
