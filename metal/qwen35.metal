@@ -1261,14 +1261,14 @@ kernel void kernel_qwen35_attn_decode3<2>(
  * Folds the row's own ns_r partials with a fixed binary tree (pairs
  * (0,1),(2,3),... then pairs of pairs, padded with neutral elements up to
  * the next power of two): the shape depends only on ns_r, never on how many
- * were live at the source split's dispatch, so it matches decode3's own
- * direct-write path (ns_r==1) and any other ns_r bit for bit.  A neutral pad
- * slot has l==0 (m finite, no infinities -- this file builds under fast
- * math) so it contributes exactly zero to both l and the accumulator, ready
- * for a future caller that fills a real "no keys landed here" partial the
- * same way.  Rows whose own split count is 1 were written directly by
- * decode3 and are skipped here; the host dispatches this kernel only when at
- * least one row needs it. */
+ * were live at the source split's dispatch, so it merges correctly for any
+ * ns_r.  A neutral pad slot has l==0 (m finite, no infinities -- this file
+ * builds under fast math) so it contributes exactly zero to both l and the
+ * accumulator; the flash key split (kernel_qwen35_attn_flash_split) relies
+ * on this too, writing the same l==0 neutral partial for a split a causal
+ * query row has no keys in.  Rows whose own split count is 1 were written
+ * directly by decode3 and are skipped here; the host dispatches this kernel
+ * only when at least one row needs it. */
 kernel void kernel_qwen35_attn_merge3(
         constant ds4_metal_args_qwen35_attn_decode3 & args,
         device const float *part,
@@ -1362,7 +1362,7 @@ struct ds4_metal_args_qwen35_attn_flash {
  *
  * This kernel never splits the key range (the host only ever calls it with
  * Ks == 1, whether because the caller passed no `part` at all or because
- * Task 4's split rule itself came out at Ks == 1); every row tile therefore
+ * the flash key split's own rule came out at Ks == 1); every row tile therefore
  * normalises and writes its own gated output directly, one token at a time
  * through the (reused) KV scratch -- that scratch is only G*D floats (one
  * token's [8 head][256 dim] tile), the smallest of the two instances' K/V
@@ -1589,7 +1589,7 @@ kernel void kernel_qwen35_attn_flash<4u, 8u>(
         constant ds4_metal_args_qwen35_attn_flash &, device const float *, device const float *,
         device const half *, device const half *, device float *, uint3, ushort, ushort, ushort);
 
-/* --- M5: flash prefill key split (Task 4) -------------------------------- */
+/* --- M5: flash prefill key split ------------------------------------------ */
 
 struct ds4_metal_args_qwen35_attn_flash_split {
     uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0;

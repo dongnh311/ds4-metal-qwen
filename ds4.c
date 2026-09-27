@@ -40221,6 +40221,20 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
                           2ull * DS4_N_VOCAB * sizeof(float) +
                           2ull * n_lin * ((uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM +
                                           (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM) * sizeof(float);
+        /* attn_part (decode2/decode3 merge scratch, whichever is larger) and
+         * attn_flash_part (the flash key-split scratch, scanned the same way
+         * the graph itself sizes it -- see ds4_qwen35moe.inc's alloc). */
+        const uint64_t attn_part_decode2 = ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM);
+        const uint64_t attn_part_decode3 = ds4_gpu_qwen35_attn_part3_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM);
+        m.scratch_bytes += (attn_part_decode2 > attn_part_decode3 ? attn_part_decode2 : attn_part_decode3) * sizeof(float);
+        if (T > 8u) {
+            uint64_t attn_flash_part_floats = 0;
+            for (uint64_t t = 9u; t <= T; t++) {
+                const uint64_t need = ds4_gpu_qwen35_attn_flash_part_floats((uint32_t)t, DS4_N_HEAD, DS4_N_HEAD_DIM);
+                if (need > attn_flash_part_floats) attn_flash_part_floats = need;
+            }
+            m.scratch_bytes += attn_flash_part_floats * sizeof(float);
+        }
         m.total_bytes = m.raw_bytes + m.scratch_bytes;
         return m;
     }

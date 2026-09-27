@@ -73,7 +73,11 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
      * worst case; scan every T the graph can ever call flash with (9..T)
      * to stay exact rather than trust that monotonicity.  T <= 8 never
      * dispatches flash (attn_flash_tensor refuses T <= 8), so no scratch is
-     * allocated then.  ~17 MB at the default DS4_QWEN35_ATTN_FLASH_MIN_TG
+     * allocated then.  ds4_gpu_qwen35_attn_flash_part_floats returns 0 for a
+     * T that never splits; when every T in range comes out at 0, no split
+     * ever happens for this graph and attn_flash_part is left NULL, which
+     * attn_flash_tensor treats the same as an allocated part that Ks == 1
+     * never touches.  ~17 MB at the default DS4_QWEN35_ATTN_FLASH_MIN_TG
      * (256) for a 2048-token prefill chunk. */
     if (T > 8u) {
         uint64_t attn_flash_part_floats = 0;
@@ -81,7 +85,7 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
             const uint64_t need = ds4_gpu_qwen35_attn_flash_part_floats((uint32_t)t, DS4_N_HEAD, DS4_N_HEAD_DIM);
             if (need > attn_flash_part_floats) attn_flash_part_floats = need;
         }
-        QWEN35_ALLOC(attn_flash_part, attn_flash_part_floats);
+        if (attn_flash_part_floats > 0u) QWEN35_ALLOC(attn_flash_part, attn_flash_part_floats);
     }
     QWEN35_ALLOC(router, T * DS4_N_EXPERT);
     QWEN35_ALLOC(selected, T * DS4_N_EXPERT_USED);
@@ -338,6 +342,8 @@ static int qwen35_attn_decode_env(void) {
     static int gen = -1;
     if (gen < 0) {
         const char *e = getenv("DS4_QWEN35_ATTN_DECODE");
+        if (e && e[0] && strcmp(e, "2") != 0 && strcmp(e, "3") != 0)
+            fprintf(stderr, "ds4: DS4_QWEN35_ATTN_DECODE=%s not recognised (2 or 3); using 3\n", e);
         gen = (e && strcmp(e, "2") == 0) ? 2 : 3;
     }
     return gen;
@@ -351,6 +357,8 @@ static int qwen35_attn_flash_env(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("DS4_QWEN35_ATTN_FLASH");
+        if (e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "1") != 0)
+            fprintf(stderr, "ds4: DS4_QWEN35_ATTN_FLASH=%s not recognised (0 or 1); using on\n", e);
         on = (e && strcmp(e, "0") == 0) ? 0 : 1;
     }
     return on;

@@ -907,7 +907,7 @@ static void test_attn_flash(arena_t *a, uint32_t pos0, uint32_t T, int use_part)
     ds4_gpu_tensor *qT = ds4_gpu_tensor_view(pq, (uint64_t)pos0 * H * D * sizeof(float), (uint64_t)T * H * D * sizeof(float));
     ds4_gpu_tensor *gT = ds4_gpu_tensor_view(pg, (uint64_t)pos0 * H * D * sizeof(float), (uint64_t)T * H * D * sizeof(float));
     ds4_gpu_tensor *of = upload(NULL, (uint64_t)T * H * D), *om = upload(NULL, (uint64_t)T * H * D);
-    /* key-split scratch only for the Task 4 cases: its size follows the split rule */
+    /* key-split scratch only for the forced-split cases: its size follows the split rule */
     ds4_gpu_tensor *partf = use_part ? upload(NULL, ds4_gpu_qwen35_attn_flash_part_floats(T, H, D)) : NULL;
     require_ok(qT && gT && of && om && (!use_part || partf) &&
                ds4_gpu_tensor_fill_f32(of, -1234.5f, (uint64_t)T * H * D), "flash buffers");
@@ -994,9 +994,11 @@ int main(void) {
     test_attn_decode3_rows(&arena, 6u, 64u);      /* one split per row */
     test_attn_decode3_rows(&arena, 62u, 64u);     /* n0 = 63 (1 split), n1 = 64 (1 split, full) */
     test_attn_decode3_rows(&arena, 63u, 64u);     /* n0 = 64 (1 split), n1 = 65 (2 splits): ns0 != ns1 */
-    test_attn_decode3_rows(&arena, 200u, 16u);    /* many splits, kps0 != kps1 around the boundary */
+    test_attn_decode3_rows(&arena, 200u, 16u);    /* shared dispatch, kps 16/16 */
     test_attn_decode3_rows(&arena, 194u, 16u);    /* same ns 13, kps0 = 15 != kps1 = 16 */
     test_attn_decode3_rows(&arena, 4200u, 16u);   /* at the 256-split cap: n / 16 > 256 */
+    test_attn_decode3_rows(&arena, 64u, 64u);     /* shared dispatch (ns 2, kps 33): row 1 needs a third tile */
+    test_attn_decode3_rows(&arena, 4112u, 16u);   /* near the cap (ns 242, kps 17), shared dispatch, extra tile */
     printf("qwen4 moe reduce without residual (as Ornith calls it)\n");
     test_reduce_nohc(1, 8, 2048, true);
     test_reduce_nohc(12, 8, 2048, false);
@@ -1015,6 +1017,8 @@ int main(void) {
     require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=64)");
     test_attn_flash(&arena, 8000u, 200u, 1);
     require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=200)");
+    test_attn_flash(&arena, 1000u, 1100u, 1);
+    require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=1100, neutral partials)");
     unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
     printf("qwen35 kernels: ok\n");
     return 0;

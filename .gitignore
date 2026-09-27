@@ -23,6 +23,7 @@
 !/tests/test-vectors/**
 !/tests/vision-fixtures/
 !/tests/vision-fixtures/**
+/tests/bench_qwen35_attn
 /tests/cuda_long_context_smoke
 *.o
 *.dSYM/

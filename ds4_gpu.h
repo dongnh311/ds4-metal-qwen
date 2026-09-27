@@ -3595,8 +3595,8 @@ uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32
  * positions pos0..pos0+T-1 (their K/V already written), causal, F16 K/V
  * only, head_dim must be 256 and n_head/n_head_kv must be 8; refuses T <= 8
  * (attn_decode_tensor's own attn_mm cutover).  `part == NULL` means no key
- * split.  `part != NULL` splits the key range into Ks parts (Task 4's rule,
- * see ds4_gpu_qwen35_attn_flash_part_floats) when that helps -- short chunks
+ * split.  `part != NULL` splits the key range into Ks parts (the rule is in
+ * ds4_gpu_qwen35_attn_flash_part_floats below) when that helps -- short chunks
  * at long context, where a lone dispatch is too few threadgroups to fill the
  * GPU; a 2048-token chunk already gives plenty and Ks comes out as 1, which
  * behaves exactly like `part == NULL` (no merge dispatch either).  `part`
@@ -3606,17 +3606,19 @@ int ds4_gpu_qwen35_attn_flash_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, float scale);
-/* Upper bound on the key-split scratch flash's key split (Task 4) will need,
- * over both TOK instances (2 and 4) and every pos0, given the split rule
+/* Upper bound on the key-split scratch flash's key split will need, over
+ * both TOK instances (2 and 4) and every pos0, given the split rule
  * Ks = min(QWEN35_ATTN_MAX_SPLITS, ceil(min_tg / (Hkv * ceil(T/TOK)))) with
  * min_tg = DS4_QWEN35_ATTN_FLASH_MIN_TG (default 256).  n_head_kv is not a
- * parameter here, so this bounds with Hkv = 1 (the smallest, hence largest
- * Ks) and TOK = 4 (the largest instance, hence largest ceil(T/TOK) is not
- * the driver -- the smallest ceil(T/TOK) is, so TOK=4 gives the largest Ks
- * per token): about 17 MB at worst for T in 9..255 with the default
- * min_tg=256.  This is an upper bound only (it ignores pos0 and the >=1024
- * keys-per-part floor the actual call applies), so it is always >= the
- * floats a real call with the same n_tokens actually needs. */
+ * parameter here, but attn_flash_tensor only ever accepts n_head/n_head_kv
+ * == 8, so Hkv = n_head/8 is exact.  TOK = 4 (the larger instance) gives the
+ * smaller ceil(T/TOK), hence the larger Ks, so it is the conservative choice
+ * between the two: about 8.4 MB at worst with TOK = 2 (the default) and
+ * 17 MB with TOK = 4, for the default min_tg=256.  Returns 0 when Ks would
+ * come out at 1 (no split can happen at that T, so no scratch is ever
+ * bound).  This is an upper bound only otherwise (it ignores pos0 and the
+ * >=1024 keys-per-part floor the actual call applies), so it is always >=
+ * the floats a real call with the same n_tokens actually needs. */
 uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim);
 /* Ks used by the most recent ds4_gpu_qwen35_attn_flash_tensor call (1 when
  * that call took no split, either because part was NULL or because the

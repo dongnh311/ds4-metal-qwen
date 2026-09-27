@@ -97,7 +97,7 @@ static int run_flash(void *p) {            /* M5 successor for T>8 prefill: flas
     return ds4_gpu_qwen35_attn_flash_tensor(c->out, c->q, c->gate, c->kc, c->vc, NULL,
                                             c->T, H, HKV, D, c->pos0, c->scale);
 }
-static int run_flash_split(void *p) {      /* Task 4: same, with the key split engaged via `part` */
+static int run_flash_split(void *p) {      /* same, with the key split engaged via `part` */
     bench_ctx *c = p;
     return ds4_gpu_qwen35_attn_flash_tensor(c->out, c->q, c->gate, c->kc, c->vc, c->part_flash,
                                             c->T, H, HKV, D, c->pos0, c->scale);
@@ -124,11 +124,24 @@ static void report(const char *kernel, const char *mode, uint32_t pos0, uint32_t
            kernel, mode, pos0, T, rows, ms, gb, gb / (ms * 1e-3), gb / FLOOR_GBS * 1e3);
 }
 
+/* Puts DS4_QWEN35_ATTN_FLASH_MIN_TG back to what the caller had before this
+ * bench started forcing its own values, so DS4_QWEN35_ATTN_FLASH_MIN_TG=64
+ * ./tests/bench_qwen35_attn applies to every default-rule row and not just
+ * the ones this file never overrides. */
+static void restore_min_tg(int had_value, const char *saved) {
+    if (had_value) setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", saved, 1);
+    else unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+}
+
 int main(int argc, char **argv) {
     const char *what = argc > 1 ? argv[1] : "all";
     const int do_prefill = !strcmp(what, "all") || !strcmp(what, "prefill");
     const int do_decode = !strcmp(what, "all") || !strcmp(what, "decode");
     need(ds4_gpu_init(), "GPU initialization");
+    const char *min_tg_env = getenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+    const int have_min_tg = min_tg_env != NULL;
+    char min_tg_saved[32] = {0};
+    if (have_min_tg) strncpy(min_tg_saved, min_tg_env, sizeof(min_tg_saved) - 1);
     const uint32_t cap = 131072u + 2048u + 8u;
     bench_ctx c = {0};
     c.scale = 1.0f / sqrtf((float)D);
@@ -140,13 +153,26 @@ int main(int argc, char **argv) {
     c.part = ds4_gpu_tensor_alloc(ds4_gpu_qwen4_attn_part_floats(2048u, H, D) * sizeof(float));
     c.part3 = ds4_gpu_tensor_alloc(ds4_gpu_qwen35_attn_part3_floats(2u, H, D) * sizeof(float));
     {
-        /* Size for the largest min_tg this bench forces (4096, for the T=2048
-         * forced-split case below) as well as the default (128 short chunks). */
-        setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", "4096", 1);
-        const uint64_t pf2048 = ds4_gpu_qwen35_attn_flash_part_floats(2048u, H, D);
-        unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
-        const uint64_t pf128 = ds4_gpu_qwen35_attn_flash_part_floats(128u, H, D);
-        const uint64_t pf_max = pf2048 > pf128 ? pf2048 : pf128;
+        /* Size for the largest MIN_TG this run can ever see: the caller's own
+         * value (if set, e.g. DS4_QWEN35_ATTN_FLASH_MIN_TG=64 ./tests/bench...),
+         * the 4096 this bench forces for the T=2048 split case below, and the
+         * unset default (256) the default-rule rows use -- each checked at
+         * both T=2048 and T=128, the two chunk sizes benched. */
+        uint64_t pf_max = 0;
+        const char *tg_settings[3];
+        int n_settings = 0;
+        if (have_min_tg) tg_settings[n_settings++] = min_tg_saved;
+        tg_settings[n_settings++] = "4096";
+        tg_settings[n_settings++] = NULL;   /* unset: the function's own default (256) */
+        for (int i = 0; i < n_settings; i++) {
+            if (tg_settings[i]) setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", tg_settings[i], 1);
+            else unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+            const uint64_t pf2048 = ds4_gpu_qwen35_attn_flash_part_floats(2048u, H, D);
+            const uint64_t pf128 = ds4_gpu_qwen35_attn_flash_part_floats(128u, H, D);
+            if (pf2048 > pf_max) pf_max = pf2048;
+            if (pf128 > pf_max) pf_max = pf128;
+        }
+        restore_min_tg(have_min_tg, min_tg_saved);
         c.part_flash = ds4_gpu_tensor_alloc(pf_max * sizeof(float));
     }
     need(c.out && c.part && c.part3 && c.part_flash, "output buffers");
@@ -163,7 +189,7 @@ int main(int argc, char **argv) {
         }
         unsetenv("DS4_QWEN35_ATTN_FLASH_TOK");
 
-        /* Task 4: key split at long context, T=2048 forced into the split path
+        /* key split at long context, T=2048 forced into the split path
          * (a 2048-token chunk already gives plenty of threadgroups, so the
          * split rule naturally picks Ks=1 here -- MIN_TG=4096 forces a split
          * anyway, to see its overhead/benefit at the chunk size this project
@@ -178,7 +204,7 @@ int main(int argc, char **argv) {
             report("flash_tok2_split", "prefill", c.pos0, c.T, 0, time_ms(run_flash_split, &c, 1, 3));
             setenv("DS4_QWEN35_ATTN_FLASH_TOK", "4", 1);
             report("flash_tok4_split", "prefill", c.pos0, c.T, 0, time_ms(run_flash_split, &c, 1, 3));
-            unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+            restore_min_tg(have_min_tg, min_tg_saved);
         }
         unsetenv("DS4_QWEN35_ATTN_FLASH_TOK");
 
