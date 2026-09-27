@@ -49559,7 +49559,6 @@ enum {
     QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK4,
     QWEN4_K_QWEN35_ATTN_QPACK,
     QWEN4_K_QWEN35_ATTN_FLASH_NAX,
-    QWEN4_K_QWEN35_ATTN_FLASH_NAX_D2,
     QWEN4_K_COUNT,
 };
 
@@ -49712,7 +49711,6 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_attn_flash_split_tok4_kt8",
     "kernel_qwen35_attn_qpack",
     "kernel_qwen35_attn_flash_nax",
-    "kernel_qwen35_attn_flash_nax_d2",
 };
 
 typedef struct {
@@ -51467,11 +51465,6 @@ int ds4_gpu_qwen35_attn_flash_nax_tensor(
         return 0;
     }
 
-    /* M6 Task 2: DS4_QWEN35_ATTN_NAX_KERNEL=d2 selects variant A2 (the 256
-     * head dims split across simdgroup pairs, 256 threads); read per call,
-     * benchmark and test only. */
-    const char *variant = getenv("DS4_QWEN35_ATTN_NAX_KERNEL");
-    const int d2 = variant && strcmp(variant, "d2") == 0;
     const uint32_t blocks = t_pad / 8u;
     g_qwen35_attn_flash_last_splits = 1u;
     struct ds4_qwen35_attn_flash_nax_args args = { n_tokens, t_pad, n_head, n_head_kv, pos0, pos0 + n_tokens, 1u };
@@ -51483,8 +51476,8 @@ int ds4_gpu_qwen35_attn_flash_nax_tensor(
         !qwen4_bind_tensor(&b[4], out, q_bytes, "flash nax out")) {
         return 0;
     }
-    return qwen4_dispatch(d2 ? QWEN4_K_QWEN35_ATTN_FLASH_NAX_D2 : QWEN4_K_QWEN35_ATTN_FLASH_NAX, &args, sizeof(args),
-                          b, 5, MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(d2 ? 256 : 128, 1, 1), 0)
+    return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_FLASH_NAX, &args, sizeof(args), b, 5,
+                          MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(256, 1, 1), 0)
            ? 1 : 0;
 }
 

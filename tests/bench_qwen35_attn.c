@@ -191,12 +191,8 @@ int main(int argc, char **argv) {
             report("attn_flash_tok2", "prefill", c.pos0, c.T, 0, time_ms(run_flash, &c, 1, 3));
             setenv("DS4_QWEN35_ATTN_FLASH_TOK", "4", 1);
             report("attn_flash_tok4", "prefill", c.pos0, c.T, 0, time_ms(run_flash, &c, 1, 3));
-            if (ds4_gpu_tensor_api_available()) {
+            if (ds4_gpu_tensor_api_available())
                 report("attn_flash_nax", "prefill", c.pos0, c.T, 0, time_ms(run_flash_nax, &c, 1, 3));
-                setenv("DS4_QWEN35_ATTN_NAX_KERNEL", "d2", 1);
-                report("attn_flash_nax_d2", "prefill", c.pos0, c.T, 0, time_ms(run_flash_nax, &c, 1, 3));
-                unsetenv("DS4_QWEN35_ATTN_NAX_KERNEL");
-            }
         }
         unsetenv("DS4_QWEN35_ATTN_FLASH_TOK");
 
