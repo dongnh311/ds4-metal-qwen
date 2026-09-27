@@ -1,0 +1,46 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/snap-efa0b1e/ (exe-relative)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.618 ms, residency requested in 105.305 ms, warmup 2.525 ms (mapped 21768.11 MiB from offset 10.50 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 5.50 GiB (raw 5.50 + compressed 0.00) + buffers 0.94 GiB + resident model 21.26 GiB = 27.70 GiB planned
+ds4: memory detail: ctx=262144 prefill_cap=2048 raw_kv_rows=262144 compressed_kv_rows=0 backend=metal
+ds4: memory: KV 5.50 GiB (raw 5.50 + compressed 0.00) + buffers 0.94 GiB = 6.45 GiB context
+ds4: memory detail: ctx=262144 prefill_cap=2048 raw_kv_rows=262144 compressed_kv_rows=0 backend=metal
+ds4: Ornith stage ms/chunk (pos=0 T=2048): gdn 715.0 attn 348.9 head 2.3
+processing 32659 input tokens: 2048/32659 (6.3%)
+ds4: Ornith stage ms/chunk (pos=2048 T=2048): gdn 699.9 attn 405.6 head 2.1
+processing 32659 input tokens: 4096/32659 (12.5%)
+ds4: Ornith stage ms/chunk (pos=4096 T=2048): gdn 710.0 attn 561.4 head 2.2
+processing 32659 input tokens: 6144/32659 (18.8%)
+ds4: Ornith stage ms/chunk (pos=6144 T=2048): gdn 719.1 attn 710.4 head 2.2
+processing 32659 input tokens: 8192/32659 (25.1%)
+ds4: Ornith stage ms/chunk (pos=8192 T=2048): gdn 696.8 attn 851.0 head 2.2
+processing 32659 input tokens: 10240/32659 (31.4%)
+ds4: Ornith stage ms/chunk (pos=10240 T=2048): gdn 699.5 attn 1001.5 head 2.1
+processing 32659 input tokens: 12288/32659 (37.6%)
+ds4: Ornith stage ms/chunk (pos=12288 T=2048): gdn 701.1 attn 1140.8 head 2.2
+processing 32659 input tokens: 14336/32659 (43.9%)
+ds4: Ornith stage ms/chunk (pos=14336 T=2048): gdn 700.5 attn 1284.7 head 2.2
+processing 32659 input tokens: 16384/32659 (50.2%)
+ds4: Ornith stage ms/chunk (pos=16384 T=2048): gdn 699.0 attn 1426.2 head 2.1
+processing 32659 input tokens: 18432/32659 (56.4%)
+ds4: Ornith stage ms/chunk (pos=18432 T=2048): gdn 701.0 attn 1567.3 head 2.1
+processing 32659 input tokens: 20480/32659 (62.7%)
+ds4: Ornith stage ms/chunk (pos=20480 T=2048): gdn 704.1 attn 1712.6 head 2.2
+processing 32659 input tokens: 22528/32659 (69.0%)
+ds4: Ornith stage ms/chunk (pos=22528 T=2048): gdn 701.0 attn 1853.8 head 2.2
+processing 32659 input tokens: 24576/32659 (75.3%)
+ds4: Ornith stage ms/chunk (pos=24576 T=2048): gdn 699.9 attn 1997.9 head 2.2
+processing 32659 input tokens: 26624/32659 (81.5%)
+ds4: Ornith stage ms/chunk (pos=26624 T=2048): gdn 699.4 attn 2138.2 head 2.2
+processing 32659 input tokens: 28672/32659 (87.8%)
+ds4: Ornith stage ms/chunk (pos=28672 T=2048): gdn 702.7 attn 2281.5 head 2.2
+processing 32659 input tokens: 30720/32659 (94.1%)
+ds4: Ornith stage ms/chunk (pos=30720 T=1939): gdn 685.8 attn 2314.5 head 2.2
+processing 32659 input tokens: 32659/32659 (100.0%)
+lo avea posto in lui, da giovane
+ds4: prefill: 992.78 t/s, generation: 53.76 t/s
