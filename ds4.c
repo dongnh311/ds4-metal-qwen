@@ -40138,6 +40138,27 @@ static DS4_MAYBE_UNUSED uint32_t qwen35_prefill_chunk_tokens(uint32_t ctx) {
     return chunk > ctx ? ctx : chunk;
 }
 
+/* Ornith KV storage: f16 (default) | fp8 (E4M3) | q4 (4-bit). Own knob per
+ * §7.3.  4-bit needs head dim 256 (the qwen4 4-bit KV path's constraint). */
+static DS4_MAYBE_UNUSED void qwen35_kv_mode_env(bool *fp8, bool *q4) {
+    /* Parsed on every call (getenv is cheap): tests switch DS4_QWEN35_KV at
+     * runtime and create new sessions per mode, so a cached parse would
+     * make later modes silently run as the first one parsed. Only the
+     * "ignored" warning for an unrecognised value is de-duplicated, to
+     * avoid printing it on every KV lookup/store. */
+    static bool warned = false;
+    const char *e = getenv("DS4_QWEN35_KV");
+    *fp8 = *q4 = false;
+    if (e && e[0] && strcmp(e, "f16")) {
+        if (!strcmp(e, "fp8")) *fp8 = true;
+        else if (!strcmp(e, "q4") && DS4_N_HEAD_DIM == 256u) { *fp8 = true; *q4 = true; }
+        else if (!warned) {
+            fprintf(stderr, "ds4: DS4_QWEN35_KV=%s ignored (use f16|fp8|q4)\n", e);
+            warned = true;
+        }
+    }
+}
+
 ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
         ds4_backend backend,
         int         ctx_size,
@@ -40181,7 +40202,14 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
          * reserves the MTP share (2 KiB per context token plus ~66 MB),
          * as the Qwen3.8 estimate reserves its snapshots. */
         const uint64_t T = prefill_chunk ? prefill_chunk : qwen35_prefill_chunk_tokens(ctx);
-        const uint64_t E = DS4_N_EMBD, kv_row = 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;
+        const uint64_t E = DS4_N_EMBD;
+        bool kv_fp8 = false, kv_q4 = false;
+        qwen35_kv_mode_env(&kv_fp8, &kv_q4);
+        const uint64_t kv_row = kv_fp8
+            ? (kv_q4 ? (uint64_t)DS4_N_HEAD_KV * DS4_N_HEAD_DIM            /* K+V 4-bit: 2 * (Hkv*D/2) */
+                     : 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM)             /* K+V E4M3: 2 * (Hkv*D) */
+              + 2ull * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u) * 2u        /* K and V per-64-block fp16 scales */
+            : 2ull * DS4_N_HEAD_KV * DS4_N_HEAD_DIM * 2u;                 /* F16 K+V */
         uint32_t n_attn = 0;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) n_attn += ds4_qwen35_layer_is_attention(il);
         const uint32_t n_lin = DS4_N_LAYER - n_attn;
@@ -60256,13 +60284,19 @@ static bool qwen4_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor
  * those output rows, so the draft is scored over that subset and the argmax
  * maps back through the list; the verify rows still use the full head.
  * Loaded once per graph; a missing or invalid file leaves the full head. */
-static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_tensor *w) {
+static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_tensor *w,
+                                      const char *env_name) {
     if (g->draft_head_tried) return g->draft_head != NULL;
     g->draft_head_tried = true;
-    const char *path = getenv("DS4_QWEN4_MTP_DRAFT_VOCAB");
-    if (!path || !path[0] || w->type != DS4_TENSOR_Q8_0 || w->ndim < 2 || (w->dim[0] % 32u) != 0) return false;
+    const char *path = getenv(env_name);
+    if (!path || !path[0]) return false;
+    if (w->type != DS4_TENSOR_Q8_0) {
+        fprintf(stderr, "ds4: %s ignored (output head is not Q8_0)\n", env_name);
+        return false;
+    }
+    if (w->ndim < 2 || (w->dim[0] % 32u) != 0) return false;
     FILE *fp = fopen(path, "r");
-    if (!fp) { fprintf(stderr, "ds4: Qwen3.8 MTP draft vocabulary %s: %s\n", path, strerror(errno)); return false; }
+    if (!fp) { fprintf(stderr, "ds4: MTP draft vocabulary %s: %s\n", path, strerror(errno)); return false; }
     const uint64_t V = w->dim[1];
     int32_t *ids = malloc(V * sizeof(int32_t));
     uint8_t *seen = calloc(V, 1);
@@ -60276,7 +60310,7 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     fclose(fp);
     free(seen);
     if (!ids || n == 0 || n >= V) {
-        fprintf(stderr, "ds4: Qwen3.8 MTP draft vocabulary %s: need 1..%" PRIu64 " distinct ids (got %u)\n", path, V - 1u, n);
+        fprintf(stderr, "ds4: MTP draft vocabulary %s: need 1..%" PRIu64 " distinct ids (got %u)\n", path, V - 1u, n);
         free(ids);
         return false;
     }
@@ -60291,7 +60325,7 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     const bool ok = rows && head && ds4_gpu_tensor_write(head, 0, rows, bytes);
     free(rows);
     if (!ok) {
-        fprintf(stderr, "ds4: Qwen3.8 MTP draft head upload failed\n");
+        fprintf(stderr, "ds4: MTP draft head upload failed\n");
         ds4_gpu_tensor_free(head);
         free(ids);
         return false;
@@ -60299,9 +60333,15 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     g->draft_head = head;
     g->draft_ids = ids;
     g->draft_rows = n;
-    fprintf(stderr, "ds4: Qwen3.8 MTP draft head: %u of %" PRIu64 " vocabulary rows from %s (%.0f MiB)\n",
+    fprintf(stderr, "ds4: MTP draft head: %u of %" PRIu64 " vocabulary rows from %s (%.0f MiB)\n",
             n, V, path, (double)bytes / (1024.0 * 1024.0));
     return true;
+}
+
+/* Ornith draft head from DS4_QWEN35_MTP_DRAFT_VOCAB (its own knob, spec sec 7.3);
+ * same gathered-head machinery as Qwen3.8, verify rows use the full output. */
+static DS4_MAYBE_UNUSED bool qwen35_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_tensor *w) {
+    return qwen4_mtp_draft_head_load(g, m, w, "DS4_QWEN35_MTP_DRAFT_VOCAB");
 }
 
 /* Decode-sized batches (a token, or the 2/3-token MTP verify) take the fused
@@ -61583,7 +61623,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     const bool gpu_argmax = want_logits && draft_out && !logits_out &&
         (!argmax_env || strcmp(argmax_env, "0") != 0);
     /* draft-only rows: host logits consumers always see the full head */
-    const bool gathered = gpu_argmax && qwen4_mtp_draft_head_load(g, m, w->output);
+    const bool gathered = gpu_argmax && qwen4_mtp_draft_head_load(g, m, w->output, "DS4_QWEN4_MTP_DRAFT_VOCAB");
     const uint32_t head_rows = gathered ? g->draft_rows : gpu_argmax ? qwen4_mtp_draft_rows() : DS4_N_VOCAB;
     if (ok && want_logits) {
         last = ds4_gpu_tensor_view(g->mtp_R, (T - 1u) * hc * emb_bytes, hc * emb_bytes);
@@ -64991,20 +65031,19 @@ static int ds41_load_payload(ds4_session *s, FILE *fp, const uint32_t *h,
 static uint64_t qwen4_payload_tensor_bytes(uint32_t rows, uint32_t mtp_rows, bool fp8, bool q4);
 #endif
 #ifdef DS4_HAS_QWEN4_METAL
-static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp);
+static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp, bool fp8, bool q4);
 #endif
 
 uint64_t ds4_session_payload_bytes(ds4_session *s) {
 #ifdef DS4_HAS_QWEN4_METAL
     if (s && !s->distributed && ds4_session_is_qwen35(s)) {
         const ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
-        if (!s->qwen35_graph_ready || !s->checkpoint_valid || g->pos != (uint32_t)s->checkpoint.len ||
-            g->kv_fp8 || g->kv_q4) return 0;
+        if (!s->qwen35_graph_ready || !s->checkpoint_valid || g->pos != (uint32_t)s->checkpoint.len) return 0;
         const uint32_t rows = (uint32_t)s->checkpoint.len;
         const bool mtp = g->mtp_h != NULL;
         const uint32_t mtp_rows = mtp ? (g->mtp_pos < rows ? g->mtp_pos : rows) : 0u;
         return (uint64_t)DS4_SESSION_PAYLOAD_U32_FIELDS * sizeof(uint32_t) +
-               qwen35_payload_body_bytes(rows, mtp_rows, mtp);
+               qwen35_payload_body_bytes(rows, mtp_rows, mtp, g->kv_fp8, g->kv_q4);
     }
 #endif
     if (s && !s->distributed && ds4_session_is_qwen4(s)) {
@@ -65496,18 +65535,26 @@ static int qwen4_session_load_payload(ds4_session *s, FILE *fp, const uint32_t *
  * the trunk hidden-state carry h_{rows-1} (E floats); per layer the GDN state
  * and conv history, the trunk attention K/V rows [0, rows), with MTP the MTP
  * block's K/V rows [0, mtp_rows); last the rope positions of the rows
- * (16 bytes each), which a later MTP pass below g->pos may read.  F16 KV
- * only: an FP8/Q4 KV mode needs its own layout before it saves. */
+ * (16 bytes each), which a later MTP pass below g->pos may read.  A
+ * mode-specific tag (F16/FP8/Q4) so a checkpoint never cross-loads into a
+ * session in a different KV mode. */
 #define DS4_QWEN35_PAYLOAD_TAG 0x51573501u
+#define DS4_QWEN35_PAYLOAD_TAG_FP8 0x51573502u   /* E4M3 KV */
+#define DS4_QWEN35_PAYLOAD_TAG_Q4  0x51573503u   /* 4-bit KV */
 
-static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp) {
+static uint64_t qwen35_payload_body_bytes(uint32_t rows, uint32_t mtp_rows, bool mtp, bool fp8, bool q4) {
     uint64_t bytes = (uint64_t)rows * sizeof(uint32_t) + (uint64_t)DS4_N_VOCAB * sizeof(float);
     bytes += sizeof(uint32_t);
     if (mtp) bytes += (uint64_t)DS4_N_EMBD * sizeof(float);
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (ds4_qwen35_layer_is_nextn(il) && !mtp) continue;
         if (ds4_qwen35_layer_is_attention(il)) {
-            bytes += 2u * qwen4_payload_kv_bytes(ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows);
+            const uint32_t r = ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows;
+            if (fp8)
+                bytes += 2u * qwen4_payload_kv_fp8_bytes(r, q4)
+                       + 4ull * (uint64_t)r * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u);   /* K,V fp16 block scales */
+            else
+                bytes += 2u * qwen4_payload_kv_bytes(r);
         } else {
             bytes += qwen4_payload_lin_state_bytes() + qwen4_payload_lin_hist_bytes();
         }
@@ -65520,10 +65567,6 @@ static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size
     const uint32_t rows = (uint32_t)s->checkpoint.len;
     if (!s->qwen35_graph_ready || g->pos != rows) {
         payload_set_err(err, errlen, "Ornith snapshot requires a synchronized session");
-        return 1;
-    }
-    if (g->kv_fp8 || g->kv_q4) {
-        payload_set_err(err, errlen, "Ornith checkpoints support the F16 KV cache only");
         return 1;
     }
     if (ds4_gpu_synchronize() == 0) {
@@ -65554,7 +65597,7 @@ static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size
         DS4_N_HEAD_DIM,
         mtp ? 1u : 0u,
         DS4_N_VOCAB,
-        DS4_QWEN35_PAYLOAD_TAG,
+        g->kv_q4 ? DS4_QWEN35_PAYLOAD_TAG_Q4 : g->kv_fp8 ? DS4_QWEN35_PAYLOAD_TAG_FP8 : DS4_QWEN35_PAYLOAD_TAG,
     };
     int rc = 0;
     for (uint32_t i = 0; rc == 0 && i < DS4_SESSION_PAYLOAD_U32_FIELDS; i++)
@@ -65569,10 +65612,19 @@ static int qwen35_session_save_payload(ds4_session *s, FILE *fp, char *err, size
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         if (ds4_qwen35_layer_is_nextn(il) && !mtp) continue;
         if (ds4_qwen35_layer_is_attention(il)) {
-            const uint64_t kvb = qwen4_payload_kv_bytes(ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows);
-            rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
-            if (rc == 0)
-                rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            const uint32_t r = ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows;
+            if (g->kv_fp8) {
+                const uint64_t kvb = qwen4_payload_kv_fp8_bytes(r, g->kv_q4);
+                const uint64_t scb = (uint64_t)r * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u) * 2u;
+                rc = payload_write_tensor_span(fp, g->layer_k_cache_fp8[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache_fp8[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_k_scale[il], 0, scb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_scale[il], 0, scb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            } else {
+                const uint64_t kvb = qwen4_payload_kv_bytes(r);
+                rc = payload_write_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+                if (rc == 0) rc = payload_write_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK, err, errlen);
+            }
         } else {
             rc = payload_write_tensor_span(fp, g->layer_lin_state[il], 0, qwen4_payload_lin_state_bytes(),
                                            buf, DS4_SESSION_IO_CHUNK, err, errlen);
@@ -65596,19 +65648,21 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
     }
     const bool mtp = g->mtp_h != NULL;
     const uint32_t rows = h[7];
-    if (h[12] != DS4_QWEN35_PAYLOAD_TAG || h[6] != DS4_N_EMBD || h[8] != DS4_N_LAYER ||
-        h[9] != DS4_N_HEAD_DIM || h[10] > 1u || h[11] != DS4_N_VOCAB) {
+    const uint32_t want_tag = g->kv_q4 ? DS4_QWEN35_PAYLOAD_TAG_Q4
+                            : g->kv_fp8 ? DS4_QWEN35_PAYLOAD_TAG_FP8 : DS4_QWEN35_PAYLOAD_TAG;
+    if (h[6] != DS4_N_EMBD || h[8] != DS4_N_LAYER || h[9] != DS4_N_HEAD_DIM || h[10] > 1u || h[11] != DS4_N_VOCAB ||
+        (h[12] != DS4_QWEN35_PAYLOAD_TAG && h[12] != DS4_QWEN35_PAYLOAD_TAG_FP8 && h[12] != DS4_QWEN35_PAYLOAD_TAG_Q4)) {
         payload_set_err(err, errlen, "KV checkpoint was written by a different model family or shape");
+        return 1;
+    }
+    if (h[12] != want_tag) {
+        payload_set_err(err, errlen, "KV checkpoint uses a different KV cache mode than this session");
         return 1;
     }
     if (h[10] != (mtp ? 1u : 0u)) {
         payload_set_err(err, errlen, mtp ?
             "KV checkpoint was saved without --mtp; this Ornith session keeps MTP state" :
             "KV checkpoint was saved with --mtp; this Ornith session has no MTP state");
-        return 1;
-    }
-    if (g->kv_fp8 || g->kv_q4) {
-        payload_set_err(err, errlen, "Ornith checkpoints support the F16 KV cache only");
         return 1;
     }
     if (rows > g->ctx_cap || rows > (uint32_t)s->ctx_size) {
@@ -65654,12 +65708,25 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
     for (uint32_t il = 0; rc == 0 && il < DS4_N_LAYER; il++) {
         if (ds4_qwen35_layer_is_nextn(il) && !mtp) continue;
         if (ds4_qwen35_layer_is_attention(il)) {
-            const uint64_t kvb = qwen4_payload_kv_bytes(ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows);
-            rc = payload_read_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
-                                          remaining, err, errlen);
-            if (rc == 0)
-                rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+            const uint32_t r = ds4_qwen35_layer_is_nextn(il) ? mtp_rows : rows;
+            if (g->kv_fp8) {
+                const uint64_t kvb = qwen4_payload_kv_fp8_bytes(r, g->kv_q4);
+                const uint64_t scb = (uint64_t)r * (DS4_N_HEAD_KV * DS4_N_HEAD_DIM / 64u) * 2u;
+                rc = payload_read_tensor_span(fp, g->layer_k_cache_fp8[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
                                               remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache_fp8[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+                                                           remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_k_scale[il], 0, scb, buf, DS4_SESSION_IO_CHUNK,
+                                                           remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_scale[il], 0, scb, buf, DS4_SESSION_IO_CHUNK,
+                                                           remaining, err, errlen);
+            } else {
+                const uint64_t kvb = qwen4_payload_kv_bytes(r);
+                rc = payload_read_tensor_span(fp, g->layer_k_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+                                              remaining, err, errlen);
+                if (rc == 0) rc = payload_read_tensor_span(fp, g->layer_v_cache[il], 0, kvb, buf, DS4_SESSION_IO_CHUNK,
+                                                           remaining, err, errlen);
+            }
         } else {
             rc = payload_read_tensor_span(fp, g->layer_lin_state[il], 0, qwen4_payload_lin_state_bytes(),
                                           buf, DS4_SESSION_IO_CHUNK, remaining, err, errlen);
@@ -74790,6 +74857,20 @@ bool ds4_engine_glm_layer_payload_bytes(ds4_engine *e,
 int ds4_engine_model_id(ds4_engine *e) {
     (void)e;
     return (int)DS4_MODEL_VARIANT;
+}
+
+int ds4_engine_payload_variant(ds4_engine *e) {
+    if (!e || !ds4_model_is_qwen35moe()) return 0;
+    bool kv_fp8 = false, kv_q4 = false;
+#ifndef DS4_NO_GPU
+    /* The Ornith Metal payload (qwen35_session_save_payload /
+     * qwen35_session_load_payload, DS4_HAS_QWEN4_METAL) is the only place
+     * a non-F16 KV mode exists; a CPU build has no such payload, so it
+     * always reports mode 0 (f16), matching qwen35_kv_mode_env's default. */
+    qwen35_kv_mode_env(&kv_fp8, &kv_q4);
+#endif
+    const int kv_mode = kv_q4 ? 2 : kv_fp8 ? 1 : 0;
+    return (e->glm_mtp ? 1 : 0) | (kv_mode << 1);
 }
 
 bool ds4_engine_is_glm53(ds4_engine *e) {

@@ -44,6 +44,10 @@ typedef struct {
 
 int ds4_gpu_init(void);
 void ds4_gpu_cleanup(void);
+/* True when the Metal4 tensor-op API is enabled on this device/run (test
+ * support: lets a kernel test skip-and-label the tensor-tile case instead of
+ * relying on a dispatch fallback). */
+int ds4_gpu_tensor_api_available(void);
 
 ds4_gpu_tensor *ds4_gpu_tensor_alloc(uint64_t bytes);
 ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes);
@@ -3545,14 +3549,29 @@ int ds4_gpu_qwen4_attn_prep_tensor(
         float rope_base, float eps,
         ds4_gpu_tensor *k_cache_fp8, ds4_gpu_tensor *v_cache_fp8,
         ds4_gpu_tensor *k_scale, ds4_gpu_tensor *v_scale, uint32_t fp8, uint32_t ik_ring);
-/* q/k RMSNorm, NEOX RoPE on n_rot dims, F16 KV append; no indexer. */
+/* q/k RMSNorm, NEOX RoPE on n_rot dims, KV append; no indexer.  kv_mode 0
+ * F16, 1 E4M3, 2 4-bit. */
 int ds4_gpu_qwen35_attn_prep_tensor(
         ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         const ds4_gpu_tensor *qg, const ds4_gpu_tensor *kproj, const ds4_gpu_tensor *vproj,
         const ds4_gpu_tensor *pos3, const void *model_map, uint64_t model_size,
         uint64_t g_q_offset, uint64_t g_k_offset,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t n_rot,
-        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps);
+        uint32_t pos0, uint32_t cache_cap, float rope_base, float eps,
+        ds4_gpu_tensor *k_cache_fp8, ds4_gpu_tensor *v_cache_fp8,
+        ds4_gpu_tensor *k_scale, ds4_gpu_tensor *v_scale, uint32_t kv_mode);
+/* L12 (DS4_QWEN35_ATTN_DECODE2): shared-KV decode.  rows==1 a lone decode,
+ * rows==2 the MTP verify's two rows (pos0, pos0+1) sharing each key's K/V
+ * read; each row's own split geometry never depends on the other row, so
+ * output row r matches a lone rows==1 call at that row's position bit for
+ * bit.  part (optional; only touched when a row's own split count is >1)
+ * needs ds4_gpu_qwen4_attn_part_floats(rows, n_head, head_dim) floats. */
+int ds4_gpu_qwen35_attn_decode2_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, uint32_t rows, float scale,
+        const ds4_gpu_tensor *k_cache_fp8, const ds4_gpu_tensor *v_cache_fp8,
+        const ds4_gpu_tensor *k_scale, const ds4_gpu_tensor *v_scale, uint32_t fp8);
 /* ik_ring != 0: ik_cache keeps only the last ik_ring raw indexer keys, row pos % ik_ring. */
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
@@ -3616,6 +3635,19 @@ int ds4_gpu_qwen35_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type);
+/* Q5_K tiled prefill GEMM (T > 64 tokens): same tile-batched semantics as the
+ * qwen4 Q4_K pair (ds4_gpu_qwen4_moe_mm_{mid,down}_tensor), fed by the shared
+ * ds4_gpu_qwen4_moe_build_lists_tensor lists/counts, weight_type 13 (Q5_K) only. */
+int ds4_gpu_qwen35_moe_mm_mid_tensor(
+        ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,
+        uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+        uint32_t in_dim, uint32_t ff_dim, uint32_t list_cap);
+int ds4_gpu_qwen35_moe_mm_down_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
+        uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
 /* Streamed decode lookahead: before a streamed layer's MoE, name the next
  * streamed layer so its gate can read the experts its router input predicts.
  * top == 0 disables it for that gate. */

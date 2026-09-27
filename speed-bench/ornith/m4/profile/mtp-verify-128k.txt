@@ -1,0 +1,139 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: Ornith stage ms/chunk (pos=0 T=2048): gdn 711.3 attn 407.7 head 2.5
+ds4: Ornith stage ms/chunk (pos=2048 T=2048): gdn 700.2 attn 617.5 head 2.3
+ds4: Ornith stage ms/chunk (pos=4096 T=2048): gdn 700.6 attn 901.2 head 2.4
+ds4: Ornith stage ms/chunk (pos=6144 T=2048): gdn 703.0 attn 1185.3 head 2.3
+ds4: Ornith stage ms/chunk (pos=8192 T=2048): gdn 697.5 attn 1456.7 head 2.4
+ds4: Ornith stage ms/chunk (pos=10240 T=2048): gdn 703.6 attn 1749.6 head 2.4
+ds4: Ornith stage ms/chunk (pos=12288 T=2048): gdn 731.0 attn 2117.1 head 2.4
+ds4: Ornith stage ms/chunk (pos=14336 T=2048): gdn 734.2 attn 2430.7 head 2.5
+ds4: Ornith stage ms/chunk (pos=16384 T=2048): gdn 732.0 attn 2727.8 head 2.6
+ds4: Ornith stage ms/chunk (pos=18432 T=2048): gdn 732.6 attn 3020.7 head 2.5
+ds4: Ornith stage ms/chunk (pos=20480 T=2048): gdn 731.2 attn 3300.5 head 2.4
+ds4: Ornith stage ms/chunk (pos=22528 T=2048): gdn 735.7 attn 3629.0 head 2.5
+ds4: Ornith stage ms/chunk (pos=24576 T=2048): gdn 732.8 attn 3889.0 head 2.4
+ds4: Ornith stage ms/chunk (pos=26624 T=2048): gdn 734.0 attn 4215.0 head 2.5
+ds4: Ornith stage ms/chunk (pos=28672 T=2048): gdn 742.6 attn 4578.0 head 2.5
+ds4: Ornith stage ms/chunk (pos=30720 T=2048): gdn 732.4 attn 4772.6 head 2.5
+ds4: Ornith stage ms/chunk (pos=32768 T=2048): gdn 740.1 attn 5141.2 head 2.5
+ds4: Ornith stage ms/chunk (pos=34816 T=2048): gdn 731.8 attn 5386.3 head 2.4
+ds4: Ornith stage ms/chunk (pos=36864 T=2048): gdn 735.3 attn 5716.6 head 2.4
+ds4: Ornith stage ms/chunk (pos=38912 T=2048): gdn 736.5 attn 6008.5 head 2.5
+ds4: Ornith stage ms/chunk (pos=40960 T=2048): gdn 741.7 attn 6362.6 head 2.6
+ds4: Ornith stage ms/chunk (pos=43008 T=2048): gdn 751.6 attn 6770.8 head 2.5
+ds4: Ornith stage ms/chunk (pos=45056 T=2048): gdn 739.3 attn 6970.2 head 2.5
+ds4: Ornith stage ms/chunk (pos=47104 T=2048): gdn 751.4 attn 7434.4 head 2.6
+ds4: Ornith stage ms/chunk (pos=49152 T=2048): gdn 760.3 attn 7790.8 head 2.5
+ds4: Ornith stage ms/chunk (pos=51200 T=2048): gdn 745.1 attn 7934.8 head 2.4
+ds4: Ornith stage ms/chunk (pos=53248 T=2048): gdn 758.4 attn 8394.3 head 2.5
+ds4: Ornith stage ms/chunk (pos=55296 T=2048): gdn 759.0 attn 8637.0 head 2.5
+ds4: Ornith stage ms/chunk (pos=57344 T=2048): gdn 753.7 attn 9071.0 head 2.7
+ds4: Ornith stage ms/chunk (pos=59392 T=2048): gdn 755.7 attn 9365.2 head 2.6
+ds4: Ornith stage ms/chunk (pos=61440 T=2048): gdn 755.3 attn 9765.3 head 2.6
+ds4: Ornith stage ms/chunk (pos=63488 T=2048): gdn 759.6 attn 10001.3 head 2.7
+ds4: Ornith stage ms/chunk (pos=65536 T=2048): gdn 761.6 attn 10295.0 head 2.5
+ds4: Ornith stage ms/chunk (pos=67584 T=2048): gdn 766.4 attn 10567.2 head 2.6
+ds4: Ornith stage ms/chunk (pos=69632 T=2048): gdn 759.0 attn 10882.8 head 2.6
+ds4: Ornith stage ms/chunk (pos=71680 T=2048): gdn 772.1 attn 11313.0 head 2.4
+ds4: Ornith stage ms/chunk (pos=73728 T=2048): gdn 766.3 attn 11506.6 head 2.6
+ds4: Ornith stage ms/chunk (pos=75776 T=2048): gdn 767.2 attn 11864.9 head 2.5
+ds4: Ornith stage ms/chunk (pos=77824 T=2048): gdn 769.7 attn 12200.8 head 2.6
+ds4: Ornith stage ms/chunk (pos=79872 T=2048): gdn 773.5 attn 12582.8 head 2.6
+ds4: Ornith stage ms/chunk (pos=81920 T=2048): gdn 784.1 attn 13070.6 head 2.5
+ds4: Ornith stage ms/chunk (pos=83968 T=2048): gdn 777.1 attn 13188.7 head 2.6
+ds4: Ornith stage ms/chunk (pos=86016 T=2048): gdn 783.3 attn 13807.5 head 2.6
+ds4: Ornith stage ms/chunk (pos=88064 T=2048): gdn 784.2 attn 14036.5 head 2.6
+ds4: Ornith stage ms/chunk (pos=90112 T=2048): gdn 781.7 attn 14523.6 head 2.6
+ds4: Ornith stage ms/chunk (pos=92160 T=2048): gdn 773.2 attn 14446.4 head 2.5
+ds4: Ornith stage ms/chunk (pos=94208 T=2048): gdn 786.2 attn 15037.1 head 2.5
+ds4: Ornith stage ms/chunk (pos=96256 T=2048): gdn 821.4 attn 16081.4 head 2.6
+ds4: Ornith stage ms/chunk (pos=98304 T=2048): gdn 791.1 attn 15763.7 head 2.7
+ds4: Ornith stage ms/chunk (pos=100352 T=2048): gdn 807.8 attn 16513.4 head 3.3
+ds4: Ornith stage ms/chunk (pos=102400 T=2048): gdn 857.3 attn 17361.5 head 2.6
+ds4: Ornith stage ms/chunk (pos=104448 T=2048): gdn 851.5 attn 17823.0 head 2.9
+ds4: Ornith stage ms/chunk (pos=106496 T=2048): gdn 835.5 attn 17819.8 head 2.6
+ds4: Ornith stage ms/chunk (pos=108544 T=2048): gdn 801.3 attn 17477.4 head 2.7
+ds4: Ornith stage ms/chunk (pos=110592 T=2048): gdn 830.3 attn 18474.8 head 2.6
+ds4: Ornith stage ms/chunk (pos=112640 T=2048): gdn 803.4 attn 18274.4 head 2.6
+ds4: Ornith stage ms/chunk (pos=114688 T=2048): gdn 801.2 attn 18592.0 head 2.6
+ds4: Ornith stage ms/chunk (pos=116736 T=2048): gdn 807.5 attn 18853.3 head 2.8
+ds4: Ornith stage ms/chunk (pos=118784 T=2048): gdn 799.4 attn 19052.9 head 2.5
+ds4: Ornith stage ms/chunk (pos=120832 T=2048): gdn 798.6 attn 19281.3 head 2.6
+ds4: Ornith stage ms/chunk (pos=122880 T=2048): gdn 805.1 attn 19724.0 head 2.6
+ds4: Ornith stage ms/chunk (pos=124928 T=2048): gdn 794.7 attn 20081.5 head 2.6
+ds4: Ornith stage ms/chunk (pos=126976 T=2048): gdn 802.0 attn 20501.2 head 2.8
+ds4: Ornith stage ms/chunk (pos=129024 T=1603): gdn 682.3 attn 16241.0 head 2.6
+ds4: Ornith spec pos 130627 token 66752 plain
+ds4: Ornith stage ms/chunk (pos=130628 T=2): gdn 27.7 attn 64.3 head 4.2
+ds4: Ornith spec pos 130628 token 21009 draft 42553 accept
+ds4: Ornith spec pos 130630 token 1789 plain
+ds4: Ornith spec pos 130631 token 75597 plain
+ds4: Ornith spec pos 130632 token 181735 plain
+ds4: Ornith stage ms/chunk (pos=130633 T=2): gdn 26.7 attn 63.1 head 4.0
+ds4: Ornith spec pos 130633 token 11 draft 4259 reject
+ds4: Ornith spec pos 130634 token 274 plain
+ds4: Ornith stage ms/chunk (pos=130635 T=2): gdn 26.8 attn 62.4 head 4.0
+ds4: Ornith spec pos 130635 token 6 draft 2337 accept
+ds4: Ornith spec pos 130637 token 61721 plain
+ds4: Ornith stage ms/chunk (pos=130638 T=2): gdn 25.9 attn 61.9 head 4.1
+ds4: Ornith spec pos 130638 token 179765 draft 264 accept
+ds4: Ornith spec pos 130640 token 213683 plain
+ds4: Ornith stage ms/chunk (pos=130641 T=2): gdn 25.9 attn 61.7 head 4.0
+ds4: Ornith spec pos 130641 token 4120 draft 11 reject
+ds4: Ornith spec pos 130642 token 11 plain
+ds4: Ornith stage ms/chunk (pos=130643 T=2): gdn 25.9 attn 61.5 head 3.9
+ds4: Ornith spec pos 130643 token 198 draft 692 reject
+ds4: Ornith spec pos 130644 token 692 plain
+ds4: Ornith spec pos 130645 token 28840 plain
+ds4: Ornith spec pos 130646 token 57988 plain
+ds4: Ornith spec pos 130647 token 3687 plain
+ds4: Ornith spec pos 130648 token 479 plain
+ds4: Ornith stage ms/chunk (pos=130649 T=2): gdn 26.0 attn 61.8 head 4.0
+ds4: Ornith spec pos 130649 token 24534 draft 11 reject
+ds4: Ornith spec pos 130650 token 378 plain
+ds4: Ornith spec pos 130651 token 2384 plain
+ds4: Ornith stage ms/chunk (pos=130652 T=2): gdn 26.8 attn 62.1 head 4.0
+ds4: Ornith spec pos 130652 token 49694 draft 192172 reject
+ds4: Ornith spec pos 130653 token 293 plain
+ds4: Ornith stage ms/chunk (pos=130654 T=2): gdn 25.4 attn 61.4 head 4.0
+ds4: Ornith spec pos 130654 token 19994 draft 951 accept
+ds4: Ornith spec pos 130656 token 1538 plain
+ds4: Ornith spec pos 130657 token 29146 plain
+ds4: Ornith stage ms/chunk (pos=130658 T=2): gdn 25.6 attn 61.7 head 3.9
+ds4: Ornith spec pos 130658 token 154421 draft 13 accept
+ds4: Ornith spec pos 130660 token 357 plain
+ds4: Ornith spec pos 130661 token 632 plain
+ds4: Ornith spec pos 130662 token 59166 plain
+ds4: Ornith stage ms/chunk (pos=130663 T=2): gdn 25.5 attn 61.5 head 4.0
+ds4: Ornith spec pos 130663 token 198 draft 394 reject
+ds4: Ornith spec pos 130664 token 390 plain
+ds4: Ornith spec pos 130665 token 17016 plain
+ds4: Ornith stage ms/chunk (pos=130666 T=2): gdn 26.4 attn 61.7 head 3.9
+ds4: Ornith spec pos 130666 token 1789 draft 188868 reject
+ds4: Ornith spec pos 130667 token 1100 plain
+ds4: Ornith stage ms/chunk (pos=130668 T=2): gdn 24.9 attn 61.4 head 4.0
+ds4: Ornith spec pos 130668 token 173571 draft 11 accept
+ds4: Ornith stage ms/chunk (pos=130670 T=2): gdn 25.8 attn 61.4 head 4.0
+ds4: Ornith spec pos 130670 token 1147 draft 41622 accept
+ds4: Ornith spec pos 130672 token 4259 plain
+ds4: Ornith stage ms/chunk (pos=130673 T=2): gdn 25.0 attn 61.0 head 3.9
+ds4: Ornith spec pos 130673 token 615 draft 83 accept
+ds4: Ornith stage ms/chunk (pos=130675 T=2): gdn 23.2 attn 61.4 head 4.2
+ds4: Ornith spec pos 130675 token 21502 draft 885 reject
+ds4: Ornith spec pos 130676 token 384 plain
+ds4: Ornith spec pos 130677 token 501 plain
+ds4: Ornith spec pos 130678 token 1363 plain
+ds4: Ornith stage ms/chunk (pos=130679 T=2): gdn 24.9 attn 62.7 head 4.4
+ds4: Ornith spec pos 130679 token 154782 draft 264 reject
+ds4: Ornith spec pos 130680 token 11 plain
+ds4: Ornith spec pos 130681 token 1327 plain
+ds4: Ornith stage ms/chunk (pos=130682 T=2): gdn 25.2 attn 63.3 head 4.1
+ds4: Ornith spec pos 130682 token 6541 draft 951 accept
+ds4: Ornith spec pos 130684 token 198 plain
+ds4: Ornith spec pos 130685 token 528 plain
+ds4: Ornith stage ms/chunk (pos=130686 T=2): gdn 22.9 attn 63.0 head 4.1
+ds4: Ornith spec pos 130686 token 6 draft 10122 accept
+ds4: Ornith stage ms/chunk (pos=130688 T=2): gdn 23.1 attn 63.1 head 4.1
+ds4: Ornith spec pos 130688 token 11 draft 378 accept
+ds4: Ornith spec pos 130690 token 750 plain
+ds4: prefill: 184.27 t/s, generation: 17.52 t/s

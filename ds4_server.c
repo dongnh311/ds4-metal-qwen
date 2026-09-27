@@ -22510,10 +22510,13 @@ static void test_kv_stub_file(const char *dir, const char *sha,
     free(path);
 }
 
-static void test_kv_text_stub_file_model(const char *dir, const char *text,
-                                         uint8_t model_id, uint8_t reason,
-                                         uint32_t tokens,
-                                         uint64_t payload_bytes) {
+/* Like test_kv_text_stub_file_model but with an explicit payload variant
+ * (h[21], Task 14), for tests exercising the Ornith KV-mode/MTP lookup
+ * filter. */
+static void test_kv_text_stub_file_model_variant(const char *dir, const char *text,
+                                                  uint8_t model_id, uint8_t payload_variant,
+                                                  uint8_t reason, uint32_t tokens,
+                                                  uint64_t payload_bytes) {
     char sha[41];
     sha1_bytes_hex(text, strlen(text), sha);
     char name[44];
@@ -22527,8 +22530,8 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
 
     uint8_t h[KV_CACHE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, model_id, 2, reason, 0, tokens, 0,
-                            32768, 100, 100, payload_bytes);
+    ds4_kvstore_fill_header_v(h, model_id, 2, reason, 0, tokens, 0,
+                              32768, 100, 100, payload_bytes, payload_variant);
     uint8_t text_len[4];
     le_put32(text_len, (uint32_t)strlen(text));
     TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
@@ -22539,6 +22542,14 @@ static void test_kv_text_stub_file_model(const char *dir, const char *text,
     }
     TEST_ASSERT(fclose(fp) == 0);
     free(path);
+}
+
+static void test_kv_text_stub_file_model(const char *dir, const char *text,
+                                         uint8_t model_id, uint8_t reason,
+                                         uint32_t tokens,
+                                         uint64_t payload_bytes) {
+    test_kv_text_stub_file_model_variant(dir, text, model_id, 0, reason, tokens,
+                                         payload_bytes);
 }
 
 static void test_kv_text_stub_file(const char *dir, const char *text,
@@ -24246,6 +24257,136 @@ static void test_kv_cache_lookup_separates_qwen38_and_ornith(void) {
     rmdir(dir);
 }
 
+/* Task 14: the payload-variant byte (h[21]) partitions Ornith lookups the
+ * same way the model-id byte does, so a lookup never returns a checkpoint
+ * this session's --mtp/DS4_QWEN35_KV state would refuse to load. */
+static void test_kv_cache_lookup_filters_by_payload_variant(void) {
+    char tmpl[] = "/tmp/ds4-kv-payload-variant-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    /* variant-0 entry is the "newer"/longer checkpoint (more tokens, a
+     * longer stored prefix); variant-1 is shorter/older.  Without the
+     * variant filter the longest-prefix contest below would prefer the
+     * variant-0 entry every time. */
+    const char *short_text = "<|im_start|>system\nshared rendered prefix";
+    const char *long_text = "<|im_start|>system\nshared rendered prefix with more";
+    const char *prompt = "<|im_start|>system\nshared rendered prefix with more and tail";
+    test_kv_text_stub_file_model_variant(dir, short_text, 7, 1, KV_REASON_COLD, 512, 0);
+    test_kv_text_stub_file_model_variant(dir, long_text, 7, 0, KV_REASON_COLD, 768, 0);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    const int idx1 = ds4_kvstore_find_text_prefix_v(&kc, prompt, 7, 2, 32768, 1);
+    TEST_ASSERT(idx1 >= 0 && kc.entry[idx1].payload_variant == 1 &&
+                kc.entry[idx1].text_bytes == strlen(short_text));
+    const int idx0 = ds4_kvstore_find_text_prefix_v(&kc, prompt, 7, 2, 32768, 0);
+    TEST_ASSERT(idx0 >= 0 && kc.entry[idx0].payload_variant == 0 &&
+                kc.entry[idx0].text_bytes == strlen(long_text));
+
+    kv_cache_close(&kc);
+    char short_sha[41], long_sha[41];
+    sha1_bytes_hex(short_text, strlen(short_text), short_sha);
+    sha1_bytes_hex(long_text, strlen(long_text), long_sha);
+    char short_name[44], long_name[44];
+    snprintf(short_name, sizeof(short_name), "%.40s.kv", short_sha);
+    snprintf(long_name, sizeof(long_name), "%.40s.kv", long_sha);
+    char *short_path = path_join(dir, short_name);
+    char *long_path = path_join(dir, long_name);
+    unlink(short_path);
+    unlink(long_path);
+    free(short_path);
+    free(long_path);
+    rmdir(dir);
+
+    /* Header round trip keeps h[21]; a Qwen3.8 (model id 5) header still
+     * reads variant 0, so old and non-Ornith files stay byte-identical. */
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header_v(h, 7, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0, 3);
+    TEST_ASSERT(h[21] == 3);
+    uint8_t text_len[4] = {0};
+    TEST_ASSERT(fwrite(h, 1, sizeof(h), fp) == sizeof(h));
+    TEST_ASSERT(fwrite(text_len, 1, sizeof(text_len), fp) == sizeof(text_len));
+    rewind(fp);
+    ds4_kvstore_entry roundtrip = {0};
+    uint32_t rt_text_bytes = 0;
+    TEST_ASSERT(ds4_kvstore_read_header(fp, &roundtrip, &rt_text_bytes));
+    TEST_ASSERT(roundtrip.payload_variant == 3);
+    fclose(fp);
+
+    uint8_t hq[KV_CACHE_FIXED_HEADER];
+    ds4_kvstore_fill_header(hq, 5, 2, KV_REASON_COLD, 0, 512, 0, 32768, 100, 100, 0);
+    TEST_ASSERT(hq[21] == 0);
+}
+
+/* Important fix (final review): kv_cache_existing_compatible() (exposed as
+ * ds4_kvstore_existing_compatible()) must also compare payload_variant, or
+ * an Ornith server that flipped --mtp/DS4_QWEN35_KV would see the old
+ * variant-1 file as "compatible" for a variant-0 store and never write its
+ * own checkpoint. Model-free: a stored variant-1 file for a text, then a
+ * store of the same text with variant 0 replaces it (h[21] == 0 afterwards,
+ * and a lookup with variant 0 finds it). */
+static void test_kv_cache_store_replaces_variant_mismatched_file(void) {
+    char tmpl[] = "/tmp/ds4-kv-payload-variant-store-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "<|im_start|>system\nvariant replace test prefix";
+    test_kv_text_stub_file_model_variant(dir, text, 7, 1, KV_REASON_COLD, 512, 0);
+
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    /* The stale variant-1 file is not compatible with a variant-0 store:
+     * the function reports it incompatible and unlinks it, which is what
+     * lets ds4_kvstore_store_live_prefix_text() go on to write a fresh
+     * variant-0 file instead of treating the old one as already stored. */
+    TEST_ASSERT(!ds4_kvstore_existing_compatible(&kc, path, sha, text, strlen(text),
+                                                 7, 2, 32768, 0));
+    TEST_ASSERT(access(path, F_OK) != 0);
+
+    /* Simulate the replacement store completing (variant 0). */
+    test_kv_text_stub_file_model_variant(dir, text, 7, 0, KV_REASON_COLD, 512, 0);
+
+    ds4_kvstore_entry e = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.payload_variant == 0);
+    ds4_kvstore_entry_free(&e);
+
+    uint8_t h[KV_CACHE_FIXED_HEADER];
+    FILE *fp = fopen(path, "rb");
+    TEST_ASSERT(fp != NULL);
+    if (fp) {
+        TEST_ASSERT(fread(h, 1, sizeof(h), fp) == sizeof(h));
+        fclose(fp);
+        TEST_ASSERT(h[21] == 0);
+    }
+
+    const int idx = ds4_kvstore_find_text_prefix_v(&kc, text, 7, 2, 32768, 0);
+    TEST_ASSERT(idx >= 0 && kc.entry[idx].payload_variant == 0);
+
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
 /* Ornith ids: the aliases are known, toggle thinking like Qwen3.8's, and an
  * explicit thinking field wins over an alias. */
 static void test_ornith_model_ids(void) {
@@ -24457,6 +24598,8 @@ static void ds4_server_unit_tests_run(void) {
     test_ornith_replayed_tool_text_no_think_no_content();
     test_ornith_replayed_tool_text_keeps_think_leading_blank();
     test_kv_cache_lookup_separates_qwen38_and_ornith();
+    test_kv_cache_lookup_filters_by_payload_variant();
+    test_kv_cache_store_replaces_variant_mismatched_file();
     test_ornith_model_ids();
 }
 

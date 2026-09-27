@@ -1,0 +1,67 @@
+=== target: http://127.0.0.1:18296  model=ornith-1.5-35b-a3b ===
+
+[1/3] run_benchmarks: HumanEval-mini + GSM8K-mini …
+     HumanEval-mini (17, exec pass@1) …
+      ✅ HE/add                   1.5s  PASS
+      ✅ HE/strlen                1.3s  PASS
+      ✅ HE/gcd                   1.7s  PASS
+      ✅ HE/is_prime              2.3s  PASS
+      ✅ HE/truncate_number       1.6s  PASS
+      ✅ HE/below_zero            2.4s  PASS
+      ✅ HE/largest_divisor       3.2s  PASS
+      ✅ HE/string_xor            2.5s  PASS
+      ✅ HE/rolling_max           1.5s  PASS
+      ✅ HE/all_prefixes          1.2s  PASS
+      ✅ HE/filter_by_substring   2.1s  PASS
+      ✅ HE/longest               1.9s  PASS
+      ✅ HE/count_distinct_characters   0.9s  PASS
+      ✅ HE/triples_sum_to_zero   3.4s  PASS
+      ✅ HE/has_close_elements    3.3s  PASS
+      ✅ HE/separate_paren_groups  14.4s  PASS
+      ✅ HE/sort_even             4.0s  PASS
+     → HumanEval pass@1 = 100% (17/17)
+     GSM8K-mini (16, exact-match) …
+      ✅ gsm/0                    1.9s  got=72 gold=72
+      ✅ gsm/1                    2.2s  got=10 gold=10
+      ✅ gsm/2                    2.5s  got=5 gold=5
+      ✅ gsm/3                    1.6s  got=3 gold=3
+      ✅ gsm/4                    1.9s  got=624 gold=624
+      ✅ gsm/5                    2.4s  got=42 gold=42
+      ✅ gsm/6                    1.5s  got=18 gold=18
+      ✅ gsm/7                    1.5s  got=105 gold=105
+      ✅ gsm/8                    1.1s  got=5 gold=5
+      ✅ gsm/9                    1.1s  got=150 gold=150
+      ✅ gsm/10                   1.5s  got=336 gold=336
+      ✅ gsm/11                   1.7s  got=26 gold=26
+      ✅ gsm/12                   0.9s  got=3 gold=3
+      ✅ gsm/13                   2.2s  got=9 gold=9
+      ✅ gsm/14                   1.8s  got=20 gold=20
+      ✅ gsm/15                   2.5s  got=40 gold=40
+     → GSM8K = 100% (16/16)
+
+[2/3] code_bench: fix_bug / gentest / refactor …
+     fix_bug /factorial  ✓
+     fix_bug /dedupe     ✗ FAIL rc=1   File "/var/folders/6m/7tbx3cw94z1gc63lwcqv_
+     fix_bug /clamp      ✓
+     gentest /slugify    ✓
+     gentest /chunk      ✗ FAIL: over-constrained rc=1 ssert chunk([1, 2, 3], 0) =
+     gentest /median     ✗ FAIL: over-constrained rc=1 ost recent call last):
+  Fi
+     refactor/letter_grade ✓
+     refactor/count_true ✓
+     refactor/is_leap    ✓
+
+[3/3] review_bench: planted-bug P/R/F1 …
+     auth_db.py     recall 0.0 precision 0.0 f1 0.0 (caught 0/6, raised 0)
+     stats.py       recall 1.0 precision 0.455 f1 0.625 (caught 5/5, raised 11)
+
+============================================================
+ORNITH-1.5-35B-A3B  sealed intelligence index
+  HumanEval pass@1 : 1.000
+  GSM8K exact      : 1.000
+  code_bench mean  : 0.667  (fix 0.667 / gentest 0.333 / refactor 1.000)
+  review F1        : 0.455
+  --> INDEX        : 78.0   (pass bar 86.6)
+  truncated_total  : 0   errored_total: 0
+  GATE2            : FAIL
+============================================================

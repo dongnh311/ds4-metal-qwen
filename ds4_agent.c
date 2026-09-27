@@ -5090,12 +5090,13 @@ static bool agent_kv_save_path(agent_worker *w, const char *path,
     }
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
-    ds4_kvstore_fill_header(h, (uint8_t)model_id, (uint8_t)quant_bits,
-                            ds4_kvstore_reason_code(reason),
-                            session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0,
-                            (uint32_t)tokens->len, 0,
-                            (uint32_t)ds4_session_ctx(w->session),
-                            created_at, now, payload_bytes);
+    ds4_kvstore_fill_header_v(h, (uint8_t)model_id, (uint8_t)quant_bits,
+                              ds4_kvstore_reason_code(reason),
+                              session_identity ? DS4_KVSTORE_EXT_SESSION_TITLE : 0,
+                              (uint32_t)tokens->len, 0,
+                              (uint32_t)ds4_session_ctx(w->session),
+                              created_at, now, payload_bytes,
+                              (uint8_t)ds4_engine_payload_variant(w->engine));
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, (uint32_t)text_len);
 
@@ -6506,9 +6507,9 @@ static bool agent_worker_strip_session(agent_worker *w, const char *prefix,
 
     uint8_t h[DS4_KVSTORE_FIXED_HEADER];
     uint64_t now = (uint64_t)time(NULL);
-    ds4_kvstore_fill_header(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
-                            stripped_token_count, hdr.hits, hdr.ctx_size,
-                            hdr.created_at, now, 0);
+    ds4_kvstore_fill_header_v(h, hdr.model_id, hdr.quant_bits, hdr.reason, hdr.ext_flags,
+                              stripped_token_count, hdr.hits, hdr.ctx_size,
+                              hdr.created_at, now, 0, hdr.payload_variant);
     uint8_t tb[4];
     ds4_kvstore_le_put32(tb, text_bytes);
 

@@ -378,7 +378,7 @@ static void test_attn_prep_noindexer(arena_t *a) {
     require_ok(kc && vc && gpos && ds4_gpu_tensor_write(gpos, 0, pos3, sizeof(pos3)), "prep buffers");
     require_ok(ds4_gpu_qwen35_attn_prep_tensor(gq_out, ggate, kc, vc, gqg, gkp, gvp, gpos, a->base, a->size,
                                                gq_off, gk_off, T, H, Hkv, D, n_rot, pos0, cap,
-                                               (float)base, 1e-6f), "qwen35 attn prep");
+                                               (float)base, 1e-6f, kc, vc, kc, vc, 0u), "qwen35 attn prep");
     float *got = download(gq_out, (uint64_t)T * H * D);
     check_close("attn prep q", got, q_ref, (uint64_t)T * H * D, 2e-5);
     free(got);
@@ -460,6 +460,324 @@ static void test_mtp_concat(arena_t *a, uint32_t E, uint32_t T) {
     ds4_gpu_tensor_free(ge); ds4_gpu_tensor_free(gh); ds4_gpu_tensor_free(gc);
 }
 
+/* Q5_K routed experts through the tiled GEMM: the simdgroup tiles
+ * (DS4_QWEN35_MOE_MM_NAX=0) are the exact reference for the tensor tiles, and
+ * both are bounded against the double reference and against the M1 per-token
+ * row kernels.  T=65 exercises the first tile tail, T=641 the multi-tile,
+ * partial-expert and empty-expert cases (cf. test_moe_mm_tiles_exact). */
+static void test_moe_mm_q5k(arena_t *a, uint32_t T) {
+    const uint32_t E = 256, F = 256, NE = 4, slots = 2, n_out = slots, list_cap = T + 7, guard = 16;
+    const uint64_t mid_n = (uint64_t)T * n_out * F, part_n = (uint64_t)T * n_out * E;
+    const char *nax_env = "DS4_QWEN35_MOE_MM_NAX";
+    const char *saved_nax_v = getenv(nax_env);
+    char *saved_nax = saved_nax_v ? strdup(saved_nax_v) : NULL;
+    double *gate_w, *up_w, *down_w;
+    const uint64_t gate_off = arena_q5_K(a, (uint64_t)NE * F, E, &gate_w, 0.05f);
+    const uint64_t up_off = arena_q5_K(a, (uint64_t)NE * F, E, &up_w, 0.05f);
+    const uint64_t down_off = arena_q5_K(a, (uint64_t)NE * E, F, &down_w, 0.05f);
+    float *x = rand_vec((uint64_t)T * E, 2.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * sizeof(int32_t));
+    for (uint32_t t = 0; t < T; t++) { sel[t * slots] = 0; sel[t * slots + 1] = (int32_t)(1u + t % 2u); }
+    double *mid_ex = malloc(mid_n * sizeof(double)), *part_ex = malloc(part_n * sizeof(double));
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < slots; s++) {
+            const uint32_t e = (uint32_t)sel[t * slots + s];
+            for (uint32_t f = 0; f < F; f++) {
+                double g = 0.0, u = 0.0;
+                for (uint32_t k = 0; k < E; k++) {
+                    g += gate_w[((uint64_t)e * F + f) * E + k] * (double)x[(uint64_t)t * E + k];
+                    u += up_w[((uint64_t)e * F + f) * E + k] * (double)x[(uint64_t)t * E + k];
+                }
+                mid_ex[((uint64_t)t * n_out + s) * F + f] = silu_d(g) * u;
+            }
+            for (uint32_t d = 0; d < E; d++) {
+                double p = 0.0;
+                for (uint32_t k = 0; k < F; k++) p += down_w[((uint64_t)e * E + d) * F + k] * mid_ex[((uint64_t)t * n_out + s) * F + k];
+                part_ex[((uint64_t)t * n_out + s) * E + d] = p;
+            }
+        }
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * list_cap * 4);
+    ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc(NE * 4);
+    require_ok(gsel && glists && gcounts && ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "q5k sel");
+    require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, list_cap), "q5k lists");
+    ds4_gpu_tensor *gmid = upload(NULL, mid_n + guard), *gpart = upload(NULL, part_n + guard);
+    const uint32_t levels[] = {0u, 64u};   /* 0 = simdgroup tiles; 64 = tensor tiles */
+    float *ref_mid = NULL, *ref_part = NULL;
+    const float sentinel = -1234.5f;
+    for (uint32_t li = 0; li < 2u; li++) {
+        if (levels[li] && !ds4_gpu_tensor_api_available()) {
+            printf("  q5k tiles nax=%u skipped (tensor API unavailable)\n", levels[li]);
+            continue;
+        }
+        char lv[4]; snprintf(lv, sizeof(lv), "%u", levels[li] ? 2u : 0u);   /* NAX level 2 => 64-tok tiles */
+        setenv(nax_env, lv, 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gmid, sentinel, mid_n + guard) &&
+                   ds4_gpu_tensor_fill_f32(gpart, sentinel, part_n + guard), "q5k sentinels");
+        require_ok(ds4_gpu_qwen35_moe_mm_mid_tensor(gmid, gx, glists, gcounts, a->base, a->size,
+                                gate_off, up_off, 13u, NE, T, slots, n_out, E, F, list_cap), "q5k mm mid");
+        require_ok(ds4_gpu_qwen35_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size,
+                                down_off, 13u, NE, T, slots, n_out, F, E, list_cap), "q5k mm down");
+        float *gm = download(gmid, mid_n + guard), *gp = download(gpart, part_n + guard);
+        for (uint64_t i = mid_n; i < mid_n + guard; i++) require_ok(gm[i] == sentinel, "q5k mid tail guard");
+        for (uint64_t i = part_n; i < part_n + guard; i++) require_ok(gp[i] == sentinel, "q5k down tail guard");
+        double ew = 0.0, sc = 1e-6;
+        for (uint64_t i = 0; i < part_n; i++) { double d = fabs((double)gp[i] - part_ex[i]); if (d > ew) ew = d; if (fabs(part_ex[i]) > sc) sc = fabs(part_ex[i]); }
+        char what[64]; snprintf(what, sizeof(what), "q5k tiles nax=%u down vs exact T=%u", levels[li], T);
+        printf("  %-40s max|d|=%.3e (rel %.3e)\n", what, ew, ew / sc);
+        require_ok(ew <= 3e-3 * sc, what);
+        if (levels[li] == 0u) { ref_mid = gm; ref_part = gp; }   /* simdgroup = exact reference */
+        else {
+            double wm = 0.0, sm = 1e-6;
+            for (uint64_t i = 0; i < mid_n; i++) { if (ref_mid[i] == sentinel) continue; double d = fabs((double)gm[i] - ref_mid[i]); if (d > wm) wm = d; if (fabs(ref_mid[i]) > sm) sm = fabs(ref_mid[i]); }
+            require_ok(wm <= 2e-3 * sm, "q5k tensor mid within 2e-3 of simdgroup");
+            free(gm); free(gp);
+        }
+    }
+    /* cross-check the simdgroup tiles against the M1 per-token row kernels (no shared slot). */
+    setenv(nax_env, "0", 1);
+    ds4_gpu_tensor *rmid = upload(NULL, mid_n), *rpart = upload(NULL, part_n);
+    require_ok(ds4_gpu_qwen35_moe_mid_tensor(rmid, gx, gsel, a->base, a->size, gate_off, up_off, 13u,
+                                             NE, T, slots, E, F, 0, 0, UINT32_MAX), "q5k row mid");
+    require_ok(ds4_gpu_qwen35_moe_down_tensor(rpart, rmid, gsel, a->base, a->size, down_off, 13u,
+                                              NE, T, slots, F, E, 0, UINT32_MAX), "q5k row down");
+    float *rp = download(rpart, part_n);
+    double rw = 0.0, rs = 1e-6;
+    for (uint64_t i = 0; i < part_n; i++) { double d = fabs((double)rp[i] - ref_part[i]); if (d > rw) rw = d; if (fabs(ref_part[i]) > rs) rs = fabs(ref_part[i]); }
+    printf("  q5k tiles vs row kernels down T=%u: max|d|=%.3e (rel %.3e)\n", T, rw, rw / rs);
+    require_ok(rw <= 2e-3 * rs, "q5k tiles match row kernels");
+    if (saved_nax) { setenv(nax_env, saved_nax, 1); free(saved_nax); } else unsetenv(nax_env);
+    free(x); free(sel); free(mid_ex); free(part_ex); free(gate_w); free(up_w); free(down_w);
+    free(ref_mid); free(ref_part); free(rp);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gcounts);
+    ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart); ds4_gpu_tensor_free(rmid); ds4_gpu_tensor_free(rpart);
+}
+
+/* L8: the Q5_K decode kernels at each NR are bit-identical (each row's
+ * per-lane dot order is unchanged; only the row-per-simdgroup split changes). */
+static void test_moe_q5k_rows(arena_t *a) {
+    const uint32_t NE = 16, slots = 8, E = 512, F = 256, T = 2, n_out = slots + 1;
+    double *gate_w, *up_w, *down_w, *sg_w, *su_w, *sd_w;
+    const uint64_t gate_off = arena_q5_K(a, (uint64_t)NE * F, E, &gate_w, 0.05f);
+    const uint64_t up_off = arena_q5_K(a, (uint64_t)NE * F, E, &up_w, 0.05f);
+    const uint64_t down_off = arena_q5_K(a, (uint64_t)NE * E, F, &down_w, 0.05f);
+    const uint64_t sg_off = arena_q8_0(a, F, E, &sg_w, 0.05f);
+    const uint64_t su_off = arena_q8_0(a, F, E, &su_w, 0.05f);
+    const uint64_t sd_off = arena_q8_0(a, E, F, &sd_w, 0.05f);
+    float *x = rand_vec((uint64_t)T * E, 1.0f);
+    float *mid_in = rand_vec((uint64_t)T * n_out * F, 1.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * 4);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < slots; s++) sel[t * slots + s] = (int32_t)((t * 7u + s * 3u) % NE);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * E);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    require_ok(ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "l8 sel");
+    ds4_gpu_tensor *gmidin = upload(mid_in, (uint64_t)T * n_out * F);
+    ds4_gpu_tensor *gmid = upload(NULL, (uint64_t)T * n_out * F), *gpart = upload(NULL, (uint64_t)T * n_out * E);
+    const char *mk = "DS4_QWEN35_MOE_MR_MID", *dk = "DS4_QWEN35_MOE_MR_DOWN";
+    char *sm = getenv(mk) ? strdup(getenv(mk)) : NULL, *sd = getenv(dk) ? strdup(getenv(dk)) : NULL;
+    float *ref_mid = NULL, *ref_part = NULL;
+    const char *mrv[] = {"0", "1", "2", "4"}, *drv[] = {"0", "1", "2", "4"};
+    for (uint32_t mi = 0; mi < 4u; mi++) {
+        setenv(mk, mrv[mi], 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gmid, -1234.5f, (uint64_t)T * n_out * F), "l8 mid sentinel");
+        require_ok(ds4_gpu_qwen35_moe_mid_tensor(gmid, gx, gsel, a->base, a->size, gate_off, up_off, 13u,
+                       NE, T, slots, E, F, sg_off, su_off, 8u), "l8 mid");
+        float *got = download(gmid, (uint64_t)T * n_out * F);
+        if (ref_mid) { for (uint64_t i = 0; i < (uint64_t)T * n_out * F; i++) require_ok(got[i] == ref_mid[i], "l8 mid NR bit-identical"); free(got); }
+        else ref_mid = got;
+    }
+    for (uint32_t di = 0; di < 4u; di++) {
+        setenv(dk, drv[di], 1);
+        require_ok(ds4_gpu_tensor_fill_f32(gpart, -1234.5f, (uint64_t)T * n_out * E), "l8 down sentinel");
+        require_ok(ds4_gpu_qwen35_moe_down_tensor(gpart, gmidin, gsel, a->base, a->size, down_off, 13u,
+                       NE, T, slots, F, E, sd_off, 8u), "l8 down");
+        float *got = download(gpart, (uint64_t)T * n_out * E);
+        if (ref_part) { for (uint64_t i = 0; i < (uint64_t)T * n_out * E; i++) require_ok(got[i] == ref_part[i], "l8 down NR bit-identical"); free(got); }
+        else ref_part = got;
+    }
+    printf("  q5_K decode NR {mid 0/1/2/4, down 0/1/2/4}: bit-identical\n");
+    if (sm) { setenv(mk, sm, 1); free(sm); } else unsetenv(mk);
+    if (sd) { setenv(dk, sd, 1); free(sd); } else unsetenv(dk);
+    free(x); free(mid_in); free(sel); free(ref_mid); free(ref_part);
+    free(gate_w); free(up_w); free(down_w); free(sg_w); free(su_w); free(sd_w);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gmidin);
+    ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gpart);
+}
+
+/* Ornith attention prep in an FP8/4-bit KV mode: the packed K/V a decode
+ * reads.  Prep + decode in mode m must match the F16 prep + decode within the
+ * quant's tolerance; the shared decode kernel is the reader, so no per-block
+ * packing is reproduced here.  Tolerances (1e-1 fp8, 2.5e-1 q4) are calibrated
+ * against a host dequantization of the packed cache (exact to fp8 rel 1.5e-7,
+ * q4 rel 5.2e-4); the intrinsic quantization error vs the F16 reference
+ * itself measures fp8 rel ~4.4e-2, q4 rel ~1.1e-1. */
+static void test_attn_prep_kv_modes(arena_t *a, uint32_t mode) {
+    const uint32_t T = 4, H = 16, Hkv = 2, D = 256, n_rot = 64, pos0 = 5, cap = 16;
+    const double base = 1.0e7;
+    const float scale = 1.0f / sqrtf((float)D);
+    double *gq, *gk;
+    const uint64_t gq_off = arena_f32(a, D, &gq, 0.5f, 1.5f);
+    const uint64_t gk_off = arena_f32(a, D, &gk, 0.5f, 1.5f);
+    float *qg = rand_vec((uint64_t)T * H * 2 * D, 1.0f);
+    float *kp = rand_vec((uint64_t)T * Hkv * D, 1.0f), *vp = rand_vec((uint64_t)T * Hkv * D, 1.0f);
+    uint32_t pos3[16 * 4];
+    for (uint32_t p = 0; p < cap; p++) { pos3[p * 4] = pos3[p * 4 + 1] = pos3[p * 4 + 2] = p; pos3[p * 4 + 3] = 0; }
+    ds4_gpu_tensor *gqg = upload(qg, (uint64_t)T * H * 2 * D);
+    ds4_gpu_tensor *gkp = upload(kp, (uint64_t)T * Hkv * D), *gvp = upload(vp, (uint64_t)T * Hkv * D);
+    ds4_gpu_tensor *gpos = ds4_gpu_tensor_alloc(sizeof(pos3));
+    require_ok(gpos && ds4_gpu_tensor_write(gpos, 0, pos3, sizeof(pos3)), "kv-mode pos");
+    /* F16 reference: prep into F16 caches, decode into ref */
+    ds4_gpu_tensor *gq0 = upload(NULL, (uint64_t)T * H * D), *ggate0 = upload(NULL, (uint64_t)T * H * D);
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *o_ref = upload(NULL, (uint64_t)T * H * D);
+    require_ok(kc && vc && ds4_gpu_qwen35_attn_prep_tensor(gq0, ggate0, kc, vc, gqg, gkp, gvp, gpos,
+                   a->base, a->size, gq_off, gk_off, T, H, Hkv, D, n_rot, pos0, cap, (float)base, 1e-6f,
+                   kc, vc, kc, vc, 0u), "prep f16");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(o_ref, gq0, ggate0, kc, vc, NULL, NULL, NULL, T,
+                   H, Hkv, D, pos0, 0u, 0u, scale, NULL, NULL, NULL, NULL, 0u), "decode f16");
+    float *ref = download(o_ref, (uint64_t)T * H * D);
+    /* mode m: prep into packed caches + scales, decode with the same query */
+    const uint64_t kv_elems = (uint64_t)cap * Hkv * D;
+    ds4_gpu_tensor *gq1 = upload(NULL, (uint64_t)T * H * D), *ggate1 = upload(NULL, (uint64_t)T * H * D);
+    ds4_gpu_tensor *kf = ds4_gpu_tensor_alloc(mode == 2u ? kv_elems / 2u : kv_elems);
+    ds4_gpu_tensor *vf = ds4_gpu_tensor_alloc(mode == 2u ? kv_elems / 2u : kv_elems);
+    ds4_gpu_tensor *ksb = ds4_gpu_tensor_alloc((uint64_t)cap * (Hkv * D / 64u) * 2u);
+    ds4_gpu_tensor *vsb = ds4_gpu_tensor_alloc((uint64_t)cap * (Hkv * D / 64u) * 2u);
+    ds4_gpu_tensor *o_m = upload(NULL, (uint64_t)T * H * D);
+    require_ok(kf && vf && ksb && vsb && ds4_gpu_qwen35_attn_prep_tensor(gq1, ggate1, kf, vf, gqg, gkp, gvp,
+                   gpos, a->base, a->size, gq_off, gk_off, T, H, Hkv, D, n_rot, pos0, cap, (float)base, 1e-6f,
+                   kf, vf, ksb, vsb, mode), "prep kv mode");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(o_m, gq1, ggate1, kf, vf, NULL, NULL, NULL, T,
+                   H, Hkv, D, pos0, 0u, 0u, scale, kf, vf, ksb, vsb, mode), "decode kv mode");
+    float *got = download(o_m, (uint64_t)T * H * D);
+    double worst = 0.0, sc = 1e-6;
+    for (uint64_t i = 0; i < (uint64_t)T * H * D; i++) {
+        if (fabs(ref[i]) > sc) sc = fabs(ref[i]);
+        if (fabs((double)got[i] - ref[i]) > worst) worst = fabs((double)got[i] - ref[i]);
+    }
+    printf("  attn prep+decode kv mode %u: attn out max|d| %.3e (rel %.3e)\n", mode, worst, worst / sc);
+    require_ok(worst <= (mode == 2u ? 2.5e-1 : 1e-1) * sc, "kv-mode attention within tolerance");
+    free(ref); free(got); free(qg); free(kp); free(vp); free(gq); free(gk);
+    ds4_gpu_tensor_free(gqg); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(gpos);
+    ds4_gpu_tensor_free(gq0); ds4_gpu_tensor_free(ggate0); ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc);
+    ds4_gpu_tensor_free(o_ref); ds4_gpu_tensor_free(gq1); ds4_gpu_tensor_free(ggate1); ds4_gpu_tensor_free(kf);
+    ds4_gpu_tensor_free(vf); ds4_gpu_tensor_free(ksb); ds4_gpu_tensor_free(vsb); ds4_gpu_tensor_free(o_m);
+}
+
+/* L12: kernel_qwen35_attn_decode2's shared-KV verify must reproduce, bit for
+ * bit, what the SAME kernel gives for each row decoded alone (rows==1) --
+ * that is the "exact by construction" bar (Task 11 fix 6).  Comparing
+ * against the unrelated per-row kernel_qwen4_attn_decode is not a fair
+ * memcmp (a different kernel's instruction scheduling can 1-ulp diverge even
+ * for identical math -- that is what sank the dry run's version of this
+ * test).  A host double reference separately bounds the two-row call within
+ * FP noise of the true softmax.  pos0=31 gives row 0 (32 keys) one split and
+ * row 1 (33 keys) two: the mismatched-geometry case fix 6 exists for. */
+static void test_attn_decode2_matches_perrow(arena_t *a, uint32_t pos0) {
+    const uint32_t H = 16, Hkv = 2, D = 256, n_rot = 64, cap = 320, fill = pos0 + 2u;
+    const double base = 1.0e7;
+    const float scale = 1.0f / sqrtf((float)D);
+    double *gq, *gk;
+    const uint64_t gq_off = arena_f32(a, D, &gq, 0.5f, 1.5f);
+    const uint64_t gk_off = arena_f32(a, D, &gk, 0.5f, 1.5f);
+    float *pqg = rand_vec((uint64_t)fill * H * 2 * D, 1.0f);
+    float *pkp = rand_vec((uint64_t)fill * Hkv * D, 1.0f), *pvp = rand_vec((uint64_t)fill * Hkv * D, 1.0f);
+    uint32_t *pos3 = malloc((uint64_t)cap * 4u * sizeof(uint32_t));
+    for (uint32_t p = 0; p < cap; p++) { pos3[p * 4] = pos3[p * 4 + 1] = pos3[p * 4 + 2] = p; pos3[p * 4 + 3] = 0; }
+    ds4_gpu_tensor *gqg = upload(pqg, (uint64_t)fill * H * 2 * D);
+    ds4_gpu_tensor *gkp = upload(pkp, (uint64_t)fill * Hkv * D), *gvp = upload(pvp, (uint64_t)fill * Hkv * D);
+    ds4_gpu_tensor *pq = upload(NULL, (uint64_t)fill * H * D), *pg = upload(NULL, (uint64_t)fill * H * D);
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *gpos = ds4_gpu_tensor_alloc((uint64_t)cap * 16u);
+    require_ok(kc && vc && gpos && ds4_gpu_tensor_write(gpos, 0, pos3, (uint64_t)cap * 16u), "decode2 fill buffers");
+    require_ok(ds4_gpu_qwen35_attn_prep_tensor(pq, pg, kc, vc, gqg, gkp, gvp, gpos, a->base, a->size,
+                   gq_off, gk_off, fill, H, Hkv, D, n_rot, 0u, cap, (float)base, 1e-6f, kc, vc, kc, vc, 0u),
+               "decode2 fill");
+
+    float *q2 = rand_vec(2ull * H * D, 1.0f), *g2 = rand_vec(2ull * H * D, 1.0f);
+    ds4_gpu_tensor *gq2 = upload(q2, 2ull * H * D), *gg2 = upload(g2, 2ull * H * D);
+    ds4_gpu_tensor *o2 = upload(NULL, 2ull * H * D);
+    ds4_gpu_tensor *part2 = upload(NULL, ds4_gpu_qwen4_attn_part_floats(2u, H, D));
+    require_ok(part2 && ds4_gpu_qwen35_attn_decode2_tensor(o2, gq2, gg2, kc, vc, part2, H, Hkv, D, pos0, 2u, scale,
+                   NULL, NULL, NULL, NULL, 0u), "decode2 rows=2");
+    float *shared = download(o2, 2ull * H * D);
+
+    /* the same kernel, called once per row (rows==1) */
+    float *solo = malloc(2ull * H * D * sizeof(float));
+    for (uint32_t r = 0; r < 2u; r++) {
+        ds4_gpu_tensor *qr = ds4_gpu_tensor_view(gq2, (uint64_t)r * H * D * sizeof(float),
+                                                 (uint64_t)H * D * sizeof(float));
+        ds4_gpu_tensor *gr = ds4_gpu_tensor_view(gg2, (uint64_t)r * H * D * sizeof(float),
+                                                 (uint64_t)H * D * sizeof(float));
+        ds4_gpu_tensor *orow = upload(NULL, (uint64_t)H * D);
+        ds4_gpu_tensor *part1 = upload(NULL, ds4_gpu_qwen4_attn_part_floats(1u, H, D));
+        require_ok(qr && gr && orow && part1 &&
+                   ds4_gpu_qwen35_attn_decode2_tensor(orow, qr, gr, kc, vc, part1, H, Hkv, D, pos0 + r, 1u, scale,
+                       NULL, NULL, NULL, NULL, 0u), "decode2 rows=1 reference");
+        float *rr = download(orow, (uint64_t)H * D);
+        memcpy(solo + (uint64_t)r * H * D, rr, (uint64_t)H * D * sizeof(float));
+        free(rr);
+        ds4_gpu_tensor_free(qr); ds4_gpu_tensor_free(gr); ds4_gpu_tensor_free(orow); ds4_gpu_tensor_free(part1);
+    }
+    const int bytes_equal = memcmp(shared, solo, 2ull * H * D * sizeof(float)) == 0;
+    printf("  attn decode2 pos0=%u: rows=2 vs two rows=1 calls memcmp %s\n",
+           pos0, bytes_equal ? "== 0" : "DIFFERS");
+    require_ok(bytes_equal, "decode2 rows=2 matches two rows=1 calls of the same kernel");
+
+    /* host double reference: exact softmax over the raw K/V this test wrote.
+     * kc/vc are the F16 packed cache (2 bytes/elem), not float32. */
+    uint16_t *kh = malloc((uint64_t)cap * Hkv * D * sizeof(uint16_t));
+    uint16_t *vh = malloc((uint64_t)cap * Hkv * D * sizeof(uint16_t));
+    require_ok(ds4_gpu_tensor_read(kc, 0, kh, (uint64_t)cap * Hkv * D * sizeof(uint16_t)), "decode2 k cache read");
+    require_ok(ds4_gpu_tensor_read(vc, 0, vh, (uint64_t)cap * Hkv * D * sizeof(uint16_t)), "decode2 v cache read");
+    float *kraw = malloc((uint64_t)cap * Hkv * D * sizeof(float));
+    float *vraw = malloc((uint64_t)cap * Hkv * D * sizeof(float));
+    for (uint64_t i = 0; i < (uint64_t)cap * Hkv * D; i++) { kraw[i] = f16_to_f32(kh[i]); vraw[i] = f16_to_f32(vh[i]); }
+    free(kh); free(vh);
+    float *qraw = download(gq2, 2ull * H * D);
+    float *graw = download(gg2, 2ull * H * D);
+    double worst = 0.0, sc = 1e-6;
+    for (uint32_t r = 0; r < 2u; r++) {
+        const uint32_t n_keys = pos0 + r + 1u;
+        for (uint32_t h = 0; h < H; h++) {
+            const uint32_t kvh = h / (H / Hkv);
+            double acc[256], m = -1e300, l = 0.0;
+            for (uint32_t d = 0; d < D; d++) acc[d] = 0.0;
+            for (uint32_t idx = 0; idx < n_keys; idx++) {
+                double s = 0.0;
+                for (uint32_t d = 0; d < D; d++)
+                    s += (double)qraw[((uint64_t)r * H + h) * D + d] * scale *
+                         (double)kraw[((uint64_t)idx * Hkv + kvh) * D + d];
+                const double mn = s > m ? s : m, corr = exp(m - mn), w = exp(s - mn);
+                l = l * corr + w;
+                for (uint32_t d = 0; d < D; d++)
+                    acc[d] = acc[d] * corr + w * (double)vraw[((uint64_t)idx * Hkv + kvh) * D + d];
+                m = mn;
+            }
+            const double inv = l > 0.0 ? 1.0 / l : 0.0;
+            for (uint32_t d = 0; d < D; d++) {
+                const double sig = 1.0 / (1.0 + exp(-(double)graw[((uint64_t)r * H + h) * D + d]));
+                const double refv = acc[d] * inv * sig;
+                const double got = (double)shared[((uint64_t)r * H + h) * D + d];
+                if (fabs(refv) > sc) sc = fabs(refv);
+                if (fabs(got - refv) > worst) worst = fabs(got - refv);
+            }
+        }
+    }
+    printf("  attn decode2 pos0=%u: vs host double ref max|d| %.3e (rel %.3e)\n", pos0, worst, worst / sc);
+    require_ok(worst <= 1e-5 * sc, "decode2 within FP noise of the host double reference");
+
+    free(gq); free(gk); free(pqg); free(pkp); free(pvp); free(pos3); free(q2); free(g2);
+    free(shared); free(solo); free(kraw); free(vraw); free(qraw); free(graw);
+    ds4_gpu_tensor_free(gqg); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(pq);
+    ds4_gpu_tensor_free(pg); ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc); ds4_gpu_tensor_free(gpos);
+    ds4_gpu_tensor_free(gq2); ds4_gpu_tensor_free(gg2); ds4_gpu_tensor_free(o2); ds4_gpu_tensor_free(part2);
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)512 << 20;
@@ -473,10 +791,23 @@ int main(void) {
     test_moe_q5k(&arena, 16, 8, 512, 256, 1);
     test_moe_q5k(&arena, 16, 8, 512, 256, 2);
     test_moe_q5k(&arena, 16, 8, 512, 512, 5);
+    printf("qwen35 q5_K decode row variants (L8)\n"); test_moe_q5k_rows(&arena);
+    printf("qwen35 moe q5_K tiled GEMM (simdgroup + tensor tiles)\n");
+    test_moe_mm_q5k(&arena, 65);
+    test_moe_mm_q5k(&arena, 200);
+    test_moe_mm_q5k(&arena, 641);
     printf("qwen35 gdn out (silu gate)\n");
     test_gdn_out_silu(&arena, 32, 128, 3);
     printf("qwen35 attention prep (no indexer)\n");
     test_attn_prep_noindexer(&arena);
+    printf("qwen35 attention prep + decode (KV modes)\n");
+    test_attn_prep_kv_modes(&arena, 1u);
+    test_attn_prep_kv_modes(&arena, 2u);
+    printf("qwen35 attention decode2 (L12 shared-KV verify)\n");
+    test_attn_decode2_matches_perrow(&arena, 6u);
+    test_attn_decode2_matches_perrow(&arena, 30u);
+    test_attn_decode2_matches_perrow(&arena, 31u);
+    test_attn_decode2_matches_perrow(&arena, 100u);
     printf("qwen4 moe reduce without residual (as Ornith calls it)\n");
     test_reduce_nohc(1, 8, 2048, true);
     test_reduce_nohc(12, 8, 2048, false);
