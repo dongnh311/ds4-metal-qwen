@@ -316,7 +316,7 @@ static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model 
  * M5 (DS4_QWEN35_ATTN_FLASH): gates the flash prefill kernel for chunks with
  * more than 8 tokens (the verify's per_row path, the MTP draft tail, T <= 8
  * tails and fp8/q4 K/V always keep today's attn_mm dispatch).  F16 K/V only;
- * default off until the controller's gates and A/B pass. */
+ * on by default since the M5 A/B (DS4_QWEN35_ATTN_FLASH=0 restores attn_mm). */
 static int qwen35_attn_decode2_env(void) {
     static int on = -1;
     if (on < 0) {
@@ -344,14 +344,14 @@ static int qwen35_attn_decode_env(void) {
 }
 
 /* M5 (DS4_QWEN35_ATTN_FLASH): selects the flash prefill kernel for chunks
- * above the T <= 8 tail cutover, read once.  1 turns it on; unset or any
- * other value keeps today's attn_mm dispatch.  Default off until the
- * controller's gates and A/B pass. */
+ * above the T <= 8 tail cutover, read once.  On by default since the M5 A/B
+ * (prefill +53% at 32K, +82% at 128K; gate 1 and the MTP identity tests
+ * pass); "0" keeps the attn_mm dispatch, any other value means on. */
 static int qwen35_attn_flash_env(void) {
     static int on = -1;
     if (on < 0) {
         const char *e = getenv("DS4_QWEN35_ATTN_FLASH");
-        on = (e && strcmp(e, "1") == 0) ? 1 : 0;
+        on = (e && strcmp(e, "0") == 0) ? 0 : 1;
     }
     return on;
 }
