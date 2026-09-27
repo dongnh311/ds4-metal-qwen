@@ -211,11 +211,19 @@ and `ds4_gpu_add_tensor`.
      64 dims, KV append. It is a new entry point beside the qwen4
      `attn_prep`, not a change to it.
   3. Dense attention over all positions (scale 1/16, GQA 8:1) with the qwen4
-     KV modes. Prefill runs `attn_mm`; decode (plain T=1 and the 2-row MTP
-     verify alike) runs `kernel_qwen35_attn_decode2`
-     (`DS4_QWEN35_ATTN_DECODE2`, default on; `=0` restores the older
-     per-row `attn_decode` kernel) — see the M4 decode section below for why
-     the verify rows are bit-exact against plain decode under it.
+     KV modes. Since M5 (F16 K/V): prefill chunks with T > 8 run
+     `kernel_qwen35_attn_flash` (`DS4_QWEN35_ATTN_FLASH`, default on; `=0`
+     restores the shared `attn_mm`) — two query tokens x the 8 query heads of
+     a KV head share every K/V tile, output bit-identical to `attn_mm`, and
+     short chunks at long context split the key range and merge with
+     `kernel_qwen35_attn_merge3`; decode (plain T=1 and the 2-row MTP verify
+     alike) runs `kernel_qwen35_attn_decode3` (`DS4_QWEN35_ATTN_DECODE`,
+     default 3; `=2` restores M4's `kernel_qwen35_attn_decode2`) — the
+     8 GQA heads of each verify row as one simdgroup-matrix tile, up to 256
+     key splits per row, merge3 for the partials. T <= 8 tails, fp8/q4 K/V
+     and `DS4_QWEN35_ATTN_DECODE2=0` keep the older kernels. See the decode
+     section below for why the verify rows are bit-exact against plain
+     decode.
   4. `o *= sigmoid(gate)`, then the `attn_output` GEMV into `blk`.
 - **MoE.** Reuse `qwen4_graph_moe`'s router and top-k kernel (softmax over
   256, top 8, renormalise, sigmoid shared-expert gate) and its mid/down
@@ -261,12 +269,16 @@ A/B shows a gain.
   `ds4_session_qwen35_spec_cycle` in `ds4.c`, shaped like the qwen4 cycle
   (whose snapshot helpers need hyper-connections and PLE); the GDN kernels'
   after-first-row snapshot is reused; the experts stay batched.
-  Since bbf5966, plain T=1 decode and the 2-row verify both dispatch
-  `kernel_qwen35_attn_decode2` (`DS4_QWEN35_ATTN_DECODE2`, default on; `=0`
+  Since bbf5966, plain T=1 decode and the 2-row verify both dispatch the
+  same shared-KV kernel: `kernel_qwen35_attn_decode3` since M5
+  (`DS4_QWEN35_ATTN_DECODE`, default 3), `kernel_qwen35_attn_decode2` with
+  `DS4_QWEN35_ATTN_DECODE=2` or for fp8/q4 K/V (`DS4_QWEN35_ATTN_DECODE2=0`
   restores the per-row `attn_decode` kernel). The exactness argument: plain
   decode is a rows==1 call of that same kernel, and each row keeps its own
-  split geometry inside the T=2 call, so the verify's rows equal plain
-  decode bit for bit (memcmp-tested) — attention does not need the per-row
+  split geometry inside the T=2 call (decode3 runs the two rows in one
+  dispatch only when their geometry matches and otherwise as two rows==1
+  dispatches), so the verify's rows equal plain decode bit for bit
+  (memcmp-tested) — attention does not need the per-row
   dispatch the way the dense projections and GDN layers still do under
   `verify_rows_exact` (the shared `qwen4_gemv` picks a different matvec
   kernel for T=1 than for T=2, including the GDN mixer's
@@ -393,7 +405,7 @@ A/B shows a gain.
    attention split, tiled and merge) choose between arithmetic-equivalent
    kernel paths and apply to both families by design. Tuning keyed on
    `n_embd == 2560`, `n_rank == 320` or `n_hc == 4` stays as is.
-   The Ornith (`DS4_QWEN35_*`) knobs added through M4:
+   The Ornith (`DS4_QWEN35_*`) knobs added through M5:
    - `DS4_QWEN35_PROFILE` — per-stage timing breakdown to stderr.
    - `DS4_QWEN35_FLUSH_LAYER` — command-buffer flush cadence (default 2; 0 or
      -1 disables mid-graph flushing).
@@ -406,6 +418,15 @@ A/B shows a gain.
      MTP head.
    - `DS4_QWEN35_ATTN_DECODE2` — batched decode attention kernel for both
      plain T=1 decode and the 2-row MTP verify (default 1).
+   - `DS4_QWEN35_ATTN_DECODE` — which batched decode kernel: 3 = decode3
+     (default since M5), 2 = decode2; F16 K/V only for 3.
+   - `DS4_QWEN35_ATTN_FLASH` — flash prefill attention for chunks with T > 8
+     (default 1 since M5; 0 = `attn_mm`); F16 K/V only.
+   - `DS4_QWEN35_ATTN_SPLIT_KEYS` — decode3 minimum keys per split (default
+     64; tuning/test).
+   - `DS4_QWEN35_ATTN_FLASH_TOK` / `DS4_QWEN35_ATTN_FLASH_MIN_TG` — flash
+     query tokens per threadgroup (2 default, or 4) and the threadgroup count
+     below which flash splits the key range (default 256); tuning/test.
    - `DS4_QWEN35_KV` — KV cache payload mode: f16 (default), fp8 or q4.
    - `DS4_QWEN35_PREFILL_CHUNK` — prefill chunk size override.
 4. **Qwen gate.** Every commit that touches a shared file (`ds4.c` outside the
