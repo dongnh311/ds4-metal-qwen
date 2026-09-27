@@ -3595,12 +3595,18 @@ uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32
  * positions pos0..pos0+T-1 (their K/V already written), causal, F16 K/V
  * only, head_dim must be 256 and n_head/n_head_kv must be 8; refuses T <= 8
  * (attn_decode_tensor's own attn_mm cutover).  `part == NULL` means no key
- * split (this task); a future task adds the split via `part`. */
+ * split.  `part != NULL` splits the key range into Ks parts (Task 4's rule,
+ * see ds4_gpu_qwen35_attn_flash_part_floats) when that helps -- short chunks
+ * at long context, where a lone dispatch is too few threadgroups to fill the
+ * GPU; a 2048-token chunk already gives plenty and Ks comes out as 1, which
+ * behaves exactly like `part == NULL` (no merge dispatch either).  `part`
+ * must be at least ds4_gpu_qwen35_attn_flash_part_floats(n_tokens, n_head,
+ * head_dim) floats for the chosen Ks or the bind fails. */
 int ds4_gpu_qwen35_attn_flash_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, float scale);
-/* Upper bound on the key-split scratch a future flash key split will need,
+/* Upper bound on the key-split scratch flash's key split (Task 4) will need,
  * over both TOK instances (2 and 4) and every pos0, given the split rule
  * Ks = min(QWEN35_ATTN_MAX_SPLITS, ceil(min_tg / (Hkv * ceil(T/TOK)))) with
  * min_tg = DS4_QWEN35_ATTN_FLASH_MIN_TG (default 256).  n_head_kv is not a
@@ -3608,8 +3614,14 @@ int ds4_gpu_qwen35_attn_flash_tensor(
  * Ks) and TOK = 4 (the largest instance, hence largest ceil(T/TOK) is not
  * the driver -- the smallest ceil(T/TOK) is, so TOK=4 gives the largest Ks
  * per token): about 17 MB at worst for T in 9..255 with the default
- * min_tg=256. */
+ * min_tg=256.  This is an upper bound only (it ignores pos0 and the >=1024
+ * keys-per-part floor the actual call applies), so it is always >= the
+ * floats a real call with the same n_tokens actually needs. */
 uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim);
+/* Ks used by the most recent ds4_gpu_qwen35_attn_flash_tensor call (1 when
+ * that call took no split, either because part was NULL or because the
+ * split rule itself came out at Ks == 1). Test hook. */
+uint32_t ds4_gpu_qwen35_attn_flash_last_splits(void);
 /* ik_ring != 0: ik_cache keeps only the last ik_ring raw indexer keys, row pos % ik_ring. */
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,

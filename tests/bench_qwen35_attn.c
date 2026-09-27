@@ -81,7 +81,7 @@ static double time_ms(bench_fn fn, void *ctx, int warm, int reps) {
 }
 
 typedef struct {
-    ds4_gpu_tensor *q, *gate, *out, *part, *part3, *kc, *vc;
+    ds4_gpu_tensor *q, *gate, *out, *part, *part3, *part_flash, *kc, *vc;
     uint32_t pos0, T, rows;
     float scale;
 } bench_ctx;
@@ -95,6 +95,11 @@ static int run_prefill_mm(void *p) {       /* today's prefill: kernel_qwen4_attn
 static int run_flash(void *p) {            /* M5 successor for T>8 prefill: flash (query-token tiles) */
     bench_ctx *c = p;
     return ds4_gpu_qwen35_attn_flash_tensor(c->out, c->q, c->gate, c->kc, c->vc, NULL,
+                                            c->T, H, HKV, D, c->pos0, c->scale);
+}
+static int run_flash_split(void *p) {      /* Task 4: same, with the key split engaged via `part` */
+    bench_ctx *c = p;
+    return ds4_gpu_qwen35_attn_flash_tensor(c->out, c->q, c->gate, c->kc, c->vc, c->part_flash,
                                             c->T, H, HKV, D, c->pos0, c->scale);
 }
 static int run_decode2(void *p) {          /* today's decode / verify: L12 */
@@ -134,7 +139,17 @@ int main(int argc, char **argv) {
     c.out = ds4_gpu_tensor_alloc(2048ull * H * D * sizeof(float));
     c.part = ds4_gpu_tensor_alloc(ds4_gpu_qwen4_attn_part_floats(2048u, H, D) * sizeof(float));
     c.part3 = ds4_gpu_tensor_alloc(ds4_gpu_qwen35_attn_part3_floats(2u, H, D) * sizeof(float));
-    need(c.out && c.part && c.part3, "output buffers");
+    {
+        /* Size for the largest min_tg this bench forces (4096, for the T=2048
+         * forced-split case below) as well as the default (128 short chunks). */
+        setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", "4096", 1);
+        const uint64_t pf2048 = ds4_gpu_qwen35_attn_flash_part_floats(2048u, H, D);
+        unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+        const uint64_t pf128 = ds4_gpu_qwen35_attn_flash_part_floats(128u, H, D);
+        const uint64_t pf_max = pf2048 > pf128 ? pf2048 : pf128;
+        c.part_flash = ds4_gpu_tensor_alloc(pf_max * sizeof(float));
+    }
+    need(c.out && c.part && c.part3 && c.part_flash, "output buffers");
 
     if (do_prefill) {
         const uint32_t pos[3] = { 0u, 30720u, 122880u };
@@ -146,6 +161,37 @@ int main(int argc, char **argv) {
             setenv("DS4_QWEN35_ATTN_FLASH_TOK", "4", 1);
             report("attn_flash_tok4", "prefill", c.pos0, c.T, 0, time_ms(run_flash, &c, 1, 3));
         }
+        unsetenv("DS4_QWEN35_ATTN_FLASH_TOK");
+
+        /* Task 4: key split at long context, T=2048 forced into the split path
+         * (a 2048-token chunk already gives plenty of threadgroups, so the
+         * split rule naturally picks Ks=1 here -- MIN_TG=4096 forces a split
+         * anyway, to see its overhead/benefit at the chunk size this project
+         * actually runs prefill at), and T=128 short chunks at the same long
+         * positions, where the split rule engages on its own (default
+         * min_tg). */
+        const uint32_t split_pos[2] = { 30720u, 122880u };
+        for (int i = 0; i < 2; i++) {
+            c.pos0 = split_pos[i]; c.T = 2048u; c.rows = 0;
+            setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", "4096", 1);
+            setenv("DS4_QWEN35_ATTN_FLASH_TOK", "2", 1);
+            report("flash_tok2_split", "prefill", c.pos0, c.T, 0, time_ms(run_flash_split, &c, 1, 3));
+            setenv("DS4_QWEN35_ATTN_FLASH_TOK", "4", 1);
+            report("flash_tok4_split", "prefill", c.pos0, c.T, 0, time_ms(run_flash_split, &c, 1, 3));
+            unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+        }
+        unsetenv("DS4_QWEN35_ATTN_FLASH_TOK");
+
+        for (int i = 0; i < 2; i++) {
+            c.pos0 = split_pos[i]; c.T = 128u; c.rows = 0;
+            setenv("DS4_QWEN35_ATTN_FLASH_TOK", "2", 1);
+            report("flash_tok2", "prefill", c.pos0, c.T, 0, time_ms(run_flash, &c, 1, 3));
+            report("flash_tok2_split", "prefill", c.pos0, c.T, 0, time_ms(run_flash_split, &c, 1, 3));
+            setenv("DS4_QWEN35_ATTN_FLASH_TOK", "4", 1);
+            report("flash_tok4", "prefill", c.pos0, c.T, 0, time_ms(run_flash, &c, 1, 3));
+            report("flash_tok4_split", "prefill", c.pos0, c.T, 0, time_ms(run_flash_split, &c, 1, 3));
+        }
+        unsetenv("DS4_QWEN35_ATTN_FLASH_TOK");
     }
     if (do_decode) {
         const uint32_t pos[3] = { 2048u, 32768u, 131072u };
@@ -158,6 +204,6 @@ int main(int argc, char **argv) {
     }
     ds4_gpu_tensor_free(c.kc); ds4_gpu_tensor_free(c.vc); ds4_gpu_tensor_free(c.q);
     ds4_gpu_tensor_free(c.gate); ds4_gpu_tensor_free(c.out); ds4_gpu_tensor_free(c.part);
-    ds4_gpu_tensor_free(c.part3);
+    ds4_gpu_tensor_free(c.part3); ds4_gpu_tensor_free(c.part_flash);
     return 0;
 }

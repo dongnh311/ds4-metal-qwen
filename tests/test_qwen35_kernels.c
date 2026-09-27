@@ -1010,6 +1010,12 @@ int main(void) {
     test_attn_flash(&arena, 37u, 65u, 0);
     test_attn_flash(&arena, 37u, 200u, 0);
     test_attn_flash(&arena, 4096u, 64u, 0);
+    setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", "4096", 1);   /* force key splits on short caches */
+    test_attn_flash(&arena, 4096u, 64u, 1);
+    require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=64)");
+    test_attn_flash(&arena, 8000u, 200u, 1);
+    require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=200)");
+    unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
     printf("qwen35 kernels: ok\n");
     return 0;
 }

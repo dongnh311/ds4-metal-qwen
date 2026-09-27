@@ -49555,6 +49555,8 @@ enum {
     QWEN4_K_QWEN35_ATTN_MERGE3,
     QWEN4_K_QWEN35_ATTN_FLASH_TOK2,
     QWEN4_K_QWEN35_ATTN_FLASH_TOK4,
+    QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK2,
+    QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK4,
     QWEN4_K_COUNT,
 };
 
@@ -49703,6 +49705,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_attn_merge3",
     "kernel_qwen35_attn_flash_tok2_kt16",
     "kernel_qwen35_attn_flash_tok4_kt8",
+    "kernel_qwen35_attn_flash_split_tok2_kt16",
+    "kernel_qwen35_attn_flash_split_tok4_kt8",
 };
 
 typedef struct {
@@ -51239,23 +51243,28 @@ static uint32_t qwen35_attn_flash_tok(void) {
     return v == 4 ? 4u : 2u;
 }
 
-/* Host cap used only to size the (not yet implemented) key-split scratch;
- * see ds4_gpu_qwen35_attn_flash_part_floats. Read fresh on every call.
- * Invalid or < 1 falls back to 256. */
+/* Host cap used to size the flash key-split scratch and to decide whether a
+ * given call takes a split at all; see ds4_gpu_qwen35_attn_flash_part_floats
+ * and qwen35_attn_flash_splits below. Read fresh on every call, never
+ * cached, so a mid-process setenv (Task 4's own tests and bench) always
+ * takes effect. Invalid or < 1 falls back to 256. */
 static uint32_t qwen35_attn_flash_min_tg(void) {
     const char *env = getenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
     const int v = env ? atoi(env) : 0;
     return v > 0 ? (uint32_t)v : 256u;
 }
 
-/* Upper bound on the key-split scratch a future flash key split (Task 4)
- * will need, over both TOK instances and every pos0, given the split rule
+/* Upper bound on the key-split scratch flash's key split (Task 4) needs,
+ * over both TOK instances and every pos0, given the split rule
  * Ks = min(QWEN35_ATTN_MAX_SPLITS, ceil(min_tg / (Hkv * ceil(T/TOK)))) with
  * min_tg = DS4_QWEN35_ATTN_FLASH_MIN_TG (default 256). n_head_kv is not a
  * parameter of this function, so it bounds with Hkv = 1 (the smallest
  * possible, hence the largest Ks) and TOK = 4 (the largest instance, so
  * ceil(T/TOK) is the smallest denominator among the two instances, again
- * the largest Ks): about 17 MB at worst for T in 9..255 with the default. */
+ * the largest Ks): about 17 MB at worst for T in 9..255 with the default.
+ * This ignores pos0 and the >=1024-keys-per-part floor a real call also
+ * applies (both only ever shrink Ks further), so it is always an upper
+ * bound on what a real call with the same n_tokens actually needs. */
 uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
     const uint32_t min_tg = qwen35_attn_flash_min_tg();
     const uint32_t blocks = (n_tokens + 3u) / 4u;   /* ceil(T / 4) */
@@ -51265,15 +51274,63 @@ uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_hea
     return (uint64_t)n_tokens * n_head * ks * (2u + head_dim);
 }
 
+/* Ks used by the most recent ds4_gpu_qwen35_attn_flash_tensor call. Test
+ * hook (ruling R8); not thread-safe, like the rest of this file's dispatch
+ * state. */
+static uint32_t g_qwen35_attn_flash_last_splits = 1u;
+uint32_t ds4_gpu_qwen35_attn_flash_last_splits(void) { return g_qwen35_attn_flash_last_splits; }
+
+/* Task 4's split geometry (controller ruling R8): over the whole key range
+ * [0, n_last), n_last = pos0 + n_tokens --
+ *   Ks = min(QWEN35_ATTN_MAX_SPLITS, ceil(min_tg / (Hkv * ceil(T/TOK)))),
+ *   reduced so each part keeps >= 1024 keys (Ks <= max(1, n_last / 1024)),
+ *   then kps = ceil(n_last / Ks) and Ks re-derived as ceil(n_last / kps) so
+ *   no part is ever empty -- the same no-empty rule decode3 already applies
+ *   in qwen35_attn_row_splits3 above. Ks == 1 means "no split", exactly
+ *   today's single dispatch. */
+static void qwen35_attn_flash_splits(uint32_t n_last, uint32_t n_head_kv, uint32_t blocks,
+                                     uint32_t *n_splits, uint32_t *keys_per_split) {
+    const uint32_t min_tg = qwen35_attn_flash_min_tg();
+    const uint32_t denom = n_head_kv * blocks;
+    uint32_t ks = denom > 0u ? (min_tg + denom - 1u) / denom : min_tg;
+    if (ks < 1u) ks = 1u;
+    if (ks > QWEN35_ATTN_MAX_SPLITS) ks = QWEN35_ATTN_MAX_SPLITS;
+    uint32_t max_by_1024 = n_last / 1024u;
+    if (max_by_1024 < 1u) max_by_1024 = 1u;
+    if (ks > max_by_1024) ks = max_by_1024;
+    const uint32_t kps = (n_last + ks - 1u) / ks;
+    ks = (n_last + kps - 1u) / kps;
+    *n_splits = ks;
+    *keys_per_split = kps;
+}
+
+/* Mirrors metal/qwen35.metal's ds4_metal_args_qwen35_attn_flash_split field
+ * for field. */
+struct ds4_qwen35_attn_flash_split_args {
+    uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0;
+    uint32_t kps, n_splits;
+    float scale;
+};
+
 /* M5 flash prefill attention (rework ruling R6/R7's successor to attn_mm for
  * long prefills): TOK query tokens (x 8 query heads, Ornith's group) share
  * every K/V tile instead of kernel_qwen4_attn_mm's one (kv head, token)
  * threadgroup with its 8-of-16 padded rows.  T tokens at positions
  * pos0..pos0+T-1 (their K/V already written), causal, F16 K/V only,
- * head_dim must be 256 and n_head/n_head_kv must be 8.  `part` is not yet
- * implemented (a future task adds the key split); this wrapper refuses a
- * non-NULL part. T <= 8 is refused too -- attn_decode_tensor's own cutover
- * keeps short prefill tails on the decode/attn_mm arithmetic. */
+ * head_dim must be 256 and n_head/n_head_kv must be 8. T <= 8 is refused --
+ * attn_decode_tensor's own cutover keeps short prefill tails on the
+ * decode/attn_mm arithmetic.
+ *
+ * `part == NULL` never splits. `part != NULL` first derives Ks via
+ * qwen35_attn_flash_splits (Task 4, ruling R8); Ks == 1 then behaves exactly
+ * like `part == NULL` (a single kernel_qwen35_attn_flash dispatch straight
+ * to `out`, no merge). Ks > 1 instead dispatches kernel_qwen35_attn_flash_
+ * split over grid (Hkv, blocks, Ks) into `part`, then kernel_qwen35_attn_
+ * merge3 folds the Ks partials per token and applies the gate, writing
+ * `out`. `part` is bound with the exact bytes the chosen Ks needs (Task 4's
+ * scratch-safety ruling), so an undersized buffer fails the bind rather
+ * than overrunning it; ds4_gpu_qwen35_attn_flash_part_floats sizes the
+ * worst case for a caller that does not want to recompute Ks itself. */
 int ds4_gpu_qwen35_attn_flash_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
@@ -51284,26 +51341,57 @@ int ds4_gpu_qwen35_attn_flash_tensor(
                 head_dim, n_head, n_head_kv, n_tokens);
         return 0;
     }
-    if (part) {
-        fprintf(stderr, "ds4: qwen35 attn flash key split not implemented\n");
-        return 0;
-    }
     const uint32_t tok = qwen35_attn_flash_tok();
-    struct ds4_qwen35_attn_flash_args args = { n_tokens, n_head, n_head_kv, head_dim, pos0, scale };
+    const uint32_t blocks = (n_tokens + tok - 1u) / tok;
+    uint32_t ks = 1u, kps = n_tokens + pos0;
+    if (part) qwen35_attn_flash_splits(pos0 + n_tokens, n_head_kv, blocks, &ks, &kps);
+    g_qwen35_attn_flash_last_splits = ks;
+
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
-    qwen4_bind b[5];
-    if (!qwen4_bind_tensor(&b[0], q, q_bytes, "flash q") ||
-        !qwen4_bind_tensor(&b[1], gate, q_bytes, "flash gate") ||
-        !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "flash k cache") ||
-        !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "flash v cache") ||
-        !qwen4_bind_tensor(&b[4], out, q_bytes, "flash out")) {
+
+    if (ks <= 1u) {
+        struct ds4_qwen35_attn_flash_args args = { n_tokens, n_head, n_head_kv, head_dim, pos0, scale };
+        qwen4_bind b[5];
+        if (!qwen4_bind_tensor(&b[0], q, q_bytes, "flash q") ||
+            !qwen4_bind_tensor(&b[1], gate, q_bytes, "flash gate") ||
+            !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "flash k cache") ||
+            !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "flash v cache") ||
+            !qwen4_bind_tensor(&b[4], out, q_bytes, "flash out")) {
+            return 0;
+        }
+        const int kernel = tok == 4u ? QWEN4_K_QWEN35_ATTN_FLASH_TOK4 : QWEN4_K_QWEN35_ATTN_FLASH_TOK2;
+        return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
+                              MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(32u * 2u * tok, 1, 1), 0)
+               ? 1 : 0;
+    }
+
+    /* Ks > 1: split into `part`, then merge. */
+    struct ds4_qwen35_attn_flash_split_args sargs =
+        { n_tokens, n_head, n_head_kv, head_dim, pos0, kps, ks, scale };
+    const uint64_t part_floats = (uint64_t)n_tokens * n_head * ks * (2u + head_dim);
+    qwen4_bind sb[4];
+    if (!qwen4_bind_tensor(&sb[0], q, q_bytes, "flash split q") ||
+        !qwen4_bind_tensor(&sb[1], k_cache, cache_bytes, "flash split k cache") ||
+        !qwen4_bind_tensor(&sb[2], v_cache, cache_bytes, "flash split v cache") ||
+        !qwen4_bind_tensor(&sb[3], part, part_floats * sizeof(float), "flash split part")) {
         return 0;
     }
-    const uint32_t blocks = (n_tokens + tok - 1u) / tok;
-    const int kernel = tok == 4u ? QWEN4_K_QWEN35_ATTN_FLASH_TOK4 : QWEN4_K_QWEN35_ATTN_FLASH_TOK2;
-    return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
-                          MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(32u * 2u * tok, 1, 1), 0)
+    const int split_kernel = tok == 4u ? QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK4 : QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK2;
+    if (!qwen4_dispatch(split_kernel, &sargs, sizeof(sargs), sb, 4,
+                        MTLSizeMake(n_head_kv, blocks, ks), MTLSizeMake(32u * 2u * tok, 1, 1), 0)) {
+        return 0;
+    }
+    struct ds4_qwen35_attn_decode3_args margs =
+        { n_head, n_head_kv, head_dim, pos0, n_tokens, ks, kps, ks, kps, scale };
+    qwen4_bind mb[3];
+    mb[0] = sb[3];   /* part, already bound above */
+    if (!qwen4_bind_tensor(&mb[1], gate, q_bytes, "flash merge gate") ||
+        !qwen4_bind_tensor(&mb[2], out, q_bytes, "flash merge out")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_MERGE3, &margs, sizeof(margs), mb, 3,
+                          MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(256, 1, 1), 0)
            ? 1 : 0;
 }
 
