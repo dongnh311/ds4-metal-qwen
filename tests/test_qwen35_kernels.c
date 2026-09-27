@@ -870,7 +870,8 @@ static void test_attn_decode3_rows(arena_t *a, uint32_t pos0, uint32_t split_key
         }
     }
     printf("  attn decode3 pos0=%u: vs host double ref max|d| %.3e (rel %.3e)\n", pos0, worst, worst / sc);
-    require_ok(worst <= 1e-5 * sc, "decode3 within FP noise of the host double reference");
+    /* queries, keys and probabilities are staged as half on the matrix path, like attn_mm */
+    require_ok(worst <= 3e-3 * sc, "decode3 within half-precision staging of the host double reference");
     unsetenv("DS4_QWEN35_ATTN_SPLIT_KEYS");
     free(gq); free(gk); free(pqg); free(pkp); free(pvp); free(pos3); free(q2); free(g2);
     free(shared); free(solo); free(kh); free(vh); free(qraw); free(graw);
