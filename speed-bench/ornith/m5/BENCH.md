@@ -51,3 +51,24 @@ Reading: decode3 is faster than decode2 at every point. At 128K a plain step dro
 K/V tile), i.e. ~19 ms instead of ~53 ms of attention per verify step over 10 layers. Sub-millisecond points move
 by up to 20% between runs (GPU clock state: decode2 at 2048 read 0.395 ms in the baseline run, which ran the
 prefill cases first); compare kernels within one run. Kernel tests in the same window: `qwen35 kernels: ok`.
+
+## attn_flash, no key split (commit 53c5193, 2026-09-27; Task 3)
+
+`./tests/bench_qwen35_attn prefill`, two runs, T = 2048, ms per layer (run 1 / run 2):
+
+| pos | qwen4_attn_mm | flash TOK=2 KT=16 | flash TOK=4 KT=8 |
+|---:|---:|---:|---:|
+| 0 | 15.8 / 14.9 | 7.97 / 7.95 | 8.17 / 8.07 |
+| 30720 | 438.2 / 431.5 | 221.6 / 221.6 | 220.9 / 220.4 |
+| 122880 | 1717.5 / 1713.3 | 879.0 / 871.4 | 1115.8 / 1116.4 |
+
+Kernel tests in the same window, both TOK values, with and without `DS4_METAL_DISABLE_METAL4=1`: `qwen35 kernels: ok`.
+TOK=2 output equals attn_mm bit for bit on all five flash cases (`vs attn_mm 0.000e+00`); TOK=4 differs from it
+by <= 1.2e-4 (it sums the two dim halves of each score through threadgroup memory); both are within 3.4e-4
+relative of the host double reference.
+
+Reading: TOK=2 halves the prefill attention time (no padding rows, two tokens per K/V tile): per 2048-token chunk
+~2.2 s at 30K and ~8.8 s at 123K over 10 layers, down from 4.3 s and 17 s. TOK=4 gains nothing at 30K and loses at
+123K, so the kernel is now bound by matrix throughput, not K/V traffic: at 30K one layer does ~1.07 TFLOP
+(2048 tokens x 16 heads x ~31.7K keys x 1024 flop), i.e. ~4.8 TFLOP/s on the simdgroup-matrix path. TOK=2 is the
+default.
