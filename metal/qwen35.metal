@@ -1841,3 +1841,278 @@ template [[host_name("kernel_qwen35_attn_flash_split_tok4_kt8")]]
 kernel void kernel_qwen35_attn_flash_split<4u, 8u>(
         constant ds4_metal_args_qwen35_attn_flash_split &, device const float *,
         device const half *, device const half *, device float *, uint3, ushort, ushort, ushort);
+
+/* --- M6: prefill attention on the M5 neural accelerators ------------------ */
+
+#ifdef DS4_METAL_HAS_TENSOR
+
+/* A 16x16 accelerator fragment held as 8 values per lane: rows c.y and
+ * c.y + 8, four consecutive columns from c.x (qwen35_nax_coord).  This is
+ * the register layout of MLX's BaseNAXFrag (mlx/backend/metal/kernels/steel/
+ * attn/nax.h, MIT licence, Copyright (c) 2025 Apple Inc.), which matmul2d's
+ * cooperative tensors use for a 16x32x16 simdgroup op.  The four lanes that
+ * share a row differ in lane bits 0 and 3, so row reductions shuffle over
+ * xor 1 and xor 8. */
+typedef vec<float, 8> qwen35_nax_f;
+typedef vec<half, 8>  qwen35_nax_h;
+
+/* relaxed_precision of every accelerator product below; false matches the
+ * Ornith MoE accelerator kernels (Task 1 Step 8 measured both settings) */
+#define QWEN35_NAX_RELAXED false
+
+static inline short2 qwen35_nax_coord(ushort lane) {
+    const short qid = (short)(lane >> 2);
+    const short fm = (qid & 4) | ((short)(lane >> 1) & 3);
+    const short fn = ((qid & 2) | (short)(lane & 1)) * 4;
+    return short2(fn, fm);   /* (column, row) of this lane's first value */
+}
+
+static inline qwen35_nax_f qwen35_nax_zero(void) {
+    qwen35_nax_f f;
+#pragma unroll
+    for (short e = 0; e < 8; e++) f[e] = 0.0f;
+    return f;
+}
+
+/* 16x16 half fragment at p, row stride str */
+static inline qwen35_nax_h qwen35_nax_load(device const half *p, uint str, short2 c) {
+    qwen35_nax_h f;
+#pragma unroll
+    for (short i = 0; i < 2; i++) {
+        const half4 v = *(device const half4 *)(p + (uint64_t)(c.y + i * 8) * str + c.x);
+        f[i * 4 + 0] = v.x; f[i * 4 + 1] = v.y; f[i * 4 + 2] = v.z; f[i * 4 + 3] = v.w;
+    }
+    return f;
+}
+
+/* same, rows at or past lim load as zero (lim <= 0: all zero) */
+static inline qwen35_nax_h qwen35_nax_load_rows(device const half *p, uint str, short2 c, int lim) {
+    qwen35_nax_h f;
+#pragma unroll
+    for (short i = 0; i < 2; i++) {
+        const int r = c.y + i * 8;
+        const half4 v = r < lim ? *(device const half4 *)(p + (uint64_t)r * str + c.x) : half4(0.0h);
+        f[i * 4 + 0] = v.x; f[i * 4 + 1] = v.y; f[i * 4 + 2] = v.z; f[i * 4 + 3] = v.w;
+    }
+    return f;
+}
+
+/* c0|c1 (16x32, F32) += a (16x16) x b0|b1 (the right operand's two 16-column
+ * halves).  TR: the right fragments hold the operand transposed (rows = its
+ * columns), as K does for S = Q K^T. */
+template <bool TR>
+static inline void qwen35_nax_mma(thread qwen35_nax_f &c0, thread qwen35_nax_f &c1, qwen35_nax_h a,
+                                  qwen35_nax_h b0, qwen35_nax_h b1) {
+    constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, TR, QWEN35_NAX_RELAXED,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto ca = op.template get_left_input_cooperative_tensor<half, half, float>();
+    auto cb = op.template get_right_input_cooperative_tensor<half, half, float>();
+    auto cc = op.template get_destination_cooperative_tensor<decltype(ca), decltype(cb), float>();
+#pragma unroll
+    for (short i = 0; i < 8; i++) {
+        ca[i] = a[i];
+        cb[i] = b0[i]; cb[8 + i] = b1[i];
+        cc[i] = c0[i]; cc[8 + i] = c1[i];
+    }
+    op.run(ca, cb, cc);
+#pragma unroll
+    for (short i = 0; i < 8; i++) { c0[i] = cc[i]; c1[i] = cc[8 + i]; }
+}
+
+struct ds4_metal_args_qwen35_attn_qpack {
+    uint32_t n_tokens, n_tokens_pad, n_head, n_head_kv;
+    float scale2;                      /* scale * log2(e): scores come out in log2 units */
+};
+
+/* q [T][H*D] F32 -> qh [Hkv][Tpad][8][256] F16 times scale2, tokens
+ * T..Tpad-1 zero: the 8 * Tpad query rows of one KV head become contiguous
+ * (row stride D), the shape the accelerator fragments load directly.  One
+ * thread per 4 values. */
+kernel void kernel_qwen35_attn_qpack(
+        constant ds4_metal_args_qwen35_attn_qpack & args,
+        device const float *q,
+        device half        *qh,
+        uint gid [[thread_position_in_grid]]) {
+    constexpr uint D = 256u, G = QWEN35_ATTN_GROUP;
+    const uint per_kvh = args.n_tokens_pad * G * D;
+    const uint e = gid * 4u;
+    if (e >= args.n_head_kv * per_kvh) return;
+    const uint kvh = e / per_kvh, rem = e % per_kvh;
+    const uint t = rem / (G * D), g = (rem / D) % G, d = rem % D;
+    half4 v = half4(0.0h);
+    if (t < args.n_tokens) {
+        const float4 x = *(device const float4 *)(q + ((uint64_t)t * args.n_head + kvh * G + g) * D + d);
+        v = half4(x * args.scale2);
+    }
+    *(device half4 *)(qh + e) = v;
+}
+
+struct ds4_metal_args_qwen35_attn_flash_nax {
+    uint32_t n_tokens, n_tokens_pad, n_head, n_head_kv, pos0;
+    uint32_t kps, n_splits;            /* SPLIT: keys per split and split count */
+};
+
+/* M6 flash prefill on the accelerators (T > 8, F16 K/V, head_dim 256, group
+ * 8).  Grid (Hkv, Tpad/8, SPLIT ? Ks : 1), 4 simdgroups: simdgroup sg owns
+ * the 16 query rows of tokens t0 = blk*8 + 2*sg and t0 + 1 (row i*8 + g =
+ * token t0 + i, query head kvh*8 + g), so every K/V fragment it loads serves
+ * all 8 heads.  K/V are read straight from the cache in 32-key blocks; S =
+ * Q K^T and O += P V run on matmul2d (qwen35_nax_mma), P as half; the online
+ * softmax runs in log2 units (scale * log2e folded into qh).  No threadgroup
+ * memory and no barriers: each simdgroup walks its own key range [lo, hi)
+ * (causal: token t sees keys <= pos0 + t), and a lane holds rows c.y and
+ * c.y + 8, i.e. head c.y of both tokens.  Keys at or past the fill
+ * (pos0 + T) load as zero, so V never multiplies memory past the cache fill.
+ * !SPLIT writes the gated output like kernel_qwen35_attn_flash; SPLIT writes
+ * kernel_qwen35_attn_merge3 partials ([T][Hkv][Ks][8][2+D], m in natural-log
+ * units, a row without keys in its split writes the neutral l = 0). */
+template <bool SPLIT>
+kernel void kernel_qwen35_attn_flash_nax(
+        constant ds4_metal_args_qwen35_attn_flash_nax & args,
+        device const half  *qh,       /* [Hkv][Tpad][8][256] */
+        device const float *gate,     /* [n_tokens][H*D] */
+        device const half  *k_cache,  /* [cap][Hkv*D] */
+        device const half  *v_cache,  /* [cap][Hkv*D] */
+        device float       *out,      /* !SPLIT: [n_tokens][H*D]; SPLIT: merge3 partials */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    constexpr uint D = 256u, G = QWEN35_ATTN_GROUP, KB = 32u;
+    constexpr float NEG = -3.0e38f;    /* finite: this file builds under fast math */
+    const uint kvh = tgpig.x, split = tgpig.z;
+    const uint H = args.n_head, Hkv = args.n_head_kv, T = args.n_tokens;
+    const uint t0 = tgpig.y * 8u + sgitg * 2u;
+    if (kvh >= Hkv || t0 >= T) return;
+    const uint n_fill = args.pos0 + T;
+    const uint lim_row[2] = { args.pos0 + t0, args.pos0 + t0 + 1u };   /* row i sees keys <= lim_row[i] */
+    uint lo = 0u, hi = min(lim_row[1], n_fill - 1u) + 1u;             /* this simdgroup's keys [lo, hi) */
+    if (SPLIT) { lo = split * args.kps; hi = min(hi, lo + args.kps); }
+
+    const short2 c = qwen35_nax_coord(tiisg);
+    const uint kstr = Hkv * D;
+    device const half *qrow = qh + ((uint64_t)kvh * args.n_tokens_pad + t0) * G * D;
+    device const half *kbase = k_cache + (uint64_t)kvh * D;
+    device const half *vbase = v_cache + (uint64_t)kvh * D;
+
+    qwen35_nax_f O[16];
+#pragma unroll
+    for (short j = 0; j < 16; j++) O[j] = qwen35_nax_zero();
+    float m[2] = { NEG, NEG }, l[2] = { 0.0f, 0.0f };
+
+    for (uint kb0 = lo; kb0 < hi; kb0 += KB) {
+        const bool edge = kb0 + KB > n_fill;           /* the block reaches past the fill */
+        const int lim = (int)n_fill - (int)kb0;        /* key rows of this block below the fill */
+        device const half *kp = kbase + (uint64_t)kb0 * kstr;
+        device const half *vp = vbase + (uint64_t)kb0 * kstr;
+
+        qwen35_nax_f S0 = qwen35_nax_zero(), S1 = qwen35_nax_zero();
+#pragma unroll
+        for (short id = 0; id < 16; id++) {
+            const qwen35_nax_h qa = qwen35_nax_load(qrow + id * 16, D, c);
+            const qwen35_nax_h ka = edge ? qwen35_nax_load_rows(kp + id * 16, kstr, c, lim)
+                                         : qwen35_nax_load(kp + id * 16, kstr, c);
+            const qwen35_nax_h kb = edge ? qwen35_nax_load_rows(kp + 16u * kstr + id * 16, kstr, c, lim - 16)
+                                         : qwen35_nax_load(kp + 16u * kstr + id * 16, kstr, c);
+            qwen35_nax_mma<true>(S0, S1, qa, ka, kb);
+        }
+
+        /* mask keys past [lo, hi) and past each row's diagonal */
+        if (kb0 + KB > min(hi, lim_row[0] + 1u)) {
+#pragma unroll
+            for (short i = 0; i < 2; i++) {
+#pragma unroll
+                for (short j = 0; j < 4; j++) {
+                    const uint a = kb0 + (uint)c.x + (uint)j, b = a + 16u;
+                    if (a >= hi || a > lim_row[i]) S0[i * 4 + j] = NEG;
+                    if (b >= hi || b > lim_row[i]) S1[i * 4 + j] = NEG;
+                }
+            }
+        }
+
+        /* online softmax, rows c.y (i = 0) and c.y + 8 (i = 1) */
+#pragma unroll
+        for (short i = 0; i < 2; i++) {
+            float mx = NEG;
+#pragma unroll
+            for (short j = 0; j < 4; j++) mx = max(mx, max(S0[i * 4 + j], S1[i * 4 + j]));
+            mx = max(mx, simd_shuffle_xor(mx, 1));
+            mx = max(mx, simd_shuffle_xor(mx, 8));
+            const float mn = max(m[i], mx);
+            float s = 0.0f;
+#pragma unroll
+            for (short j = 0; j < 4; j++) {
+                const float pa = S0[i * 4 + j] > NEG ? exp2(S0[i * 4 + j] - mn) : 0.0f;
+                const float pb = S1[i * 4 + j] > NEG ? exp2(S1[i * 4 + j] - mn) : 0.0f;
+                S0[i * 4 + j] = pa;
+                S1[i * 4 + j] = pb;
+                s += pa + pb;
+            }
+            s += simd_shuffle_xor(s, 1);
+            s += simd_shuffle_xor(s, 8);
+            const float f = m[i] > NEG ? exp2(m[i] - mn) : 0.0f;
+            l[i] = l[i] * f + s;
+            m[i] = mn;
+#pragma unroll
+            for (short j = 0; j < 16; j++) {
+#pragma unroll
+                for (short jj = 0; jj < 4; jj++) O[j][i * 4 + jj] *= f;
+            }
+        }
+
+        /* O += P V, 16 keys at a time */
+#pragma unroll
+        for (short ik = 0; ik < 2; ik++) {
+            qwen35_nax_h P;
+#pragma unroll
+            for (short e = 0; e < 8; e++) P[e] = (half)(ik == 0 ? S0[e] : S1[e]);
+            device const half *vr = vp + (uint64_t)(ik * 16) * kstr;
+            const int vlim = lim - ik * 16;
+#pragma unroll
+            for (short id = 0; id < 16; id += 2) {
+                const qwen35_nax_h v0 = edge ? qwen35_nax_load_rows(vr + id * 16, kstr, c, vlim)
+                                             : qwen35_nax_load(vr + id * 16, kstr, c);
+                const qwen35_nax_h v1 = edge ? qwen35_nax_load_rows(vr + id * 16 + 16, kstr, c, vlim)
+                                             : qwen35_nax_load(vr + id * 16 + 16, kstr, c);
+                qwen35_nax_mma<false>(O[id], O[id + 1], P, v0, v1);
+            }
+        }
+    }
+
+    const uint g = (uint)c.y;
+#pragma unroll
+    for (short i = 0; i < 2; i++) {
+        const uint t = t0 + (uint)i;
+        if (t >= T) continue;
+        if (!SPLIT) {
+            const float inv = l[i] > 0.0f ? 1.0f / l[i] : 0.0f;
+            const uint64_t at = ((uint64_t)t * H + kvh * G + g) * D;
+#pragma unroll
+            for (short id = 0; id < 16; id++) {
+                const uint d = (uint)(id * 16 + c.x);
+                const float4 gv = *(device const float4 *)(gate + at + d);
+                float4 o;
+                o.x = O[id][i * 4 + 0] * inv * qwen4_sigmoid(gv.x);
+                o.y = O[id][i * 4 + 1] * inv * qwen4_sigmoid(gv.y);
+                o.z = O[id][i * 4 + 2] * inv * qwen4_sigmoid(gv.z);
+                o.w = O[id][i * 4 + 3] * inv * qwen4_sigmoid(gv.w);
+                *(device float4 *)(out + at + d) = o;
+            }
+        } else {
+            device float *dst = out + (uint64_t)t * args.n_splits * H * (2u + D) +
+                                (((uint64_t)kvh * args.n_splits + split) * G + g) * (2u + D);
+            if (c.x == 0) { dst[0] = m[i] * 0.6931471805599453f; dst[1] = l[i]; }
+#pragma unroll
+            for (short id = 0; id < 16; id++) {
+#pragma unroll
+                for (short jj = 0; jj < 4; jj++) dst[2u + (uint)(id * 16 + c.x + jj)] = O[id][i * 4 + jj];
+            }
+        }
+    }
+}
+template [[host_name("kernel_qwen35_attn_flash_nax")]]
+kernel void kernel_qwen35_attn_flash_nax<false>(
+        constant ds4_metal_args_qwen35_attn_flash_nax &, device const half *, device const float *,
+        device const half *, device const half *, device float *, uint3, ushort, ushort);
+
+#endif /* DS4_METAL_HAS_TENSOR */

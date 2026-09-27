@@ -960,6 +960,94 @@ static void test_attn_flash(arena_t *a, uint32_t pos0, uint32_t T, int use_part)
     if (partf) ds4_gpu_tensor_free(partf);
 }
 
+/* flash_nax (M6): causal prefill attention on the accelerator path.  Every
+ * K/V row past the fill is NaN (the cache is 40 rows longer than the fill,
+ * so a 32-key block past it stays inside the buffer): a kernel that
+ * multiplies such a row, even by a zero probability, turns the output
+ * non-finite.  One guard token after the output must keep its sentinel (no
+ * write past T).  Checked against a host double reference (host_ref) and
+ * always against the M5 simdgroup flash.  Returns the Ks the accelerator
+ * call used (0 when the tensor API is unavailable). */
+static uint32_t test_attn_flash_nax(uint32_t pos0, uint32_t T, int use_part, int host_ref) {
+    const uint32_t H = 16, Hkv = 2, D = 256, fill = pos0 + T, cap = fill + 40u;
+    const uint64_t n_out = (uint64_t)T * H * D, row = (uint64_t)H * D, n_kv = (uint64_t)cap * Hkv * D;
+    const float scale = 1.0f / sqrtf((float)D);
+    if (!ds4_gpu_tensor_api_available()) {
+        printf("  attn flash nax pos0=%u T=%u skipped (tensor API unavailable)\n", pos0, T);
+        return 0;
+    }
+    float *qv = rand_vec(n_out, 3.0f), *gv = rand_vec(n_out, 1.0f);
+    uint16_t *kh = malloc(n_kv * sizeof(uint16_t)), *vh = malloc(n_kv * sizeof(uint16_t));
+    for (uint64_t i = 0; i < n_kv; i++) {
+        const int past = i >= (uint64_t)fill * Hkv * D;
+        kh[i] = past ? 0x7e00u : f32_to_f16(frand());   /* half NaN past the fill */
+        vh[i] = past ? 0x7e00u : f32_to_f16(frand());
+    }
+    ds4_gpu_tensor *q = upload(qv, n_out), *gt = upload(gv, n_out);
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc(n_kv * sizeof(uint16_t));
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc(n_kv * sizeof(uint16_t));
+    require_ok(kc && vc && ds4_gpu_tensor_write(kc, 0, kh, n_kv * sizeof(uint16_t)) &&
+               ds4_gpu_tensor_write(vc, 0, vh, n_kv * sizeof(uint16_t)), "nax cache upload");
+    ds4_gpu_tensor *on = upload(NULL, n_out + row), *of = upload(NULL, n_out);
+    ds4_gpu_tensor *part = use_part ? upload(NULL, ds4_gpu_qwen35_attn_flash_part_floats(T, H, D)) : NULL;
+    require_ok(ds4_gpu_tensor_fill_f32(on, -1234.5f, n_out + row), "nax sentinel");
+    require_ok(ds4_gpu_qwen35_attn_flash_nax_tensor(on, q, gt, kc, vc, part, T, H, Hkv, D, pos0, scale),
+               "flash nax call");
+    const uint32_t splits = ds4_gpu_qwen35_attn_flash_last_splits();
+    require_ok(ds4_gpu_qwen35_attn_flash_tensor(of, q, gt, kc, vc, NULL, T, H, Hkv, D, pos0, scale),
+               "flash reference");
+    float *gotn = download(on, n_out + row), *gotf = download(of, n_out);
+
+    uint64_t nonfinite = 0, guard_bad = 0;
+    double worst_f = 0.0, scf = 1e-6, worst_ref = 0.0, sc = 1e-6;
+    for (uint64_t o = 0; o < n_out; o++) {
+        if (!isfinite(gotn[o])) nonfinite++;
+        if (fabs((double)gotf[o]) > scf) scf = fabs((double)gotf[o]);
+        if (fabs((double)gotn[o] - (double)gotf[o]) > worst_f) worst_f = fabs((double)gotn[o] - (double)gotf[o]);
+    }
+    for (uint64_t o = n_out; o < n_out + row; o++) guard_bad += gotn[o] != -1234.5f;
+    if (host_ref) {
+        for (uint32_t t = 0; t < T; t++) {
+            const uint32_t n_keys = pos0 + t + 1u;
+            for (uint32_t h = 0; h < H; h++) {
+                const uint32_t kvh = h / (H / Hkv);
+                double acc[256], m = -1e300, l = 0.0;
+                for (uint32_t d = 0; d < D; d++) acc[d] = 0.0;
+                for (uint32_t idx = 0; idx < n_keys; idx++) {
+                    double s = 0.0;
+                    for (uint32_t d = 0; d < D; d++)
+                        s += (double)qv[((uint64_t)t * H + h) * D + d] * scale *
+                             (double)f16_to_f32(kh[((uint64_t)idx * Hkv + kvh) * D + d]);
+                    const double mn = s > m ? s : m, corr = exp(m - mn), w = exp(s - mn);
+                    l = l * corr + w;
+                    for (uint32_t d = 0; d < D; d++)
+                        acc[d] = acc[d] * corr + w * (double)f16_to_f32(vh[((uint64_t)idx * Hkv + kvh) * D + d]);
+                    m = mn;
+                }
+                for (uint32_t d = 0; d < D; d++) {
+                    const uint64_t o = ((uint64_t)t * H + h) * D + d;
+                    const double refv = acc[d] / l * sigmoid_d((double)gv[o]);
+                    if (fabs(refv) > sc) sc = fabs(refv);
+                    if (fabs((double)gotn[o] - refv) > worst_ref) worst_ref = fabs((double)gotn[o] - refv);
+                }
+            }
+        }
+    }
+    printf("  attn flash nax pos0=%u T=%u splits=%u: vs M5 flash max|d| %.3e (rel %.3e)", pos0, T, splits,
+           worst_f, worst_f / scf);
+    if (host_ref) printf(", vs host double ref rel %.3e", worst_ref / sc);
+    printf("\n");
+    require_ok(nonfinite == 0, "flash nax output finite (no K/V row past the fill multiplied)");
+    require_ok(guard_bad == 0, "flash nax writes nothing past token T");
+    require_ok(worst_f <= 2e-3 * scf, "flash nax within 2e-3 of the M5 simdgroup flash");
+    if (host_ref) require_ok(worst_ref <= 1e-3 * sc, "flash nax within 1e-3 of the host double reference");
+    free(qv); free(gv); free(kh); free(vh); free(gotn); free(gotf);
+    ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(gt); ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc);
+    ds4_gpu_tensor_free(on); ds4_gpu_tensor_free(of);
+    if (part) ds4_gpu_tensor_free(part);
+    return splits;
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)512 << 20;
@@ -1020,6 +1108,13 @@ int main(void) {
     test_attn_flash(&arena, 1000u, 1100u, 1);
     require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=1100, neutral partials)");
     unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+    printf("qwen35 attention flash on the neural accelerators (M6)\n");
+    test_attn_flash_nax(0u, 9u, 0, 1);
+    test_attn_flash_nax(0u, 65u, 0, 1);
+    test_attn_flash_nax(37u, 65u, 0, 1);
+    test_attn_flash_nax(37u, 200u, 0, 1);
+    test_attn_flash_nax(4096u, 64u, 0, 1);
+    test_attn_flash_nax(30720u, 2048u, 0, 0);   /* long context: accelerator drift vs the simdgroup flash */
     printf("qwen35 kernels: ok\n");
     return 0;
 }

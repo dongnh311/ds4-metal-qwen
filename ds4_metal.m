@@ -49557,6 +49557,8 @@ enum {
     QWEN4_K_QWEN35_ATTN_FLASH_TOK4,
     QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK2,
     QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK4,
+    QWEN4_K_QWEN35_ATTN_QPACK,
+    QWEN4_K_QWEN35_ATTN_FLASH_NAX,
     QWEN4_K_COUNT,
 };
 
@@ -49707,6 +49709,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_attn_flash_tok4_kt8",
     "kernel_qwen35_attn_flash_split_tok2_kt16",
     "kernel_qwen35_attn_flash_split_tok4_kt8",
+    "kernel_qwen35_attn_qpack",
+    "kernel_qwen35_attn_flash_nax",
 };
 
 typedef struct {
@@ -51400,6 +51404,80 @@ int ds4_gpu_qwen35_attn_flash_tensor(
     }
     return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_MERGE3, &margs, sizeof(margs), mb, 3,
                           MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(256, 1, 1), 0)
+           ? 1 : 0;
+}
+
+/* Defined with the MoE accelerator helpers further down. */
+static ds4_gpu_tensor *qwen4_nax_scratch(ds4_gpu_tensor **slot, uint64_t *slot_bytes, uint64_t bytes);
+
+/* Mirrors metal/qwen35.metal's ds4_metal_args_qwen35_attn_qpack. */
+struct ds4_qwen35_attn_qpack_args {
+    uint32_t n_tokens, n_tokens_pad, n_head, n_head_kv;
+    float scale2;
+};
+
+/* Mirrors metal/qwen35.metal's ds4_metal_args_qwen35_attn_flash_nax. */
+struct ds4_qwen35_attn_flash_nax_args {
+    uint32_t n_tokens, n_tokens_pad, n_head, n_head_kv, pos0;
+    uint32_t kps, n_splits;
+};
+
+/* Packed queries of the accelerator flash: [Hkv][ceil8(T)][8][256] half,
+ * grown on first use and kept (one buffer serves every layer). */
+static ds4_gpu_tensor *g_qwen35_attn_qh;
+static uint64_t g_qwen35_attn_qh_bytes;
+
+/* M6 flash prefill on the M5 neural accelerators: the contract of
+ * ds4_gpu_qwen35_attn_flash_tensor (T > 8 tokens at pos0.., causal, F16
+ * K/V, head_dim 256, group 8, gated output) computed by
+ * kernel_qwen35_attn_qpack + kernel_qwen35_attn_flash_nax.  Needs the Metal
+ * 4 tensor API (ds4_gpu_mpp_available(): not under --quality, not before
+ * M5/A19, not with DS4_METAL_DISABLE_METAL4=1) and refuses otherwise, so
+ * the caller picks the M5 flash instead.  `part` must be NULL until the key
+ * split lands (M6 Task 3). */
+int ds4_gpu_qwen35_attn_flash_nax_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, float scale) {
+    if (!ds4_gpu_mpp_available() || head_dim != 256u || n_head_kv == 0u || (n_head % n_head_kv) != 0u ||
+        n_head / n_head_kv != 8u || n_tokens <= 8u || part != NULL) {
+        fprintf(stderr, "ds4: qwen35 attn flash nax refuses tensor_api=%d head_dim=%u n_head=%u n_head_kv=%u "
+                        "n_tokens=%u part=%s\n", ds4_gpu_mpp_available(), head_dim, n_head, n_head_kv, n_tokens,
+                part ? "set" : "null");
+        return 0;
+    }
+    const uint32_t t_pad = (n_tokens + 7u) & ~7u;
+    const uint64_t qh_count = (uint64_t)n_head_kv * t_pad * 8u * head_dim;
+    ds4_gpu_tensor *qh = qwen4_nax_scratch(&g_qwen35_attn_qh, &g_qwen35_attn_qh_bytes, qh_count * sizeof(uint16_t));
+    if (!qh) return 0;
+    const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
+    const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
+
+    struct ds4_qwen35_attn_qpack_args pargs = { n_tokens, t_pad, n_head, n_head_kv, scale * 1.4426950408889634f };
+    qwen4_bind pb[2];
+    if (!qwen4_bind_tensor(&pb[0], q, q_bytes, "flash nax q") ||
+        !qwen4_bind_tensor(&pb[1], qh, qh_count * sizeof(uint16_t), "flash nax packed q")) {
+        return 0;
+    }
+    const uint32_t n4 = (uint32_t)(qh_count / 4u);
+    if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_QPACK, &pargs, sizeof(pargs), pb, 2,
+                        MTLSizeMake((n4 + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0)) {
+        return 0;
+    }
+
+    const uint32_t blocks = t_pad / 8u;
+    g_qwen35_attn_flash_last_splits = 1u;
+    struct ds4_qwen35_attn_flash_nax_args args = { n_tokens, t_pad, n_head, n_head_kv, pos0, pos0 + n_tokens, 1u };
+    qwen4_bind b[5];
+    b[0] = pb[1];   /* packed queries, already bound above */
+    if (!qwen4_bind_tensor(&b[1], gate, q_bytes, "flash nax gate") ||
+        !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "flash nax k cache") ||
+        !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "flash nax v cache") ||
+        !qwen4_bind_tensor(&b[4], out, q_bytes, "flash nax out")) {
+        return 0;
+    }
+    return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_FLASH_NAX, &args, sizeof(args), b, 5,
+                          MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(128, 1, 1), 0)
            ? 1 : 0;
 }
 

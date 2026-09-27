@@ -3624,6 +3624,13 @@ uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_hea
  * that call took no split, either because part was NULL or because the
  * split rule itself came out at Ks == 1). Test hook. */
 uint32_t ds4_gpu_qwen35_attn_flash_last_splits(void);
+/* M6: ds4_gpu_qwen35_attn_flash_tensor on the M5 neural accelerators (Metal 4
+ * tensor API): same arguments, contract and key-split scratch.  Returns 0
+ * without the tensor API (see ds4_gpu_tensor_api_available). */
+int ds4_gpu_qwen35_attn_flash_nax_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, float scale);
 /* ik_ring != 0: ik_cache keeps only the last ik_ring raw indexer keys, row pos % ik_ring. */
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
