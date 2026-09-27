@@ -778,6 +778,188 @@ static void test_attn_decode2_matches_perrow(arena_t *a, uint32_t pos0) {
     ds4_gpu_tensor_free(gq2); ds4_gpu_tensor_free(gg2); ds4_gpu_tensor_free(o2); ds4_gpu_tensor_free(part2);
 }
 
+/* decode3 (M5): the rows==2 verify call equals two rows==1 calls of the same
+ * kernel bit for bit, and both equal a host double reference within FP noise.
+ * `split_keys` forces small splits so short caches exercise many splits and
+ * the split-count boundaries (ns0 != ns1, kps0 != kps1). Outputs are
+ * sentinel-filled before every call so a kernel that writes nothing fails. */
+static void test_attn_decode3_rows(arena_t *a, uint32_t pos0, uint32_t split_keys) {
+    const uint32_t H = 16, Hkv = 2, D = 256, n_rot = 64, fill = pos0 + 2u;
+    const uint32_t cap = fill + 8u;
+    const float scale = 1.0f / sqrtf((float)D);
+    char sk[16];
+    snprintf(sk, sizeof(sk), "%u", split_keys);
+    setenv("DS4_QWEN35_ATTN_SPLIT_KEYS", sk, 1);
+    double *gq, *gk;
+    const uint64_t gq_off = arena_f32(a, D, &gq, 0.5f, 1.5f);
+    const uint64_t gk_off = arena_f32(a, D, &gk, 0.5f, 1.5f);
+    float *pqg = rand_vec((uint64_t)fill * H * 2 * D, 1.0f);
+    float *pkp = rand_vec((uint64_t)fill * Hkv * D, 1.0f), *pvp = rand_vec((uint64_t)fill * Hkv * D, 1.0f);
+    uint32_t *pos3 = malloc((uint64_t)cap * 4u * sizeof(uint32_t));
+    for (uint32_t p = 0; p < cap; p++) { pos3[p * 4] = pos3[p * 4 + 1] = pos3[p * 4 + 2] = p; pos3[p * 4 + 3] = 0; }
+    ds4_gpu_tensor *gqg = upload(pqg, (uint64_t)fill * H * 2 * D);
+    ds4_gpu_tensor *gkp = upload(pkp, (uint64_t)fill * Hkv * D), *gvp = upload(pvp, (uint64_t)fill * Hkv * D);
+    ds4_gpu_tensor *pq = upload(NULL, (uint64_t)fill * H * D), *pg = upload(NULL, (uint64_t)fill * H * D);
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *gpos = ds4_gpu_tensor_alloc((uint64_t)cap * 16u);
+    require_ok(kc && vc && gpos && ds4_gpu_tensor_write(gpos, 0, pos3, (uint64_t)cap * 16u), "decode3 fill buffers");
+    require_ok(ds4_gpu_qwen35_attn_prep_tensor(pq, pg, kc, vc, gqg, gkp, gvp, gpos, a->base, a->size,
+                   gq_off, gk_off, fill, H, Hkv, D, n_rot, 0u, cap, 1.0e7f, 1e-6f, kc, vc, kc, vc, 0u),
+               "decode3 fill");
+
+    float *q2 = rand_vec(2ull * H * D, 1.0f), *g2 = rand_vec(2ull * H * D, 1.0f);
+    ds4_gpu_tensor *gq2 = upload(q2, 2ull * H * D), *gg2 = upload(g2, 2ull * H * D);
+    ds4_gpu_tensor *o2 = upload(NULL, 2ull * H * D);
+    ds4_gpu_tensor *part2 = upload(NULL, ds4_gpu_qwen35_attn_part3_floats(2u, H, D));
+    require_ok(o2 && part2 && ds4_gpu_tensor_fill_f32(o2, -1234.5f, 2ull * H * D), "decode3 sentinel rows=2");
+    require_ok(ds4_gpu_qwen35_attn_decode3_tensor(o2, gq2, gg2, kc, vc, part2, H, Hkv, D, pos0, 2u, scale),
+               "decode3 rows=2");
+    float *shared = download(o2, 2ull * H * D);
+
+    float *solo = malloc(2ull * H * D * sizeof(float));
+    for (uint32_t r = 0; r < 2u; r++) {
+        ds4_gpu_tensor *qr = ds4_gpu_tensor_view(gq2, (uint64_t)r * H * D * sizeof(float), (uint64_t)H * D * sizeof(float));
+        ds4_gpu_tensor *gr = ds4_gpu_tensor_view(gg2, (uint64_t)r * H * D * sizeof(float), (uint64_t)H * D * sizeof(float));
+        ds4_gpu_tensor *orow = upload(NULL, (uint64_t)H * D);
+        ds4_gpu_tensor *part1 = upload(NULL, ds4_gpu_qwen35_attn_part3_floats(1u, H, D));
+        require_ok(qr && gr && orow && part1 && ds4_gpu_tensor_fill_f32(orow, -1234.5f, (uint64_t)H * D),
+                   "decode3 sentinel rows=1");
+        require_ok(ds4_gpu_qwen35_attn_decode3_tensor(orow, qr, gr, kc, vc, part1, H, Hkv, D, pos0 + r, 1u, scale),
+                   "decode3 rows=1");
+        float *rr = download(orow, (uint64_t)H * D);
+        memcpy(solo + (uint64_t)r * H * D, rr, (uint64_t)H * D * sizeof(float));
+        free(rr);
+        ds4_gpu_tensor_free(qr); ds4_gpu_tensor_free(gr); ds4_gpu_tensor_free(orow); ds4_gpu_tensor_free(part1);
+    }
+    const int same = memcmp(shared, solo, 2ull * H * D * sizeof(float)) == 0;
+    printf("  attn decode3 pos0=%u split_keys=%u: rows=2 vs two rows=1 memcmp %s\n",
+           pos0, split_keys, same ? "== 0" : "DIFFERS");
+    require_ok(same, "decode3 rows=2 matches two rows=1 calls of the same kernel");
+
+    /* host double reference over the packed F16 cache */
+    uint16_t *kh = malloc((uint64_t)cap * Hkv * D * 2u), *vh = malloc((uint64_t)cap * Hkv * D * 2u);
+    require_ok(ds4_gpu_tensor_read(kc, 0, kh, (uint64_t)cap * Hkv * D * 2u) &&
+               ds4_gpu_tensor_read(vc, 0, vh, (uint64_t)cap * Hkv * D * 2u), "decode3 cache read");
+    float *qraw = download(gq2, 2ull * H * D), *graw = download(gg2, 2ull * H * D);
+    double worst = 0.0, sc = 1e-6;
+    for (uint32_t r = 0; r < 2u; r++) {
+        const uint32_t n_keys = pos0 + r + 1u;
+        for (uint32_t h = 0; h < H; h++) {
+            const uint32_t kvh = h / (H / Hkv);
+            double acc[256], m = -1e300, l = 0.0;
+            for (uint32_t d = 0; d < D; d++) acc[d] = 0.0;
+            for (uint32_t idx = 0; idx < n_keys; idx++) {
+                double s = 0.0;
+                for (uint32_t d = 0; d < D; d++)
+                    s += (double)qraw[((uint64_t)r * H + h) * D + d] * scale *
+                         (double)f16_to_f32(kh[((uint64_t)idx * Hkv + kvh) * D + d]);
+                const double mn = s > m ? s : m, corr = exp(m - mn), w = exp(s - mn);
+                l = l * corr + w;
+                for (uint32_t d = 0; d < D; d++)
+                    acc[d] = acc[d] * corr + w * (double)f16_to_f32(vh[((uint64_t)idx * Hkv + kvh) * D + d]);
+                m = mn;
+            }
+            for (uint32_t d = 0; d < D; d++) {
+                const double sig = 1.0 / (1.0 + exp(-(double)graw[((uint64_t)r * H + h) * D + d]));
+                const double refv = acc[d] / l * sig;
+                const double got = (double)shared[((uint64_t)r * H + h) * D + d];
+                if (fabs(refv) > sc) sc = fabs(refv);
+                if (fabs(got - refv) > worst) worst = fabs(got - refv);
+            }
+        }
+    }
+    printf("  attn decode3 pos0=%u: vs host double ref max|d| %.3e (rel %.3e)\n", pos0, worst, worst / sc);
+    /* queries, keys and probabilities are staged as half on the matrix path, like attn_mm */
+    require_ok(worst <= 3e-3 * sc, "decode3 within half-precision staging of the host double reference");
+    unsetenv("DS4_QWEN35_ATTN_SPLIT_KEYS");
+    free(gq); free(gk); free(pqg); free(pkp); free(pvp); free(pos3); free(q2); free(g2);
+    free(shared); free(solo); free(kh); free(vh); free(qraw); free(graw);
+    ds4_gpu_tensor_free(gqg); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(pq);
+    ds4_gpu_tensor_free(pg); ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc); ds4_gpu_tensor_free(gpos);
+    ds4_gpu_tensor_free(gq2); ds4_gpu_tensor_free(gg2); ds4_gpu_tensor_free(o2); ds4_gpu_tensor_free(part2);
+}
+
+/* attn_flash (M5): causal prefill attention for T tokens at pos0 against a
+ * host double reference and against today's kernel (qwen4 attn_mm via the
+ * qwen4 wrapper). */
+static void test_attn_flash(arena_t *a, uint32_t pos0, uint32_t T, int use_part) {
+    const uint32_t H = 16, Hkv = 2, D = 256, n_rot = 64, fill = pos0 + T, cap = fill + 8u;
+    const float scale = 1.0f / sqrtf((float)D);
+    double *gq, *gk;
+    const uint64_t gq_off = arena_f32(a, D, &gq, 0.5f, 1.5f);
+    const uint64_t gk_off = arena_f32(a, D, &gk, 0.5f, 1.5f);
+    float *pqg = rand_vec((uint64_t)fill * H * 2 * D, 1.0f);
+    float *pkp = rand_vec((uint64_t)fill * Hkv * D, 1.0f), *pvp = rand_vec((uint64_t)fill * Hkv * D, 1.0f);
+    uint32_t *pos3 = malloc((uint64_t)cap * 4u * sizeof(uint32_t));
+    for (uint32_t p = 0; p < cap; p++) { pos3[p * 4] = pos3[p * 4 + 1] = pos3[p * 4 + 2] = p; pos3[p * 4 + 3] = 0; }
+    ds4_gpu_tensor *gqg = upload(pqg, (uint64_t)fill * H * 2 * D);
+    ds4_gpu_tensor *gkp = upload(pkp, (uint64_t)fill * Hkv * D), *gvp = upload(pvp, (uint64_t)fill * Hkv * D);
+    ds4_gpu_tensor *pq = upload(NULL, (uint64_t)fill * H * D), *pg = upload(NULL, (uint64_t)fill * H * D);
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *gpos = ds4_gpu_tensor_alloc((uint64_t)cap * 16u);
+    require_ok(kc && vc && gpos && ds4_gpu_tensor_write(gpos, 0, pos3, (uint64_t)cap * 16u), "flash fill buffers");
+    require_ok(ds4_gpu_qwen35_attn_prep_tensor(pq, pg, kc, vc, gqg, gkp, gvp, gpos, a->base, a->size,
+                   gq_off, gk_off, fill, H, Hkv, D, n_rot, 0u, cap, 1.0e7f, 1e-6f, kc, vc, kc, vc, 0u),
+               "flash fill");
+    /* the last T rows of the prepped q/gate are the queries */
+    ds4_gpu_tensor *qT = ds4_gpu_tensor_view(pq, (uint64_t)pos0 * H * D * sizeof(float), (uint64_t)T * H * D * sizeof(float));
+    ds4_gpu_tensor *gT = ds4_gpu_tensor_view(pg, (uint64_t)pos0 * H * D * sizeof(float), (uint64_t)T * H * D * sizeof(float));
+    ds4_gpu_tensor *of = upload(NULL, (uint64_t)T * H * D), *om = upload(NULL, (uint64_t)T * H * D);
+    /* key-split scratch only for the forced-split cases: its size follows the split rule */
+    ds4_gpu_tensor *partf = use_part ? upload(NULL, ds4_gpu_qwen35_attn_flash_part_floats(T, H, D)) : NULL;
+    require_ok(qT && gT && of && om && (!use_part || partf) &&
+               ds4_gpu_tensor_fill_f32(of, -1234.5f, (uint64_t)T * H * D), "flash buffers");
+    require_ok(ds4_gpu_qwen35_attn_flash_tensor(of, qT, gT, kc, vc, partf, T, H, Hkv, D, pos0, scale), "flash call");
+    require_ok(ds4_gpu_qwen4_attn_decode_tensor(om, qT, gT, kc, vc, NULL, NULL, NULL, T, H, Hkv, D, pos0,
+                   0u, 0u, scale, NULL, NULL, NULL, NULL, 0u), "qwen4 attn reference");
+    float *gotf = download(of, (uint64_t)T * H * D), *gotm = download(om, (uint64_t)T * H * D);
+
+    uint16_t *kh = malloc((uint64_t)cap * Hkv * D * 2u), *vh = malloc((uint64_t)cap * Hkv * D * 2u);
+    require_ok(ds4_gpu_tensor_read(kc, 0, kh, (uint64_t)cap * Hkv * D * 2u) &&
+               ds4_gpu_tensor_read(vc, 0, vh, (uint64_t)cap * Hkv * D * 2u), "flash cache read");
+    float *qraw = download(qT, (uint64_t)T * H * D), *graw = download(gT, (uint64_t)T * H * D);
+    double worst_ref = 0.0, worst_mm = 0.0, sc = 1e-6;
+    for (uint32_t t = 0; t < T; t++) {
+        const uint32_t n_keys = pos0 + t + 1u;
+        for (uint32_t h = 0; h < H; h++) {
+            const uint32_t kvh = h / (H / Hkv);
+            double acc[256], m = -1e300, l = 0.0;
+            for (uint32_t d = 0; d < D; d++) acc[d] = 0.0;
+            for (uint32_t idx = 0; idx < n_keys; idx++) {
+                double s = 0.0;
+                for (uint32_t d = 0; d < D; d++)
+                    s += (double)qraw[((uint64_t)t * H + h) * D + d] * scale *
+                         (double)f16_to_f32(kh[((uint64_t)idx * Hkv + kvh) * D + d]);
+                const double mn = s > m ? s : m, corr = exp(m - mn), w = exp(s - mn);
+                l = l * corr + w;
+                for (uint32_t d = 0; d < D; d++)
+                    acc[d] = acc[d] * corr + w * (double)f16_to_f32(vh[((uint64_t)idx * Hkv + kvh) * D + d]);
+                m = mn;
+            }
+            for (uint32_t d = 0; d < D; d++) {
+                const uint64_t o = ((uint64_t)t * H + h) * D + d;
+                const double refv = acc[d] / l / (1.0 + exp(-(double)graw[o]));
+                if (fabs(refv) > sc) sc = fabs(refv);
+                if (fabs((double)gotf[o] - refv) > worst_ref) worst_ref = fabs((double)gotf[o] - refv);
+                if (fabs((double)gotf[o] - (double)gotm[o]) > worst_mm) worst_mm = fabs((double)gotf[o] - (double)gotm[o]);
+            }
+        }
+    }
+    printf("  attn flash pos0=%u T=%u: vs host double ref max|d| %.3e (rel %.3e), vs attn_mm %.3e\n",
+           pos0, T, worst_ref, worst_ref / sc, worst_mm);
+    /* queries and K/V are staged as half on the matrix path, like attn_mm */
+    require_ok(worst_ref <= 3e-3 * sc, "flash within half-precision staging of the host double reference");
+    require_ok(worst_mm <= 3e-3 * sc, "flash within half-precision staging of qwen4 attn_mm");
+    free(gq); free(gk); free(pqg); free(pkp); free(pvp); free(pos3); free(gotf); free(gotm);
+    free(kh); free(vh); free(qraw); free(graw);
+    ds4_gpu_tensor_free(gqg); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(pq);
+    ds4_gpu_tensor_free(pg); ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc); ds4_gpu_tensor_free(gpos);
+    ds4_gpu_tensor_free(qT); ds4_gpu_tensor_free(gT); ds4_gpu_tensor_free(of); ds4_gpu_tensor_free(om);
+    if (partf) ds4_gpu_tensor_free(partf);
+}
+
 int main(void) {
     arena_t arena;
     arena.size = (uint64_t)512 << 20;
@@ -808,6 +990,15 @@ int main(void) {
     test_attn_decode2_matches_perrow(&arena, 30u);
     test_attn_decode2_matches_perrow(&arena, 31u);
     test_attn_decode2_matches_perrow(&arena, 100u);
+    printf("qwen35 attention decode3 (M5)\n");
+    test_attn_decode3_rows(&arena, 6u, 64u);      /* one split per row */
+    test_attn_decode3_rows(&arena, 62u, 64u);     /* n0 = 63 (1 split), n1 = 64 (1 split, full) */
+    test_attn_decode3_rows(&arena, 63u, 64u);     /* n0 = 64 (1 split), n1 = 65 (2 splits): ns0 != ns1 */
+    test_attn_decode3_rows(&arena, 200u, 16u);    /* shared dispatch, kps 16/16 */
+    test_attn_decode3_rows(&arena, 194u, 16u);    /* same ns 13, kps0 = 15 != kps1 = 16 */
+    test_attn_decode3_rows(&arena, 4200u, 16u);   /* at the 256-split cap: n / 16 > 256 */
+    test_attn_decode3_rows(&arena, 64u, 64u);     /* shared dispatch (ns 2, kps 33): row 1 needs a third tile */
+    test_attn_decode3_rows(&arena, 4112u, 16u);   /* near the cap (ns 242, kps 17), shared dispatch, extra tile */
     printf("qwen4 moe reduce without residual (as Ornith calls it)\n");
     test_reduce_nohc(1, 8, 2048, true);
     test_reduce_nohc(12, 8, 2048, false);
@@ -815,6 +1006,20 @@ int main(void) {
     test_mtp_concat(&arena, 2048, 1);
     test_mtp_concat(&arena, 2048, 7);
     test_mtp_concat(&arena, 256, 3);
+    printf("qwen35 attention flash prefill (M5)\n");
+    test_attn_flash(&arena, 0u, 9u, 0);
+    test_attn_flash(&arena, 0u, 65u, 0);
+    test_attn_flash(&arena, 37u, 65u, 0);
+    test_attn_flash(&arena, 37u, 200u, 0);
+    test_attn_flash(&arena, 4096u, 64u, 0);
+    setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", "4096", 1);   /* force key splits on short caches */
+    test_attn_flash(&arena, 4096u, 64u, 1);
+    require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=64)");
+    test_attn_flash(&arena, 8000u, 200u, 1);
+    require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=200)");
+    test_attn_flash(&arena, 1000u, 1100u, 1);
+    require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=1100, neutral partials)");
+    unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
     printf("qwen35 kernels: ok\n");
     return 0;
 }

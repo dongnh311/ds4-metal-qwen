@@ -1,0 +1,68 @@
+=== target: http://127.0.0.1:18085  model=Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx ===
+
+[1/3] run_benchmarks: HumanEval-mini + GSM8K-mini …
+     HumanEval-mini (17, exec pass@1) …
+      ✅ HE/add                   7.1s  PASS
+      ✅ HE/strlen                2.8s  PASS
+      ✅ HE/gcd                   5.9s  PASS
+      ✅ HE/is_prime              3.0s  PASS
+      ✅ HE/truncate_number       3.6s  PASS
+      ✅ HE/below_zero            2.4s  PASS
+      ✅ HE/largest_divisor       2.4s  PASS
+      ❌ HE/string_xor            6.5s  FAIL: NameError: name 'B' is not defined
+      ✅ HE/rolling_max           2.6s  PASS
+      ✅ HE/all_prefixes          1.7s  PASS
+      ✅ HE/filter_by_substring   3.5s  PASS
+      ✅ HE/longest               2.4s  PASS
+      ✅ HE/count_distinct_characters   1.8s  PASS
+      ❌ HE/triples_sum_to_zero   9.4s  FAIL: NameError: name 'L' is not defined
+      ✅ HE/has_close_elements    7.2s  PASS
+      ✅ HE/separate_paren_groups   9.6s  PASS
+      ✅ HE/sort_even             7.3s  PASS
+     → HumanEval pass@1 = 88% (15/17)
+     GSM8K-mini (16, exact-match) …
+      ✅ gsm/0                    4.4s  got=72 gold=72
+      ✅ gsm/1                    3.7s  got=10 gold=10
+      ✅ gsm/2                    3.8s  got=5 gold=5
+      ✅ gsm/3                    1.9s  got=3 gold=3
+      ✅ gsm/4                    4.3s  got=624 gold=624
+      ✅ gsm/5                    3.6s  got=42 gold=42
+      ✅ gsm/6                    3.0s  got=18 gold=18
+      ✅ gsm/7                    2.1s  got=105 gold=105
+      ✅ gsm/8                    1.7s  got=5 gold=5
+      ✅ gsm/9                    1.7s  got=150 gold=150
+      ✅ gsm/10                   1.6s  got=336 gold=336
+      ✅ gsm/11                   2.0s  got=26 gold=26
+      ✅ gsm/12                   1.5s  got=3 gold=3
+      ✅ gsm/13                   4.6s  got=9 gold=9
+      ✅ gsm/14                   3.1s  got=20 gold=20
+      ✅ gsm/15                   2.9s  got=40 gold=40
+     → GSM8K = 100% (16/16)
+
+[2/3] code_bench: fix_bug / gentest / refactor …
+     fix_bug /factorial  ✗ FAIL rc=1 tbx3cw94z1gc63lwcqv_0lm0000gn/T/tmpsph_30yx/m
+     fix_bug /dedupe     ✓
+     fix_bug /clamp      ✗ FAIL rc=1 m/7tbx3cw94z1gc63lwcqv_0lm0000gn/T/tmp7na6rr_
+     gentest /slugify    ✓
+     gentest /chunk      ✗ FAIL: over-constrained rc=1 [1, 2, 3, 4, 5], 0) == []
+ 
+     gentest /median     ✗ FAIL: over-constrained rc=1 call last):
+  File "/var/fo
+     refactor/letter_grade ✓
+     refactor/count_true ✓
+     refactor/is_leap    ✓
+
+[3/3] review_bench: planted-bug P/R/F1 …
+     auth_db.py     recall 0.833 precision 0.625 f1 0.714 (caught 5/6, raised 8)
+     stats.py       recall 1.0 precision 0.556 f1 0.714 (caught 5/5, raised 9)
+
+============================================================
+SHIFTEDX--ORNITH-1.5-35B-A3B-ABLITERATED-ATTENTION8-BF16RECURRENCE-VISION-MTPLX  sealed intelligence index
+  HumanEval pass@1 : 0.882
+  GSM8K exact      : 1.000
+  code_bench mean  : 0.555  (fix 0.333 / gentest 0.333 / refactor 1.000)
+  review F1        : 0.714
+  --> INDEX        : 78.8   (pass bar 86.6)
+  truncated_total  : 0   errored_total: 0
+  GATE2            : FAIL
+============================================================

@@ -3572,6 +3572,58 @@ int ds4_gpu_qwen35_attn_decode2_tensor(
         uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, uint32_t rows, float scale,
         const ds4_gpu_tensor *k_cache_fp8, const ds4_gpu_tensor *v_cache_fp8,
         const ds4_gpu_tensor *k_scale, const ds4_gpu_tensor *v_scale, uint32_t fp8);
+/* M5 successor to decode2 above, rebuilt on kernel_qwen4_attn_mm's
+ * simdgroup-matrix tiles: more splits (cap 256), 16-key tiles scored via 8x8
+ * matrix multiplies (staged once per tile, shared by both verify rows when
+ * their split geometry matches) instead of a per-key scalar loop, and the
+ * two rows' merges run in one parallel kernel_qwen35_attn_merge3 dispatch.
+ * Same rows contract as decode2: rows==1 a lone decode at pos0, rows==2 the
+ * MTP verify's two rows (pos0, pos0+1); each row's own split geometry never
+ * depends on the other row, so output row r matches a lone rows==1 call at
+ * that row's position bit for bit. F16 K/V only, head_dim must be 256 and
+ * n_head/n_head_kv must be 8 (Ornith's group; no padding for other ratios).
+ * part needs ds4_gpu_qwen35_attn_part3_floats(rows, n_head, head_dim) floats. */
+int ds4_gpu_qwen35_attn_decode3_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, uint32_t rows, float scale);
+/* Scratch floats for `rows` rows at decode3's split cap (256). */
+uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32_t head_dim);
+/* M5 flash prefill attention: TOK query tokens (x 8 query heads, Ornith's
+ * group) per threadgroup share every K/V tile instead of attn_mm's one
+ * (kv head, token) threadgroup with padded 8-of-16 rows.  T query tokens at
+ * positions pos0..pos0+T-1 (their K/V already written), causal, F16 K/V
+ * only, head_dim must be 256 and n_head/n_head_kv must be 8; refuses T <= 8
+ * (attn_decode_tensor's own attn_mm cutover).  `part == NULL` means no key
+ * split.  `part != NULL` splits the key range into Ks parts (the rule is in
+ * ds4_gpu_qwen35_attn_flash_part_floats below) when that helps -- short chunks
+ * at long context, where a lone dispatch is too few threadgroups to fill the
+ * GPU; a 2048-token chunk already gives plenty and Ks comes out as 1, which
+ * behaves exactly like `part == NULL` (no merge dispatch either).  `part`
+ * must be at least ds4_gpu_qwen35_attn_flash_part_floats(n_tokens, n_head,
+ * head_dim) floats for the chosen Ks or the bind fails. */
+int ds4_gpu_qwen35_attn_flash_tensor(
+        ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
+        const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
+        uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, float scale);
+/* Upper bound on the key-split scratch flash's key split will need, over
+ * both TOK instances (2 and 4) and every pos0, given the split rule
+ * Ks = min(QWEN35_ATTN_MAX_SPLITS, ceil(min_tg / (Hkv * ceil(T/TOK)))) with
+ * min_tg = DS4_QWEN35_ATTN_FLASH_MIN_TG (default 256).  n_head_kv is not a
+ * parameter here, but attn_flash_tensor only ever accepts n_head/n_head_kv
+ * == 8, so Hkv = n_head/8 is exact.  TOK = 4 (the larger instance) gives the
+ * smaller ceil(T/TOK), hence the larger Ks, so it is the conservative choice
+ * between the two: about 8.4 MB at worst with TOK = 2 (the default) and
+ * 17 MB with TOK = 4, for the default min_tg=256.  Returns 0 when Ks would
+ * come out at 1 (no split can happen at that T, so no scratch is ever
+ * bound).  This is an upper bound only otherwise (it ignores pos0 and the
+ * >=1024 keys-per-part floor the actual call applies), so it is always >=
+ * the floats a real call with the same n_tokens actually needs. */
+uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim);
+/* Ks used by the most recent ds4_gpu_qwen35_attn_flash_tensor call (1 when
+ * that call took no split, either because part was NULL or because the
+ * split rule itself came out at Ks == 1). Test hook. */
+uint32_t ds4_gpu_qwen35_attn_flash_last_splits(void);
 /* ik_ring != 0: ik_cache keeps only the last ik_ring raw indexer keys, row pos % ik_ring. */
 int ds4_gpu_qwen4_idx_block_key_tensor(
         ds4_gpu_tensor *block_key, const ds4_gpu_tensor *ik_cache, const ds4_gpu_tensor *pos3,
