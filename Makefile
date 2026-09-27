@@ -639,6 +639,16 @@ tests/test_qwen35_kernels.o: tests/test_qwen35_kernels.c ds4_gpu.h ds4.h
 tests/test_qwen35_kernels: tests/test_qwen35_kernels.o ds4_metal.o ds4_image.o
 	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
 
+tests/bench_qwen35_attn.o: tests/bench_qwen35_attn.c ds4.h ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_qwen35_attn: tests/bench_qwen35_attn.o ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: bench-qwen35-attn
+bench-qwen35-attn: tests/bench_qwen35_attn
+	./tests/bench_qwen35_attn all
+
 tests/test_qwen35_session.o: tests/test_qwen35_session.c ds4.h
 	$(CC) $(CFLAGS) -I. -c -o $@ tests/test_qwen35_session.c
 
