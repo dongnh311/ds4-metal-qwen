@@ -1,0 +1,143 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/snap-80db522/ (exe-relative)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.641 ms, residency requested in 109.693 ms, warmup 2.458 ms (mapped 21768.11 MiB from offset 10.50 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 5.50 GiB (raw 5.50 + compressed 0.00) + buffers 1.00 GiB + resident model 21.26 GiB = 27.76 GiB planned
+ds4: memory detail: ctx=262144 prefill_cap=2048 raw_kv_rows=262144 compressed_kv_rows=0 backend=metal
+ds4: memory: KV 5.50 GiB (raw 5.50 + compressed 0.00) + buffers 1.00 GiB = 6.50 GiB context
+ds4: memory detail: ctx=262144 prefill_cap=2048 raw_kv_rows=262144 compressed_kv_rows=0 backend=metal
+ds4: Ornith stage ms/chunk (pos=0 T=2048): gdn 716.9 attn 303.1 head 2.4
+processing 130627 input tokens: 2048/130627 (1.6%)
+ds4: Ornith stage ms/chunk (pos=2048 T=2048): gdn 699.5 attn 245.7 head 2.2
+processing 130627 input tokens: 4096/130627 (3.1%)
+ds4: Ornith stage ms/chunk (pos=4096 T=2048): gdn 702.1 attn 283.1 head 2.1
+processing 130627 input tokens: 6144/130627 (4.7%)
+ds4: Ornith stage ms/chunk (pos=6144 T=2048): gdn 700.9 attn 320.8 head 2.2
+processing 130627 input tokens: 8192/130627 (6.3%)
+ds4: Ornith stage ms/chunk (pos=8192 T=2048): gdn 730.9 attn 381.2 head 2.4
+processing 130627 input tokens: 10240/130627 (7.8%)
+ds4: Ornith stage ms/chunk (pos=10240 T=2048): gdn 786.6 attn 468.8 head 2.4
+processing 130627 input tokens: 12288/130627 (9.4%)
+ds4: Ornith stage ms/chunk (pos=12288 T=2048): gdn 798.7 attn 542.8 head 2.4
+processing 130627 input tokens: 14336/130627 (11.0%)
+ds4: Ornith stage ms/chunk (pos=14336 T=2048): gdn 805.5 attn 594.9 head 2.6
+processing 130627 input tokens: 16384/130627 (12.5%)
+ds4: Ornith stage ms/chunk (pos=16384 T=2048): gdn 831.9 attn 659.5 head 2.3
+processing 130627 input tokens: 18432/130627 (14.1%)
+ds4: Ornith stage ms/chunk (pos=18432 T=2048): gdn 776.1 attn 666.2 head 2.4
+processing 130627 input tokens: 20480/130627 (15.7%)
+ds4: Ornith stage ms/chunk (pos=20480 T=2048): gdn 793.1 attn 727.1 head 2.5
+processing 130627 input tokens: 22528/130627 (17.2%)
+ds4: Ornith stage ms/chunk (pos=22528 T=2048): gdn 793.0 attn 777.7 head 2.3
+processing 130627 input tokens: 24576/130627 (18.8%)
+ds4: Ornith stage ms/chunk (pos=24576 T=2048): gdn 803.5 attn 824.5 head 2.5
+processing 130627 input tokens: 26624/130627 (20.4%)
+ds4: Ornith stage ms/chunk (pos=26624 T=2048): gdn 790.6 attn 871.2 head 2.4
+processing 130627 input tokens: 28672/130627 (21.9%)
+ds4: Ornith stage ms/chunk (pos=28672 T=2048): gdn 791.0 attn 909.1 head 2.6
+processing 130627 input tokens: 30720/130627 (23.5%)
+ds4: Ornith stage ms/chunk (pos=30720 T=2048): gdn 798.1 attn 958.1 head 2.3
+processing 130627 input tokens: 32768/130627 (25.1%)
+ds4: Ornith stage ms/chunk (pos=32768 T=2048): gdn 794.6 attn 1000.8 head 2.4
+processing 130627 input tokens: 34816/130627 (26.7%)
+ds4: Ornith stage ms/chunk (pos=34816 T=2048): gdn 794.1 attn 1050.8 head 2.4
+processing 130627 input tokens: 36864/130627 (28.2%)
+ds4: Ornith stage ms/chunk (pos=36864 T=2048): gdn 793.5 attn 1105.6 head 2.4
+processing 130627 input tokens: 38912/130627 (29.8%)
+ds4: Ornith stage ms/chunk (pos=38912 T=2048): gdn 796.3 attn 1156.6 head 2.4
+processing 130627 input tokens: 40960/130627 (31.4%)
+ds4: Ornith stage ms/chunk (pos=40960 T=2048): gdn 796.7 attn 1208.5 head 2.3
+processing 130627 input tokens: 43008/130627 (32.9%)
+ds4: Ornith stage ms/chunk (pos=43008 T=2048): gdn 795.8 attn 1247.2 head 2.4
+processing 130627 input tokens: 45056/130627 (34.5%)
+ds4: Ornith stage ms/chunk (pos=45056 T=2048): gdn 802.8 attn 1294.8 head 2.4
+processing 130627 input tokens: 47104/130627 (36.1%)
+ds4: Ornith stage ms/chunk (pos=47104 T=2048): gdn 796.7 attn 1357.8 head 2.5
+processing 130627 input tokens: 49152/130627 (37.6%)
+ds4: Ornith stage ms/chunk (pos=49152 T=2048): gdn 802.6 attn 1403.9 head 2.3
+processing 130627 input tokens: 51200/130627 (39.2%)
+ds4: Ornith stage ms/chunk (pos=51200 T=2048): gdn 798.1 attn 1445.9 head 2.4
+processing 130627 input tokens: 53248/130627 (40.8%)
+ds4: Ornith stage ms/chunk (pos=53248 T=2048): gdn 796.9 attn 1516.3 head 2.3
+processing 130627 input tokens: 55296/130627 (42.3%)
+ds4: Ornith stage ms/chunk (pos=55296 T=2048): gdn 799.7 attn 1554.0 head 2.4
+processing 130627 input tokens: 57344/130627 (43.9%)
+ds4: Ornith stage ms/chunk (pos=57344 T=2048): gdn 809.7 attn 1610.3 head 2.4
+processing 130627 input tokens: 59392/130627 (45.5%)
+ds4: Ornith stage ms/chunk (pos=59392 T=2048): gdn 814.4 attn 1671.1 head 2.5
+processing 130627 input tokens: 61440/130627 (47.0%)
+ds4: Ornith stage ms/chunk (pos=61440 T=2048): gdn 812.4 attn 1719.2 head 2.4
+processing 130627 input tokens: 63488/130627 (48.6%)
+ds4: Ornith stage ms/chunk (pos=63488 T=2048): gdn 834.6 attn 1830.6 head 2.8
+processing 130627 input tokens: 65536/130627 (50.2%)
+ds4: Ornith stage ms/chunk (pos=65536 T=2048): gdn 798.1 attn 1764.4 head 2.7
+processing 130627 input tokens: 67584/130627 (51.7%)
+ds4: Ornith stage ms/chunk (pos=67584 T=2048): gdn 816.8 attn 1861.8 head 2.5
+processing 130627 input tokens: 69632/130627 (53.3%)
+ds4: Ornith stage ms/chunk (pos=69632 T=2048): gdn 812.9 attn 1908.1 head 2.5
+processing 130627 input tokens: 71680/130627 (54.9%)
+ds4: Ornith stage ms/chunk (pos=71680 T=2048): gdn 805.2 attn 1963.8 head 2.6
+processing 130627 input tokens: 73728/130627 (56.4%)
+ds4: Ornith stage ms/chunk (pos=73728 T=2048): gdn 842.9 attn 2078.2 head 2.3
+processing 130627 input tokens: 75776/130627 (58.0%)
+ds4: Ornith stage ms/chunk (pos=75776 T=2048): gdn 797.8 attn 2023.3 head 2.4
+processing 130627 input tokens: 77824/130627 (59.6%)
+ds4: Ornith stage ms/chunk (pos=77824 T=2048): gdn 814.5 attn 2109.4 head 2.5
+processing 130627 input tokens: 79872/130627 (61.1%)
+ds4: Ornith stage ms/chunk (pos=79872 T=2048): gdn 816.6 attn 2166.4 head 2.4
+processing 130627 input tokens: 81920/130627 (62.7%)
+ds4: Ornith stage ms/chunk (pos=81920 T=2048): gdn 815.3 attn 2203.0 head 2.4
+processing 130627 input tokens: 83968/130627 (64.3%)
+ds4: Ornith stage ms/chunk (pos=83968 T=2048): gdn 818.3 attn 2275.6 head 2.5
+processing 130627 input tokens: 86016/130627 (65.8%)
+ds4: Ornith stage ms/chunk (pos=86016 T=2048): gdn 807.1 attn 2288.7 head 2.4
+processing 130627 input tokens: 88064/130627 (67.4%)
+ds4: Ornith stage ms/chunk (pos=88064 T=2048): gdn 812.3 attn 2364.7 head 2.4
+processing 130627 input tokens: 90112/130627 (69.0%)
+ds4: Ornith stage ms/chunk (pos=90112 T=2048): gdn 809.8 attn 2419.6 head 2.4
+processing 130627 input tokens: 92160/130627 (70.6%)
+ds4: Ornith stage ms/chunk (pos=92160 T=2048): gdn 807.4 attn 2448.6 head 2.5
+processing 130627 input tokens: 94208/130627 (72.1%)
+ds4: Ornith stage ms/chunk (pos=94208 T=2048): gdn 819.6 attn 2511.7 head 2.6
+processing 130627 input tokens: 96256/130627 (73.7%)
+ds4: Ornith stage ms/chunk (pos=96256 T=2048): gdn 814.4 attn 2574.4 head 2.5
+processing 130627 input tokens: 98304/130627 (75.3%)
+ds4: Ornith stage ms/chunk (pos=98304 T=2048): gdn 839.6 attn 2658.0 head 2.5
+processing 130627 input tokens: 100352/130627 (76.8%)
+ds4: Ornith stage ms/chunk (pos=100352 T=2048): gdn 831.8 attn 2714.8 head 2.5
+processing 130627 input tokens: 102400/130627 (78.4%)
+ds4: Ornith stage ms/chunk (pos=102400 T=2048): gdn 831.4 attn 2731.3 head 2.6
+processing 130627 input tokens: 104448/130627 (80.0%)
+ds4: Ornith stage ms/chunk (pos=104448 T=2048): gdn 832.6 attn 2857.8 head 2.9
+processing 130627 input tokens: 106496/130627 (81.5%)
+ds4: Ornith stage ms/chunk (pos=106496 T=2048): gdn 863.9 attn 2871.1 head 2.5
+processing 130627 input tokens: 108544/130627 (83.1%)
+ds4: Ornith stage ms/chunk (pos=108544 T=2048): gdn 841.5 attn 2949.2 head 2.6
+processing 130627 input tokens: 110592/130627 (84.7%)
+ds4: Ornith stage ms/chunk (pos=110592 T=2048): gdn 881.4 attn 3142.3 head 2.5
+processing 130627 input tokens: 112640/130627 (86.2%)
+ds4: Ornith stage ms/chunk (pos=112640 T=2048): gdn 870.8 attn 3168.4 head 2.7
+processing 130627 input tokens: 114688/130627 (87.8%)
+ds4: Ornith stage ms/chunk (pos=114688 T=2048): gdn 881.6 attn 3243.6 head 2.6
+processing 130627 input tokens: 116736/130627 (89.4%)
+ds4: Ornith stage ms/chunk (pos=116736 T=2048): gdn 877.0 attn 3307.0 head 2.7
+processing 130627 input tokens: 118784/130627 (90.9%)
+ds4: Ornith stage ms/chunk (pos=118784 T=2048): gdn 881.4 attn 3339.5 head 2.5
+processing 130627 input tokens: 120832/130627 (92.5%)
+ds4: Ornith stage ms/chunk (pos=120832 T=2048): gdn 858.4 attn 3285.1 head 2.6
+processing 130627 input tokens: 122880/130627 (94.1%)
+ds4: Ornith stage ms/chunk (pos=122880 T=2048): gdn 838.0 attn 3302.5 head 2.6
+processing 130627 input tokens: 124928/130627 (95.6%)
+ds4: Ornith stage ms/chunk (pos=124928 T=2048): gdn 818.7 attn 3312.5 head 2.5
+processing 130627 input tokens: 126976/130627 (97.2%)
+ds4: Ornith stage ms/chunk (pos=126976 T=2048): gdn 821.2 attn 3359.8 head 2.5
+processing 130627 input tokens: 129024/130627 (98.8%)
+ds4: Ornith stage ms/chunk (pos=129024 T=1603): gdn 695.6 attn 2695.3 head 2.5
+processing 130627 input tokens: 130627/130627 (100.0%)
+meno gran complice di quella sciag
+ds4: prefill: 779.78 t/s, generation: 35.00 t/s
+ds4: Metal cleanup discarded 1 live tensor handles
