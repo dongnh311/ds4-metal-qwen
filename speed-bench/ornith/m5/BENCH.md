@@ -72,3 +72,27 @@ Reading: TOK=2 halves the prefill attention time (no padding rows, two tokens pe
 123K, so the kernel is now bound by matrix throughput, not K/V traffic: at 30K one layer does ~1.07 TFLOP
 (2048 tokens x 16 heads x ~31.7K keys x 1024 flop), i.e. ~4.8 TFLOP/s on the simdgroup-matrix path. TOK=2 is the
 default.
+
+## attn_flash with key split (commit cb2fec2, 2026-09-27; Task 4 Step 7)
+
+`./tests/bench_qwen35_attn prefill`, two runs (ms per layer, run 1 / run 2). T = 2048 rows force a split with
+`DS4_QWEN35_ATTN_FLASH_MIN_TG=4096` (a 2048-token chunk never splits under the default rule); T = 128 rows use the
+default rule (min_tg 256 -> Ks = 2 for TOK=2, 4 for TOK=4 at these positions).
+
+| pos | T | flash TOK=2 | TOK=2 + split | flash TOK=4 | TOK=4 + split |
+|---:|---:|---:|---:|---:|---:|
+| 30720 | 2048 | 223.3 / 221.7 | 220.5 / 220.5 | 223.0 / 221.4 | 218.4 / 218.3 |
+| 122880 | 2048 | 875.9 / 869.5 | 867.0 / 865.7 | 1142.3 / 1080.7 | 844.4 / 851.9 |
+| 30720 | 128 | 16.03 / 16.07 | 14.70 / 14.73 | 19.78 / 19.81 | 14.45 / 14.43 |
+| 122880 | 128 | 63.34 / 63.30 | 57.27 / 57.28 | 77.92 / 78.88 | 55.65 / 55.72 |
+
+Kernel tests in the same window (TOK=2, TOK=4, TOK=2 without Metal 4): `qwen35 kernels: ok`, forced-split cases
+within 2.8e-4 relative of the host double reference. (A min_tg sweep in the same window was void: the benchmark
+unsets `DS4_QWEN35_ATTN_FLASH_MIN_TG` after sizing its scratch, so every sweep run used the default.)
+
+Choice: TOK=2 stays the default and the key split stays on its default rule (min_tg 256): it takes 8-10% off short
+chunks (T = 128) at long context and never engages for full 2048-token chunks, where splitting gains <= 1% for
+TOK=2. TOK=4 needs the split to catch up and ends within 3% of TOK=2 + split, so it gives no reason to switch.
+Against the plan's per-chunk targets (<= 0.6 s at 30,720 and <= 2.5 s at 122,880 over 10 layers): measured ~2.2 s
+and ~8.7 s, so both are missed; the simdgroup-matrix path does ~4.8 TFLOP/s of attention (see the Task 3 section),
+so reaching them needs more matrix throughput (the Metal 4 tensor API, out of M5's scope), not less K/V traffic.
