@@ -366,6 +366,23 @@ static int qwen35_attn_flash_env(void) {
     return on;
 }
 
+/* M6 (DS4_QWEN35_ATTN_NAX): runs flash prefill on the M5 neural accelerators
+ * (kernel_qwen35_attn_flash_nax), read once.  Off until the M6 adoption
+ * checks pass; "1" turns it on, "0" keeps the M5 simdgroup flash.  Takes
+ * effect only with DS4_QWEN35_ATTN_FLASH on and the Metal 4 tensor API
+ * available (not under --quality, before M5/A19, or with
+ * DS4_METAL_DISABLE_METAL4=1), where the M5 flash keeps running. */
+static int qwen35_attn_nax_env(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DS4_QWEN35_ATTN_NAX");
+        if (e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "1") != 0)
+            fprintf(stderr, "ds4: DS4_QWEN35_ATTN_NAX=%s not recognised (0 or 1); using off\n", e);
+        on = (e && strcmp(e, "1") == 0) ? 1 : 0;
+    }
+    return on;
+}
+
 static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t pos0,
                                 uint32_t r0, uint32_t n, bool per_row) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
@@ -384,6 +401,11 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
                         g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
         }
         if (n > 8u && qwen35_attn_flash_env() && !qwen4_kv_mode(g)) {
+            if (qwen35_attn_nax_env() && ds4_gpu_tensor_api_available()) {
+                return ds4_gpu_qwen35_attn_flash_nax_tensor(g->attn_o, g->q, g->gate,
+                            qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_flash_part, n,
+                            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale) != 0;
+            }
             return ds4_gpu_qwen35_attn_flash_tensor(g->attn_o, g->q, g->gate,
                         qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_flash_part, n,
                         DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale) != 0;

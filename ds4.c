@@ -40235,6 +40235,10 @@ ds4_context_memory ds4_context_memory_estimate_with_prefill_mode(
             }
             m.scratch_bytes += attn_flash_part_floats * sizeof(float);
         }
+        /* M6: the accelerator flash's packed-query scratch (a ds4_metal.m
+         * slot of Hkv x ceil8(T) x 8 x 256 halves, 16.8 MB at T = 2048),
+         * counted whether or not the tensor API ends up available. */
+        if (T > 8u) m.scratch_bytes += ((T + 7u) & ~7ull) * DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(uint16_t);
         m.total_bytes = m.raw_bytes + m.scratch_bytes;
         return m;
     }
