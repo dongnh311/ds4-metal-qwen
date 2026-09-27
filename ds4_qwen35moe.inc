@@ -306,8 +306,8 @@ static bool qwen35_graph_attention_prep(ds4_qwen4_gpu_graph *g, const ds4_model 
  * identical split geometry per row and stay bit for bit exact.
  *
  * M5 (DS4_QWEN35_ATTN_DECODE): on top of the DECODE2 gate above, chooses
- * which shared-KV kernel generation runs: 2 (default) is L12's decode2, 3
- * selects decode3 (simdgroup-matrix tiles, F16 K/V only -- fp8/q4 K/V and
+ * which shared-KV kernel generation runs: 3 (default) is decode3
+ * (simdgroup-matrix tiles, F16 K/V only), 2 is L12's decode2 (fp8/q4 K/V and
  * DS4_QWEN35_ATTN_DECODE2=0 always keep today's paths).  Plain decode and
  * the verify read the same qwen35_attn_decode_env()/qwen4_kv_mode() pair,
  * so they always pick the same kernel generation and stay bit for bit
@@ -330,14 +330,15 @@ static int qwen35_attn_decode2_env(void) {
 }
 
 /* M5 (DS4_QWEN35_ATTN_DECODE): picks the shared-KV decode kernel generation,
- * read once.  2 (default) is L12's decode2; 3 selects decode3, the
- * simdgroup-matrix successor (F16 K/V only).  Any value other than "3"
- * (including unset or malformed) means 2. */
+ * read once.  3 (default since the M5 A/B: +15% decode at 32K, +84% at 128K,
+ * gate 1 and the MTP identity tests pass) selects decode3, the
+ * simdgroup-matrix successor (F16 K/V only); 2 restores L12's decode2.  Any
+ * value other than "2" (including unset or malformed) means 3. */
 static int qwen35_attn_decode_env(void) {
     static int gen = -1;
     if (gen < 0) {
         const char *e = getenv("DS4_QWEN35_ATTN_DECODE");
-        gen = (e && strcmp(e, "3") == 0) ? 3 : 2;
+        gen = (e && strcmp(e, "2") == 0) ? 2 : 3;
     }
     return gen;
 }
