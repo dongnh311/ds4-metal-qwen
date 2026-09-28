@@ -1,0 +1,12 @@
+[
+ {"id": "vi-w01", "prompt": "Viết email xin nghỉ phép 2 ngày gửi quản lý, giọng lịch sự, dưới 150 chữ."},
+ {"id": "vi-w02", "prompt": "Viết một đoạn văn khoảng 100 chữ giới thiệu món phở cho du khách nước ngoài."},
+ {"id": "vi-w03", "prompt": "Tóm tắt ưu và nhược điểm của làm việc từ xa trong đúng 5 gạch đầu dòng."},
+ {"id": "vi-w04", "prompt": "Giải thích cho học sinh lớp 6 vì sao có ngày và đêm."},
+ {"id": "vi-w05", "prompt": "Viết lời cảm ơn khách hàng sau khi mua hàng online, đúng 3 câu."},
+ {"id": "vi-w06", "prompt": "Viết thông báo nội bộ về lịch nghỉ Tết của công ty, gồm ngày nghỉ và ngày đi làm lại."},
+ {"id": "vi-w07", "prompt": "Viết một bài thơ lục bát 4 câu về mùa thu Hà Nội."},
+ {"id": "vi-w08", "prompt": "Giải thích khái niệm lãi suất kép kèm một ví dụ tính bằng tiền đồng."},
+ {"id": "vi-w09", "prompt": "Viết mô tả sản phẩm khoảng 80 chữ cho một chiếc tai nghe không dây."},
+ {"id": "vi-w10", "prompt": "Đưa ra 3 lời khuyên để ngủ ngon hơn, mỗi lời khuyên một câu."}
+]
