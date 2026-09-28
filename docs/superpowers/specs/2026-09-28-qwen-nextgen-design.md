@@ -182,8 +182,9 @@ automatically and repeatably, and apply the gate. Everything later in this desig
 | `data/vi_knowledge.json` | 30 Vietnamese factual questions with accepted answer keywords (in git) |
 | `data/vi_writing.json` | 10 Vietnamese writing prompts (in git) |
 | `graders.py` | pure grading functions (code, IF checks, refusal detector, VI keywords, CJK leak, needle) |
-| `server.py` | start/stop one ds4-server from an arm config; parse its log per request |
-| `suites.py` | the suites: build requests, call the server, grade, emit rows |
+| `server.py` | start/stop one ds4-server from an arm config; parse its log per request; sample `vm_stat` |
+| `eval_suites.py` | the server-backed suites: build requests, call the server, grade, emit rows (not `suites.py`: that name would shadow the gateway's `suites` package) |
+| `ds4eval.py` | the reasoning suite: run `ds4-eval`, parse its report |
 | `run.py` | CLI: run one arm through selected suites, write rows + summary |
 | `compare.py` | CLI: compare two arms' summaries, apply the gate, write `RESULTS.md` |
 | `configs/prod.json` | the PROD arm: registry command, only port and KV dir replaced |
@@ -218,12 +219,12 @@ It uses `-c` = min(resolved `-c`, 65536), because reasoning prompts are short.
 
 | suite | cases | source | grading |
 |---|---|---|---|
-| `code` | HumanEval-mini 17 + MBPP+ first 50 by `task_id` | gateway `humaneval_mini`; `evalplus/mbppplus` | execute tests in a subprocess with a timeout (humaneval_mini's runner); pass@1 |
+| `code` | HumanEval-mini 17 + MBPP+ first 50 by `task_id` | gateway `humaneval_mini`; `evalplus/mbppplus` | execute tests in a subprocess with a timeout (humaneval_mini's runner); pass@1. MBPP uses its base `test_list` asserts, because the plus tests need numpy |
 | `reason` | four `ds4-eval --plain` runs: `--suite core --source "GPQA Diamond" --questions 8`, `--suite core --source SuperGPQA --questions 8`, `--suite core --source AIME2025 --questions 8`, `--suite hard --source MMLU-Pro --questions 20` | built into `ds4-eval` (cases embedded in `ds4_eval_cases.c`) | ds4-eval's own grader, read from its report table; `INCOMPLETE` counts as fail |
 | `ifeval` | 60 IFEval prompts whose every instruction id is in the supported checker set, lowest `key` first | `google/IFEval` | strict per-instruction checks; a prompt passes when all its instructions pass |
 | `tools` | gateway `toolcall` suite (all axes) + `faithfulness` code-graded metrics | AI-Gateway-MLX `evals/suites` pointed at the arm's port, concurrency 1 | the suites' own graders; judge-graded metrics are excluded because the judge would differ per arm |
 | `vi` | 30 knowledge questions + 10 writing prompts + the 5 think-budget VI prompts | `data/vi_*.json` | keyword match for knowledge; CJK-character leak count on all VI answers; writing answers saved side by side for human review |
-| `uncensor` | 50 harmful + 50 harmless | `mlabonne/harmful_behaviors` test, `mlabonne/harmless_alpaca` test, first 50 each | refusal detector on the answer (after `</think>`), EN + VI phrase list; empty answer = not compliant; borderline list for review |
+| `uncensor` | 50 harmful + 50 harmless | `mlabonne/harmful_behaviors` test, `mlabonne/harmless_alpaca` test, first 50 each | refusal detector on the answer (after `</think>`), EN + VI phrase list; empty answer = not compliant; the first 600 characters of each answer are kept in `rows.jsonl` for review |
 | `longctx` | needle prompts of ~120K / 240K / 480K / 960K tokens (the 128K / 256K / 512K / 1M tiers, with margin), each skipped when it exceeds the arm's `-c`; 3 questions on the 240K document | haystack = the first N characters of `ds4.c` (3.03 chars per token, measured 2026-09-23) with the needle at 50% depth | needle and answers by exact match; thinking off; peak wired memory and swap-outs sampled from `vm_stat` every 2 s |
 | `speed` | derived from every request above | server log | per request: prefill seconds, thinking tokens, generated tokens, decode t/s, total seconds |
 
