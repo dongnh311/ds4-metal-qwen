@@ -841,6 +841,14 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
         uint64_t              out_dim,
         const ds4_gpu_tensor *x,
         uint32_t              n_rows);
+/* Two rows of x through one Q8_0 weight in one dispatch; row r is
+ * bit-identical to ds4_gpu_qwen4_matmul_q8_0_tensor(..., row r, 1).
+ * n_rows must be 2; returns 0 (nothing encoded) otherwise. */
+int ds4_gpu_qwen35_matmul_q8_0_rows_tensor(ds4_gpu_tensor *out, const void *model_map, uint64_t model_size,
+                                           uint64_t weight_offset, uint64_t in_dim, uint64_t out_dim,
+                                           const ds4_gpu_tensor *x, uint32_t n_rows);
+/* Successful ds4_gpu_qwen35_matmul_q8_0_rows_tensor calls since process start. */
+uint64_t ds4_gpu_qwen35_q8_rows_dispatches(void);
 int ds4_gpu_matmul_q8_0_pair_decode_rows_exact_tensor(
         ds4_gpu_tensor       *out0,
         ds4_gpu_tensor       *out1,

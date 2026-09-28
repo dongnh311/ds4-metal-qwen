@@ -2150,3 +2150,93 @@ kernel void kernel_qwen35_attn_flash_nax<true>(
         device const half *, device const half *, device float *, uint3, ushort, ushort);
 
 #endif /* DS4_METAL_HAS_TENSOR */
+
+/* ---- M7: two-row Q8_0 matvec for the MTP verify ----------------------------
+ * kernel_mul_mv_q8_0_f32_impl (dense.metal) for R input rows at once: the
+ * same K walk, the same per-row multiply-adds (sumq over NQ quants, then
+ * sumf += sumq * d) and the same reduction tree (simd_sum, threadgroup
+ * partials, simd_sum) with the same NR0 and NSG, while each weight block is
+ * loaded once for all rows.  Row r of dst is therefore bit-identical to a
+ * kernel_mul_mv_q8_0_f32 dispatch on row r alone.  Each row reduces in its
+ * own NR0 x 32-float threadgroup region, so row 1's zeroing cannot race row
+ * 0's reads. */
+template<short NR0, short R>
+void kernel_qwen35_mv_q8_0_rows_impl(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NQ = 8;
+
+    const int nb = args.ne00/QK8_0;
+    const int r0 = tgpig.x*NR0;
+
+    device const block_q8_0 * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        ax[row] = (device const block_q8_0 *) (src0 + (r0 + row)*args.nb01);
+    }
+
+    const short ix = tiisg/(NW/NQ);
+    const short il = tiisg%(NW/NQ);
+
+    const int ib0 = sgitg*NQ + ix;
+
+    float sumf[R][NR0];
+    device const float * yb[R];
+    FOR_UNROLL (short r = 0; r < R; ++r) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) sumf[r][row] = 0.f;
+        yb[r] = (device const float *) (src1 + (uint64_t)r*args.nb11) + ib0*QK8_0 + il*NQ;
+    }
+
+    float yl[R][NQ];
+
+    for (int ib = ib0; ib < nb; ib += NSG*NQ) {
+        FOR_UNROLL (short r = 0; r < R; ++r) {
+            for (short i = 0; i < NQ; ++i) {
+                yl[r][i] = yb[r][i];
+            }
+        }
+
+        for (short row = 0; row < NR0; row++) {
+            device const int8_t * qs = ax[row][ib].qs + il*NQ;
+            const half d = ax[row][ib].d;
+
+            FOR_UNROLL (short r = 0; r < R; ++r) {
+                float sumq = 0.f;
+                FOR_UNROLL (short i = 0; i < NQ; ++i) {
+                    sumq += qs[i] * yl[r][i];
+                }
+
+                sumf[r][row] += sumq*d;
+            }
+        }
+
+        FOR_UNROLL (short r = 0; r < R; ++r) yb[r] += NSG*NQ*QK8_0;
+    }
+
+    FOR_UNROLL (short r = 0; r < R; ++r) {
+        device float * dst_f32 = (device float *) dst + (uint64_t)r*args.ne0;
+        helper_mv_reduce_and_write<NR0, false>(dst_f32, sumf[r], r0, args.ne01, tiisg, sgitg,
+                                               shmem + r*NR0*NW*sizeof(float));
+    }
+}
+
+[[host_name("kernel_qwen35_mv_q8_0_rows2")]]
+kernel void kernel_qwen35_mv_q8_0_rows2(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_qwen35_mv_q8_0_rows_impl<N_R0_Q8_0, 2>(args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}

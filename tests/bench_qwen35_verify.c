@@ -1,10 +1,14 @@
 /* Model-free micro-benchmark for the M7 verify (Ornith's Q8_0 projection
  * shapes): one T=1 matvec, two T=1 matvecs (today's per-row verify), the
  * existing exact two-row dispatch (ds4_gpu_matmul_q8_0_decode_rows_exact_tensor)
- * and, from M7 Task 2, the two-row kernel.  Every timed call reads a
- * different copy of the weights (>= 256 MB per shape, above the system
- * cache): a decode step streams ~2.7 GB and never finds its weights cached.
- * Needs the GPU but no model; run it with the live stack paused. */
+ * and the two-row kernel (ds4_gpu_qwen35_matmul_q8_0_rows_tensor).  Every
+ * timed call reads a different copy of the weights (>= 256 MB per shape,
+ * above the system cache): a decode step streams ~2.7 GB and never finds its
+ * weights cached.  Each method first runs untimed for WARM_S so the GPU
+ * clock has ramped up, and each timed repetition reads >= 1 GiB of weights;
+ * the host encoding time (spent before the command buffer commits) is
+ * reported separately.  Needs the GPU but no model; run it with the live
+ * stack paused. */
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -30,11 +34,12 @@ static const shape_t SHAPES[] = {
     { "4096x2048(lin_out,attn_output)", 4096u, 2048u },
     { "2048x248320(lm_head)", 2048u, 248320u },
 };
-enum { N_SHAPES = 4, CALLS = 32, REPS = 5, MAX_COPIES = 64 };
-static const uint64_t COLD_BYTES = 256ull << 20;
+enum { N_SHAPES = 4, MIN_CALLS = 32, MAX_CALLS = 1024, REPS = 5, MAX_COPIES = 64 };
+static const uint64_t COLD_BYTES = 256ull << 20, REP_BYTES = 1ull << 30;
+static const double WARM_S = 0.3;
 
-typedef enum { M_T1, M_T1X2, M_ROWS_EXACT, N_METHODS } method_t;
-static const char *METHOD_NAMES[N_METHODS] = { "t1", "t1x2", "rows_exact" };
+typedef enum { M_T1, M_T1X2, M_ROWS_EXACT, M_ROWS2, N_METHODS } method_t;
+static const char *METHOD_NAMES[N_METHODS] = { "t1", "t1x2", "rows_exact", "rows2" };
 
 static double now_s(void) {
     struct timespec ts;
@@ -55,7 +60,7 @@ typedef struct {
     uint8_t *base;
     uint64_t size;
     uint64_t off[MAX_COPIES];
-    uint32_t copies, in_dim, out_dim;
+    uint32_t copies, in_dim, out_dim, calls;
     uint64_t bytes;
     ds4_gpu_tensor *x, *x0, *x1, *o, *o0, *o1;
 } ctx_t;
@@ -85,24 +90,38 @@ static int call(ctx_t *c, method_t m, uint32_t k) {
     case M_ROWS_EXACT:
         return ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(c->o, c->base, c->size, off, c->in_dim, c->out_dim,
                                                             c->x, 2u);
+    case M_ROWS2:
+        return ds4_gpu_qwen35_matmul_q8_0_rows_tensor(c->o, c->base, c->size, off, c->in_dim, c->out_dim, c->x, 2u);
     default:
         return 0;
     }
 }
 
-/* median over REPS of (CALLS calls encoded into one command buffer) / CALLS,
- * after one untimed repetition */
-static double time_ms(ctx_t *c, method_t m) {
-    double t[REPS];
-    for (int r = -1; r < REPS; r++) {
-        const double t0 = now_s();
-        need(ds4_gpu_begin_commands(), "begin commands");
-        for (uint32_t k = 0; k < CALLS; k++) need(call(c, m, k), METHOD_NAMES[m]);
-        need(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "end commands");
-        if (r >= 0) t[r] = (now_s() - t0) * 1e3 / CALLS;
-    }
+/* one repetition: c->calls calls encoded into one command buffer; returns
+ * the wall ms per call and stores the host encoding ms per call in *enc */
+static double one_rep(ctx_t *c, method_t m, double *enc) {
+    const double t0 = now_s();
+    need(ds4_gpu_begin_commands(), "begin commands");
+    for (uint32_t k = 0; k < c->calls; k++) need(call(c, m, k), METHOD_NAMES[m]);
+    const double t1 = now_s();
+    need(ds4_gpu_end_commands() && ds4_gpu_synchronize(), "end commands");
+    *enc = (t1 - t0) * 1e3 / c->calls;
+    return (now_s() - t0) * 1e3 / c->calls;
+}
+
+static void sort5(double *t) {
     for (int i = 1; i < REPS; i++)
         for (int j = i; j > 0 && t[j] < t[j - 1]; j--) { const double x = t[j]; t[j] = t[j - 1]; t[j - 1] = x; }
+}
+
+/* median over REPS repetitions, after WARM_S of untimed ones */
+static double time_ms(ctx_t *c, method_t m, double *enc_ms) {
+    double t[REPS], e[REPS], dummy;
+    for (const double w0 = now_s(); now_s() - w0 < WARM_S;) (void)one_rep(c, m, &dummy);
+    for (int r = 0; r < REPS; r++) t[r] = one_rep(c, m, &e[r]);
+    sort5(t);
+    sort5(e);
+    *enc_ms = e[REPS / 2];
     return t[REPS / 2];
 }
 
@@ -126,11 +145,13 @@ int main(void) {
     need(ds4_gpu_init(), "GPU initialization");
     need(ds4_gpu_set_model_map(base, total), "model map registration");
     uint64_t used = 0;
-    double ratio_exact[N_SHAPES];
+    double ratio_exact[N_SHAPES], ratio_rows2[N_SHAPES];
     for (int s = 0; s < N_SHAPES; s++) {
         ctx_t c = { .base = base, .size = total, .in_dim = SHAPES[s].in_dim, .out_dim = SHAPES[s].out_dim };
         c.bytes = (uint64_t)c.out_dim * (c.in_dim / 32u) * 34u;
         c.copies = copies_for(c.bytes);
+        const uint64_t calls = (REP_BYTES + c.bytes - 1u) / c.bytes;
+        c.calls = calls < MIN_CALLS ? MIN_CALLS : calls > MAX_CALLS ? MAX_CALLS : (uint32_t)calls;
         for (uint32_t k = 0; k < c.copies; k++) {
             c.off[k] = used;
             fill_q8(base + used, c.bytes);
@@ -145,11 +166,13 @@ int main(void) {
         need(c.x0 && c.x1 && c.o && c.o0 && c.o1, "tensor views");
         double t1 = 0.0;
         for (int m = 0; m < N_METHODS; m++) {
-            const double ms = time_ms(&c, (method_t)m);
+            double enc = 0.0;
+            const double ms = time_ms(&c, (method_t)m, &enc);
             if (m == M_T1) t1 = ms;
             if (m == M_ROWS_EXACT) ratio_exact[s] = ms / t1;
-            printf("bench: %-32s %-10s %8.4f ms  x%.2f  %6.1f GB/s\n", SHAPES[s].name, METHOD_NAMES[m], ms,
-                   ms / t1, (double)c.bytes / (ms * 1e6));
+            if (m == M_ROWS2) ratio_rows2[s] = ms / t1;
+            printf("bench: %-32s %-10s %8.4f ms  x%.2f  %6.1f GB/s  (encode %.1f us/call, %u calls/rep)\n",
+                   SHAPES[s].name, METHOD_NAMES[m], ms, ms / t1, (double)c.bytes / (ms * 1e6), enc * 1e3, c.calls);
         }
         ds4_gpu_tensor_free(c.x0); ds4_gpu_tensor_free(c.x1); ds4_gpu_tensor_free(c.x);
         ds4_gpu_tensor_free(c.o0); ds4_gpu_tensor_free(c.o1); ds4_gpu_tensor_free(c.o);
@@ -157,5 +180,7 @@ int main(void) {
     bool use = true;
     for (int s = 0; s < N_SHAPES; s++) use = use && ratio_exact[s] <= 1.2;
     printf("bench: verdict decode_rows_exact %s\n", use ? "use" : "build-kernel");
+    printf("bench: stop-rule rows2 %s (2048x8192 x%.2f, lm_head x%.2f; limit x1.50)\n",
+           ratio_rows2[0] < 1.5 && ratio_rows2[3] < 1.5 ? "pass" : "STOP", ratio_rows2[0], ratio_rows2[3]);
     return 0;
 }
