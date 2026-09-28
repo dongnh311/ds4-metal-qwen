@@ -106,11 +106,16 @@ def mbpp_entry_point(row):
 
 
 def mbpp_problem(row):
-    """An MBPP+ row as the problem dict humaneval_mini.grade() runs: base asserts, stdlib only."""
-    body = "\n".join(as_list(row.get("test_imports")) + as_list(row["test_list"]))
-    test = "def check(_candidate):\n" + "\n".join("    " + line for line in body.splitlines())
-    return {"task_id": "MBPP/%s" % row["task_id"], "entry_point": mbpp_entry_point(row),
-            "prompt": "", "test": test}
+    """An MBPP+ row as the problem dict humaneval_mini.grade() runs: base asserts, stdlib only.
+
+    The runner calls check(<entry point>). The candidate is captured before the wrapper is defined
+    and rebound inside it, so a task whose function is itself named `check` (MBPP 56) still works."""
+    entry = mbpp_entry_point(row)
+    body = "\n".join(["%s = _mbpp_candidate" % entry] + as_list(row.get("test_imports")) +
+                     as_list(row["test_list"]))
+    test = ("_mbpp_candidate = %s\n" % entry + "def check(_candidate):\n" +
+            "\n".join("    " + line for line in body.splitlines()))
+    return {"task_id": "MBPP/%s" % row["task_id"], "entry_point": entry, "prompt": "", "test": test}
 
 
 def mbpp_prompt(row):

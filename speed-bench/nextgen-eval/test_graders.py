@@ -99,6 +99,14 @@ class Mbpp(unittest.TestCase):
                                         "```python\n" + MBPP_ROW["code"] + "```")
         self.assertTrue(ok, detail)
 
+    def test_entry_point_named_check(self):
+        # MBPP task 56 defines `check`, the name of humaneval_mini's test wrapper.
+        row = dict(MBPP_ROW, task_id="56",
+                   code="def check(n):\n    return n == 2 * int(str(n)[::-1]) - 1\n",
+                   test_list=["assert check(70) == False", "assert check(73) == True"])
+        ok, detail = graders.grade_code(graders.mbpp_problem(row), "```python\n" + row["code"] + "```")
+        self.assertTrue(ok, detail)
+
     def test_wrong_solution_fails(self):
         bad = "```python\ndef similar_elements(a, b):\n    return ()\n```"
         ok, _ = graders.grade_code(graders.mbpp_problem(MBPP_ROW), bad)
