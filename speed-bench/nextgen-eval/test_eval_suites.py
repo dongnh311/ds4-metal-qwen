@@ -154,7 +154,9 @@ class Suites(unittest.TestCase):
         pos = doc.index(eval_suites.NEEDLE)
         self.assertTrue(0.4 < pos / len(doc) < 0.6)
 
-    def test_tools_adapter(self):
+    def _fake_gateway(self):
+        """Fake gateway harness + suites modules that behave like the real ones against ds4-server:
+        /mcp answers 404, and each suite's run() calls client.chat() the way the real suite does."""
         class Case:
             def __init__(self, cid, inp):
                 self.id, self.inp, self.suite = cid, inp, ""
@@ -163,35 +165,81 @@ class Suites(unittest.TestCase):
             def __init__(self, passed):
                 self.passed, self.score, self.metrics = passed, 1.0 if passed else 0.0, {"m": 1}
 
-        class FakeSuite:
-            def __init__(self, name, cases):
-                self.name, self._cases = name, cases
+        chats = []
+
+        class ArmClient:
+            def __init__(self, base, key, model):
+                self.base = base
+
+            def post(self, path, body, timeout=300):
+                raise OSError("HTTP Error 404: unknown endpoint %s" % path)
+
+            def chat(self, prompt, max_tokens=800, chat_template_kwargs=None, **kw):
+                chats.append({"max_tokens": max_tokens, "chat_template_kwargs": chat_template_kwargs})
+                raw = {"choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                       "usage": {"completion_tokens": 9}}
+                return "ok", 0.5, raw
+
+        class ToolCall:
+            name = "toolcall"
 
             def available(self, client):
-                return True, ""
+                r, _ = client.post("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, timeout=30)
+                return bool(r["result"]["tools"]), ""
 
             def cases(self):
-                return self._cases
+                return [Case("sel-ok", {"kind": "pos"}), Case("neg-bad", {"kind": "neg"}),
+                        Case("xfer-ok", {"kind": "xfer"})]
 
             def run(self, client, case):
-                return {"latency": 0.5}
+                txt, dt, raw = client.chat("task", max_tokens=600,
+                                           chat_template_kwargs={"enable_thinking": False})
+                return {"text": txt, "raw": raw, "latency": dt}
 
             def grade(self, case, output, judge_client):
                 assert judge_client is None
                 return Result(case.id.endswith("ok"))
 
-        toolcall = FakeSuite("toolcall", [Case("sel-ok", {"kind": "pos"}), Case("neg-bad", {"kind": "neg"}),
-                                          Case("xfer-ok", {"kind": "xfer"})])
-        faith = FakeSuite("faithfulness", [Case("judge", {"no_fabricate": "x"}), Case("fact-ok", {"q": "q"})])
+        class Faithfulness:
+            name = "faithfulness"
+
+            def cases(self):
+                return [Case("judge", {"no_fabricate": "x"}), Case("fact-ok", {"q": "q"})]
+
+            def run(self, client, case):
+                content, dt, _ = client.chat(case.inp["q"], max_tokens=500)
+                return {"answer": content, "latency": dt}
+
+            def grade(self, case, output, judge_client):
+                assert judge_client is None
+                return Result(case.id.endswith("ok"))
+
         harness = types.ModuleType("harness")
-        harness.Client = lambda base, key, model: object()
+        harness.Client = ArmClient
         suites = types.ModuleType("suites")
-        suites.BY_NAME = {"toolcall": toolcall, "faithfulness": faith}
-        with mock.patch.dict(sys.modules, {"harness": harness, "suites": suites}):
+        suites.BY_NAME = {"toolcall": ToolCall(), "faithfulness": Faithfulness()}
+        return {"harness": harness, "suites": suites}, chats
+
+    def test_tools_adapter(self):
+        catalog = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "read_file"}]}}
+        (self.data / "mcp_tools.json").write_text(json.dumps(catalog))
+        modules, chats = self._fake_gateway()
+        with mock.patch.dict(sys.modules, modules):
             rows = eval_suites.run_tools(FakeCtx(self.data, lambda p: ""))
         self.assertEqual([r["suite"] for r in rows], ["tools_pos", "tools_neg", "tools_xfer", "faithfulness"])
         self.assertEqual([r["passed"] for r in rows], [True, False, True, True])
         self.assertTrue(all(r["seconds"] == 0.5 for r in rows))
+        self.assertEqual([r["gen_tokens"] for r in rows[:3]], [9, 9, 9])
+        self.assertEqual(rows[0]["finish"], "stop")
+        # faithfulness does not set thinking itself; straight to ds4-server it would think inside
+        # its 500-token budget, so the harness pins thinking off like toolcall does.
+        self.assertEqual(chats[-1], {"max_tokens": 500, "chat_template_kwargs": {"enable_thinking": False}})
+
+    def test_tools_without_frozen_catalog_fails_clearly(self):
+        modules, _ = self._fake_gateway()
+        with mock.patch.dict(sys.modules, modules), self.assertRaises(RuntimeError) as cm:
+            eval_suites.run_tools(FakeCtx(self.data, lambda p: ""))
+        self.assertIn("fetch_data.py", str(cm.exception))
 
 
 if __name__ == "__main__":

@@ -5,7 +5,8 @@ python3 speed-bench/nextgen-eval/fetch_data.py
 Subsets are deterministic:
 - MBPP+: first 50 by numeric task_id;
 - IFEval: first 60 by key among prompts whose every instruction id is supported;
-- harmful / harmless: first 50 rows of each test split.
+- harmful / harmless: first 50 rows of each test split;
+- mcp_tools.json: the gateway's MCP tool catalog, frozen (run this while the gateway stack is up).
 """
 import hashlib
 import json
@@ -75,8 +76,24 @@ def select_first(rows, n):
     return [{"text": r["text"]} for r in rows[:n]]
 
 
+def fetch_mcp_catalog(client=None):
+    """The gateway's MCP tool catalog (tools/list response). ds4-server has no /mcp, so the toolcall
+    suite grades every arm against this frozen copy. Needs the gateway stack up."""
+    if client is None:
+        evals = str(graders.GATEWAY_REPO / "evals")
+        if evals not in sys.path:
+            sys.path.append(evals)
+        import harness
+        client = harness.Client()
+    response, _ = client.post("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, timeout=30)
+    if not ((response or {}).get("result") or {}).get("tools"):
+        raise SystemExit("gateway /mcp tools/list returned no tools; is the gateway stack up?")
+    return response
+
+
 def main():
     DATA.mkdir(parents=True, exist_ok=True)
+    catalog = fetch_mcp_catalog()
     ifeval_rows = [json.loads(line) for line in _get(IFEVAL_URL).decode().splitlines() if line.strip()]
     sets = {
         "mbpp.jsonl": select_mbpp(fetch_rows("evalplus/mbppplus", "test")),
@@ -90,6 +107,11 @@ def main():
         (DATA / name).write_bytes(blob)
         manifest[name] = {"rows": len(rows), "sha256": hashlib.sha256(blob).hexdigest()}
         print("%-16s %3d rows" % (name, len(rows)))
+    blob = (json.dumps(catalog, indent=1, sort_keys=True, ensure_ascii=False) + "\n").encode()
+    (DATA / "mcp_tools.json").write_bytes(blob)
+    tools = len(catalog["result"]["tools"])
+    manifest["mcp_tools.json"] = {"tools": tools, "sha256": hashlib.sha256(blob).hexdigest()}
+    print("%-16s %3d tools" % ("mcp_tools.json", tools))
     (DATA / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
 
 

@@ -30,6 +30,26 @@ class Select(unittest.TestCase):
         self.assertEqual(fetch_data.select_first(rows, 2), [{"text": "a"}, {"text": "b"}])
 
 
+class McpCatalog(unittest.TestCase):
+    class Client:
+        def __init__(self, response):
+            self.response, self.calls = response, []
+
+        def post(self, path, body, timeout=300):
+            self.calls.append((path, body["method"]))
+            return self.response, 0.1
+
+    def test_catalog_is_the_tools_list_response(self):
+        response = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "read_file"}]}}
+        client = self.Client(response)
+        self.assertEqual(fetch_data.fetch_mcp_catalog(client), response)
+        self.assertEqual(client.calls, [("/mcp", "tools/list")])
+
+    def test_empty_catalog_is_refused(self):
+        with self.assertRaises(SystemExit):
+            fetch_data.fetch_mcp_catalog(self.Client({"result": {"tools": []}}))
+
+
 class ViData(unittest.TestCase):
     def test_knowledge_file(self):
         items = json.loads((HERE / "data" / "vi_knowledge.json").read_text())
