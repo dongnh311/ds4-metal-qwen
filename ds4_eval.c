@@ -1175,6 +1175,10 @@ typedef struct {
     const char *model_path;
     const char *mtp_path;
     const char *ple_path;
+    const char *directional_steering_file;
+    float directional_steering_attn;
+    float directional_steering_ffn;
+    bool directional_steering_scale_set;
     const char *trace_path;
     const char *regrade_trace_path;
     const char *case_sequence;
@@ -1662,6 +1666,14 @@ static eval_config parse_options(int argc, char **argv) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--ple")) {
             c.ple_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-file")) {
+            c.directional_steering_file = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--dir-steering-ffn")) {
+            c.directional_steering_ffn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            c.directional_steering_scale_set = true;
+        } else if (!strcmp(arg, "--dir-steering-attn")) {
+            c.directional_steering_attn = parse_float_arg(need_arg(&i, argc, argv, arg), arg, -100.0f, 100.0f);
+            c.directional_steering_scale_set = true;
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {
             c.ctx_size = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
@@ -1785,6 +1797,9 @@ static eval_config parse_options(int argc, char **argv) {
             usage(stderr, NULL);
             exit(2);
         }
+    }
+    if (c.directional_steering_file && !c.directional_steering_scale_set) {
+        c.directional_steering_ffn = 1.0f;
     }
     if (c.self_test_extractors || c.validate_cases || c.list_cases ||
         c.regrade_trace_path)
@@ -4775,6 +4790,9 @@ int main(int argc, char **argv) {
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,
         .ple_path = cfg.ple_path,
+        .directional_steering_file = cfg.directional_steering_file,
+        .directional_steering_attn = cfg.directional_steering_attn,
+        .directional_steering_ffn = cfg.directional_steering_ffn,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_size > 0 ? cfg.ctx_size : 0,

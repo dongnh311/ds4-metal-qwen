@@ -435,7 +435,8 @@ static bool tool_has_topic(ds4_help_tool tool, const char *topic) {
     if (streq(topic, "sampling"))
         return tool == DS4_HELP_DS4 || tool == DS4_HELP_AGENT || tool == DS4_HELP_EVAL;
     if (streq(topic, "steering"))
-        return tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER || tool == DS4_HELP_AGENT;
+        return tool == DS4_HELP_DS4 || tool == DS4_HELP_SERVER || tool == DS4_HELP_AGENT ||
+               tool == DS4_HELP_EVAL;
     switch (tool) {
     case DS4_HELP_DS4:
         return streq(topic, "diagnostics") || streq(topic, "commands");
