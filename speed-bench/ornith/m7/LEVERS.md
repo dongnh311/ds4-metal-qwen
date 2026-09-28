@@ -51,3 +51,16 @@ Per repetition (decode t/s): base 67.1 / 72.8 (2K), 53.6 / 55.8 (32K), 42.0 / 41
 Adopt: every identity check holds (the verify is exact by construction and by test), plain decode is byte-unchanged,
 the stop rule (>= +5% at 2K) passes with +30.6%, and no context regresses. For reference, M6's gate 3 measured the
 live oMLX at 79.9 / 64.5 / 38.9 t/s decode (2K / 32K / 128K); the same-day comparison is Task 6's gate 3.
+
+## Addendum: startup self-check and per-row fallback (final review fix)
+
+Window `m7t7` (2026-09-28 10:13-10:22), RED `b563f6a` / GREEN `b923d2d`. The engine compiles a copy of
+`metal/qwen35.metal` through `DS4_METAL_QWEN35_SOURCE` whose two-row kernel adds 1e-3 to every partial sum
+(`--perturbed-kernel`) or is missing (`--broken-kernel`). Raw: `tests/m7t7-*.txt`.
+
+| run | RED (no self-check) | GREEN |
+|---|---|---|
+| `--perturbed-kernel` | FAIL: "cycle 1: 111 two-row matvecs, expected 0" (the inexact kernel ran in the verify) | ok: "batched verify off: ... failed its startup check", 0 two-row matvecs, bit-identical to plain |
+| `--broken-kernel` | FAIL: "Ornith mtp: verify failed" | ok: same fallback, bit-identical |
+| default / knob on / knob off | - | ok: 149 x 111 / 149 x 111 / 0 (the self-check passes on this toolchain) |
+| `test_qwen35_mtp`, `test_mtp_cli.py`, Qwen fast gate | - | ok, PASS, PASS |

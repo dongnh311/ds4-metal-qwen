@@ -28,8 +28,9 @@ Head-to-head sweep (`h2h/`, A-B order, oMLX first, one cold request per length, 
 | 128K | **153.8 s** | 347.6 s | **49.3** | 39.5 | 28.2 GiB | 44.0 GiB |
 
 \* process footprint + the 21.26 GiB model ds4 maps outside it (see `../m6/plot_h2h.py`). The 192K and 250K rows
-were not re-run (the verify change does not touch prefill; M6's `../m6/h2h.txt`: oMLX aborted the 192K request,
-ds4 decoded 31.8 / 28.6 t/s there and M7's verify speeds decode at every length).
+were not re-run. M6 measured them (`../m6/h2h.txt`): oMLX aborted the 192K request, and ds4 decoded 31.8 / 28.6 t/s
+there with M6's per-row verify. M7 should raise those too (the A/B gain was +21% at 128K), but that is an
+expectation, not a measurement.
 
 ## What changed
 
@@ -38,7 +39,10 @@ decoding), costing ~1.55-1.74x a plain step. M7 adds `kernel_qwen35_mv_q8_0_rows
 per-row multiply-adds and reduction tree for two input rows, each weight block loaded once. The verify runs its Q8_0
 projections through it: attention q/output, the GDN `lin_qkv`/`lin_gate`/`lin_out` (a new Ornith-local GDN verify
 layer keeps the recurrence one row at a time) and the lm head. F16/F32 projections and the experts stay per row.
-`DS4_QWEN35_VERIFY_BATCH`, default on; `=0` restores the per-row verify.
+`DS4_QWEN35_VERIFY_BATCH`, default on; `=0` restores the per-row verify. Because the shader library is compiled
+at run time with fast math, the first MTP session re-checks the two-row matvec against two one-row dispatches on
+the lm head and one GDN projection; a mismatch, or any two-row call that fails, turns the batched verify off for
+the process (a stderr line says so), so `--mtp` output never depends on the compiler matching.
 
 | | one T=1 call | today's two T=1 calls | two-row kernel |
 |---|---:|---:|---:|
