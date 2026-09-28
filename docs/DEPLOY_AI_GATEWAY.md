@@ -1,10 +1,13 @@
 # Deploying ds4 to the local AI-Gateway
 
-The AI-Gateway serves the Qwen3.8-Flash-Next model through `ds4-server`,
-launched on demand from the PROD checkout at
-`~/.local/share/ai-gateway/ds4-metal` with the command stored in the gateway
-registry (`~/.local/ai-gateway/runtime-registry.json`, runtime `ds4`, port
-18086). This document is the only supported way to change what runs there.
+The AI-Gateway serves models through `ds4-server`, launched from the PROD
+checkout at `~/.local/share/ai-gateway/ds4-metal` with the command stored in
+the gateway registry (`~/.local/ai-gateway/runtime-registry.json`). Every model
+row with a `ds4` runtime is its own process on its own port: Qwen3.8-Flash-Next
+on 18086 (on demand) and Ornith-1.5 on 18087 (the default model). All rows run
+the same PROD binary, so one deploy ships both. The gateway stops the running
+ds4 row before it starts another one. This document is the only supported way
+to change what runs there.
 `deploy-ai-gateway.sh` at the repository root implements the mechanical steps
 and refuses to run when a rule below is broken.
 
@@ -41,11 +44,15 @@ Rules:
   (use the new registry command if this deploy changes it, see step 4):
 
   ```sh
-  ./deploy-ai-gateway.sh smoke --bin . --out /tmp/ds4-ref-<feature>
+  ./deploy-ai-gateway.sh smoke --model <registry key> --bin . --out /tmp/ds4-ref-<feature>-<model>
   ```
 
   Greedy output depends on the commit, the model and the launch flags, so the
   reference must come from the same commit and command you are about to deploy.
+  Record one reference per ds4 row. `--model` names the registry row and is
+  required when more than one row has an enabled `ds4` runtime. To record with
+  a registry change that is not live yet, point the script at an edited copy
+  with `DS4_GATEWAY_REGISTRY=<copy>`.
 
 ### 2. Cut the prod branch
 
@@ -85,15 +92,18 @@ appends `previous -> new` to `.deploy-history` in the PROD checkout.
 ### 5. Smoke test before handing over
 
 ```sh
-./deploy-ai-gateway.sh smoke --ref /tmp/ds4-ref-<feature>
+./deploy-ai-gateway.sh smoke --model <registry key> --ref /tmp/ds4-ref-<feature>-<model>
 ```
 
-This starts the exact registry command from the PROD checkout on a scratch
-port (18297) with a scratch KV directory, sends a Vietnamese and a code prompt
-at temperature 0, and compares both replies with the `develop` reference. The
-deploy passes only if both replies are non-empty and identical to the
-reference, and the tokens per second match the `develop` run. It never touches
-port 18086 or the live KV cache.
+Run it once per ds4 row. It starts that row's exact registry command from the
+PROD checkout on a scratch port (18297) with a scratch KV directory, sends a
+Vietnamese and a code prompt at temperature 0, and compares both replies with
+the `develop` reference. The deploy passes only if both replies are non-empty
+and identical to the reference, and the tokens per second match the `develop`
+run. It never touches the live ports or KV caches. If the server does not exit
+within 60 s of SIGTERM, the smoke fails and leaves it running (a Metal process
+is never SIGKILLed); stop it before going on. The script itself is tested
+without a GPU by `python3 tests/test_deploy_smoke.py`.
 
 ### 6. Hand over
 

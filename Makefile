@@ -1139,6 +1139,10 @@ mxfp4-dot-test: tests/test_mxfp4_dot.c
 test-download-model:
 	python3 tests/test_model_download.py
 
+.PHONY: test-deploy-smoke
+test-deploy-smoke:
+	python3 tests/test_deploy_smoke.py
+
 .PHONY: test-quality-api
 # Only the scorer's JSON parser is needed; discard the unused engine entry point.
 test-quality-api: tests/test_quality_api.c gguf-tools/quality-testing/score_official.c
