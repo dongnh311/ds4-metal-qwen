@@ -203,8 +203,9 @@ python3 dir-steering/tools/build_direction.py \
   --ctx 512
 ```
 
-Qwen steering is Metal-only. `--mtp-model`, SSD streaming, and `--power`
-remain unsupported for this graph. The bank contains only the 48 trunk layers;
+Qwen steering is Metal-only. `--mtp-model` and `--power` remain unsupported
+for this graph. SSD streaming works: streamed layers run the same steered
+layer loop. The bank contains only the 48 trunk layers;
 the embedded MTP predictor remains unsteered. Its drafts are verified by the
 steered target trunk, so `--mtp` remains supported.
 
