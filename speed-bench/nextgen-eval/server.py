@@ -94,7 +94,8 @@ def resolve(config, registry, root, port, kv_dir):
 _PROMPT_DONE = re.compile(r"prompt done ([\d.]+)s")
 _PREFILL = re.compile(r"prefill chunk \d+/\d+ \([\d.]+%\) chunk=[\d.]+ t/s avg=([\d.]+) t/s")
 _THINK = re.compile(r"thinking closed after (\d+) tokens")
-_FINISH = re.compile(r"gen=(\d+) finish=(\w+) ([\d.]+)s")
+# ds4_server.c: "gen=%d%s%s finish=%s[ error=\"%s\"] %.3fs"; the %s%s are flags such as " TOOLS" or " THINKING".
+_FINISH = re.compile(r"gen=(\d+)(?: [A-Z_]+)* finish=(\w+)(?: error=\"(?:[^\"\\]|\\.)*\")? ([\d.]+)s")
 _DECODE = re.compile(r"decoding chunk=[\d.]+ t/s avg=([\d.]+) t/s")
 
 

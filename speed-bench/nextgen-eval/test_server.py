@@ -106,6 +106,16 @@ class Logs(unittest.TestCase):
         seg = "\n".join(l for l in LOG.splitlines() if "thinking closed" not in l)
         self.assertIsNone(server.parse_request_log(seg)["think_tokens"])
 
+    def test_parse_finish_line_flags_and_errors(self):
+        # ds4_server.c prints "gen=%d%s%s finish=%s": TOOLS / THINKING flags sit between the two.
+        cases = [("gen=50 TOOLS finish=tool_calls 1.200s", (50, "tool_calls", 1.2)),
+                 ("gen=16384 THINKING finish=length 300.500s", (16384, "length", 300.5)),
+                 ('gen=3 finish=error error="engine: out of memory" 0.500s', (3, "error", 0.5))]
+        for line, (gen, finish, total) in cases:
+            with self.subTest(line=line):
+                got = server.parse_request_log("0925 10:18:13 ds4-server: chat ctx=0..81:81 " + line + "\n")
+                self.assertEqual((got["gen_tokens"], got["finish"], got["total_s"]), (gen, finish, total))
+
     def test_parse_empty_segment(self):
         self.assertTrue(all(v is None for v in server.parse_request_log("").values()))
 

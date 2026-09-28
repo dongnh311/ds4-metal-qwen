@@ -54,7 +54,19 @@ class Ctx:
         self.cursor.take()  # drop log lines from before this request
         out = server.chat(self.base_url, messages, max_tokens, extra)
         out.update(self.take_log())
+        out.update(_http_numbers(out.get("usage"), out.get("finish_reason")))
         return out
+
+
+def _http_numbers(usage, finish_reason):
+    """Generated tokens and finish reason from the HTTP response. ds4-server logs its finish line only
+    after sending the response, so the log copy can be late; the response is authoritative."""
+    out = {}
+    if (usage or {}).get("completion_tokens") is not None:
+        out["gen_tokens"] = usage["completion_tokens"]
+    if finish_reason:
+        out["finish"] = finish_reason
+    return out
 
 
 def _speed(r):

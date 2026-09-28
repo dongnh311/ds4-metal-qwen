@@ -46,6 +46,30 @@ def write_jsonl(path, rows):
     path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
 
 
+class RealCtx(unittest.TestCase):
+    def test_ask_attributes_log_lines_and_prefers_http_numbers(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = pathlib.Path(d) / "server.log"
+            # A late line from the previous request: it must not be attributed to this one.
+            log.write_text("ds4-server: chat ctx=0..9:9 thinking closed after 999 tokens\n")
+
+            def fake_chat(base_url, messages, max_tokens=16384, extra=None, timeout=7200):
+                with open(log, "a") as f:
+                    f.write("ds4-server: chat ctx=0..81:81 prompt done 0.500s\n"
+                            "ds4-server: chat ctx=0..81:81 prefill chunk 81/81 (100.0%) chunk=0.00 t/s "
+                            "avg=162.00 t/s 0.500s\n"
+                            "ds4-server: chat ctx=81..131:50 gen=50 decoding chunk=40.00 t/s avg=40.00 t/s 1.2s\n")
+                return {"content": "x", "reasoning": "", "usage": {"completion_tokens": 77},
+                        "finish_reason": "length", "seconds": 2.0}
+
+            ctx = eval_suites.Ctx("http://fake", eval_suites.server.LogCursor(log), d, 262144, d)
+            with mock.patch.object(eval_suites.server, "chat", fake_chat):
+                r = ctx.ask("hi")
+        self.assertEqual((r["gen_tokens"], r["finish"]), (77, "length"))
+        self.assertEqual((r["prefill_s"], r["prefill_tps"], r["decode_tps"]), (0.5, 162.0, 40.0))
+        self.assertIsNone(r["think_tokens"])
+
+
 class Suites(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
