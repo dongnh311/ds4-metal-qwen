@@ -9,12 +9,19 @@ import server
 EVAL_WITH_VALUE = {"-m", "--model", "--ple", "--prefill-chunk", "--ssd-streaming-cache-experts",
                    "--ssd-streaming-full-layers", "--ssd-streaming-preload-experts", "--threads"}
 EVAL_NO_VALUE = {"--metal", "--ssd-streaming", "--ssd-streaming-cold", "--quality"}
+# Serving flags that do not apply to ds4-eval's offline runs. Every other flag must be classified here
+# or above: a new candidate flag (runtime projection, YaRN, ...) is refused, never dropped silently.
+SERVER_ONLY_WITH_VALUE = {"-c", "--ctx", "--host", "--port", "--kv-disk-dir", "--kv-disk-space-mb",
+                          "--kv-cache-cold-max-tokens", "--think-budget"}
+SERVER_ONLY_NO_VALUE = {"--mtp"}
 REASON_RUNS = [("core", "GPQA Diamond", 8), ("core", "SuperGPQA", 8), ("core", "AIME2025", 8),
                ("hard", "MMLU-Pro", 20)]
 TOKENS = 32768
 CTX_CAP = 65536
 _STATES = {"PASSED", "FAILED", "INCOMPLETE", "SKIPPED", "STOPPED", "PREFILL", "RUNNING", "PENDING"}
-_ROW = re.compile(r"^\s*(\d+) (\S+)\s+(\d+)\s+(\d+)\s+(\d+) (.{20}) (.{20}) (.+)$")
+_GRADED = {"PASSED", "FAILED", "INCOMPLETE"}  # INCOMPLETE counts as a fail; anything else means the run broke
+# C pads %-20.20s by bytes, so the report is matched as bytes and each field decoded afterwards.
+_ROW = re.compile(rb"^\s*(\d+) (\S+)\s+(\d+)\s+(\d+)\s+(\d+) (.{20}) (.{20}) (.+)$")
 
 
 def eval_argv(server_argv, root, suite, source, questions, trace):
@@ -27,8 +34,14 @@ def eval_argv(server_argv, root, suite, source, questions, trace):
             out += [arg, server_argv[i + 1]]
             i += 2
             continue
+        if arg in SERVER_ONLY_WITH_VALUE:
+            i += 2
+            continue
         if arg in EVAL_NO_VALUE:
             out.append(arg)
+        elif arg not in SERVER_ONLY_NO_VALUE:
+            raise ValueError("ds4-eval cannot place server flag %r: add it to ds4eval.EVAL_* (passed to "
+                             "ds4-eval) or SERVER_ONLY_* (serving only)" % arg)
         i += 1
     ctx = int(server.argv_value(server_argv, "-c") or CTX_CAP)
     out += ["-c", str(min(ctx, CTX_CAP)), "--suite", suite, "--source", source,
@@ -36,17 +49,37 @@ def eval_argv(server_argv, root, suite, source, questions, trace):
     return out
 
 
+def _text(raw):
+    return raw.decode("utf-8", errors="replace")
+
+
 def parse_report(stdout):
+    """Report rows from ds4-eval's stdout (bytes, or str for convenience)."""
+    if isinstance(stdout, str):
+        stdout = stdout.encode()
     rows = []
     for line in stdout.splitlines():
         m = _ROW.match(line)
-        if not m or m.group(2) not in _STATES:
+        if not m or _text(m.group(2)) not in _STATES:
             continue
-        source, _, case_id = m.group(8).strip().partition("/")
-        rows.append({"idx": int(m.group(1)), "state": m.group(2), "prompt_tokens": int(m.group(3)),
-                     "gen_tokens": int(m.group(4)), "given": m.group(6).strip(),
-                     "correct": m.group(7).strip(), "source": source, "case_id": case_id})
+        source, _, case_id = _text(m.group(8)).strip().partition("/")
+        rows.append({"idx": int(m.group(1)), "state": _text(m.group(2)), "prompt_tokens": int(m.group(3)),
+                     "gen_tokens": int(m.group(4)), "given": _text(m.group(6)).strip(),
+                     "correct": _text(m.group(7)).strip(), "source": source, "case_id": case_id})
     return rows
+
+
+def _run(argv, cwd, env):
+    """Run ds4-eval to the end. No timeout, and on Ctrl-C SIGTERM and wait: a Metal process killed with
+    -9 can wedge its GGUF until reboot."""
+    proc = subprocess.Popen(argv, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = proc.communicate()
+    except BaseException:
+        proc.terminate()
+        proc.wait()
+        raise
+    return proc.returncode, out, err
 
 
 def run_reason(env, server_argv, root, out_dir):
@@ -56,13 +89,14 @@ def run_reason(env, server_argv, root, out_dir):
         trace = pathlib.Path(out_dir) / (stem + ".trace")
         argv = eval_argv(server_argv, root, suite, source, questions, trace)
         print("   %s" % " ".join(argv), flush=True)
-        proc = subprocess.run(argv, cwd=str(root), env={**os.environ, **env}, capture_output=True,
-                              text=True, timeout=6 * 3600)
-        (pathlib.Path(out_dir) / (stem + ".log")).write_text(proc.stdout + "\n--- stderr ---\n" + proc.stderr)
-        parsed = parse_report(proc.stdout)
-        if len(parsed) != questions:
-            raise RuntimeError("ds4-eval %s: expected %d report rows, got %d (exit %s), see %s.log" % (
-                source, questions, len(parsed), proc.returncode, stem))
+        code, out, err = _run(argv, str(root), {**os.environ, **env})
+        (pathlib.Path(out_dir) / (stem + ".log")).write_text(
+            " ".join(argv) + "\n" + _text(out) + "\n--- stderr ---\n" + _text(err))
+        parsed = parse_report(out)
+        states = sorted({r["state"] for r in parsed} - _GRADED)
+        if code != 0 or len(parsed) != questions or states:
+            raise RuntimeError("ds4-eval %s: exit %s, %d/%d report rows, ungraded states %s; see %s.log" % (
+                source, code, len(parsed), questions, states or "none", stem))
         rows += [dict(r, suite="reason", id="%s/%s" % (r["source"], r["case_id"]),
                       passed=r["state"] == "PASSED") for r in parsed]
     return rows

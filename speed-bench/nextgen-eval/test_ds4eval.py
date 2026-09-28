@@ -14,13 +14,37 @@ SERVER_ARGV = ["/repo/ds4-server", "--metal", "-m", "/m/prod.gguf", "--ple", "/m
 
 
 def report(rows):
-    lines = ["ds4-eval: %d/%d passed, runtime 0:10" % (sum(r[1] == "PASSED" for r in rows), len(rows)),
-             "%-3s %-10s %8s %8s %8s %-20s %-20s %s" % ("#", "state", "prompt", "gen", "total", "given",
-                                                        "correct", "test")]
+    """A ds4-eval report as bytes, padded the way C's %-20.20s pads: by bytes, not characters."""
+    lines = [b"ds4-eval: %d/%d passed, runtime 0:10" % (sum(r[1] == "PASSED" for r in rows), len(rows)),
+             b"#   state        prompt      gen    total given                correct              test"]
     for i, (source, state, given, correct) in enumerate(rows, 1):
-        lines.append("%3d %-10s %8d %8d %8d %-20.20s %-20.20s %s/%s" % (
-            i, state, 100, 200, 300, given, correct, source, "case-%d" % i))
-    return "\n".join(lines) + "\n"
+        lines.append(b"%3d %-10s %8d %8d %8d %s %s %s/%s" % (
+            i, state.encode(), 100, 200, 300, given.encode().ljust(20)[:20], correct.encode().ljust(20)[:20],
+            source.encode(), b"case-%d" % i))
+    return b"\n".join(lines) + b"\n"
+
+
+class FakePopen:
+    """Stands in for subprocess.Popen: `script(argv)` returns (returncode, stdout bytes) or raises."""
+    script = None
+    last = None
+
+    def __init__(self, argv, **kwargs):
+        self.argv, self.returncode, self.terminated, self.killed = argv, None, False, False
+        FakePopen.last = self
+
+    def communicate(self, timeout=None):
+        self.returncode, out = FakePopen.script(self.argv)
+        return out, b""
+
+    def terminate(self):
+        self.terminated = True
+
+    def kill(self):
+        self.killed = True
+
+    def wait(self, timeout=None):
+        return self.returncode
 
 
 class Argv(unittest.TestCase):
@@ -31,6 +55,19 @@ class Argv(unittest.TestCase):
             "--prefill-chunk", "2048", "--ssd-streaming", "--ssd-streaming-cache-experts", "6GB",
             "-c", "65536", "--suite", "core", "--source", "GPQA Diamond", "--questions", "8",
             "--tokens", "32768", "--trace", "/t/x.trace"])
+
+    def test_server_only_flags_are_dropped(self):
+        argv = SERVER_ARGV + ["--kv-cache-cold-max-tokens", "262144", "--think-budget", "4096"]
+        self.assertEqual(ds4eval.eval_argv(argv, pathlib.Path("/repo"), "core", "AIME2025", 8, "/t"),
+                         ds4eval.eval_argv(SERVER_ARGV, pathlib.Path("/repo"), "core", "AIME2025", 8, "/t"))
+
+    def test_unknown_flag_is_refused(self):
+        # A candidate flag (say, runtime refusal projection) must never be dropped silently: the
+        # reasoning suite would score a model other than the candidate.
+        with self.assertRaises(ValueError) as cm:
+            ds4eval.eval_argv(SERVER_ARGV + ["--refusal-projection", "/d/v.gguf"], pathlib.Path("/repo"),
+                              "core", "AIME2025", 8, "/t")
+        self.assertIn("--refusal-projection", str(cm.exception))
 
 
 class Report(unittest.TestCase):
@@ -44,33 +81,69 @@ class Report(unittest.TestCase):
         self.assertEqual(rows[1]["state"], "INCOMPLETE")
 
     def test_ignores_progress_lines(self):
-        text = "loading model...\n" + report([("AIME2025", "FAILED", "12", "70")]) + "done\n"
+        text = b"loading model...\n" + report([("AIME2025", "FAILED", "12", "70")]) + b"done\n"
         self.assertEqual(len(ds4eval.parse_report(text)), 1)
 
 
 class Run(unittest.TestCase):
-    def _fake_run(self, missing_rows=False):
-        def fake(argv, **kwargs):
-            n = int(argv[argv.index("--questions") + 1])
-            source = argv[argv.index("--source") + 1]
-            count = n - 1 if missing_rows else n
-            rows = [(source, "PASSED" if i % 2 == 0 else "FAILED", "A", "A") for i in range(count)]
-            return mock.Mock(stdout=report(rows), stderr="", returncode=0)
-        return fake
+    def _run(self, script):
+        FakePopen.script = staticmethod(script)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(ds4eval.subprocess, "Popen", FakePopen):
+            return ds4eval.run_reason({}, SERVER_ARGV, pathlib.Path("/repo"), d)
+
+    @staticmethod
+    def _rows(argv, count_delta=0, states=None):
+        n = int(argv[argv.index("--questions") + 1])
+        source = argv[argv.index("--source") + 1]
+        states = states or ["PASSED" if i % 2 == 0 else "FAILED" for i in range(n)]
+        return [(source, states[i], "A", "A") for i in range(n + count_delta)]
 
     def test_run_reason_collects_every_run(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch.object(ds4eval.subprocess, "run", self._fake_run()):
-            rows = ds4eval.run_reason({}, SERVER_ARGV, pathlib.Path("/repo"), d)
+        rows = self._run(lambda argv: (0, report(self._rows(argv))))
         self.assertEqual(len(rows), sum(n for _, _, n in ds4eval.REASON_RUNS))
         self.assertTrue(all(r["suite"] == "reason" for r in rows))
         self.assertEqual(rows[0]["passed"], True)
         self.assertEqual(rows[1]["passed"], False)
 
     def test_short_report_fails_loudly(self):
-        with tempfile.TemporaryDirectory() as d, \
-                mock.patch.object(ds4eval.subprocess, "run", self._fake_run(missing_rows=True)):
-            with self.assertRaises(RuntimeError):
-                ds4eval.run_reason({}, SERVER_ARGV, pathlib.Path("/repo"), d)
+        with self.assertRaises(RuntimeError):
+            self._run(lambda argv: (0, report(self._rows(argv, count_delta=-1))))
+
+    def test_engine_error_report_fails_loudly(self):
+        # ds4-eval stops on an engine error but still prints one row per case, then exits 1.
+        def engine_error(argv):
+            n = int(argv[argv.index("--questions") + 1])
+            states = ["PASSED", "FAILED", "RUNNING"] + ["PENDING"] * (n - 3)
+            return 1, report(self._rows(argv, states=states))
+        with self.assertRaises(RuntimeError):
+            self._run(engine_error)
+
+    def test_nonzero_exit_fails_loudly(self):
+        with self.assertRaises(RuntimeError):
+            self._run(lambda argv: (1, report(self._rows(argv))))
+
+    def test_skipped_case_fails_loudly(self):
+        def skipped(argv):
+            n = int(argv[argv.index("--questions") + 1])
+            return 0, report(self._rows(argv, states=["SKIPPED"] + ["PASSED"] * (n - 1)))
+        with self.assertRaises(RuntimeError):
+            self._run(skipped)
+
+    def test_interrupt_terminates_and_never_kills(self):
+        def interrupted(argv):
+            raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self._run(interrupted)
+        self.assertTrue(FakePopen.last.terminated)
+        self.assertFalse(FakePopen.last.killed)
+
+    def test_partial_utf8_output_and_non_ascii_given(self):
+        # --plain streams generated tokens to stdout; one can end inside a multi-byte character.
+        def odd_bytes(argv):
+            rows = [(r[0], r[1], "\u221a2 (sqrt)", "A") for r in self._rows(argv)]
+            return 0, b"token stream \xe2\x88\n" + report(rows)
+        rows = self._run(odd_bytes)
+        self.assertEqual(rows[0]["given"], "\u221a2 (sqrt)")
 
 
 if __name__ == "__main__":
