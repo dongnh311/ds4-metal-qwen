@@ -7778,6 +7778,28 @@ static void test_qwen_kv_grow(void) {
     test_restore_env("DS4_QWEN4_KV_GROW_TEST_FAIL", saved[3]);
 }
 
+static void test_dir_steering_rows(void) {
+    enum { W = 4 };
+    float rows[3 * W] = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.6f, 0.8f, 0.0f, 0.0f,
+    };
+    char err[192] = {0};
+    TEST_ASSERT(ds4_directional_steering_check_rows(rows, 3, W, err, sizeof(err)) == 0);
+    rows[2 * W] = 0.6006f;                        /* norm ~1.00036: inside the tolerance */
+    TEST_ASSERT(ds4_directional_steering_check_rows(rows, 3, W, err, sizeof(err)) == 0);
+    rows[2 * W] = 1.2f;                           /* norm 2 */
+    rows[2 * W + 1] = 1.6f;
+    TEST_ASSERT(ds4_directional_steering_check_rows(rows, 3, W, err, sizeof(err)) == 1);
+    TEST_ASSERT(strstr(err, "layer 2") != NULL);
+    rows[2 * W] = 0.6f;
+    rows[2 * W + 1] = 0.8f;
+    rows[1] = NAN;                                /* a corrupted row: NaN must not pass */
+    TEST_ASSERT(ds4_directional_steering_check_rows(rows, 3, W, err, sizeof(err)) == 1);
+    TEST_ASSERT(strstr(err, "layer 0") != NULL);
+}
+
 static void test_server_unit_group(void) {
     ds4_server_unit_tests_run();
 }
@@ -7793,6 +7815,7 @@ typedef struct {
 
 static const ds4_test_entry test_entries[] = {
     {"--qwen-kv-grow-policy", "qwen-kv-grow-policy", "Qwen3.8 grow-on-demand KV capacity policy (no model)", test_qwen_kv_grow_policy},
+    {"--dir-steering-rows", "dir-steering-rows", "directional steering rows must be unit length or zero (no model)", test_dir_steering_rows},
 #ifndef DS4_NO_GPU
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},

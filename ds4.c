@@ -2131,6 +2131,35 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
     return true;
 }
 
+int ds4_directional_steering_check_rows(const float *dirs, uint32_t n_rows, uint32_t width,
+                                        char *err, size_t errlen) {
+    for (uint32_t r = 0; r < n_rows; r++) {
+        double sum = 0.0;
+        for (uint32_t i = 0; i < width; i++) {
+            const float v = dirs[(uint64_t)r * width + i];
+            uint32_t bits;
+            memcpy(&bits, &v, sizeof(bits));
+            /* -ffast-math lets the compiler drop NaN tests, so read the exponent bits */
+            if ((bits & 0x7f800000u) == 0x7f800000u) {
+                if (err && errlen) {
+                    snprintf(err, errlen, "steering row for layer %u has a non-finite value", r);
+                }
+                return 1;
+            }
+            sum += (double)v * v;
+        }
+        const double norm = sqrt(sum);
+        if (norm == 0.0 || fabs(norm - 1.0) <= 1e-3) continue;
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "steering row for layer %u has norm %g; rows must be unit length or zero",
+                     r, norm);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static bool cpu_directional_steering_enabled(
         const float *dirs,
         float        scale);
@@ -60121,6 +60150,12 @@ static bool qwen4_graph_load_steering(ds4_qwen4_gpu_graph *g,
     const uint64_t n = (uint64_t)n_layers * DS4_N_EMBD;
     float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
     bool ok = read_f32_binary_file(path, dirs, n);
+    char row_err[192];
+    if (ok && ds4_directional_steering_check_rows(dirs, n_layers, DS4_N_EMBD,
+                                                   row_err, sizeof(row_err)) != 0) {
+        fprintf(stderr, "ds4: %s: %s\n", path, row_err);
+        ok = false;
+    }
     if (ok) {
         g->steer_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
         ok = g->steer_dirs != NULL &&

@@ -430,6 +430,11 @@ float ds4_session_directional_steering_ffn(ds4_session *s);
 /* Change steering for future evaluation without rebuilding the existing KV
  * state. Live changes are currently limited to non-distributed sessions. */
 int ds4_session_set_directional_steering_ffn(ds4_session *s, float scale);
+/* Rows of a directional steering matrix must be unit length or zero: the
+ * projection kernels assume unit rows. Returns 0 when every row qualifies,
+ * otherwise 1 with the first offending row and its norm written to err. */
+int ds4_directional_steering_check_rows(const float *dirs, uint32_t n_rows, uint32_t width,
+                                        char *err, size_t errlen);
 bool ds4_session_is_distributed(ds4_session *s);
 void ds4_session_set_progress(ds4_session *s, ds4_session_progress_fn fn, void *ud);
 /* UI-only progress. It may report fine-grained progress inside a prefill chunk;
