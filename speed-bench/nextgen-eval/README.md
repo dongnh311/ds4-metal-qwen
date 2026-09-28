@@ -52,6 +52,10 @@ does not stop one that is already loaded (up to ~50 GiB). If `pgrep` lists one, 
 (`kill -TERM <pid>`, never `-9`) and wait for it to exit before running an arm. A `<defunct>` entry in
 `ps` is an exited process whose parent has not reaped it; it holds no memory.
 
+The gateway process on :8090 is not owned by the ai-proxy LaunchAgent, so it stays up. It starts a
+ds4 backend only when a request arrives. After the run, `curl -s localhost:8090/status` lists the
+recent requests (`ago_s`); check that none arrived during the run.
+
 Run the arm:
 
 ```bash
