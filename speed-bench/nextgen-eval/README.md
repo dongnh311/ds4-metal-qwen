@@ -44,12 +44,13 @@ gateway stack:
 launchctl unload ~/Library/LaunchAgents/dev.dongnh.ai-proxy.plist
 launchctl unload ~/Library/LaunchAgents/dev.dongnh.gateway-watchdog.plist
 kill -TERM "$(cat ~/.local/share/ai-gateway/omlx.pid)"
-pgrep -fl ds4-server   # must print nothing
+pgrep -lx ds4-server   # must print nothing (-x: by process name; -f would match this shell's own text)
 ```
 
-The gateway starts its ds4-server on demand, and pausing the stack does not stop one that is already
-loaded (it holds ~50 GiB). If `pgrep` lists one, SIGTERM it (`kill -TERM <pid>`, never `-9`) and wait for
-it to exit before running an arm.
+The gateway starts its ds4-server on demand (Qwen on :18086, Ornith on :18087), and pausing the stack
+does not stop one that is already loaded (up to ~50 GiB). If `pgrep` lists one, SIGTERM it
+(`kill -TERM <pid>`, never `-9`) and wait for it to exit before running an arm. A `<defunct>` entry in
+`ps` is an exited process whose parent has not reaped it; it holds no memory.
 
 Run the arm:
 
@@ -64,6 +65,8 @@ Restore the stack (the watchdog restarts omlx):
 ```bash
 launchctl load ~/Library/LaunchAgents/dev.dongnh.ai-proxy.plist
 launchctl load ~/Library/LaunchAgents/dev.dongnh.gateway-watchdog.plist
+launchctl kickstart gui/$(id -u)/dev.dongnh.gateway-watchdog
+curl -s localhost:8090/status   # wait for "backend_ok":true; the proxy answers 200 even while its backend is down
 ```
 
 A full arm takes about 4 hours. Each run writes `command.json`, `server.log`, `rows.jsonl`,
