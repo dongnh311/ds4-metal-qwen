@@ -94,7 +94,10 @@ def run_reason(env, server_argv, root, out_dir):
             " ".join(argv) + "\n" + _text(out) + "\n--- stderr ---\n" + _text(err))
         parsed = parse_report(out)
         states = sorted({r["state"] for r in parsed} - _GRADED)
-        if code != 0 or len(parsed) != questions or states:
+        # ds4_eval.c exits `rc || failed || incomplete ? 1 : 0`, so a wrong answer alone exits 1; an engine
+        # error shows as ungraded rows or as an exit code the rows do not explain.
+        expected = 1 if any(r["state"] in ("FAILED", "INCOMPLETE") for r in parsed) else 0
+        if code != expected or len(parsed) != questions or states:
             raise RuntimeError("ds4-eval %s: exit %s, %d/%d report rows, ungraded states %s; see %s.log" % (
                 source, code, len(parsed), questions, states or "none", stem))
         for r in parsed:

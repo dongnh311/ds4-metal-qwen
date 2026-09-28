@@ -99,7 +99,7 @@ class Run(unittest.TestCase):
         return [(source, states[i], "A", "A") for i in range(n + count_delta)]
 
     def test_run_reason_collects_every_run(self):
-        rows = self._run(lambda argv: (0, report(self._rows(argv))))
+        rows = self._run(lambda argv: (1, report(self._rows(argv))))
         self.assertEqual(len(rows), sum(n for _, _, n in ds4eval.REASON_RUNS))
         self.assertTrue(all(r["suite"] == "reason" for r in rows))
         self.assertEqual(rows[0]["passed"], True)
@@ -109,7 +109,7 @@ class Run(unittest.TestCase):
         def fourth_fails(argv):
             if "MMLU-Pro" in argv:
                 return 1, b"engine error\n"
-            return 0, report(self._rows(argv))
+            return 1, report(self._rows(argv))
         got = []
         FakePopen.script = staticmethod(fourth_fails)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(ds4eval.subprocess, "Popen", FakePopen):
@@ -131,9 +131,22 @@ class Run(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self._run(engine_error)
 
-    def test_nonzero_exit_fails_loudly(self):
+    def test_exit_one_with_failed_cases_is_normal(self):
+        # ds4_eval.c returns `rc || failed || incomplete ? 1 : 0`: one wrong answer exits 1 (seen live on
+        # SuperGPQA 7/8, 2026-09-28).
+        rows = self._run(lambda argv: (1, report(self._rows(argv))))
+        self.assertEqual(len(rows), sum(n for _, _, n in ds4eval.REASON_RUNS))
+
+    def test_exit_zero_with_failed_cases_fails_loudly(self):
         with self.assertRaises(RuntimeError):
-            self._run(lambda argv: (1, report(self._rows(argv))))
+            self._run(lambda argv: (0, report(self._rows(argv))))
+
+    def test_nonzero_exit_with_every_case_passed_fails_loudly(self):
+        def all_passed(argv):
+            n = int(argv[argv.index("--questions") + 1])
+            return 1, report(self._rows(argv, states=["PASSED"] * n))
+        with self.assertRaises(RuntimeError):
+            self._run(all_passed)
 
     def test_skipped_case_fails_loudly(self):
         def skipped(argv):
@@ -154,7 +167,7 @@ class Run(unittest.TestCase):
         # --plain streams generated tokens to stdout; one can end inside a multi-byte character.
         def odd_bytes(argv):
             rows = [(r[0], r[1], "\u221a2 (sqrt)", "A") for r in self._rows(argv)]
-            return 0, b"token stream \xe2\x88\n" + report(rows)
+            return 1, b"token stream \xe2\x88\n" + report(rows)
         rows = self._run(odd_bytes)
         self.assertEqual(rows[0]["given"], "\u221a2 (sqrt)")
 
