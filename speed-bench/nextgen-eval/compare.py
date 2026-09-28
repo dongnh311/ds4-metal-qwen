@@ -31,14 +31,27 @@ def suite_verdict(base, cand):
     return "same"
 
 
+def _longctx_kept(base_lc, cand_lc):
+    """Every long-context row PROD answered (needles and 240K document questions), the candidate answers
+    too: the goal's rule is no regression in any measured area."""
+    for group in ("needle", "docqa"):
+        b, c = base_lc.get(group, {}), cand_lc.get(group, {})
+        if any(v is True and c.get(k) is not True for k, v in b.items()):
+            return False
+    return True
+
+
 def gate(base, cand):
     per_suite = {}
     for name in ACCURACY:
         b, c = base["suites"].get(name), cand["suites"].get(name)
-        if b and c:
+        b_ids, c_ids = base.get("case_ids", {}).get(name), cand.get("case_ids", {}).get(name)
+        if not (b and c):
+            per_suite[name] = "missing"  # an axis nobody measured is not a pass
+        elif b_ids and c_ids and b_ids != c_ids:
+            per_suite[name] = "incomparable"  # same count, different cases
+        else:
             per_suite[name] = suite_verdict(b, c)
-        elif b or c:
-            per_suite[name] = "missing"
     bu, cu = base.get("uncensor", {}), cand.get("uncensor", {})
     have_unc = all(k in bu and k in cu for k in ("harmful_refusals", "harmless_refusals"))
     lc = cand.get("longctx", {})
@@ -52,6 +65,8 @@ def gate(base, cand):
                          and cand["vi_cjk_leaks"] <= base["vi_cjk_leaks"]),
         "needle_480k": lc.get("needle", {}).get("480k") is True and lc.get("swapouts") == 0,
         "total_time_lower": have_time and sum(ct[s] for s in SPEED_SUITES) < sum(bt[s] for s in SPEED_SUITES),
+        "complete_runs": not base.get("errors") and not cand.get("errors"),
+        "longctx_no_regression": _longctx_kept(base.get("longctx", {}), lc),
     }
     regressions = [k for k, v in per_suite.items() if v in ("regressed", "missing", "incomparable")]
     improvements = [k for k, v in per_suite.items() if v == "improved"]
@@ -93,7 +108,36 @@ def render_markdown(base, cand, verdict):
     lines.append("| peak wired GiB | %s | %s |" % (bl.get("peak_wired_gib"), cl.get("peak_wired_gib")))
     lines.append("| swap-outs | %s | %s |" % (bl.get("swapouts"), cl.get("swapouts")))
     lines.append("| VI CJK leaks | %s | %s |" % (base.get("vi_cjk_leaks"), cand.get("vi_cjk_leaks")))
+    lines += ["", "## Provenance", "", "| | %s | %s |" % (b_arm, c_arm), "|---|---|---|",
+              "| suites run | %s | %s |" % (",".join(base.get("suites_run", [])), ",".join(cand.get("suites_run", [])))]
+    bp, cp = base.get("provenance", {}), cand.get("provenance", {})
+    for key in sorted(set(bp) | set(cp)):
+        lines.append("| %s | %s | %s |" % (key, _flat(bp.get(key)), _flat(cp.get(key))))
+    for arm, s in ((b_arm, base), (c_arm, cand)):
+        for e in s.get("errors", []):
+            lines.append("| error (%s) | %s | %s |" % (arm, e.get("suite"), _flat(e.get("error"))))
     return "\n".join(lines) + "\n"
+
+
+def _flat(value):
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def writing_side_by_side(base_rows, cand_rows):
+    """The Vietnamese writing answers of both arms, paired by prompt id, for a human to read."""
+    def answers(rows):
+        return {r["id"]: r.get("answer", "") for r in rows if r.get("suite") == "vi_writing"}
+    b, c = answers(base_rows), answers(cand_rows)
+    lines = ["# Vietnamese writing, side by side", ""]
+    for rid in sorted(set(b) | set(c)):
+        lines += ["## %s" % rid, "", "**baseline**", "", b.get(rid, "(missing)"), "", "**candidate**", "",
+                  c.get(rid, "(missing)"), ""]
+    return "\n".join(lines) + "\n"
+
+
+def _load_rows(path):
+    return [json.loads(line) for line in pathlib.Path(path).read_text().splitlines() if line.strip()]
 
 
 def main():
@@ -101,6 +145,8 @@ def main():
     ap.add_argument("base")
     ap.add_argument("cand")
     ap.add_argument("--out")
+    ap.add_argument("--rows", nargs=2, metavar=("BASE_ROWS", "CAND_ROWS"),
+                    help="the two rows.jsonl files: also write the VI writing answers side by side")
     args = ap.parse_args()
     base = json.loads(pathlib.Path(args.base).read_text())
     cand = json.loads(pathlib.Path(args.cand).read_text())
@@ -108,6 +154,14 @@ def main():
     md = render_markdown(base, cand, verdict)
     if args.out:
         pathlib.Path(args.out).write_text(md)
+    if args.rows:
+        writing = writing_side_by_side(_load_rows(args.rows[0]), _load_rows(args.rows[1]))
+        target = pathlib.Path(args.out).with_suffix(".writing.md") if args.out else None
+        if target:
+            target.write_text(writing)
+            print("writing side by side: %s" % target)
+        else:
+            print(writing)
     print(md)
     sys.exit(0 if verdict["passed"] else 1)
 

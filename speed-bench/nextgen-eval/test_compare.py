@@ -101,6 +101,58 @@ class Gate(unittest.TestCase):
         c["speed"]["total_seconds"]["vi"] = 5000.0
         self.assertFalse(compare.gate(BASE, c)["checks"]["total_time_lower"])
 
+    def test_suite_neither_arm_ran_is_missing(self):
+        b, c = copy.deepcopy(BASE), candidate()
+        del b["suites"]["tools_pos"], c["suites"]["tools_pos"]
+        v = compare.gate(b, c)
+        self.assertFalse(v["passed"])
+        self.assertEqual(v["per_suite"]["tools_pos"], "missing")
+
+    def test_different_case_sets_are_incomparable(self):
+        b, c = copy.deepcopy(BASE), candidate()
+        b["case_ids"], c["case_ids"] = {"code": "aaa"}, {"code": "bbb"}
+        self.assertEqual(compare.gate(b, c)["per_suite"]["code"], "incomparable")
+        c["case_ids"] = {"code": "aaa"}
+        self.assertEqual(compare.gate(b, c)["per_suite"]["code"], "same")
+
+    def test_suite_errors_fail_the_gate(self):
+        c = candidate()
+        c["errors"] = [{"suite": "tools", "error": "boom"}]
+        v = compare.gate(BASE, c)
+        self.assertFalse(v["checks"]["complete_runs"])
+        self.assertFalse(v["passed"])
+
+    def test_long_context_regression_fails(self):
+        c = candidate()
+        c["longctx"]["needle"]["240k"] = False
+        self.assertFalse(compare.gate(BASE, c)["checks"]["longctx_no_regression"])
+        b, c = copy.deepcopy(BASE), candidate()
+        b["longctx"]["docqa"], c["longctx"]["docqa"] = {"docqa-0": True}, {"docqa-0": False}
+        self.assertFalse(compare.gate(b, c)["checks"]["longctx_no_regression"])
+        c["longctx"]["docqa"] = {"docqa-0": True}
+        self.assertTrue(compare.gate(b, c)["checks"]["longctx_no_regression"])
+
+    def test_markdown_shows_what_each_arm_ran(self):
+        b, c = copy.deepcopy(BASE), candidate()
+        b["provenance"] = {"git_head": "aaa", "argv": ["ds4-server", "-c", "262144"]}
+        c["provenance"] = {"git_head": "bbb", "argv": ["ds4-server", "-c", "524288"]}
+        b["suites_run"] = c["suites_run"] = ["code", "vi"]
+        md = compare.render_markdown(b, c, compare.gate(b, c))
+        self.assertIn("## Provenance", md)
+        self.assertIn("| git_head | aaa | bbb |", md)
+        self.assertIn("524288", md)
+        self.assertIn("suites run", md)
+
+    def test_writing_side_by_side(self):
+        base_rows = [{"suite": "vi_writing", "id": "vi-w01", "answer": "Kính gửi anh"},
+                     {"suite": "code", "id": "x", "answer": "no"}]
+        cand_rows = [{"suite": "vi_writing", "id": "vi-w01", "answer": "Chào anh"}]
+        md = compare.writing_side_by_side(base_rows, cand_rows)
+        self.assertIn("vi-w01", md)
+        self.assertIn("Kính gửi anh", md)
+        self.assertIn("Chào anh", md)
+        self.assertNotIn("no", md.split("vi-w01")[0])
+
     def test_markdown_has_verdict_and_rows(self):
         md = compare.render_markdown(BASE, candidate(), compare.gate(BASE, candidate()))
         self.assertIn("**Gate: PASS**", md)

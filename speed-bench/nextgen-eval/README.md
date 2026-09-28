@@ -19,9 +19,18 @@ Scores a ds4 server configuration (an "arm") against PROD for the next-gen Qwen3
 ## Setup (once)
 
 ```bash
-python3 speed-bench/nextgen-eval/fetch_data.py      # datasets into $NEXTGEN_EVAL_DATA
+python3 speed-bench/nextgen-eval/fetch_data.py      # with the gateway stack UP (see below)
 make -j8 ds4-server ds4-eval                        # this checkout's binaries are the ones that run
 ```
+
+`fetch_data.py` writes into `$NEXTGEN_EVAL_DATA`:
+- the dataset subsets;
+- the gateway's MCP tool catalog (`mcp_tools.json`, from `/mcp tools/list`: ds4-server has no `/mcp`);
+- a frozen copy of `ds4.c` (`haystack.c`, the long-context document);
+- `manifest.json` with every file's sha256.
+
+Every arm reads these frozen inputs, so arms run days apart grade the same cases. Re-fetch only between
+comparisons, never between a baseline and its candidates.
 
 `$NEXTGEN_EVAL_DATA` defaults to `~/orca/workspaces/ds4-metal-data/evals/nextgen`, and
 `$NEXTGEN_GATEWAY_REPO` defaults to `~/Documents/GitHub/AI-Gateway-MLX`.
@@ -58,36 +67,54 @@ launchctl load ~/Library/LaunchAgents/dev.dongnh.gateway-watchdog.plist
 ```
 
 A full arm takes about 4 hours. Each run writes `command.json`, `server.log`, `rows.jsonl`,
-`summary.json` and the ds4-eval logs/traces under `$NEXTGEN_EVAL_DATA/runs/<arm>-<stamp>/`. The script
-never SIGKILLs ds4-server; if it refuses to exit, stop it by hand.
+`summary.json` and the ds4-eval logs/traces under `$NEXTGEN_EVAL_DATA/runs/<arm>-<stamp>/`:
+- Rows are appended as they are produced.
+- A suite that fails leaves a `suite-error` row (listed under `errors` in the summary), and the run
+  goes on.
+- `summary.json` is written even when the run is interrupted.
+
+The script never SIGKILLs ds4-server or ds4-eval; if one refuses to exit, stop it by hand.
 
 ## Arm configs
 
 ```json
-{"name": "cand", "base": "registry", "model": "/path/main.gguf",
- "args_add": ["--some-flag", "value"], "args_remove": ["--flag-to-drop"], "env": {"DS4_X": "1"}}
+{"name": "cand", "base": "registry", "registry_model": "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2",
+ "model": "/path/main.gguf", "args_add": ["-c", "524288", "--some-flag"], "args_remove": ["--flag-to-drop"],
+ "env": {"DS4_X": "1"}}
 ```
 
-The base is the single enabled ds4 runtime's `process_command` in `~/.local/ai-gateway/runtime-registry.json`,
-with `--port` and `--kv-disk-dir` replaced and this checkout's `ds4-server`.
+The base is the ds4 `process_command` of `registry_model` in `~/.local/ai-gateway/runtime-registry.json`,
+with `--port` and `--kv-disk-dir` replaced and this checkout's `ds4-server`. The model is named
+explicitly because the registry has more than one enabled ds4 runtime.
+
+A flag in `args_add` that the command already has replaces its value. The reasoning suite passes
+ds4-eval only the flags in `ds4eval.EVAL_*`. A flag that is neither there nor in
+`ds4eval.SERVER_ONLY_*` stops the run before the server starts: classify every new candidate flag.
 
 ## Comparing arms
 
 ```bash
 python3 speed-bench/nextgen-eval/compare.py RUNS/prod-X/summary.json RUNS/cand-Y/summary.json \
-  --out speed-bench/nextgen-eval/results/<date>-cand-vs-prod.md
+  --out speed-bench/nextgen-eval/results/<date>-cand-vs-prod.md \
+  --rows RUNS/prod-X/rows.jsonl RUNS/cand-Y/rows.jsonl   # also writes <out>.writing.md, VI writing side by side
 ```
 
 Gate:
 - An accuracy suite with at most 30 cases regresses at 2 or more fewer passes; a larger suite regresses
   more than 3 points below the baseline.
-- Suites of different sizes are incomparable, and incomparable fails.
+- The following fail the gate:
+  - a suite that is missing from either arm;
+  - suites of different sizes, or with different case ids (incomparable);
+  - any `suite-error`.
 - The candidate passes when no suite regresses, at least one improves, and in addition:
   - harmful refusals <= baseline;
   - harmless refusals <= baseline + 1;
   - VI CJK leaks <= baseline;
   - the 480K needle is hit with zero swap-outs;
+  - every long-context needle and 240K document question the baseline answered is answered;
   - total seconds over code + ifeval + vi + uncensor are lower.
+
+The report's Provenance table shows what each arm ran: commit, binary hashes, command and frozen data.
 
 Exit code 0 means PASS.
 

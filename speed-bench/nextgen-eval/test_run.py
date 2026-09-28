@@ -1,3 +1,4 @@
+import hashlib
 import json
 import pathlib
 import sys
@@ -36,8 +37,8 @@ class Summarize(unittest.TestCase):
         self.assertEqual(s["vi_cjk_leaks"], 1)
         self.assertEqual(s["uncensor"], {"harmful_refusals": 1, "harmful_n": 2,
                                          "harmless_refusals": 0, "harmless_n": 1})
-        self.assertEqual(s["longctx"], {"needle": {"120k": True, "480k": None}, "peak_wired_gib": 49.1,
-                                        "swapouts": 0})
+        self.assertEqual(s["longctx"], {"needle": {"120k": True, "480k": None}, "docqa": {},
+                                        "peak_wired_gib": 49.1, "swapouts": 0})
         self.assertEqual(s["speed"]["total_seconds"], {"code": 30.0, "vi": 12.0, "uncensor": 5.0})
         self.assertEqual(s["speed"]["think_tokens_median"], 200)
         self.assertEqual(s["speed"]["decode_tps_median"], 41.0)
@@ -52,6 +53,35 @@ class Summarize(unittest.TestCase):
         self.assertEqual(cfg, {"name": "prod", "base": "registry",
                                "registry_model": "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2",
                                "model": None, "args_add": [], "args_remove": [], "env": {}})
+
+    def test_case_ids_and_doc_questions(self):
+        rows = ROWS + [{"suite": "longctx", "id": "docqa-0", "passed": False}]
+        s = run.summarize(rows)
+        self.assertEqual(s["case_ids"]["code"], hashlib.sha256(b"a\nb").hexdigest()[:16])
+        self.assertNotIn("vi_writing", s["case_ids"])
+        self.assertEqual(s["longctx"]["docqa"], {"docqa-0": False})
+        self.assertEqual(s["longctx"]["needle"], {"120k": True, "480k": None})
+
+    def test_provenance(self):
+        with tempfile.TemporaryDirectory() as d:
+            root, data = pathlib.Path(d) / "repo", pathlib.Path(d) / "data"
+            root.mkdir()
+            data.mkdir()
+            (root / "ds4-server").write_bytes(b"server")
+            (data / "manifest.json").write_text('{"mbpp.jsonl": {"rows": 50, "sha256": "abc"}}')
+            calls = []
+
+            def git(repo, *args):
+                calls.append((str(repo), args))
+                return {"rev-parse": "c0ffee", "status": " M ds4.c"}[args[0]]
+            p = run.provenance({"K": "1"}, ["ds4-server", "-c", "8"], root, data, pathlib.Path(d) / "gw", git=git)
+        self.assertEqual(p["git_head"], "c0ffee")
+        self.assertTrue(p["git_dirty"])
+        self.assertEqual(p["gateway_head"], "c0ffee")
+        self.assertEqual(p["ds4_server_sha256"], hashlib.sha256(b"server").hexdigest())
+        self.assertIsNone(p["ds4_eval_sha256"])
+        self.assertEqual(p["data"], {"mbpp.jsonl": "abc"})
+        self.assertEqual((p["env"], p["argv"]), ({"K": "1"}, ["ds4-server", "-c", "8"]))
 
     def test_errors_are_listed(self):
         s = run.summarize(ROWS + [{"suite": "tools", "id": "suite-error", "passed": None, "error": "boom"}])

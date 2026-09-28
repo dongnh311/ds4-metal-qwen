@@ -7,10 +7,12 @@ server has stopped, so only one model is ever loaded. Pause the gateway stack be
 """
 import argparse
 import datetime
+import hashlib
 import json
 import pathlib
 import shutil
 import statistics
+import subprocess
 import sys
 import tempfile
 
@@ -18,6 +20,7 @@ HERE = pathlib.Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import ds4eval  # noqa: E402
 import eval_suites  # noqa: E402
+import graders  # noqa: E402
 import server  # noqa: E402
 from compare import ACCURACY, SPEED_SUITES  # noqa: E402
 from fetch_data import DATA  # noqa: E402
@@ -46,6 +49,12 @@ def summarize(rows):
         s = suites.setdefault(r["suite"], {"n": 0, "passed": 0})
         s["n"] += 1
         s["passed"] += int(bool(r["passed"]))
+    ids = {}
+    for r in rows:
+        if r.get("passed") is not None and r["suite"] in ACCURACY:
+            ids.setdefault(r["suite"], []).append(str(r["id"]))
+    case_ids = {k: hashlib.sha256("\n".join(sorted(v)).encode()).hexdigest()[:16] for k, v in ids.items()}
+    docqa = {r["id"]: r["passed"] for r in rows if r["suite"] == "longctx" and r["id"].startswith("docqa-")}
     vi_rows = [r for r in rows if r["suite"].startswith("vi_")]
     uncensor = {}
     for kind in ("harmful", "harmless"):
@@ -63,15 +72,46 @@ def summarize(rows):
             totals[group] = round(totals.get(group, 0.0) + r["seconds"], 1)
     return {
         "suites": suites,
+        "case_ids": case_ids,
         "errors": [{"suite": r["suite"], "error": r.get("error")} for r in rows if r.get("id") == "suite-error"],
         "vi_cjk_leaks": sum(1 for r in vi_rows if (r.get("cjk") or 0) > 0) if vi_rows else None,
         "uncensor": uncensor,
-        "longctx": {"needle": needle, "peak_wired_gib": mem.get("peak_wired_gib"), "swapouts": mem.get("swapouts")},
+        "longctx": {"needle": needle, "docqa": docqa, "peak_wired_gib": mem.get("peak_wired_gib"), "swapouts": mem.get("swapouts")},
         "speed": {"total_seconds": totals,
                   "think_tokens_median": _median([r.get("think_tokens") for r in rows]),
                   "decode_tps_median": _median([r.get("decode_tps") for r in rows]),
                   "prefill_tps_median": _median([r.get("prefill_tps") for r in rows])},
     }
+
+
+def _git(repo, *args):
+    try:
+        return subprocess.run(["git", "-C", str(repo)] + list(args), capture_output=True, text=True,
+                              timeout=60).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _sha256(path):
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except FileNotFoundError:
+        return None
+
+
+def provenance(env, argv, root, data, gateway, git=_git):
+    """What this arm ran: commit, binaries, command, frozen data. Two arms run days apart can differ in
+    any of these; compare.py prints them side by side."""
+    manifest = data / "manifest.json"
+    frozen = json.loads(manifest.read_text()) if manifest.exists() else {}
+    return {"git_head": git(root, "rev-parse", "HEAD"), "git_dirty": bool(git(root, "status", "--porcelain")),
+            "gateway_head": git(gateway, "rev-parse", "HEAD"),
+            "ds4_server_sha256": _sha256(root / "ds4-server"), "ds4_eval_sha256": _sha256(root / "ds4-eval"),
+            "env": env, "argv": argv, "data": {k: v.get("sha256") for k, v in frozen.items()}}
 
 
 def _error_row(suite, error):
@@ -139,12 +179,13 @@ def main():
     kv_dir = pathlib.Path(tempfile.mkdtemp(prefix="kv-", dir=str(out)))
     env, argv = server.resolve(config, registry, server.ROOT, args.port, kv_dir)
     (out / "command.json").write_text(json.dumps({"config": config, "env": env, "argv": argv}, indent=1) + "\n")
+    prov = provenance(env, argv, server.ROOT, DATA, graders.GATEWAY_REPO)
     rows = []
     try:
         run_arm(env, argv, wanted, out, rows, port=args.port)
     finally:
         shutil.rmtree(kv_dir, ignore_errors=True)
-        summary = dict(summarize(rows), arm=config["name"], config=config, suites_run=wanted)
+        summary = dict(summarize(rows), arm=config["name"], config=config, suites_run=wanted, provenance=prov)
         (out / "summary.json").write_text(json.dumps(summary, indent=1, ensure_ascii=False) + "\n")
     print(json.dumps(summary, indent=1, ensure_ascii=False))
     print("run directory: %s" % out)
