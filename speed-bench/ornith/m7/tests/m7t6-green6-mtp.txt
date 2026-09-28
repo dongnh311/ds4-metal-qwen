@@ -1,0 +1,7 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: metal backend initialized for graph diagnostics
+  greedy: 150 cycles, 115 accepted, bit-identical to plain decoding
+  forced accepts: 20 of 20 cycles committed two tokens, bit-identical
+  divergent prompt: 30 cycles bit-identical
+  context end: 'context is full' at position 4160
+qwen35 mtp: ok

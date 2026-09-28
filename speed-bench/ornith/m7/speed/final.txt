@@ -1,0 +1,5 @@
+m4_ab: 2048     ds4 decode 93.0 / oMLX 80.7  ds4 prefill 1842 / oMLX 1713
+m4_ab: 32768    ds4 decode 68.3 / oMLX 64.8  ds4 prefill 1668 / oMLX 1660
+m4_ab: 131072   ds4 decode 50.4 / oMLX 39.9  ds4 prefill 903 / oMLX 750
+m4_ab: cold31k  ds4 decode 68.5 / oMLX 65.2  ds4 prefill 1567 / oMLX 1527
+m4_ab: PASS

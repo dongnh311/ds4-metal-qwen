@@ -1,10 +1,11 @@
 """Charts and CSV for the Ornith head-to-head (h2h.py output).
 
-  uv run --with matplotlib python speed-bench/ornith/m6/plot_h2h.py h2h/h2h.json
+  uv run --with matplotlib python speed-bench/ornith/m6/plot_h2h.py h2h/h2h.json \
+      [--out-dir DIR] [--ds4-label TEXT] [--png-dir DIR]
 
 Writes h2h.csv (every request), h2h-throughput.svg (prefill and decode t/s per
 context) and h2h-ttft-memory.svg (time to first token and peak footprint per
-context) next to this script. A request that failed is drawn as an x on the
+context) next to this script, or into --out-dir. A request that failed is drawn as an x on the
 axis floor and labelled.
 """
 import csv
@@ -37,10 +38,10 @@ def load(path):
     return rows
 
 
-def write_csv(rows):
+def write_csv(rows, out):
     keys = ["runtime", "context", "rep", "prompt_tokens", "ttft_s", "prefill_tps", "decode_tps",
             "completion_tokens", "peak_footprint_gib", "total_gib", "idle_footprint_gib", "finish_reason", "error"]
-    with (ROOT / "h2h.csv").open("w", newline="") as fp:
+    with (out / "h2h.csv").open("w", newline="") as fp:
         w = csv.DictWriter(fp, fieldnames=keys, extrasaction="ignore")
         w.writeheader()
         for r in rows:
@@ -89,31 +90,39 @@ def panel(ax, rows, metric, title, ylabel, fmt, log=False):
     ax.legend(frameon=False, fontsize=9)
 
 
-def chart(name, rows, panels, png_dir=None):
+def chart(name, rows, panels, out, png_dir=None):
     fig, axes = plt.subplots(1, 2, figsize=(13, 4.8))
     for ax, args in zip(axes, panels):
         panel(ax, rows, *args)
     fig.tight_layout()
-    fig.savefig(ROOT / name)
+    fig.savefig(out / name)
     if png_dir:
         fig.savefig(Path(png_dir) / name.replace(".svg", ".png"), dpi=110)
     plt.close(fig)
 
 
+def take_opt(argv, name):
+    if name not in argv:
+        return None, argv
+    i = argv.index(name)
+    return argv[i + 1], argv[:i] + argv[i + 2:]
+
+
 def main(argv):
-    png_dir = None
-    if "--png-dir" in argv:
-        i = argv.index("--png-dir")
-        png_dir = argv[i + 1]
-        argv = argv[:i] + argv[i + 2:]
+    png_dir, argv = take_opt(argv, "--png-dir")
+    out_dir, argv = take_opt(argv, "--out-dir")
+    label, argv = take_opt(argv, "--ds4-label")
+    out = Path(out_dir) if out_dir else ROOT
+    if label:
+        STYLE["ds4"] = (label,) + STYLE["ds4"][1:]
     rows = load(argv[0] if argv else ROOT / "h2h.json")
-    write_csv(rows)
+    write_csv(rows, out)
     chart("h2h-throughput.svg", rows, [
         ("prefill_tps", "Prefill", "Tokens / second", lambda v: "%.0f" % v),
-        ("decode_tps", "Decode (MTP on both)", "Tokens / second", lambda v: "%.1f" % v)], png_dir)
+        ("decode_tps", "Decode (MTP on both)", "Tokens / second", lambda v: "%.1f" % v)], out, png_dir)
     chart("h2h-ttft-memory.svg", rows, [
         ("ttft_s", "Time to first token (lower is better)", "Seconds", lambda v: "%.1f" % v, True),
-        ("total_gib", "Peak memory (weights + KV + buffers)", "GiB", lambda v: "%.1f" % v)], png_dir)
+        ("total_gib", "Peak memory (weights + KV + buffers)", "GiB", lambda v: "%.1f" % v)], out, png_dir)
     return 0
 
 
