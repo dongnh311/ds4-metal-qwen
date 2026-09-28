@@ -207,3 +207,20 @@ Qwen steering is Metal-only. `--mtp-model`, SSD streaming, and `--power`
 remain unsupported for this graph. The bank contains only the 48 trunk layers;
 the embedded MTP predictor remains unsteered. Its drafts are verified by the
 steered target trunk, so `--mtp` remains supported.
+
+### Refusal projection from a llama.cpp control vector
+
+A llama.cpp control-vector GGUF (`general.architecture = controlvector`, tensors `direction.N`) converts
+to a ds4 steering file. llama.cpp applies `direction.N` at layer N, and so does the converted file.
+Layers outside `--layers` get a zero row, which ds4 leaves untouched:
+
+```sh
+python3 dir-steering/tools/cvec_to_f32.py \
+  --in Qwen3.8-Flash-Next-refusal-projection.gguf --layers 4-44 --out refusal-4-44.f32
+./ds4-server -m qwen.gguf ... --dir-steering-file refusal-4-44.f32 --dir-steering-ffn 1
+```
+
+For Qwen, FFN steering projects all four hyper-connection streams of the residual right after each
+layer's FFN combine, the same place llama.cpp's `build_cvec` runs. ds4 refuses a steering file whose
+rows are neither unit length nor zero. A steered `ds4-server` keeps its disk KV cache in
+`<kv-disk-dir>/steer-<sha8>`, so a cache written without that steering is never restored with it.
