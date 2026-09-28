@@ -66,6 +66,31 @@ class Resolve(unittest.TestCase):
         with self.assertRaises(SystemExit):
             server.registry_command(two)
 
+    def test_registry_model_picks_among_several_enabled(self):
+        # Ornith's ds4 runtime is enabled next to PROD's Qwen (2026-09-28).
+        two = {"models": {"a": REGISTRY["models"]["a"],
+                          "ornith": {"runtimes": {"ds4": {"enabled": True, "process_command": ["x"]}}}}}
+        self.assertEqual(server.registry_command(two, "a"), PROD_CMD)
+        with self.assertRaises(SystemExit) as cm:
+            server.registry_command(two)
+        self.assertIn("ornith", str(cm.exception))
+        cfg = {"name": "prod", "base": "registry", "registry_model": "a"}
+        env, argv = server.resolve(cfg, two, pathlib.Path("/repo"), 18299, "/tmp/kv")
+        self.assertEqual(server.argv_value(argv, "-m"), "/m/prod.gguf")
+
+    def test_args_add_replaces_a_flag_the_registry_has(self):
+        cfg = {"name": "cand", "base": "registry", "args_add": ["-c", "524288", "--warm-weights"]}
+        env, argv = server.resolve(cfg, REGISTRY, pathlib.Path("/repo"), 18299, "/tmp/kv")
+        self.assertEqual(argv.count("-c"), 1)
+        self.assertEqual(server.argv_value(argv, "-c"), "524288")
+        self.assertEqual(argv[-1], "--warm-weights")
+
+    def test_ctx_alias_is_normalized(self):
+        cfg = {"name": "cand", "base": "registry", "args_add": ["--ctx", "524288"]}
+        env, argv = server.resolve(cfg, REGISTRY, pathlib.Path("/repo"), 18299, "/tmp/kv")
+        self.assertNotIn("--ctx", argv)
+        self.assertEqual(server.argv_value(argv, "-c"), "524288")
+
     def test_unknown_base_is_refused(self):
         with self.assertRaises(SystemExit):
             server.resolve({"name": "x", "base": "file"}, REGISTRY, pathlib.Path("/repo"), 1, "/k")

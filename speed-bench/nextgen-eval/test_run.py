@@ -48,8 +48,9 @@ class Summarize(unittest.TestCase):
 
     def test_prod_config(self):
         cfg = json.loads((HERE / "configs" / "prod.json").read_text())
-        self.assertEqual(cfg, {"name": "prod", "base": "registry", "model": None, "args_add": [],
-                               "args_remove": [], "env": {}})
+        self.assertEqual(cfg, {"name": "prod", "base": "registry",
+                               "registry_model": "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2",
+                               "model": None, "args_add": [], "args_remove": [], "env": {}})
 
     def test_all_suites(self):
         self.assertEqual(run.ALL_SUITES, ["code", "ifeval", "vi", "uncensor", "tools", "longctx", "reason"])

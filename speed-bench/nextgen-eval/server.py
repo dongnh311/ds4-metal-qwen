@@ -12,13 +12,16 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 REGISTRY = pathlib.Path.home() / ".local/ai-gateway/runtime-registry.json"
 
 
-def registry_command(registry):
-    """The process_command of the single enabled ds4 runtime (logic of speed-bench/think-budget/measure.py)."""
-    enabled = [m["runtimes"]["ds4"] for m in registry["models"].values()
+def registry_command(registry, model=None):
+    """The ds4 process_command of registry model `model`, or of the single enabled ds4 runtime."""
+    if model:
+        return list(registry["models"][model]["runtimes"]["ds4"]["process_command"])
+    enabled = [name for name, m in registry["models"].items()
                if m.get("runtimes", {}).get("ds4", {}).get("enabled")]
     if len(enabled) != 1:
-        raise SystemExit("expected exactly one enabled ds4 runtime in the registry, found %d" % len(enabled))
-    return list(enabled[0]["process_command"])
+        raise SystemExit("expected exactly one enabled ds4 runtime in the registry, found %d (%s); name one "
+                         "with \"registry_model\" in the arm config" % (len(enabled), ", ".join(enabled)))
+    return list(registry["models"][enabled[0]]["runtimes"]["ds4"]["process_command"])
 
 
 def split_env(cmd):
@@ -52,18 +55,38 @@ def _remove_flag(argv, flag):
         del argv[i:end]
 
 
+_ALIASES = {"--ctx": "-c", "--model": "-m"}
+
+
+def _add_args(argv, extra):
+    """Append `extra`; a flag that argv already has gets its value replaced, never a second copy
+    (ds4-server keeps the last copy, argv_value() reads the first)."""
+    extra = [_ALIASES.get(a, a) for a in extra]
+    i = 0
+    while i < len(extra):
+        flag = extra[i]
+        if i + 1 < len(extra) and not extra[i + 1].startswith("-"):
+            _set_flag(argv, flag, extra[i + 1])
+            i += 2
+            continue
+        if flag not in argv:
+            argv.append(flag)
+        i += 1
+
+
 def resolve(config, registry, root, port, kv_dir):
     if config.get("base") != "registry":
         raise SystemExit("unsupported arm base %r (only 'registry')" % config.get("base"))
-    env, argv = split_env(registry_command(registry))
+    env, argv = split_env(registry_command(registry, config.get("registry_model")))
+    argv = [argv[0]] + [_ALIASES.get(a, a) for a in argv[1:]]
     argv[0] = str(pathlib.Path(root) / "ds4-server")
     _set_flag(argv, "--port", str(port))
     _set_flag(argv, "--kv-disk-dir", str(kv_dir))
     if config.get("model"):
         _set_flag(argv, "-m", config["model"])
     for flag in config.get("args_remove", []):
-        _remove_flag(argv, flag)
-    argv += list(config.get("args_add", []))
+        _remove_flag(argv, _ALIASES.get(flag, flag))
+    _add_args(argv, config.get("args_add", []))
     env.update(config.get("env", {}))
     return env, argv
 

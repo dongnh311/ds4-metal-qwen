@@ -1,1 +1,1 @@
-{"name": "prod", "base": "registry", "model": null, "args_add": [], "args_remove": [], "env": {}}
+{"name": "prod", "base": "registry", "registry_model": "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2", "model": null, "args_add": [], "args_remove": [], "env": {}}
