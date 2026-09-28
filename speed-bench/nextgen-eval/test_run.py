@@ -90,6 +90,18 @@ class Summarize(unittest.TestCase):
     def test_all_suites(self):
         self.assertEqual(run.ALL_SUITES, ["code", "ifeval", "vi", "uncensor", "tools", "longctx", "reason"])
 
+    def test_ivan_configs_differ_only_by_the_projection(self):
+        ivan = json.loads((HERE / "configs" / "ivan.json").read_text())
+        proj = json.loads((HERE / "configs" / "ivan-proj.json").read_text())
+        self.assertEqual(ivan["registry_model"], "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2")
+        self.assertTrue(ivan["model"].endswith("/gguf/ivan/Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf"))
+        self.assertEqual(ivan["args_add"], [])
+        self.assertEqual(dict(proj, name="ivan", args_add=[]), ivan)
+        self.assertEqual(proj["name"], "ivan-proj")
+        self.assertEqual(proj["args_add"][0], "--dir-steering-file")
+        self.assertTrue(proj["args_add"][1].endswith("/steering/refusal-4-44.f32"))
+        self.assertEqual(proj["args_add"][2:], ["--dir-steering-ffn", "1"])
+
 
 class Rerun(unittest.TestCase):
     ROWS = [{"suite": "code", "id": "a", "passed": True},

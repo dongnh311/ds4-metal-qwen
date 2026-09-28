@@ -102,6 +102,11 @@ A flag in `args_add` that the command already has replaces its value. The reason
 ds4-eval only the flags in `ds4eval.EVAL_*`. A flag that is neither there nor in
 `ds4eval.SERVER_ONLY_*` stops the run before the server starts: classify every new candidate flag.
 
+The directional steering flags (`--dir-steering-file`, `--dir-steering-ffn`, `--dir-steering-attn`)
+go to ds4-eval too, so the reasoning suite runs with the same projection as the server. `ivan.json`
+and `ivan-proj.json` are Ivan's stock IQ2 without and with Cudecnik's refusal projection (sub-project
+2).
+
 ## Comparing arms
 
 ```bash
@@ -126,6 +131,22 @@ Gate:
   - total seconds over code + ifeval + vi + uncensor are lower.
 
 The report's Provenance table shows what each arm ran: commit, binary hashes, command and frozen data.
+
+An engine change on one set of weights (the refusal projection on Ivan's stock IQ2; YaRN) uses the
+engine gate:
+
+```bash
+python3 speed-bench/nextgen-eval/compare.py RUNS/ivan-X/summary.json RUNS/ivan-proj-Y/summary.json \
+  --gate engine --refusal-caps 1,1 --out speed-bench/nextgen-eval/results/<date>-sp2-projection.md
+```
+
+- **What it keeps:** the accuracy rule, `complete_runs`, `longctx_no_regression` and `vi_cjk_leaks`.
+- **What it drops:** "at least one suite improves", `total_time_lower` and `needle_480k`.
+- **Refusals:** harmful and harmless refusals must be at most the two caps. The baseline arm is the
+  censored stock model, so comparing refusals with it would prove nothing.
+
+Copy both `summary.json` files next to the report in `results/`, because the run directories are not
+in git.
 
 Exit code 0 means PASS.
 

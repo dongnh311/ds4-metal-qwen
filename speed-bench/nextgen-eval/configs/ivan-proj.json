@@ -1,0 +1,5 @@
+{"name": "ivan-proj", "base": "registry", "registry_model": "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2",
+ "model": "/Users/dongnh/orca/workspaces/ds4-metal-data/gguf/ivan/Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf",
+ "args_add": ["--dir-steering-file", "/Users/dongnh/orca/workspaces/ds4-metal-data/steering/refusal-4-44.f32",
+              "--dir-steering-ffn", "1"],
+ "args_remove": [], "env": {}}

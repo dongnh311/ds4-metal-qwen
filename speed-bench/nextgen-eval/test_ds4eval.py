@@ -61,6 +61,14 @@ class Argv(unittest.TestCase):
         self.assertEqual(ds4eval.eval_argv(argv, pathlib.Path("/repo"), "core", "AIME2025", 8, "/t"),
                          ds4eval.eval_argv(SERVER_ARGV, pathlib.Path("/repo"), "core", "AIME2025", 8, "/t"))
 
+    def test_steering_flags_reach_ds4_eval(self):
+        argv = SERVER_ARGV + ["--dir-steering-file", "/d/refusal.f32", "--dir-steering-ffn", "1",
+                              "--dir-steering-attn", "0"]
+        out = ds4eval.eval_argv(argv, pathlib.Path("/repo"), "core", "AIME2025", 8, "/t")
+        i = out.index("--dir-steering-file")
+        self.assertEqual(out[i:i + 6], ["--dir-steering-file", "/d/refusal.f32", "--dir-steering-ffn", "1",
+                                        "--dir-steering-attn", "0"])
+
     def test_unknown_flag_is_refused(self):
         # A candidate flag (say, runtime refusal projection) must never be dropped silently: the
         # reasoning suite would score a model other than the candidate.

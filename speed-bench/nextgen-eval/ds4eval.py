@@ -7,7 +7,8 @@ import subprocess
 import server
 
 EVAL_WITH_VALUE = {"-m", "--model", "--ple", "--prefill-chunk", "--ssd-streaming-cache-experts",
-                   "--ssd-streaming-full-layers", "--ssd-streaming-preload-experts", "--threads"}
+                   "--ssd-streaming-full-layers", "--ssd-streaming-preload-experts", "--threads",
+                   "--dir-steering-file", "--dir-steering-ffn", "--dir-steering-attn"}
 EVAL_NO_VALUE = {"--metal", "--ssd-streaming", "--ssd-streaming-cold", "--quality"}
 # Serving flags that do not apply to ds4-eval's offline runs. Every other flag must be classified here
 # or above: a new candidate flag (runtime projection, YaRN, ...) is refused, never dropped silently.
