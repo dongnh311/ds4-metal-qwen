@@ -89,7 +89,7 @@ class Run(unittest.TestCase):
     def _run(self, script):
         FakePopen.script = staticmethod(script)
         with tempfile.TemporaryDirectory() as d, mock.patch.object(ds4eval.subprocess, "Popen", FakePopen):
-            return ds4eval.run_reason({}, SERVER_ARGV, pathlib.Path("/repo"), d)
+            return list(ds4eval.run_reason({}, SERVER_ARGV, pathlib.Path("/repo"), d))
 
     @staticmethod
     def _rows(argv, count_delta=0, states=None):
@@ -104,6 +104,19 @@ class Run(unittest.TestCase):
         self.assertTrue(all(r["suite"] == "reason" for r in rows))
         self.assertEqual(rows[0]["passed"], True)
         self.assertEqual(rows[1]["passed"], False)
+
+    def test_finished_runs_stream_before_a_later_failure(self):
+        def fourth_fails(argv):
+            if "MMLU-Pro" in argv:
+                return 1, b"engine error\n"
+            return 0, report(self._rows(argv))
+        got = []
+        FakePopen.script = staticmethod(fourth_fails)
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(ds4eval.subprocess, "Popen", FakePopen):
+            with self.assertRaises(RuntimeError):
+                for row in ds4eval.run_reason({}, SERVER_ARGV, pathlib.Path("/repo"), d):
+                    got.append(row)
+        self.assertEqual(len(got), 8 + 8 + 8)
 
     def test_short_report_fails_loudly(self):
         with self.assertRaises(RuntimeError):

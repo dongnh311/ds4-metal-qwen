@@ -83,7 +83,7 @@ class Suites(unittest.TestCase):
         # HumanEval prompts get code that crashes at import, so no HE row can pass by accident.
         answer = lambda p: ("```python\n" + MBPP_ROW["code"] + "```" if "shared elements" in p
                             else "```python\nraise RuntimeError('fake')\n```")
-        rows = eval_suites.run_code(FakeCtx(self.data, answer))
+        rows = list(eval_suites.run_code(FakeCtx(self.data, answer)))
         he = graders.bench_module("humaneval_mini").PROBLEMS
         self.assertEqual(len(rows), len(he) + 1)
         self.assertTrue(rows[-1]["passed"])
@@ -94,14 +94,14 @@ class Suites(unittest.TestCase):
         write_jsonl(self.data / "ifeval.jsonl", [{"key": 7, "prompt": "p", "kwargs": [{}, {}],
                                                    "instruction_id_list": ["punctuation:no_comma",
                                                                            "change_case:english_lowercase"]}])
-        rows = eval_suites.run_ifeval(FakeCtx(self.data, lambda p: "all lower no comma"))
+        rows = list(eval_suites.run_ifeval(FakeCtx(self.data, lambda p: "all lower no comma")))
         self.assertEqual(rows[0]["id"], "7")
         self.assertTrue(rows[0]["passed"])
         self.assertEqual(rows[0]["instructions"], [["punctuation:no_comma", True],
                                                    ["change_case:english_lowercase", True]])
 
     def test_vi(self):
-        rows = eval_suites.run_vi(FakeCtx(self.data, lambda p: "Đáp án: Hà Nội. 你好"))
+        rows = list(eval_suites.run_vi(FakeCtx(self.data, lambda p: "Đáp án: Hà Nội. 你好")))
         by = {}
         for r in rows:
             by.setdefault(r["suite"], []).append(r)
@@ -116,7 +116,7 @@ class Suites(unittest.TestCase):
         write_jsonl(self.data / "harmful.jsonl", [{"text": "bad one"}, {"text": "bad two"}])
         write_jsonl(self.data / "harmless.jsonl", [{"text": "good one"}, {"text": "good two"}])
         answer = lambda p: "I'm sorry, but I can't help with that." if p.startswith("bad") else "Sure: done."
-        rows = eval_suites.run_uncensor(FakeCtx(self.data, answer))
+        rows = list(eval_suites.run_uncensor(FakeCtx(self.data, answer)))
         harmful = [r for r in rows if r["suite"] == "uncensor_harmful"]
         harmless = [r for r in rows if r["suite"] == "uncensor_harmless"]
         self.assertTrue(all(r["refused"] and not r["passed"] for r in harmful))
@@ -126,15 +126,29 @@ class Suites(unittest.TestCase):
         # A stand-in for the frozen ds4.c snapshot, long enough for the 240k tier (727,200 characters).
         (self.data / eval_suites.HAYSTACK).write_text("int x = 1;\n" * 80000)
 
+    def test_rows_stream_before_a_failure(self):
+        # Rows reach run.py one at a time, so a request that fails late keeps the earlier rows.
+        write_jsonl(self.data / "harmful.jsonl", [{"text": "bad one"}, {"text": "bad two"}])
+
+        def answer(p):
+            if p == "bad two":
+                raise OSError("connection reset")
+            return "Sure."
+        got = []
+        with self.assertRaises(OSError):
+            for row in eval_suites.run_uncensor(FakeCtx(self.data, answer)):
+                got.append(row)
+        self.assertEqual([r["id"] for r in got], ["harmful-00"])
+
     def test_longctx_needs_the_frozen_haystack(self):
         with self.assertRaises(RuntimeError) as cm:
-            eval_suites.run_longctx(FakeCtx(self.data, lambda p: "7314-QX", ctx_limit=130000))
+            list(eval_suites.run_longctx(FakeCtx(self.data, lambda p: "7314-QX", ctx_limit=130000)))
         self.assertIn("fetch_data.py", str(cm.exception))
 
     def test_longctx_skips_tiers_beyond_ctx(self):
         self._haystack()
         ctx = FakeCtx(self.data, lambda p: "7314-QX", ctx_limit=130000)
-        rows = eval_suites.run_longctx(ctx)
+        rows = list(eval_suites.run_longctx(ctx))
         needles = {r["id"]: r for r in rows if r["suite"] == "longctx"}
         self.assertTrue(needles["needle-120k"]["passed"])
         for tier in ("240k", "480k", "960k"):
@@ -154,7 +168,7 @@ class Suites(unittest.TestCase):
                 if question in tail:
                     return value
             return "7314-QX"
-        rows = eval_suites.run_longctx(FakeCtx(self.data, answer, ctx_limit=262144))
+        rows = list(eval_suites.run_longctx(FakeCtx(self.data, answer, ctx_limit=262144)))
         ids = {r["id"]: r["passed"] for r in rows if r["suite"] == "longctx"}
         self.assertEqual(ids["docqa-0"], True)
         self.assertEqual(ids["docqa-2"], True)
@@ -237,7 +251,7 @@ class Suites(unittest.TestCase):
         (self.data / "mcp_tools.json").write_text(json.dumps(catalog))
         modules, chats = self._fake_gateway()
         with mock.patch.dict(sys.modules, modules):
-            rows = eval_suites.run_tools(FakeCtx(self.data, lambda p: ""))
+            rows = list(eval_suites.run_tools(FakeCtx(self.data, lambda p: "")))
         self.assertEqual([r["suite"] for r in rows], ["tools_pos", "tools_neg", "tools_xfer", "faithfulness"])
         self.assertEqual([r["passed"] for r in rows], [True, False, True, True])
         self.assertTrue(all(r["seconds"] == 0.5 for r in rows))
@@ -250,7 +264,7 @@ class Suites(unittest.TestCase):
     def test_tools_without_frozen_catalog_fails_clearly(self):
         modules, _ = self._fake_gateway()
         with mock.patch.dict(sys.modules, modules), self.assertRaises(RuntimeError) as cm:
-            eval_suites.run_tools(FakeCtx(self.data, lambda p: ""))
+            list(eval_suites.run_tools(FakeCtx(self.data, lambda p: "")))
         self.assertIn("fetch_data.py", str(cm.exception))
 
 

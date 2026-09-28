@@ -1,6 +1,7 @@
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -52,8 +53,81 @@ class Summarize(unittest.TestCase):
                                "registry_model": "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2",
                                "model": None, "args_add": [], "args_remove": [], "env": {}})
 
+    def test_errors_are_listed(self):
+        s = run.summarize(ROWS + [{"suite": "tools", "id": "suite-error", "passed": None, "error": "boom"}])
+        self.assertEqual(s["errors"], [{"suite": "tools", "error": "boom"}])
+
     def test_all_suites(self):
         self.assertEqual(run.ALL_SUITES, ["code", "ifeval", "vi", "uncensor", "tools", "longctx", "reason"])
+
+
+class FakeProc:
+    def __init__(self):
+        self.code = None
+
+    def poll(self):
+        return self.code
+
+
+class FakeServer:
+    instances = []
+
+    def __init__(self, env, argv, log_path, port):
+        self.base_url, self.proc, self.stopped = "http://fake", FakeProc(), False
+        FakeServer.instances.append(self)
+
+    def start(self):
+        pass
+
+    def stop(self):
+        self.stopped = True
+
+
+class RunArm(unittest.TestCase):
+    ARGV = ["/repo/ds4-server", "-c", "262144"]
+
+    def _arm(self, suites, wanted, reason=None):
+        FakeServer.instances = []
+        rows = []
+        with tempfile.TemporaryDirectory() as d:
+            out = pathlib.Path(d)
+            run.run_arm({}, self.ARGV, wanted, out, rows, server_cls=FakeServer, suites=suites,
+                        reason=reason or (lambda env, argv, root, out_dir: iter([{"suite": "reason", "id": "r",
+                                                                                   "passed": True}])))
+            on_disk = [json.loads(l) for l in (out / "rows.jsonl").read_text().splitlines()]
+        return rows, on_disk
+
+    def test_a_failing_suite_keeps_its_rows_and_the_run_continues(self):
+        def flaky(ctx):
+            yield {"suite": "a", "id": "a1", "passed": True}
+            raise OSError("connection reset")
+
+        def fine(ctx):
+            yield {"suite": "b", "id": "b1", "passed": True}
+        rows, on_disk = self._arm({"a": flaky, "b": fine}, ["a", "b", "reason"])
+        self.assertEqual([(r["suite"], r["id"]) for r in on_disk],
+                         [("a", "a1"), ("a", "suite-error"), ("b", "b1"), ("reason", "r")])
+        self.assertIn("connection reset", on_disk[1]["error"])
+        self.assertEqual(rows, on_disk)
+        self.assertTrue(FakeServer.instances[0].stopped)
+
+    def test_unknown_flag_fails_before_the_server_starts(self):
+        FakeServer.instances = []
+        with tempfile.TemporaryDirectory() as d, self.assertRaises(ValueError):
+            run.run_arm({}, self.ARGV + ["--refusal-projection", "/d/v.gguf"], ["a", "reason"], pathlib.Path(d),
+                        [], server_cls=FakeServer, suites={"a": lambda ctx: iter([])})
+        self.assertEqual(FakeServer.instances, [])
+
+    def test_a_dead_server_ends_the_server_suites(self):
+        def dies(ctx):
+            FakeServer.instances[0].proc.code = -6
+            yield {"suite": "a", "id": "a1", "passed": True}
+
+        def never(ctx):
+            raise AssertionError("must not run after the server died")
+        rows, _ = self._arm({"a": dies, "b": never}, ["a", "b"])
+        self.assertEqual([(r["suite"], r["id"]) for r in rows], [("a", "a1"), ("b", "suite-error")])
+        self.assertIn("exited", rows[1]["error"])
 
 
 if __name__ == "__main__":

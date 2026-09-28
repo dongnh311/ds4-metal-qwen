@@ -83,7 +83,7 @@ def _run(argv, cwd, env):
 
 
 def run_reason(env, server_argv, root, out_dir):
-    rows = []
+    """Yields the rows of each ds4-eval run as soon as the run is checked."""
     for suite, source, questions in REASON_RUNS:
         stem = "ds4-eval-%s" % source.replace(" ", "_")
         trace = pathlib.Path(out_dir) / (stem + ".trace")
@@ -97,6 +97,5 @@ def run_reason(env, server_argv, root, out_dir):
         if code != 0 or len(parsed) != questions or states:
             raise RuntimeError("ds4-eval %s: exit %s, %d/%d report rows, ungraded states %s; see %s.log" % (
                 source, code, len(parsed), questions, states or "none", stem))
-        rows += [dict(r, suite="reason", id="%s/%s" % (r["source"], r["case_id"]),
-                      passed=r["state"] == "PASSED") for r in parsed]
-    return rows
+        for r in parsed:
+            yield dict(r, suite="reason", id="%s/%s" % (r["source"], r["case_id"]), passed=r["state"] == "PASSED")

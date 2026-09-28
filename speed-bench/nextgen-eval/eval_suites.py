@@ -79,56 +79,48 @@ def _load_jsonl(path):
 
 def run_code(ctx):
     he = graders.bench_module("humaneval_mini")
-    rows = []
     for problem in he.PROBLEMS:
         r = ctx.ask(he.build_prompt(problem))
         ok, detail = graders.grade_code(problem, r["content"])
-        rows.append(dict(_speed(r), suite="code", id=problem["task_id"], passed=ok, detail=detail))
+        yield (dict(_speed(r), suite="code", id=problem["task_id"], passed=ok, detail=detail))
     for row in _load_jsonl(ctx.data_dir / "mbpp.jsonl"):
         problem = graders.mbpp_problem(row)
         r = ctx.ask(graders.mbpp_prompt(row))
         ok, detail = graders.grade_code(problem, r["content"])
-        rows.append(dict(_speed(r), suite="code", id=problem["task_id"], passed=ok, detail=detail))
-    return rows
+        yield (dict(_speed(r), suite="code", id=problem["task_id"], passed=ok, detail=detail))
 
 
 def run_ifeval(ctx):
-    rows = []
     for row in _load_jsonl(ctx.data_dir / "ifeval.jsonl"):
         r = ctx.ask(row["prompt"])
         ok, each = ifeval_checks.check_prompt(row, r["content"])
-        rows.append(dict(_speed(r), suite="ifeval", id=str(row["key"]), passed=ok,
+        yield (dict(_speed(r), suite="ifeval", id=str(row["key"]), passed=ok,
                          instructions=[[i, e] for i, e in zip(row["instruction_id_list"], each)]))
-    return rows
 
 
 def run_vi(ctx):
-    rows = []
     for item in json.loads((HERE / "data" / "vi_knowledge.json").read_text()):
         r = ctx.ask(item["q"] + " Trả lời ngắn gọn.")
-        rows.append(dict(_speed(r), suite="vi_knowledge", id=item["id"],
+        yield (dict(_speed(r), suite="vi_knowledge", id=item["id"],
                          passed=graders.keyword_groups_hit(r["content"], item["groups"]),
                          cjk=graders.cjk_count(r["content"]), answer=r["content"]))
     for item in json.loads((HERE / "data" / "vi_writing.json").read_text()):
         r = ctx.ask(item["prompt"])
-        rows.append(dict(_speed(r), suite="vi_writing", id=item["id"], passed=None,
+        yield (dict(_speed(r), suite="vi_writing", id=item["id"], passed=None,
                          cjk=graders.cjk_count(r["content"]), answer=r["content"]))
     for i, prompt in enumerate(THINK_BUDGET_VI):
         r = ctx.ask(prompt)
-        rows.append(dict(_speed(r), suite="vi_speed", id="tb-vi-%d" % i, passed=None,
+        yield (dict(_speed(r), suite="vi_speed", id="tb-vi-%d" % i, passed=None,
                          cjk=graders.cjk_count(r["content"]), answer=r["content"]))
-    return rows
 
 
 def run_uncensor(ctx):
-    rows = []
     for kind in ("harmful", "harmless"):
         for i, row in enumerate(_load_jsonl(ctx.data_dir / ("%s.jsonl" % kind))):
             r = ctx.ask(row["text"])
             refused = graders.is_refusal(r["content"])
-            rows.append(dict(_speed(r), suite="uncensor_" + kind, id="%s-%02d" % (kind, i),
+            yield (dict(_speed(r), suite="uncensor_" + kind, id="%s-%02d" % (kind, i),
                              passed=not refused, refused=refused, answer=r["content"][:600]))
-    return rows
 
 
 MCP_CATALOG = "mcp_tools.json"
@@ -177,7 +169,6 @@ def run_tools(ctx):
     from suites import BY_NAME
     client = _ArmClient(harness.Client(base=ctx.base_url, key="nextgen-eval", model="ds4"),
                         json.loads(catalog_path.read_text()))
-    rows = []
     toolcall = BY_NAME["toolcall"]
     ok, note = toolcall.available(client)
     if not ok:
@@ -187,7 +178,7 @@ def run_tools(ctx):
         ctx.take_log()
         out = toolcall.run(client, case)
         res = toolcall.grade(case, out, None)
-        rows.append(_tool_row(ctx, out, suite="tools_" + case.inp["kind"], id=case.id, passed=bool(res.passed),
+        yield (_tool_row(ctx, out, suite="tools_" + case.inp["kind"], id=case.id, passed=bool(res.passed),
                               score=res.score, metrics=res.metrics))
     faith = BY_NAME["faithfulness"]
     for case in faith.cases():
@@ -197,9 +188,8 @@ def run_tools(ctx):
         ctx.take_log()
         out = faith.run(client, case)
         res = faith.grade(case, out, None)
-        rows.append(_tool_row(ctx, out, suite="faithfulness", id=case.id, passed=bool(res.passed),
+        yield (_tool_row(ctx, out, suite="faithfulness", id=case.id, passed=bool(res.passed),
                               score=res.score, metrics=res.metrics))
-    return rows
 
 
 HAYSTACK = "haystack.c"  # ds4.c frozen by fetch_data.py: later sub-projects edit ds4.c on this branch
@@ -220,30 +210,28 @@ def run_longctx(ctx):
     source = ctx.data_dir / HAYSTACK
     if not source.exists():
         raise RuntimeError("%s missing: run fetch_data.py" % source)
-    rows = []
     sampler = ctx.sampler_factory()
     sampler.start()
     try:
         for label, tokens in TIERS:
             if tokens + CTX_MARGIN > ctx.ctx_limit:
-                rows.append({"suite": "longctx", "id": "needle-" + label, "passed": None,
+                yield ({"suite": "longctx", "id": "needle-" + label, "passed": None,
                              "skipped": "ctx limit %d" % ctx.ctx_limit})
                 continue
             doc = "Here is a C source file.\n\n" + haystack(source, tokens) + "\n\n"
             r = ctx.ask(doc + NEEDLE_Q, max_tokens=512, extra=NO_THINK)
-            rows.append(dict(_speed(r), suite="longctx", id="needle-" + label,
+            yield (dict(_speed(r), suite="longctx", id="needle-" + label,
                              passed=graders.needle_hit(r["content"], NEEDLE_VALUE),
                              prompt_tokens=r["usage"].get("prompt_tokens"), answer=r["content"][:200]))
             if label == "240k":
                 for j, (question, value) in enumerate(DOC_QA):
                     r = ctx.ask(doc + question, max_tokens=512, extra=NO_THINK)
-                    rows.append(dict(_speed(r), suite="longctx", id="docqa-%d" % j,
+                    yield (dict(_speed(r), suite="longctx", id="docqa-%d" % j,
                                      passed=graders.keyword_hit(r["content"], value),
                                      prompt_tokens=r["usage"].get("prompt_tokens"), answer=r["content"][:200]))
     finally:
         mem = sampler.stop()
-    rows.append(dict(mem, suite="longctx_mem", id="memory", passed=None))
-    return rows
+    yield (dict(mem, suite="longctx_mem", id="memory", passed=None))
 
 
 SERVER_SUITES = {"code": run_code, "ifeval": run_ifeval, "vi": run_vi, "uncensor": run_uncensor,

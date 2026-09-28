@@ -63,6 +63,7 @@ def summarize(rows):
             totals[group] = round(totals.get(group, 0.0) + r["seconds"], 1)
     return {
         "suites": suites,
+        "errors": [{"suite": r["suite"], "error": r.get("error")} for r in rows if r.get("id") == "suite-error"],
         "vi_cjk_leaks": sum(1 for r in vi_rows if (r.get("cjk") or 0) > 0) if vi_rows else None,
         "uncensor": uncensor,
         "longctx": {"needle": needle, "peak_wired_gib": mem.get("peak_wired_gib"), "swapouts": mem.get("swapouts")},
@@ -71,6 +72,52 @@ def summarize(rows):
                   "decode_tps_median": _median([r.get("decode_tps") for r in rows]),
                   "prefill_tps_median": _median([r.get("prefill_tps") for r in rows])},
     }
+
+
+def _error_row(suite, error):
+    return {"suite": suite, "id": "suite-error", "passed": None, "error": error}
+
+
+def run_arm(env, argv, wanted, out, rows, port=18299, server_cls=None, suites=None, reason=None):
+    """Run the wanted suites. Every row goes to `rows` and to out/rows.jsonl as soon as it exists. A
+    failing suite leaves an error row and the run goes on; a dead server ends the server suites."""
+    server_cls = server_cls or server.Ds4Server
+    suites = eval_suites.SERVER_SUITES if suites is None else suites
+    reason = reason or ds4eval.run_reason
+    if "reason" in wanted:
+        ds4eval.eval_argv(argv, server.ROOT, "core", "-", 1, out / "-")  # refuse unknown flags before GPU time
+
+    def keep(row):
+        rows.append(row)
+        with open(out / "rows.jsonl", "a") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    def drain(name, produce):
+        print("== suite %s" % name, flush=True)
+        try:
+            for row in produce():
+                keep(row)
+        except Exception as e:  # recorded as an error row; the gate fails on it
+            print("   suite %s failed: %r" % (name, e), flush=True)
+            keep(_error_row(name, repr(e)[:500]))
+
+    server_suites = [s for s in wanted if s in suites]
+    if server_suites:
+        srv = server_cls(env, argv, out / "server.log", port)
+        srv.start()
+        try:
+            ctx = eval_suites.Ctx(srv.base_url, server.LogCursor(out / "server.log"), DATA,
+                                  int(server.argv_value(argv, "-c") or 0), server.ROOT)
+            for name in server_suites:
+                code = srv.proc.poll()
+                if code is not None:
+                    keep(_error_row(name, "ds4-server exited with %s; see server.log" % code))
+                    continue
+                drain(name, lambda: suites[name](ctx))
+        finally:
+            srv.stop()
+    if "reason" in wanted:
+        drain("reason", lambda: reason(env, argv, server.ROOT, out))
 
 
 def main():
@@ -93,33 +140,12 @@ def main():
     env, argv = server.resolve(config, registry, server.ROOT, args.port, kv_dir)
     (out / "command.json").write_text(json.dumps({"config": config, "env": env, "argv": argv}, indent=1) + "\n")
     rows = []
-
-    def keep(new_rows):
-        rows.extend(new_rows)
-        with open(out / "rows.jsonl", "a") as f:
-            for r in new_rows:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    server_suites = [s for s in wanted if s in eval_suites.SERVER_SUITES]
     try:
-        if server_suites:
-            srv = server.Ds4Server(env, argv, out / "server.log", args.port)
-            srv.start()
-            try:
-                ctx = eval_suites.Ctx(srv.base_url, server.LogCursor(out / "server.log"), DATA,
-                                      int(server.argv_value(argv, "-c") or 0), server.ROOT)
-                for name in server_suites:
-                    print("== suite %s" % name, flush=True)
-                    keep(eval_suites.SERVER_SUITES[name](ctx))
-            finally:
-                srv.stop()
-        if "reason" in wanted:
-            print("== suite reason", flush=True)
-            keep(ds4eval.run_reason(env, argv, server.ROOT, out))
+        run_arm(env, argv, wanted, out, rows, port=args.port)
     finally:
         shutil.rmtree(kv_dir, ignore_errors=True)
-    summary = dict(summarize(rows), arm=config["name"], config=config, suites_run=wanted)
-    (out / "summary.json").write_text(json.dumps(summary, indent=1, ensure_ascii=False) + "\n")
+        summary = dict(summarize(rows), arm=config["name"], config=config, suites_run=wanted)
+        (out / "summary.json").write_text(json.dumps(summary, indent=1, ensure_ascii=False) + "\n")
     print(json.dumps(summary, indent=1, ensure_ascii=False))
     print("run directory: %s" % out)
 
