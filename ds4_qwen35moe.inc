@@ -206,6 +206,18 @@ static bool qwen35_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m
            ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
 }
 
+/* DS4_QWEN35_VERIFY_BATCH (M7, default off until its gates pass): a
+ * verify's Q8_0 projections run both rows through one two-row matvec
+ * (ds4_gpu_qwen35_matmul_q8_0_rows_tensor) that loads each weight block
+ * once and keeps kernel_mul_mv_q8_0_f32's arithmetic for every row, so each
+ * row stays bit-identical to the T=1 dispatch qwen35_gemv would otherwise
+ * issue for it.  Other weight types keep the per-row loop. */
+static bool qwen35_verify_batch_env(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_QWEN35_VERIFY_BATCH"); v = e && e[0] && e[0] != '0'; }
+    return v;
+}
+
 /* qwen4_gemv's batched dispatch (qwen4_gemv_rows, ds4.c) picks its Q8_0/F16
  * matvec path by n_tok (dispatch geometry and internal tiling change with
  * the token count), and a T=1 call is not guaranteed to produce the same
@@ -216,13 +228,21 @@ static bool qwen35_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m
  * helper instead of calling qwen4_gemv directly: under g->verify_rows_exact
  * it dispatches one row at a time, each row taking exactly the T=1 kernel a
  * plain decode would use.  Plain decode, prefill and non-MTP graphs (T<=1 or
- * verify_rows_exact false) fall straight through to qwen4_gemv unchanged. */
+ * verify_rows_exact false) fall straight through to qwen4_gemv unchanged.
+ * With DS4_QWEN35_VERIFY_BATCH a 2-row verify's Q8_0 weights take one
+ * two-row matvec instead (same per-row arithmetic, weights read once). */
 static bool qwen35_gemv(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *out, const ds4_model *m,
                         const ds4_tensor *w, const ds4_gpu_tensor *x, uint32_t T) {
     if (!g->verify_rows_exact || T <= 1u) return qwen4_gemv(out, m, w, x, T);
     const uint64_t in_dim = w->dim[0];
     const uint64_t out_dim = w->ndim >= 2 ? w->dim[1] : 1u;
     const uint64_t xrow = in_dim * sizeof(float), orow = out_dim * sizeof(float);
+    if (T == 2u && w->type == DS4_TENSOR_Q8_0 && qwen35_verify_batch_env()) {
+        if (ds4_gpu_qwen35_matmul_q8_0_rows_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, T))
+            return true;
+        fprintf(stderr, "ds4: Ornith two-row verify matvec failed for %.*s\n", (int)w->name.len, w->name.ptr);
+        return false;
+    }
     bool ok = true;
     for (uint32_t t = 0; t < T && ok; t++) {
         ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, (uint64_t)t * xrow, xrow);
