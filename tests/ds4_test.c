@@ -705,7 +705,18 @@ static void test_qwen35_rewind(void) {
     TEST_ASSERT(ds4_session_checkpoint_valid(live) == mtp);
     prefix.len = replay.len - 1;
     if (!mtp) TEST_ASSERT(ds4_session_sync(live, &prefix, err, sizeof(err)) == 0);
-    TEST_ASSERT(ds4_session_sync(fresh, &prefix, err, sizeof(err)) == 0);
+    if (mtp) {
+        /* The rewound live state was built by the prompt prefill and decode
+         * steps, so the fresh reference is built the same way: the check pins
+         * the snapshot rewind, not prefill-vs-decode kernel parity (with the
+         * accelerator prefill an MoE top-8 near-tie can flip between the two
+         * kernels' rounding). */
+        TEST_ASSERT(ds4_session_sync(fresh, &prompt, err, sizeof(err)) == 0);
+        for (int i = prompt.len; i < prefix.len; i++)
+            TEST_ASSERT(ds4_session_eval(fresh, prefix.v[i], err, sizeof(err)) == 0);
+    } else {
+        TEST_ASSERT(ds4_session_sync(fresh, &prefix, err, sizeof(err)) == 0);
+    }
     TEST_ASSERT(ds4_session_top_logprobs(live, got, 8) == 8);
     TEST_ASSERT(ds4_session_top_logprobs(fresh, want, 8) == 8);
     TEST_ASSERT(got[0].id == want[0].id);

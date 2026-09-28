@@ -1,0 +1,44 @@
+MODEL MATRIX client=claude model=local gateway=http://127.0.0.1:18131 ledger=off cases=repo out=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/repo
+  repo T0 plan         46.6s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  repo T1 implement    157.3s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  repo T2 audit        422.1s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  repo[off] OBJECTIVE PASS · public=[rc=0 [{"id": "1", "title": "ship", "done": false, "archived": false, "tags": ["Work"]}, {"id": "2", "title": "old", "done": true, "archived": true, "tags": ["work"]}] ... ---------------------------------------------------------------------- Ran 3 tests in 0.001s  OK ] hidden=[rc=0 ] tests_unchanged=True
+MATRIX 1/1 objective cases passed · summary=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/repo/summary.json
+matrix repo      PASS  (ok)
+MODEL MATRIX client=claude model=local gateway=http://127.0.0.1:18131 ledger=off cases=easy out=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/easy
+  easy T0 implement    32.0s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  easy[off] OBJECTIVE PASS · public=[rc=0 ... ---------------------------------------------------------------------- Ran 3 tests in 0.000s  OK ] hidden=[rc=0 ] tests_unchanged=True
+MATRIX 1/1 objective cases passed · summary=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/easy/summary.json
+matrix easy      PASS  (ok)
+MODEL MATRIX client=claude model=local gateway=http://127.0.0.1:18131 ledger=off cases=medium out=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/medium
+  medium T0 implement    42.7s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  medium T1 audit        358.8s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  medium[off] OBJECTIVE PASS · public=[rc=0 ... ---------------------------------------------------------------------- Ran 3 tests in 0.000s  OK ] hidden=[rc=0 ] tests_unchanged=True
+MATRIX 1/1 objective cases passed · summary=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/medium/summary.json
+matrix medium    PASS  (ok)
+MODEL MATRIX client=claude model=local gateway=http://127.0.0.1:18131 ledger=off cases=hard out=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/hard
+  hard T0 plan         138.2s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  hard T1 implement    153.2s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  hard T2 audit        480.0s rc=124 model=ornith-1.5-35b-a3b incidents=['TIMEOUT', 'EMPTY']
+  hard[off] OBJECTIVE FAIL · public=[rc=0 .... ---------------------------------------------------------------------- Ran 4 tests in 0.001s  OK ] hidden=[rc=0 ] tests_unchanged=True execution=FAIL (every planned turn must rc=0 and is_error=false)
+MATRIX 0/1 objective cases passed · summary=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/hard/summary.json
+matrix hard      FAIL  (?: objective_pass=False incident_turns=1)
+MODEL MATRIX client=claude model=local gateway=http://127.0.0.1:18131 ledger=off cases=bugfix out=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/bugfix
+  bugfix T0 reproduce    208.1s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  bugfix T1 audit        480.0s rc=124 model=ornith-1.5-35b-a3b incidents=['TIMEOUT', 'EMPTY']
+  bugfix[off] OBJECTIVE FAIL · public=[rc=0 ... ---------------------------------------------------------------------- Ran 3 tests in 0.000s  OK ] hidden=[rc=0 ] tests_unchanged=True execution=FAIL (every planned turn must rc=0 and is_error=false)
+MATRIX 0/1 objective cases passed · summary=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/bugfix/summary.json
+matrix bugfix    FAIL  (?: objective_pass=False incident_turns=1)
+MODEL MATRIX client=claude model=local gateway=http://127.0.0.1:18131 ledger=off cases=refactor out=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/refactor
+  refactor T0 plan         39.2s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  refactor T1 implement    97.4s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  refactor[off] OBJECTIVE PASS · public=[rc=0 .. ---------------------------------------------------------------------- Ran 2 tests in 0.000s  OK ] hidden=[rc=0 ] tests_unchanged=True
+MATRIX 1/1 objective cases passed · summary=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/refactor/summary.json
+matrix refactor  PASS  (ok)
+MODEL MATRIX client=claude model=local gateway=http://127.0.0.1:18131 ledger=off cases=testgen out=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/testgen
+  testgen T0 plan         49.9s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  testgen T1 generate     37.4s rc=0 model=ornith-1.5-35b-a3b incidents=-
+  testgen[off] OBJECTIVE PASS · public=[rc=0 . ---------------------------------------------------------------------- Ran 1 test in 0.025s  OK ] hidden=[rc=0 ] tests_unchanged=True source_unchanged=True
+MATRIX 1/1 objective cases passed · summary=/private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/m4-gate2/matrix-ds4/testgen/summary.json
+matrix testgen   PASS  (ok)
+matrix: 5/7 cases PASS — FAIL

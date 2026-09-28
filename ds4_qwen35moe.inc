@@ -68,7 +68,8 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
     const uint64_t attn_part_decode2 = ds4_gpu_qwen4_attn_part_floats(3u, DS4_N_HEAD, DS4_N_HEAD_DIM);
     const uint64_t attn_part_decode3 = ds4_gpu_qwen35_attn_part3_floats(2u, DS4_N_HEAD, DS4_N_HEAD_DIM);
     QWEN35_ALLOC(attn_part, attn_part_decode2 > attn_part_decode3 ? attn_part_decode2 : attn_part_decode3);
-    /* M5 flash prefill split scratch (DS4_QWEN35_ATTN_FLASH): the split
+    /* Flash prefill split scratch (DS4_QWEN35_ATTN_FLASH; the M5 simdgroup
+     * flash and the M6 accelerator flash share it): the split
      * shrinks as T grows, so the smallest attended chunk (T = 9) is the
      * worst case; scan every T the graph can ever call flash with (9..T)
      * to stay exact rather than trust that monotonicity.  T <= 8 never
@@ -77,8 +78,9 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
      * T that never splits; when every T in range comes out at 0, no split
      * ever happens for this graph and attn_flash_part is left NULL, which
      * attn_flash_tensor treats the same as an allocated part that Ks == 1
-     * never touches.  ~17 MB at the default DS4_QWEN35_ATTN_FLASH_MIN_TG
-     * (256) for a 2048-token prefill chunk. */
+     * never touches.  ~34 MB at the default DS4_QWEN35_ATTN_FLASH_MIN_TG
+     * (256) for a 2048-token prefill chunk (the bound covers the
+     * accelerator kernel's 8-token blocks). */
     if (T > 8u) {
         uint64_t attn_flash_part_floats = 0;
         for (uint64_t t = 9u; t <= T; t++) {
@@ -364,6 +366,24 @@ static int qwen35_attn_flash_env(void) {
     return on;
 }
 
+/* M6 (DS4_QWEN35_ATTN_NAX): runs flash prefill on the M5 neural accelerators
+ * (kernel_qwen35_attn_flash_nax), read once.  On by default since the M6
+ * gates (prefill +68% at 32K and +152% at 128K in the lever A/B, gate 1 and
+ * the MTP identity tests pass); "0" keeps the M5 simdgroup flash, any other
+ * value means on.  Takes effect only with DS4_QWEN35_ATTN_FLASH on and the
+ * Metal 4 tensor API available (not under --quality, before M5/A19, or with
+ * DS4_METAL_DISABLE_METAL4=1), where the M5 flash keeps running. */
+static int qwen35_attn_nax_env(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("DS4_QWEN35_ATTN_NAX");
+        if (e && e[0] && strcmp(e, "0") != 0 && strcmp(e, "1") != 0)
+            fprintf(stderr, "ds4: DS4_QWEN35_ATTN_NAX=%s not recognised (0 or 1); using on\n", e);
+        on = (e && strcmp(e, "0") == 0) ? 0 : 1;
+    }
+    return on;
+}
+
 static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t pos0,
                                 uint32_t r0, uint32_t n, bool per_row) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
@@ -382,6 +402,11 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
                         g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
         }
         if (n > 8u && qwen35_attn_flash_env() && !qwen4_kv_mode(g)) {
+            if (qwen35_attn_nax_env() && ds4_gpu_tensor_api_available()) {
+                return ds4_gpu_qwen35_attn_flash_nax_tensor(g->attn_o, g->q, g->gate,
+                            qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_flash_part, n,
+                            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale) != 0;
+            }
             return ds4_gpu_qwen35_attn_flash_tensor(g->attn_o, g->q, g->gate,
                         qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_flash_part, n,
                         DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale) != 0;

@@ -102,6 +102,16 @@ static int run_flash_split(void *p) {      /* same, with the key split engaged v
     return ds4_gpu_qwen35_attn_flash_tensor(c->out, c->q, c->gate, c->kc, c->vc, c->part_flash,
                                             c->T, H, HKV, D, c->pos0, c->scale);
 }
+static int run_flash_nax(void *p) {        /* M6: flash on the neural accelerators (tensor API) */
+    bench_ctx *c = p;
+    return ds4_gpu_qwen35_attn_flash_nax_tensor(c->out, c->q, c->gate, c->kc, c->vc, NULL,
+                                                c->T, H, HKV, D, c->pos0, c->scale);
+}
+static int run_flash_nax_split(void *p) {  /* same, with the key split engaged via `part` */
+    bench_ctx *c = p;
+    return ds4_gpu_qwen35_attn_flash_nax_tensor(c->out, c->q, c->gate, c->kc, c->vc, c->part_flash,
+                                                c->T, H, HKV, D, c->pos0, c->scale);
+}
 static int run_decode2(void *p) {          /* today's decode / verify: L12 */
     bench_ctx *c = p;
     return ds4_gpu_qwen35_attn_decode2_tensor(c->out, c->q, c->gate, c->kc, c->vc, c->part,
@@ -157,7 +167,7 @@ int main(int argc, char **argv) {
          * value (if set, e.g. DS4_QWEN35_ATTN_FLASH_MIN_TG=64 ./tests/bench...),
          * the 4096 this bench forces for the T=2048 split case below, and the
          * unset default (256) the default-rule rows use -- each checked at
-         * both T=2048 and T=128, the two chunk sizes benched. */
+         * every chunk size benched (T = 16..256 and 2048). */
         uint64_t pf_max = 0;
         const char *tg_settings[3];
         int n_settings = 0;
@@ -167,10 +177,11 @@ int main(int argc, char **argv) {
         for (int i = 0; i < n_settings; i++) {
             if (tg_settings[i]) setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", tg_settings[i], 1);
             else unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
-            const uint64_t pf2048 = ds4_gpu_qwen35_attn_flash_part_floats(2048u, H, D);
-            const uint64_t pf128 = ds4_gpu_qwen35_attn_flash_part_floats(128u, H, D);
-            if (pf2048 > pf_max) pf_max = pf2048;
-            if (pf128 > pf_max) pf_max = pf128;
+            const uint32_t benched_t[6] = { 16u, 32u, 64u, 128u, 256u, 2048u };
+            for (int j = 0; j < 6; j++) {
+                const uint64_t pf = ds4_gpu_qwen35_attn_flash_part_floats(benched_t[j], H, D);
+                if (pf > pf_max) pf_max = pf;
+            }
         }
         restore_min_tg(have_min_tg, min_tg_saved);
         c.part_flash = ds4_gpu_tensor_alloc(pf_max * sizeof(float));
@@ -186,6 +197,8 @@ int main(int argc, char **argv) {
             report("attn_flash_tok2", "prefill", c.pos0, c.T, 0, time_ms(run_flash, &c, 1, 3));
             setenv("DS4_QWEN35_ATTN_FLASH_TOK", "4", 1);
             report("attn_flash_tok4", "prefill", c.pos0, c.T, 0, time_ms(run_flash, &c, 1, 3));
+            if (ds4_gpu_tensor_api_available())
+                report("attn_flash_nax", "prefill", c.pos0, c.T, 0, time_ms(run_flash_nax, &c, 1, 3));
         }
         unsetenv("DS4_QWEN35_ATTN_FLASH_TOK");
 
@@ -218,6 +231,19 @@ int main(int argc, char **argv) {
             report("flash_tok4_split", "prefill", c.pos0, c.T, 0, time_ms(run_flash_split, &c, 1, 3));
         }
         unsetenv("DS4_QWEN35_ATTN_FLASH_TOK");
+        if (ds4_gpu_tensor_api_available()) {
+            /* short chunks at long context, default split rule: where the
+             * accelerator kernel starts to beat the simdgroup flash */
+            const uint32_t ts[5] = { 16u, 32u, 64u, 128u, 256u };
+            setenv("DS4_QWEN35_ATTN_FLASH_TOK", "2", 1);
+            for (int i = 0; i < 2; i++)
+                for (int j = 0; j < 5; j++) {
+                    c.pos0 = split_pos[i]; c.T = ts[j]; c.rows = 0;
+                    report("flash_tok2_split", "prefill", c.pos0, c.T, 0, time_ms(run_flash_split, &c, 1, 3));
+                    report("flash_nax_split", "prefill", c.pos0, c.T, 0, time_ms(run_flash_nax_split, &c, 1, 3));
+                }
+            unsetenv("DS4_QWEN35_ATTN_FLASH_TOK");
+        }
     }
     if (do_decode) {
         const uint32_t pos[3] = { 2048u, 32768u, 131072u };
