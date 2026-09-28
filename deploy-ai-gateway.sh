@@ -4,8 +4,9 @@
 #
 #   deploy-ai-gateway.sh cut FEATURE           create prod/FEATURE-YYYYMMDD from the remote develop
 #   deploy-ai-gateway.sh install BRANCH        check out BRANCH in the PROD checkout and clean-build it
-#   deploy-ai-gateway.sh smoke [--bin DIR] [--out DIR] [--ref DIR]
-#                                              run the registry's ds4 command on a scratch port + KV dir
+#   deploy-ai-gateway.sh smoke [--model KEY] [--bin DIR] [--out DIR] [--ref DIR]
+#                                              run a registry row's ds4 command on a scratch port + KV dir
+#                                              (--model is required when several rows run on ds4)
 set -euo pipefail
 
 PROD_DIR=${DS4_PROD_DIR:-$HOME/.local/share/ai-gateway/ds4-metal}
@@ -69,13 +70,14 @@ cmd_install() {
 }
 
 cmd_smoke() {
-    local bin="" out="" ref=""
+    local model="" bin="" out="" ref=""
     while [ $# -gt 0 ]; do
         case "$1" in
+            --model) model=$2; shift 2 ;;
             --bin) bin=$2; shift 2 ;;
             --out) out=$2; shift 2 ;;
             --ref) ref=$2; shift 2 ;;
-            *) die "usage: smoke [--bin DIR] [--out DIR] [--ref DIR]" ;;
+            *) die "usage: smoke [--model KEY] [--bin DIR] [--out DIR] [--ref DIR]" ;;
         esac
     done
     local running
@@ -83,19 +85,26 @@ cmd_smoke() {
     [ -z "$running" ] || die "ds4 is running; one model process at a time on this machine:"$'\n'"$running"
     out=${out:-$(mktemp -d "${TMPDIR:-/tmp}/ds4-smoke.XXXXXX")}
     mkdir -p "$out"
-    python3 - "$REGISTRY" "$bin" "$out" "$ref" <<'PY'
+    python3 - "$REGISTRY" "$bin" "$out" "$ref" "$model" <<'PY'
 import json, os, shutil, subprocess, sys, time, urllib.request
 
-registry, bin_dir, out, ref = sys.argv[1:5]
+registry, bin_dir, out, ref, want = sys.argv[1:6]
 port = int(os.environ.get("DS4_SMOKE_PORT", "18297"))
-entry = None
-for model in json.load(open(registry))["models"].values():
-    rt = model.get("runtimes", {}).get("ds4")
-    if rt and rt.get("enabled"):
-        entry = rt
-        break
-if entry is None:
+stop_timeout = float(os.environ.get("DS4_SMOKE_STOP_TIMEOUT", "60"))
+# Every model row runs its own ds4 process, so with several rows the one to test must be named.
+rows = [(key, model["runtimes"]["ds4"]) for key, model in json.load(open(registry))["models"].items()
+        if model.get("runtimes", {}).get("ds4", {}).get("enabled")]
+if want:
+    rows = [(key, rt) for key, rt in rows if key == want]
+    if not rows:
+        sys.exit("deploy: no enabled ds4 runtime for model %s in %s" % (want, registry))
+elif len(rows) > 1:
+    sys.exit("deploy: several enabled ds4 runtimes in %s, pick one with --model: %s"
+             % (registry, ", ".join(key for key, _ in rows)))
+elif not rows:
     sys.exit("deploy: no enabled ds4 runtime in " + registry)
+key, entry = rows[0]
+print("deploy: smoke model:", key)
 
 cmd = list(entry["process_command"])
 kv = os.path.join(out, "kv")
@@ -154,9 +163,12 @@ try:
 finally:
     srv.terminate()
     try:
-        srv.wait(60)
+        srv.wait(stop_timeout)
     except subprocess.TimeoutExpired:
-        srv.kill()
+        # Never SIGKILL a Metal process: a killed ds4 can leave its GGUF unopenable until a reboot.
+        print("deploy: ds4-server pid %d did not exit %g s after SIGTERM; it is left running, "
+              "stop it before the next step" % (srv.pid, stop_timeout), file=sys.stderr)
+        failed = True
 print("deploy: smoke outputs in", out)
 sys.exit(1 if failed else 0)
 PY
