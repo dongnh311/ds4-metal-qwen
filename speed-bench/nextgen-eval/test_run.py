@@ -91,6 +91,45 @@ class Summarize(unittest.TestCase):
         self.assertEqual(run.ALL_SUITES, ["code", "ifeval", "vi", "uncensor", "tools", "longctx", "reason"])
 
 
+class Rerun(unittest.TestCase):
+    ROWS = [{"suite": "code", "id": "a", "passed": True},
+            {"suite": "tools_pos", "id": "t", "passed": True},
+            {"suite": "reason", "id": "GPQA/1", "passed": True},
+            {"suite": "reason", "id": "suite-error", "passed": None, "error": "boom"},
+            {"suite": "tools", "id": "suite-error", "passed": None, "error": "x"}]
+
+    def test_every_suite_maps_its_rows(self):
+        self.assertEqual(sorted(run.ROW_SUITES), sorted(run.ALL_SUITES))
+
+    def test_rows_outside(self):
+        self.assertEqual([r["id"] for r in run.rows_outside(self.ROWS, ["reason"])], ["a", "t", "suite-error"])
+        self.assertEqual([r["id"] for r in run.rows_outside(self.ROWS, ["tools"])], ["a", "GPQA/1", "suite-error"])
+
+    def test_prepare_rerun_keeps_the_other_suites(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = pathlib.Path(d)
+            (out / "rows.jsonl").write_text("".join(json.dumps(r) + "\n" for r in self.ROWS))
+            (out / "summary.json").write_text(json.dumps({"arm": "prod", "suites_run": ["code", "tools", "reason"],
+                                                          "provenance": {"git_head": "aaa"}}))
+            rows, previous = run.prepare_rerun(out, ["reason"], "prod")
+            on_disk = [json.loads(l) for l in (out / "rows.jsonl").read_text().splitlines()]
+            backups = list(out.glob("rows.before-rerun-*.jsonl"))
+            with self.assertRaises(SystemExit):
+                run.prepare_rerun(out, ["reason"], "cand")
+        self.assertEqual([r["id"] for r in rows], ["a", "t", "suite-error"])
+        self.assertEqual(on_disk, rows)
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(previous["provenance"], {"git_head": "aaa"})
+
+    def test_rerun_provenance(self):
+        new = {"git_head": "bbb", "git_dirty": False, "ds4_server_sha256": "s", "ds4_eval_sha256": "e",
+               "gateway_head": "g", "env": {}, "argv": [], "data": {}}
+        p = run.rerun_provenance({"git_head": "aaa"}, new, ["reason"])
+        self.assertEqual(p["git_head"], "aaa")
+        self.assertEqual(p["reruns"], [{"suites": ["reason"], "git_head": "bbb", "git_dirty": False,
+                                        "ds4_server_sha256": "s", "ds4_eval_sha256": "e"}])
+
+
 class FakeProc:
     def __init__(self):
         self.code = None

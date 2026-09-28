@@ -76,6 +76,10 @@ A full arm takes about 4 hours. Each run writes `command.json`, `server.log`, `r
   goes on.
 - `summary.json` is written even when the run is interrupted.
 
+To redo failed suites in the same run, pass `--suites <them> --out <run dir> --rerun`. This replaces
+those suites' rows, keeps the others (the old `rows.jsonl` is backed up), summarizes every row, and
+records the rerun under `provenance.reruns`.
+
 The script never SIGKILLs ds4-server or ds4-eval; if one refuses to exit, stop it by hand.
 
 ## Arm configs

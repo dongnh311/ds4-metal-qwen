@@ -114,6 +114,39 @@ def provenance(env, argv, root, data, gateway, git=_git):
             "env": env, "argv": argv, "data": {k: v.get("sha256") for k, v in frozen.items()}}
 
 
+# The row suites each arm-level suite produces; its error rows carry the arm-level name.
+ROW_SUITES = {"code": ("code",), "ifeval": ("ifeval",), "vi": ("vi_knowledge", "vi_writing", "vi_speed"),
+              "uncensor": ("uncensor_harmful", "uncensor_harmless"),
+              "tools": ("tools_pos", "tools_neg", "tools_xfer", "faithfulness"),
+              "longctx": ("longctx", "longctx_mem"), "reason": ("reason",)}
+
+
+def rows_outside(rows, suites):
+    """The rows that belong to none of the arm-level `suites` (their error rows included)."""
+    drop = set(suites) | {s for name in suites for s in ROW_SUITES[name]}
+    return [r for r in rows if r["suite"] not in drop]
+
+
+def prepare_rerun(out, wanted, arm):
+    """Drop the rows of `wanted` from an earlier run of `arm` in `out` (old rows.jsonl kept as a backup);
+    returns the remaining rows and the earlier summary."""
+    previous = json.loads((out / "summary.json").read_text())
+    if previous.get("arm") != arm:
+        raise SystemExit("%s holds arm %r, not %r" % (out, previous.get("arm"), arm))
+    old = (out / "rows.jsonl").read_text()
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    (out / ("rows.before-rerun-%s.jsonl" % stamp)).write_text(old)
+    rows = rows_outside([json.loads(line) for line in old.splitlines() if line.strip()], wanted)
+    (out / "rows.jsonl").write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows))
+    return rows, previous
+
+
+def rerun_provenance(previous, new, wanted):
+    """The first run's provenance, plus what each rerun used."""
+    keys = ("git_head", "git_dirty", "ds4_server_sha256", "ds4_eval_sha256")
+    return dict(previous, reruns=previous.get("reruns", []) + [dict({"suites": wanted}, **{k: new[k] for k in keys})])
+
+
 def _error_row(suite, error):
     return {"suite": suite, "id": "suite-error", "passed": None, "error": error}
 
@@ -166,26 +199,36 @@ def main():
     ap.add_argument("--suites", default=",".join(ALL_SUITES))
     ap.add_argument("--port", type=int, default=18299)
     ap.add_argument("--out")
+    ap.add_argument("--rerun", action="store_true",
+                    help="--out is an earlier run of this arm: replace the rows of --suites there, keep the "
+                         "others, and summarize them all")
     args = ap.parse_args()
     config = json.loads(pathlib.Path(args.config).read_text())
     wanted = [s for s in args.suites.split(",") if s]
     unknown = sorted(set(wanted) - set(ALL_SUITES))
     if unknown:
         raise SystemExit("unknown suites: %s (known: %s)" % (", ".join(unknown), ", ".join(ALL_SUITES)))
+    if args.rerun and not (args.out and (pathlib.Path(args.out) / "summary.json").exists()):
+        raise SystemExit("--rerun needs --out pointing at an earlier run of this arm")
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = pathlib.Path(args.out) if args.out else DATA / "runs" / ("%s-%s" % (config["name"], stamp))
     out.mkdir(parents=True, exist_ok=True)
     registry = json.loads(server.REGISTRY.read_text())
     kv_dir = pathlib.Path(tempfile.mkdtemp(prefix="kv-", dir=str(out)))
     env, argv = server.resolve(config, registry, server.ROOT, args.port, kv_dir)
-    (out / "command.json").write_text(json.dumps({"config": config, "env": env, "argv": argv}, indent=1) + "\n")
     prov = provenance(env, argv, server.ROOT, DATA, graders.GATEWAY_REPO)
-    rows = []
+    if args.rerun:
+        rows, previous = prepare_rerun(out, wanted, config["name"])
+        suites_run = [s for s in ALL_SUITES if s in set(previous["suites_run"]) | set(wanted)]
+        prov = rerun_provenance(previous["provenance"], prov, wanted)
+    else:
+        (out / "command.json").write_text(json.dumps({"config": config, "env": env, "argv": argv}, indent=1) + "\n")
+        rows, suites_run = [], wanted
     try:
         run_arm(env, argv, wanted, out, rows, port=args.port)
     finally:
         shutil.rmtree(kv_dir, ignore_errors=True)
-        summary = dict(summarize(rows), arm=config["name"], config=config, suites_run=wanted, provenance=prov)
+        summary = dict(summarize(rows), arm=config["name"], config=config, suites_run=suites_run, provenance=prov)
         (out / "summary.json").write_text(json.dumps(summary, indent=1, ensure_ascii=False) + "\n")
     print(json.dumps(summary, indent=1, ensure_ascii=False))
     print("run directory: %s" % out)
