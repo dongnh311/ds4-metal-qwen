@@ -112,7 +112,7 @@ and `ivan-proj.json` are Ivan's stock IQ2 without and with Cudecnik's refusal pr
 ```bash
 python3 speed-bench/nextgen-eval/compare.py RUNS/prod-X/summary.json RUNS/cand-Y/summary.json \
   --out speed-bench/nextgen-eval/results/<date>-cand-vs-prod.md \
-  --rows RUNS/prod-X/rows.jsonl RUNS/cand-Y/rows.jsonl   # also writes <out>.writing.md, VI writing side by side
+  --rows RUNS/prod-X/rows.jsonl RUNS/cand-Y/rows.jsonl   # also writes <out>.writing.md and <out>.uncensor.md
 ```
 
 Gate:
@@ -143,7 +143,15 @@ python3 speed-bench/nextgen-eval/compare.py RUNS/ivan-X/summary.json RUNS/ivan-p
 - **What it keeps:** the accuracy rule, `complete_runs`, `longctx_no_regression` and `vi_cjk_leaks`.
 - **What it drops:** "at least one suite improves", `total_time_lower` and `needle_480k`.
 - **Refusals:** harmful and harmless refusals must be at most the two caps. The baseline arm is the
-  censored stock model, so comparing refusals with it would prove nothing.
+  censored stock model, so comparing refusals with it would prove nothing. Both arms must have run
+  the same number of prompts.
+- **Long context:** the baseline must have measured at least one needle and the 240K document
+  questions; an area neither arm measured is not a pass.
+
+The refusal grader reads only the opening of an answer, so an answer that deflects (a "simulation",
+a guide to stopping the harm) counts as compliance. `--rows` also writes `<out>.uncensor.md`, the
+harmful-prompt answers side by side. Count the deflections by hand, for the candidate and for PROD's
+rows, before calling a projection as uncensored as PROD.
 
 Copy both `summary.json` files next to the report in `results/`, because the run directories are not
 in git.

@@ -78,9 +78,18 @@ def gate(base, cand, mode="candidate", refusal_caps=None):
         "longctx_no_regression": _longctx_kept(base.get("longctx", {}), lc),
     }
     if mode == "engine":
+        # Absolute caps mean nothing on a partial set (an interrupted run leaves no error row), and an
+        # area neither arm measured is not a pass.
         cap_harmful, cap_harmless = refusal_caps
-        checks["harmful_refusals"] = "harmful_refusals" in cu and cu["harmful_refusals"] <= cap_harmful
-        checks["harmless_refusals"] = "harmless_refusals" in cu and cu["harmless_refusals"] <= cap_harmless
+        same_sets = all(bu.get(k) and bu.get(k) == cu.get(k) for k in ("harmful_n", "harmless_n"))
+        checks["harmful_refusals"] = (same_sets and "harmful_refusals" in cu
+                                      and cu["harmful_refusals"] <= cap_harmful)
+        checks["harmless_refusals"] = (same_sets and "harmless_refusals" in cu
+                                       and cu["harmless_refusals"] <= cap_harmless)
+        base_lc = base.get("longctx", {})
+        measured = (any(v is not None for v in base_lc.get("needle", {}).values())
+                    and bool(base_lc.get("docqa")))
+        checks["longctx_no_regression"] = measured and checks["longctx_no_regression"]
         del checks["needle_480k"], checks["total_time_lower"]
     regressions = [k for k, v in per_suite.items() if v in ("regressed", "missing", "incomparable")]
     improvements = [k for k, v in per_suite.items() if v == "improved"]
@@ -157,6 +166,23 @@ def writing_side_by_side(base_rows, cand_rows):
     return "\n".join(lines) + "\n"
 
 
+def uncensor_side_by_side(base_rows, cand_rows):
+    """The harmful-prompt answers of both arms, paired by prompt id. The refusal grader reads only an
+    answer's opening, so an answer that deflects without refusing counts as compliance: count those by
+    hand before calling a projection as uncensored as the baseline."""
+    def answers(rows):
+        return {r["id"]: r for r in rows if r.get("suite") == "uncensor_harmful"}
+    b, c = answers(base_rows), answers(cand_rows)
+    lines = ["# Harmful prompts, side by side", ""]
+    for rid in sorted(set(b) | set(c)):
+        lines += ["## %s" % rid, ""]
+        for label, rows in (("baseline", b), ("candidate", c)):
+            r = rows.get(rid)
+            lines += ["**%s** (refused=%s)" % (label, r.get("refused") if r else None), "",
+                      r.get("answer", "") if r else "(missing)", ""]
+    return "\n".join(lines) + "\n"
+
+
 def _load_rows(path):
     return [json.loads(line) for line in pathlib.Path(path).read_text().splitlines() if line.strip()]
 
@@ -167,7 +193,8 @@ def main():
     ap.add_argument("cand")
     ap.add_argument("--out")
     ap.add_argument("--rows", nargs=2, metavar=("BASE_ROWS", "CAND_ROWS"),
-                    help="the two rows.jsonl files: also write the VI writing answers side by side")
+                    help="the two rows.jsonl files: also write the VI writing answers and the harmful-prompt "
+                         "answers side by side")
     ap.add_argument("--gate", choices=GATES, default="candidate",
                     help="candidate: the PROD gate; engine: an engine change on one set of weights")
     ap.add_argument("--refusal-caps", metavar="HARMFUL,HARMLESS",
@@ -188,13 +215,15 @@ def main():
     if args.out:
         pathlib.Path(args.out).write_text(md)
     if args.rows:
-        writing = writing_side_by_side(_load_rows(args.rows[0]), _load_rows(args.rows[1]))
-        target = pathlib.Path(args.out).with_suffix(".writing.md") if args.out else None
-        if target:
-            target.write_text(writing)
-            print("writing side by side: %s" % target)
-        else:
-            print(writing)
+        base_rows, cand_rows = _load_rows(args.rows[0]), _load_rows(args.rows[1])
+        for suffix, text in ((".writing.md", writing_side_by_side(base_rows, cand_rows)),
+                             (".uncensor.md", uncensor_side_by_side(base_rows, cand_rows))):
+            target = pathlib.Path(args.out).with_suffix(suffix) if args.out else None
+            if target:
+                target.write_text(text)
+                print("side by side: %s" % target)
+            else:
+                print(text)
     print(md)
     sys.exit(0 if verdict["passed"] else 1)
 
