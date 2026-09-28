@@ -206,15 +206,15 @@ static bool qwen35_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m
            ds4_gpu_tensor_write(g->pos3, (uint64_t)g->pos * 16u, g->host_pos3, (uint64_t)T * 16u);
 }
 
-/* DS4_QWEN35_VERIFY_BATCH (M7, default off until its gates pass): a
- * verify's Q8_0 projections run both rows through one two-row matvec
- * (ds4_gpu_qwen35_matmul_q8_0_rows_tensor) that loads each weight block
- * once and keeps kernel_mul_mv_q8_0_f32's arithmetic for every row, so each
- * row stays bit-identical to the T=1 dispatch qwen35_gemv would otherwise
- * issue for it.  Other weight types keep the per-row loop. */
+/* DS4_QWEN35_VERIFY_BATCH (M7, default on; =0 restores the per-row
+ * verify): a verify's Q8_0 projections run both rows through one two-row
+ * matvec (ds4_gpu_qwen35_matmul_q8_0_rows_tensor) that loads each weight
+ * block once and keeps kernel_mul_mv_q8_0_f32's arithmetic for every row,
+ * so each row stays bit-identical to the T=1 dispatch qwen35_gemv would
+ * otherwise issue for it.  Other weight types keep the per-row loop. */
 static bool qwen35_verify_batch_env(void) {
     static int v = -1;
-    if (v < 0) { const char *e = getenv("DS4_QWEN35_VERIFY_BATCH"); v = e && e[0] && e[0] != '0'; }
+    if (v < 0) { const char *e = getenv("DS4_QWEN35_VERIFY_BATCH"); v = !(e && strcmp(e, "0") == 0); }
     return v;
 }
 
