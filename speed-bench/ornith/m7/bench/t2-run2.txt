@@ -1,0 +1,24 @@
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/snap-0e652aa (CWD)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.109 ms, residency requested in 37.100 ms, warmup 2.477 ms (mapped 1829.62 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+bench: 2048x8192(lin_qkv,attn_q)        t1           0.0852 ms  x1.00   209.2 GB/s  (encode 0.8 us/call, 61 calls/rep)
+bench: 2048x8192(lin_qkv,attn_q)        t1x2         0.1067 ms  x1.25   167.0 GB/s  (encode 3.0 us/call, 61 calls/rep)
+bench: 2048x8192(lin_qkv,attn_q)        rows_exact   0.0775 ms  x0.91   230.1 GB/s  (encode 0.8 us/call, 61 calls/rep)
+bench: 2048x8192(lin_qkv,attn_q)        rows2        0.0674 ms  x0.79   264.4 GB/s  (encode 0.8 us/call, 61 calls/rep)
+bench: 2048x4096(lin_gate)              t1           0.0349 ms  x1.00   255.7 GB/s  (encode 0.7 us/call, 121 calls/rep)
+bench: 2048x4096(lin_gate)              t1x2         0.0554 ms  x1.59   160.9 GB/s  (encode 1.4 us/call, 121 calls/rep)
+bench: 2048x4096(lin_gate)              rows_exact   0.0402 ms  x1.15   221.9 GB/s  (encode 0.7 us/call, 121 calls/rep)
+bench: 2048x4096(lin_gate)              rows2        0.0359 ms  x1.03   248.2 GB/s  (encode 1.2 us/call, 121 calls/rep)
+bench: 4096x2048(lin_out,attn_output)   t1           0.0363 ms  x1.00   245.3 GB/s  (encode 0.7 us/call, 121 calls/rep)
+bench: 4096x2048(lin_out,attn_output)   t1x2         0.0557 ms  x1.53   160.0 GB/s  (encode 1.7 us/call, 121 calls/rep)
+bench: 4096x2048(lin_out,attn_output)   rows_exact   0.0386 ms  x1.06   231.2 GB/s  (encode 0.8 us/call, 121 calls/rep)
+bench: 4096x2048(lin_out,attn_output)   rows2        0.0359 ms  x0.99   248.4 GB/s  (encode 1.1 us/call, 121 calls/rep)
+bench: 2048x248320(lm_head)             t1           1.8376 ms  x1.00   294.0 GB/s  (encode 1.0 us/call, 32 calls/rep)
+bench: 2048x248320(lm_head)             t1x2         3.6903 ms  x2.01   146.4 GB/s  (encode 1.9 us/call, 32 calls/rep)
+bench: 2048x248320(lm_head)             rows_exact   3.4979 ms  x1.90   154.5 GB/s  (encode 1.2 us/call, 32 calls/rep)
+bench: 2048x248320(lm_head)             rows2        1.8550 ms  x1.01   291.3 GB/s  (encode 1.1 us/call, 32 calls/rep)
+bench: verdict decode_rows_exact build-kernel
+bench: stop-rule rows2 pass (2048x8192 x0.79, lm_head x1.01; limit x1.50)

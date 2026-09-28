@@ -1,0 +1,19 @@
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/snap-3a9bd43 (CWD)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.099 ms, residency requested in 34.867 ms, warmup 2.569 ms (mapped 1829.62 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+bench: 2048x8192(lin_qkv,attn_q)        t1           0.0725 ms  x1.00   245.9 GB/s
+bench: 2048x8192(lin_qkv,attn_q)        t1x2         0.1077 ms  x1.48   165.6 GB/s
+bench: 2048x8192(lin_qkv,attn_q)        rows_exact   0.0813 ms  x1.12   219.2 GB/s
+bench: 2048x4096(lin_gate)              t1           0.0531 ms  x1.00   167.8 GB/s
+bench: 2048x4096(lin_gate)              t1x2         0.0600 ms  x1.13   148.5 GB/s
+bench: 2048x4096(lin_gate)              rows_exact   0.0452 ms  x0.85   197.2 GB/s
+bench: 4096x2048(lin_out,attn_output)   t1           0.1122 ms  x1.00    79.4 GB/s
+bench: 4096x2048(lin_out,attn_output)   t1x2         0.0644 ms  x0.57   138.4 GB/s
+bench: 4096x2048(lin_out,attn_output)   rows_exact   0.0442 ms  x0.39   201.8 GB/s
+bench: 2048x248320(lm_head)             t1           1.8268 ms  x1.00   295.8 GB/s
+bench: 2048x248320(lm_head)             t1x2         3.6606 ms  x2.00   147.6 GB/s
+bench: 2048x248320(lm_head)             rows_exact   3.4862 ms  x1.91   155.0 GB/s
+bench: verdict decode_rows_exact build-kernel

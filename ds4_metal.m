@@ -20448,6 +20448,76 @@ int ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(
     }
 }
 
+static uint64_t g_qwen35_q8_rows_dispatches;
+
+uint64_t ds4_gpu_qwen35_q8_rows_dispatches(void) {
+    return g_qwen35_q8_rows_dispatches;
+}
+
+/* Ornith's MTP verify: two rows through one Q8_0 weight, each weight block
+ * loaded once (kernel_qwen35_mv_q8_0_rows2).  NR0, NSG and the arguments
+ * are the T=1 path's (ds4_gpu_matmul_q8_0_legacy_tensor, n_tok == 1), so row
+ * r equals that path's output for row r bit for bit. */
+int ds4_gpu_qwen35_matmul_q8_0_rows_tensor(
+        ds4_gpu_tensor       *out,
+        const void           *model_map,
+        uint64_t              model_size,
+        uint64_t              weight_offset,
+        uint64_t              in_dim,
+        uint64_t              out_dim,
+        const ds4_gpu_tensor *x,
+        uint32_t              n_rows) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!out || !x || !model_map || n_rows != 2u || in_dim == 0 || out_dim == 0 ||
+        (in_dim & 31u) != 0 || in_dim > INT32_MAX || out_dim > INT32_MAX ||
+        ds4_gpu_tensor_bytes(x) < (uint64_t)n_rows * in_dim * sizeof(float) ||
+        ds4_gpu_tensor_bytes(out) < (uint64_t)n_rows * out_dim * sizeof(float)) {
+        return 0;
+    }
+
+    @autoreleasepool {
+        id<MTLBuffer> xbuf = ds4_gpu_tensor_buffer(x);
+        id<MTLBuffer> outbuf = ds4_gpu_tensor_buffer(out);
+        const uint64_t row_bytes = (in_dim / 32u) * 34u;
+        if (!xbuf || !outbuf || out_dim > UINT64_MAX / row_bytes) return 0;
+        const uint64_t weight_bytes = out_dim * row_bytes;
+        if (weight_offset > model_size || weight_bytes > model_size - weight_offset) return 0;
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map, model_size, weight_offset, weight_bytes,
+                                                      &inner_offset);
+        if (!wbuf) return 0;
+
+        ds4_gpu_mv_dispatch dispatch = ds4_gpu_make_q8_0_mv_dispatch();
+        if (out_dim > 65536u) dispatch.nsg = 8;
+        ds4_gpu_q8_0_matvec_args args = ds4_gpu_make_q8_0_mv_args(in_dim, out_dim);
+        args.nr0 = dispatch.nr0;
+
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_mul_mv_pipeline("kernel_qwen35_mv_q8_0_rows2", dispatch.nsg);
+        if (!pipeline) return 0;
+
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:1];
+        [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:2];
+        [enc setBuffer:outbuf offset:ds4_gpu_tensor_offset(out) atIndex:3];
+        [enc setThreadgroupMemoryLength:(NSUInteger)n_rows * dispatch.smem atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)out_dim + (NSUInteger)dispatch.nr0 - 1u) /
+                                                  (NSUInteger)dispatch.nr0, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(32, (NSUInteger)dispatch.nsg, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "Qwen35 Q8_0 two-row matvec")) return 0;
+        g_qwen35_q8_rows_dispatches++;
+        return 1;
+    }
+}
+
 int ds4_gpu_matmul_q8_0_decode_mpp_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,

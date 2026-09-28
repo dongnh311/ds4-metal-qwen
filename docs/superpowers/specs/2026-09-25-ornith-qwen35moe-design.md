@@ -292,6 +292,12 @@ A/B shows a gain.
   `verify_rows_exact` (the shared `qwen4_gemv` picks a different matvec
   kernel for T=1 than for T=2, including the GDN mixer's
   `lin_qkv`/`lin_gate`/`lin_out` projections).
+  Since M7 (`DS4_QWEN35_VERIFY_BATCH`, default on; `=0` restores the
+  per-row dispatch) the verify's Q8_0 projections — attention q/output, the
+  GDN `lin_qkv`/`lin_gate`/`lin_out` and the lm head — run as one two-row
+  matvec (`kernel_qwen35_mv_q8_0_rows2`) that loads each weight once and
+  keeps the one-row kernel's arithmetic per row (memcmp-tested); F16/F32
+  projections, the GDN recurrence and the experts stay per row.
   Drafts are accepted when they are the target argmax (greedy and
   opportunistic sampling); `--mtp-exact-sampling` is refused. Draft depth
   starts at 1 and follows measured acceptance. At temperature 0 the output
@@ -440,6 +446,8 @@ A/B shows a gain.
      (M6; default 1 since 2026-09-28, 0 = the simdgroup flash); needs
      `DS4_QWEN35_ATTN_FLASH` on, F16 K/V and the Metal 4 tensor API,
      otherwise the simdgroup flash runs.
+   - `DS4_QWEN35_VERIFY_BATCH` — two-row Q8_0 matvecs in the MTP verify
+     (M7; default 1, 0 = one T=1 dispatch per row).
    - `DS4_QWEN35_KV` — KV cache payload mode: f16 (default), fp8 or q4.
    - `DS4_QWEN35_PREFILL_CHUNK` — prefill chunk size override.
 4. **Qwen gate.** Every commit that touches a shared file (`ds4.c` outside the

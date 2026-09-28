@@ -1096,14 +1096,66 @@ static void test_attn_flash_nax_reinit(arena_t *a) {
     require_ok(!stale, "flash nax scratch slot fresh after init");
 }
 
+/* M7: the verify's two-row Q8_0 matvec must equal a one-row
+ * kernel_mul_mv_q8_0_f32 dispatch bit for bit on each row (NSG 4, and 8
+ * past 65536 outputs), so batching the verify cannot change --mtp output.
+ * The batched call runs 3 times (a reduction race would not repeat
+ * reliably), a third output row keeps its sentinel, and n_rows != 2 is
+ * refused. */
+static void test_q8_rows2_exact(arena_t *a, uint32_t in_dim, uint32_t out_dim) {
+    double *shadow;
+    const uint64_t off = arena_q8_0(a, out_dim, in_dim, &shadow, 0.05f);
+    free(shadow);
+    float *x = rand_vec(2ull * in_dim, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, 2ull * in_dim);
+    ds4_gpu_tensor *g3 = upload(NULL, 3ull * out_dim);
+    float *ref[2];
+    for (uint32_t r = 0; r < 2u; r++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(gx, (uint64_t)r * in_dim * sizeof(float), (uint64_t)in_dim * sizeof(float));
+        ds4_gpu_tensor *o1 = upload(NULL, out_dim);
+        require_ok(xr && ds4_gpu_qwen4_matmul_q8_0_tensor(o1, a->base, a->size, off, in_dim, out_dim, xr, 1u),
+                   "q8 T=1 reference");
+        ref[r] = download(o1, out_dim);
+        ds4_gpu_tensor_free(o1);
+        ds4_gpu_tensor_free(xr);
+    }
+    for (int rep = 0; rep < 3; rep++) {
+        require_ok(ds4_gpu_tensor_fill_f32(g3, -1234.5f, 3ull * out_dim), "q8 rows2 sentinel");
+        const uint64_t before = ds4_gpu_qwen35_q8_rows_dispatches();
+        require_ok(ds4_gpu_qwen35_matmul_q8_0_rows_tensor(g3, a->base, a->size, off, in_dim, out_dim, gx, 2u),
+                   "q8 rows2");
+        require_ok(ds4_gpu_qwen35_q8_rows_dispatches() == before + 1u, "q8 rows2 dispatch counted");
+        float *got = download(g3, 3ull * out_dim);
+        for (uint32_t r = 0; r < 2u; r++)
+            require_ok(memcmp(got + (uint64_t)r * out_dim, ref[r], (uint64_t)out_dim * sizeof(float)) == 0,
+                       "q8 rows2 row bit-identical to T=1");
+        for (uint64_t i = 2ull * out_dim; i < 3ull * out_dim; i++) require_ok(got[i] == -1234.5f, "q8 rows2 third row untouched");
+        free(got);
+    }
+    const uint64_t before = ds4_gpu_qwen35_q8_rows_dispatches();
+    require_ok(!ds4_gpu_qwen35_matmul_q8_0_rows_tensor(g3, a->base, a->size, off, in_dim, out_dim, gx, 1u) &&
+               !ds4_gpu_qwen35_matmul_q8_0_rows_tensor(g3, a->base, a->size, off, in_dim, out_dim, gx, 3u) &&
+               ds4_gpu_qwen35_q8_rows_dispatches() == before, "q8 rows2 refuses n_rows != 2");
+    printf("  q8_0 rows2 %ux%u: both rows bit-identical to T=1 (x3)\n", in_dim, out_dim);
+    free(ref[0]); free(ref[1]); free(x);
+    ds4_gpu_tensor_free(gx); ds4_gpu_tensor_free(g3);
+}
+
 int main(void) {
     arena_t arena;
-    arena.size = (uint64_t)512 << 20;
+    arena.size = (uint64_t)1024 << 20;   /* M7's rows2 cases add ~190 MB of Q8_0 */
     arena.base = mmap(NULL, arena.size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     arena.used = 0;
     if (arena.base == MAP_FAILED) { perror("mmap"); return 1; }
     require_ok(ds4_gpu_init(), "GPU initialization");
     require_ok(ds4_gpu_set_model_map(arena.base, arena.size), "model map registration");
+
+    printf("qwen35 two-row Q8_0 matvec for the MTP verify (M7)\n");
+    test_q8_rows2_exact(&arena, 2048u, 8192u);     /* lin_qkv, attn_q */
+    test_q8_rows2_exact(&arena, 2048u, 4096u);     /* lin_gate */
+    test_q8_rows2_exact(&arena, 4096u, 2048u);     /* lin_out, attn_output */
+    test_q8_rows2_exact(&arena, 2048u, 65600u);    /* past 65536 outputs: NSG 8, as the lm head */
+    test_q8_rows2_exact(&arena, 2048u, 4099u);     /* odd out_dim: half-empty last tile */
 
     printf("qwen35 moe (q5_K experts, q8_0 shared slot)\n");
     test_moe_q5k(&arena, 16, 8, 512, 256, 1);

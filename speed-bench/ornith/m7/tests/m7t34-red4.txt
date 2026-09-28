@@ -1,0 +1,2 @@
+ds4: metal backend initialized for graph diagnostics
+cycle 1: 21 two-row matvecs, expected 0 or 111

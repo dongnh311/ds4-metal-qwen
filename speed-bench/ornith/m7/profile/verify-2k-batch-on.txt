@@ -1,0 +1,215 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/snap-a0577f7/ (exe-relative)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.486 ms, residency requested in 113.255 ms, warmup 2.571 ms (mapped 21768.11 MiB from offset 10.50 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.17 GiB (raw 0.17 + compressed 0.00) + buffers 1.00 GiB + resident model 21.26 GiB = 22.43 GiB planned
+ds4: memory detail: ctx=8192 prefill_cap=2048 raw_kv_rows=8192 compressed_kv_rows=0 backend=metal
+ds4: memory: KV 0.17 GiB (raw 0.17 + compressed 0.00) + buffers 1.00 GiB = 1.17 GiB context
+ds4: memory detail: ctx=8192 prefill_cap=2048 raw_kv_rows=8192 compressed_kv_rows=0 backend=metal
+ds4: Ornith stage ms/chunk (pos=0 T=2048): gdn 712.8 attn 212.6 head 3.0
+processing 2269 input tokens: 2048/2269 (90.3%)
+ds4: Ornith stage ms/chunk (pos=2048 T=221): gdn 155.6 attn 54.0 head 2.1
+processing 2269 input tokens: 2269/2269 (100.0%)
+ds4: MTP draft head: 65568 of 248320 vocabulary rows from /private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/snap-a0577f7/speed-bench/ornith/m4/ornith-draft-vocab-vi-en-code-64k.txt (136 MiB)
+0ds4: Ornith stage ms/chunk (pos=2270 T=2): gdn 24.8 attn 7.5 head 6.7
+0ds4: Ornith stage ms/chunk (pos=2271 T=2): gdn 17.8 attn 6.6 head 2.0
+00ds4: Ornith stage ms/chunk (pos=2273 T=2): gdn 17.5 attn 6.2 head 2.0
+00ds4: Ornith stage ms/chunk (pos=2275 T=2): gdn 17.3 attn 6.1 head 2.0
+0ds4: Ornith stage ms/chunk (pos=2276 T=2): gdn 17.7 attn 6.4 head 2.1
+0
+ds4: Ornith stage ms/chunk (pos=2278 T=2): gdn 18.4 attn 6.6 head 2.1
+stessods4: Ornith stage ms/chunk (pos=2280 T=2): gdn 18.1 attn 6.4 head 2.0
+ libro,ds4: Ornith stage ms/chunk (pos=2282 T=2): gdn 17.9 attn 6.4 head 2.0
+ è unds4: Ornith stage ms/chunk (pos=2284 T=2): gdn 18.4 attn 6.5 head 2.1
+ libro cheds4: Ornith stage ms/chunk (pos=2286 T=2): gdn 18.5 attn 6.7 head 2.0
+ nonds4: Ornith stage ms/chunk (pos=2287 T=2): gdn 18.2 attn 6.8 head 2.0
+ sids4: Ornith stage ms/chunk (pos=2288 T=2): gdn 18.7 attn 6.8 head 2.0
+ leggeds4: Ornith stage ms/chunk (pos=2289 T=2): gdn 18.6 attn 6.5 head 2.0
+ mai;ds4: Ornith stage ms/chunk (pos=2291 T=2): gdn 18.1 attn 6.4 head 2.1
+ lads4: Ornith stage ms/chunk (pos=2292 T=2): gdn 18.0 attn 6.6 head 2.1
+ seconda,ds4: Ornith stage ms/chunk (pos=2294 T=2): gdn 18.1 attn 6.8 head 2.0
+ che,ds4: Ornith stage ms/chunk (pos=2296 T=2): gdn 18.2 attn 6.4 head 2.0
+ se
+ds4: Ornith stage ms/chunk (pos=2298 T=2): gdn 18.3 attn 6.5 head 2.1
+ilds4: Ornith stage ms/chunk (pos=2299 T=2): gdn 18.4 attn 6.7 head 2.0
+ librods4: Ornith stage ms/chunk (pos=2300 T=2): gdn 17.7 attn 6.7 head 2.1
+ fosseds4: Ornith stage ms/chunk (pos=2301 T=2): gdn 18.0 attn 6.7 head 2.1
+ statods4: Ornith stage ms/chunk (pos=2302 T=2): gdn 18.2 attn 6.7 head 2.1
+ bends4: Ornith stage ms/chunk (pos=2303 T=2): gdn 18.5 attn 6.9 head 2.1
+ fatto,ds4: Ornith stage ms/chunk (pos=2305 T=2): gdn 18.0 attn 6.6 head 2.1
+ nonds4: Ornith stage ms/chunk (pos=2306 T=2): gdn 18.6 attn 6.6 head 2.0
+ avrebbeds4: Ornith stage ms/chunk (pos=2307 T=2): gdn 18.1 attn 6.4 head 2.1
+ avutods4: Ornith stage ms/chunk (pos=2308 T=2): gdn 18.0 attn 6.5 head 2.1
+ bisogno dids4: Ornith stage ms/chunk (pos=2310 T=2): gdn 18.2 attn 6.8 head 2.0
+
+gids4: Ornith stage ms/chunk (pos=2312 T=2): gdn 18.1 attn 6.8 head 2.0
+ustificds4: Ornith stage ms/chunk (pos=2313 T=2): gdn 18.1 attn 6.6 head 2.1
+arsi;ds4: Ornith stage ms/chunk (pos=2315 T=2): gdn 18.0 attn 6.4 head 2.1
+ eds4: Ornith stage ms/chunk (pos=2316 T=2): gdn 17.2 attn 6.1 head 2.1
+ seds4: Ornith stage ms/chunk (pos=2317 T=2): gdn 17.4 attn 6.2 head 2.0
+ malds4: Ornith stage ms/chunk (pos=2318 T=2): gdn 18.4 attn 6.7 head 2.0
+ fatto,ds4: Ornith stage ms/chunk (pos=2320 T=2): gdn 18.6 attn 6.7 head 2.1
+ non sids4: Ornith stage ms/chunk (pos=2322 T=2): gdn 18.4 attn 6.6 head 2.0
+ sarebbeds4: Ornith stage ms/chunk (pos=2323 T=2): gdn 18.5 attn 6.7 head 2.0
+ giustificatods4: Ornith stage ms/chunk (pos=2325 T=2): gdn 18.7 attn 6.8 head 2.0
+ conds4: Ornith stage ms/chunk (pos=2326 T=2): gdn 18.5 attn 6.7 head 2.0
+ nulla.ds4: Ornith stage ms/chunk (pos=2328 T=2): gdn 18.2 attn 6.5 head 2.2
+
+
+ds4: Ornith stage ms/chunk (pos=2329 T=2): gdn 17.9 attn 6.4 head 2.1
+Eccods4: Ornith stage ms/chunk (pos=2331 T=2): gdn 18.1 attn 6.8 head 2.1
+ adds4: Ornith stage ms/chunk (pos=2332 T=2): gdn 18.2 attn 6.5 head 2.1
+unqueds4: Ornith stage ms/chunk (pos=2333 T=2): gdn 18.3 attn 6.6 head 2.0
+ comeds4: Ornith stage ms/chunk (pos=2334 T=2): gdn 18.0 attn 6.6 head 2.0
+ abbiamds4: Ornith stage ms/chunk (pos=2336 T=2): gdn 18.3 attn 6.8 head 2.0
+ pensato dids4: Ornith stage ms/chunk (pos=2338 T=2): gdn 18.4 attn 6.5 head 2.0
+ farlads4: Ornith stage ms/chunk (pos=2340 T=2): gdn 18.0 attn 6.5 head 2.0
+.ds4: Ornith stage ms/chunk (pos=2341 T=2): gdn 17.9 attn 6.7 head 2.1
+
+
+ds4: Ornith stage ms/chunk (pos=2342 T=2): gdn 18.2 attn 6.7 head 2.1
+Ilds4: Ornith stage ms/chunk (pos=2343 T=2): gdn 18.2 attn 6.6 head 2.1
+ nostrods4: Ornith stage ms/chunk (pos=2344 T=2): gdn 17.8 attn 6.6 head 2.0
+ autoreds4: Ornith stage ms/chunk (pos=2345 T=2): gdn 18.2 attn 6.4 head 2.1
+,ds4: Ornith stage ms/chunk (pos=2346 T=2): gdn 18.2 attn 6.7 head 2.0
+ come sids4: Ornith stage ms/chunk (pos=2348 T=2): gdn 18.2 attn 6.6 head 2.0
+ èds4: Ornith stage ms/chunk (pos=2349 T=2): gdn 18.0 attn 6.6 head 2.1
+ visto,ds4: Ornith stage ms/chunk (pos=2351 T=2): gdn 17.4 attn 6.5 head 2.0
+ aveads4: Ornith stage ms/chunk (pos=2352 T=2): gdn 17.7 attn 6.6 head 2.0
+ proposto dids4: Ornith stage ms/chunk (pos=2354 T=2): gdn 18.1 attn 6.7 head 2.1
+ narrareds4: Ornith stage ms/chunk (pos=2356 T=2): gdn 18.0 attn 6.5 head 2.1
+ unads4: Ornith stage ms/chunk (pos=2357 T=2): gdn 17.6 attn 6.3 head 2.1
+ storia
+ds4: Ornith stage ms/chunk (pos=2359 T=2): gdn 17.2 attn 6.2 head 2.1
+vera,ds4: Ornith stage ms/chunk (pos=2361 T=2): gdn 18.1 attn 6.7 head 2.1
+ e dids4: Ornith stage ms/chunk (pos=2363 T=2): gdn 18.8 attn 6.8 head 2.1
+ narrds4: Ornith stage ms/chunk (pos=2364 T=2): gdn 18.7 attn 6.8 head 2.0
+arlads4: Ornith stage ms/chunk (pos=2365 T=2): gdn 19.2 attn 7.0 head 2.1
+ comeds4: Ornith stage ms/chunk (pos=2366 T=2): gdn 19.2 attn 7.0 head 2.0
+ stava;ds4: Ornith stage ms/chunk (pos=2368 T=2): gdn 18.5 attn 6.9 head 2.2
+ e,ds4: Ornith stage ms/chunk (pos=2370 T=2): gdn 18.8 attn 7.0 head 2.1
+ ads4: Ornith stage ms/chunk (pos=2371 T=2): gdn 19.1 attn 7.0 head 2.1
+ questo fineds4: Ornith stage ms/chunk (pos=2373 T=2): gdn 20.3 attn 7.4 head 2.2
+,ds4: Ornith stage ms/chunk (pos=2374 T=2): gdn 20.3 attn 7.4 head 2.3
+ aveads4: Ornith stage ms/chunk (pos=2375 T=2): gdn 21.1 attn 7.8 head 2.4
+ lasciatods4: Ornith stage ms/chunk (pos=2376 T=2): gdn 22.1 attn 8.0 head 2.9
+ dads4: Ornith stage ms/chunk (pos=2377 T=2): gdn 22.2 attn 7.9 head 2.2
+ parte
+ds4: Ornith stage ms/chunk (pos=2379 T=2): gdn 18.8 attn 6.9 head 2.0
+ids4: Ornith stage ms/chunk (pos=2380 T=2): gdn 17.6 attn 6.5 head 2.0
+ nomids4: Ornith stage ms/chunk (pos=2381 T=2): gdn 17.9 attn 6.6 head 2.1
+ proprids4: Ornith stage ms/chunk (pos=2382 T=2): gdn 17.9 attn 6.6 head 2.0
+jds4: Ornith stage ms/chunk (pos=2383 T=2): gdn 17.9 attn 6.7 head 2.1
+, eds4: Ornith stage ms/chunk (pos=2385 T=2): gdn 18.3 attn 6.7 head 2.1
+ leds4: Ornith stage ms/chunk (pos=2386 T=2): gdn 18.3 attn 6.6 head 2.1
+ altreds4: Ornith stage ms/chunk (pos=2387 T=2): gdn 18.3 attn 6.6 head 2.1
+ particolards4: Ornith stage ms/chunk (pos=2388 T=2): gdn 17.9 attn 6.4 head 2.1
+ità cheds4: Ornith stage ms/chunk (pos=2390 T=2): gdn 17.7 attn 6.4 head 2.1
+ sarebds4: Ornith stage ms/chunk (pos=2391 T=2): gdn 18.3 attn 6.5 head 2.0
+berds4: Ornith stage ms/chunk (pos=2392 T=2): gdn 18.1 attn 6.7 head 2.1
+ servds4: Ornith stage ms/chunk (pos=2393 T=2): gdn 17.9 attn 6.9 head 2.1
+ite ads4: Ornith stage ms/chunk (pos=2395 T=2): gdn 17.2 attn 6.1 head 2.1
+
+ds4: Ornith stage ms/chunk (pos=2396 T=2): gdn 19.0 attn 7.0 head 2.9
+rds4: Ornith stage ms/chunk (pos=2397 T=2): gdn 22.4 attn 8.4 head 2.8
+iconoscds4: Ornith stage ms/chunk (pos=2399 T=2): gdn 24.6 attn 9.0 head 3.5
+ereds4: Ornith stage ms/chunk (pos=2400 T=2): gdn 26.7 attn 9.9 head 3.4
+ leds4: Ornith stage ms/chunk (pos=2401 T=2): gdn 30.2 attn 10.7 head 4.2
+ persone eds4: Ornith stage ms/chunk (pos=2403 T=2): gdn 30.7 attn 11.2 head 3.3
+ ids4: Ornith stage ms/chunk (pos=2404 T=2): gdn 22.5 attn 8.4 head 2.1
+ luoghids4: Ornith stage ms/chunk (pos=2405 T=2): gdn 18.3 attn 6.8 head 2.0
+.ds4: Ornith stage ms/chunk (pos=2406 T=2): gdn 17.6 attn 6.4 head 2.1
+ Ora,ds4: Ornith stage ms/chunk (pos=2408 T=2): gdn 18.1 attn 6.5 head 2.0
+ seds4: Ornith stage ms/chunk (pos=2409 T=2): gdn 18.1 attn 6.9 head 2.0
+ noids4: Ornith stage ms/chunk (pos=2410 T=2): gdn 18.2 attn 6.5 head 2.0
+ volessds4: Ornith stage ms/chunk (pos=2412 T=2): gdn 17.3 attn 6.2 head 2.1
+imods4: Ornith stage ms/chunk (pos=2413 T=2): gdn 17.9 attn 6.6 head 2.1
+ narrds4: Ornith stage ms/chunk (pos=2414 T=2): gdn 17.6 attn 6.6 head 2.0
+arlads4: Ornith stage ms/chunk (pos=2415 T=2): gdn 18.0 attn 6.6 head 2.1
+ come
+ds4: Ornith stage ms/chunk (pos=2417 T=2): gdn 18.1 attn 6.5 head 2.0
+stavads4: Ornith stage ms/chunk (pos=2419 T=2): gdn 17.8 attn 6.6 head 2.1
+,ds4: Ornith stage ms/chunk (pos=2420 T=2): gdn 18.1 attn 6.7 head 2.1
+ eds4: Ornith stage ms/chunk (pos=2421 T=2): gdn 18.0 attn 6.5 head 2.0
+ comeds4: Ornith stage ms/chunk (pos=2422 T=2): gdn 18.0 attn 6.5 head 2.1
+ stavads4: Ornith stage ms/chunk (pos=2423 T=2): gdn 18.0 attn 6.8 head 2.1
+ lads4: Ornith stage ms/chunk (pos=2424 T=2): gdn 17.5 attn 6.3 head 2.1
+ sapeds4: Ornith stage ms/chunk (pos=2426 T=2): gdn 20.8 attn 7.9 head 3.6
+vamods4: Ornith stage ms/chunk (pos=2428 T=2): gdn 27.5 attn 10.3 head 3.1
+, nonds4: Ornith stage ms/chunk (pos=2430 T=2): gdn 34.3 attn 12.7 head 5.8
+ cids4: Ornith stage ms/chunk (pos=2431 T=2): gdn 30.5 attn 11.0 head 3.0
+ sarebbeds4: Ornith stage ms/chunk (pos=2432 T=2): gdn 21.1 attn 7.5 head 2.2
+ statods4: Ornith stage ms/chunk (pos=2433 T=2): gdn 18.2 attn 6.7 head 2.0
+ bisogno dids4: Ornith stage ms/chunk (pos=2435 T=2): gdn 18.1 attn 6.8 head 2.1
+
+ds4: Ornith stage ms/chunk (pos=2436 T=2): gdn 17.8 attn 6.6 head 2.1
+scrds4: Ornith stage ms/chunk (pos=2437 T=2): gdn 17.8 attn 6.5 head 2.0
+ivereds4: Ornith stage ms/chunk (pos=2438 T=2): gdn 18.0 attn 6.7 head 2.0
+ unds4: Ornith stage ms/chunk (pos=2439 T=2): gdn 17.9 attn 6.5 head 2.1
+ libro:ds4: Ornith stage ms/chunk (pos=2441 T=2): gdn 18.3 attn 6.7 head 2.0
+ bastds4: Ornith stage ms/chunk (pos=2442 T=2): gdn 18.0 attn 6.7 head 2.0
+avads4: Ornith stage ms/chunk (pos=2443 T=2): gdn 18.0 attn 6.5 head 2.0
+ trascds4: Ornith stage ms/chunk (pos=2444 T=2): gdn 18.5 attn 6.5 head 2.0
+rivereds4: Ornith stage ms/chunk (pos=2446 T=2): gdn 18.0 attn 6.5 head 2.0
+ il mands4: Ornith stage ms/chunk (pos=2448 T=2): gdn 18.4 attn 6.6 head 2.0
+oscds4: Ornith stage ms/chunk (pos=2449 T=2): gdn 18.3 attn 6.7 head 2.1
+ritto.ds4: Ornith stage ms/chunk (pos=2451 T=2): gdn 18.4 attn 6.7 head 2.1
+ Ma,ds4: Ornith stage ms/chunk (pos=2453 T=2): gdn 18.5 attn 6.7 head 2.0
+ seds4: Ornith stage ms/chunk (pos=2454 T=2): gdn 18.4 attn 6.7 head 2.0
+ il
+ds4: Ornith stage ms/chunk (pos=2456 T=2): gdn 18.2 attn 6.9 head 2.0
+manoscds4: Ornith stage ms/chunk (pos=2458 T=2): gdn 17.6 attn 6.4 head 2.0
+rittods4: Ornith stage ms/chunk (pos=2459 T=2): gdn 17.6 attn 6.5 head 2.0
+ fosseds4: Ornith stage ms/chunk (pos=2460 T=2): gdn 17.6 attn 6.4 head 2.0
+ statods4: Ornith stage ms/chunk (pos=2461 T=2): gdn 23.5 attn 9.8 head 5.3
+ bends4: Ornith stage ms/chunk (pos=2462 T=2): gdn 34.4 attn 12.4 head 7.8
+ scritto,ds4: Ornith stage ms/chunk (pos=2464 T=2): gdn 43.5 attn 15.6 head 4.2
+ non cids4: Ornith stage ms/chunk (pos=2466 T=2): gdn 25.1 attn 8.9 head 2.4
+ sarebbeds4: Ornith stage ms/chunk (pos=2467 T=2): gdn 19.2 attn 7.3 head 2.1
+ statods4: Ornith stage ms/chunk (pos=2468 T=2): gdn 17.6 attn 6.3 head 2.0
+ bisogno dids4: Ornith stage ms/chunk (pos=2470 T=2): gdn 17.6 attn 6.7 head 2.1
+
+rifds4: Ornith stage ms/chunk (pos=2472 T=2): gdn 17.8 attn 6.5 head 2.1
+arlods4: Ornith stage ms/chunk (pos=2473 T=2): gdn 18.0 attn 6.5 head 2.0
+.ds4: Ornith stage ms/chunk (pos=2474 T=2): gdn 18.0 attn 6.5 head 2.2
+
+
+ds4: Ornith stage ms/chunk (pos=2475 T=2): gdn 18.1 attn 6.5 head 2.0
+Ilds4: Ornith stage ms/chunk (pos=2476 T=2): gdn 18.1 attn 6.6 head 2.1
+ cheds4: Ornith stage ms/chunk (pos=2477 T=2): gdn 18.3 attn 6.6 head 2.1
+ postods4: Ornith stage ms/chunk (pos=2478 T=2): gdn 18.1 attn 6.6 head 2.1
+,ds4: Ornith stage ms/chunk (pos=2479 T=2): gdn 18.0 attn 6.7 head 2.0
+ seds4: Ornith stage ms/chunk (pos=2480 T=2): gdn 18.0 attn 6.6 head 2.0
+ noids4: Ornith stage ms/chunk (pos=2481 T=2): gdn 18.3 attn 6.5 head 2.0
+ volessds4: Ornith stage ms/chunk (pos=2483 T=2): gdn 18.2 attn 6.6 head 2.1
+imo narrds4: Ornith stage ms/chunk (pos=2485 T=2): gdn 18.4 attn 6.5 head 2.1
+arla comeds4: Ornith stage ms/chunk (pos=2487 T=2): gdn 18.4 attn 6.6 head 2.0
+ stava,ds4: Ornith stage ms/chunk (pos=2489 T=2): gdn 17.7 attn 6.4 head 2.1
+ eds4: Ornith stage ms/chunk (pos=2490 T=2): gdn 17.3 attn 6.2 head 2.0
+ comeds4: Ornith stage ms/chunk (pos=2491 T=2): gdn 25.8 attn 10.1 head 2.9
+ stavads4: Ornith stage ms/chunk (pos=2492 T=2): gdn 27.2 attn 10.3 head 4.9
+ la
+ds4: Ornith stage ms/chunk (pos=2494 T=2): gdn 42.0 attn 15.5 head 3.1
+sapeds4: Ornith stage ms/chunk (pos=2496 T=2): gdn 19.2 attn 6.7 head 2.1
+vamods4: Ornith stage ms/chunk (pos=2498 T=2): gdn 18.9 attn 6.9 head 2.0
+, nonds4: Ornith stage ms/chunk (pos=2500 T=2): gdn 18.8 attn 6.9 head 2.1
+ cids4: Ornith stage ms/chunk (pos=2501 T=2): gdn 18.5 attn 6.8 head 2.1
+ sarebbeds4: Ornith stage ms/chunk (pos=2502 T=2): gdn 18.5 attn 6.7 head 2.0
+ statods4: Ornith stage ms/chunk (pos=2503 T=2): gdn 19.1 attn 6.8 head 2.0
+ bisogno dids4: Ornith stage ms/chunk (pos=2505 T=2): gdn 18.8 attn 6.7 head 2.1
+ scrivere unds4: Ornith stage ms/chunk (pos=2507 T=2): gdn 18.6 attn 6.8 head 2.0
+ libro:ds4: Ornith stage ms/chunk (pos=2509 T=2): gdn 18.4 attn 6.6 head 2.0
+ bastavads4: Ornith stage ms/chunk (pos=2511 T=2): gdn 18.2 attn 6.5 head 2.0
+
+trds4: Ornith stage ms/chunk (pos=2513 T=2): gdn 18.1 attn 6.5 head 2.1
+ascrivds4: Ornith stage ms/chunk (pos=2515 T=2): gdn 17.8 attn 6.5 head 2.1
+ere ilds4: Ornith stage ms/chunk (pos=2517 T=2): gdn 18.3 attn 6.4 head 2.0
+ manoscds4: Ornith stage ms/chunk (pos=2519 T=2): gdn 18.0 attn 6.9 head 2.1
+ritto.ds4: Ornith stage ms/chunk (pos=2521 T=2): gdn 18.2 attn 6.9 head 2.1
+ Ma,ds4: Ornith stage ms/chunk (pos=2523 T=2): gdn 18.1 attn 6.7 head 2.0
+ se il
+ds4: prefill: 1963.71 t/s, generation: 47.34 t/s

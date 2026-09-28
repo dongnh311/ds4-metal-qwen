@@ -1,0 +1,4 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: Metal kernel source dir: /private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/snap-b563f6a (CWD)
+ds4: metal backend initialized for graph diagnostics
+cycle 1: 111 two-row matvecs, expected 0 or 0

@@ -1,0 +1,7 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: Metal kernel source dir: /private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/snap-b923d2d (CWD)
+ds4: metal backend initialized for graph diagnostics
+ds4: Metal kernel_qwen35_mv_q8_0_rows2 function not found: Function kernel_qwen35_mv_q8_0_rows2 was not found in the library
+ds4: Ornith batched verify off: the two-row matvec failed its startup check against the one-row kernel; the verify dispatches one row at a time
+  150 cycles, 0 verifies with 0 two-row matvecs each, 115 accepted, bit-identical to plain
+qwen35 verify batch: ok

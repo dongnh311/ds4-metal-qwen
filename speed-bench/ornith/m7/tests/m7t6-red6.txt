@@ -1,0 +1,4 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: metal backend initialized for graph diagnostics
+Assertion failed: ((knob_off ? verifies == 0 : verifies >= CYCLES - 5) && accepts >= 10), function main, file test_qwen35_verify_batch.c, line 106.
+  150 cycles, 0 verifies with 111 two-row matvecs each, 115 accepted, bit-identical to plain
