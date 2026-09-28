@@ -1,0 +1,40 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /private/tmp/claude-501/-Users-dongnh-orca-workspaces-ds4-metal-foxface/a18593e5-414b-4337-9d32-8629ac82447a/scratchpad/snap-a0577f7/ (exe-relative)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.540 ms, residency requested in 113.448 ms, warmup 2.363 ms (mapped 21768.11 MiB from offset 10.50 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 0.17 GiB (raw 0.17 + compressed 0.00) + buffers 1.00 GiB + resident model 21.26 GiB = 22.43 GiB planned
+ds4: memory detail: ctx=8192 prefill_cap=2048 raw_kv_rows=8192 compressed_kv_rows=0 backend=metal
+ds4: memory: KV 0.17 GiB (raw 0.17 + compressed 0.00) + buffers 1.00 GiB = 1.17 GiB context
+ds4: memory detail: ctx=8192 prefill_cap=2048 raw_kv_rows=8192 compressed_kv_rows=0 backend=metal
+ds4: using GPU graph generation with graph prefill
+ds4: Ornith stage ms/chunk (pos=0 T=2048): gdn 717.6 attn 213.8 head 0.0
+processing 2269 input tokens: 2048/2269 (90.3%)
+ds4: Ornith stage ms/chunk (pos=2048 T=221): gdn 154.2 attn 54.2 head 2.3
+processing 2269 input tokens: 2269/2269 (100.0%)
+00000000
+stesso libro, è un libro che non si legge mai; la seconda, che, se
+il libro fosse stato ben fatto, non avrebbe avuto bisogno di
+giustificarsi; e se mal fatto, non si sarebbe giustificato con nulla.
+
+Ecco adunqueds4: Ornith decode stage ms/step (avg over 64 steps, pos=2269..2332): gdn 13.97 attn 4.92 head 2.04
+ come abbiam pensato di farla.
+
+Il nostro autore, come si è visto, avea proposto di narrare una storia
+vera, e di narrarla come stava; e, a questo fine, avea lasciato da parte
+i nomi proprij, e le altre particolarità che sarebber servite a
+rds4: Ornith decode stage ms/step (avg over 64 steps, pos=2333..2396): gdn 14.98 attn 5.32 head 2.17
+iconoscere le persone e i luoghi. Ora, se noi volessimo narrarla come
+stava, e come stava la sapevamo, non ci sarebbe stato bisogno di
+scrivere un libro: bastava trascrivere il manoscritto. Ma, se il
+manoscritto fosse statods4: Ornith decode stage ms/step (avg over 64 steps, pos=2397..2460): gdn 15.48 attn 5.53 head 2.48
+ ben scritto, non ci sarebbe stato bisogno di
+rifarlo.
+
+Il che posto, se noi volessimo narrarla come stava, e come stava la
+sapevamo, non ci sarebbe stato bisogno di scrivere un libro: bastava
+trascrivere il manoscritto. Ma, se il
+ds4: Ornith prefill: 1980.35 t/s, generation: 45.11 t/s

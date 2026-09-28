@@ -1,0 +1,12 @@
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: metal backend initialized for graph diagnostics
+  MTP graph logits: bit-identical to the M1 graph (prefill 1100 + 8 decodes)
+  verify at   31: both rows bit-identical to plain decoding
+  verify at   63: row 0 and the restored state bit-identical to plain decoding
+  verify at 2047: both rows bit-identical to plain decoding
+  verify at 2111: row 0 and the restored state bit-identical to plain decoding
+  verify at 3000: both rows bit-identical to plain decoding
+  prefill to 3700 after the verifies: bit-identical
+  catch-up K rows: min row cosine chunk 64 0.989318, per token 0.990429, shifted 0.301458
+  drafts after 600 tokens: 11 11 11 (chunks 512, 64, 1)
+qwen35 graph: ok

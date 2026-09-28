@@ -1,0 +1,3 @@
+ds4: metal backend initialized for graph diagnostics
+  150 cycles, 149 verifies with 111 two-row matvecs each, 115 accepted, bit-identical to plain
+qwen35 verify batch: ok

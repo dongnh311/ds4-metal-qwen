@@ -1,0 +1,20 @@
+qwen35-payloads:
+ds4: Ornith-1.5-35B-A3B: 40 layers + MTP, routed experts Q5_K x15 / Q4_K x26
+ds4: metal backend initialized for graph diagnostics
+ds4-test: refused variant 0: KV checkpoint was written by a different model family or shape
+ds4-test: refused variant 1: KV checkpoint was saved with --mtp; this Ornith session has no MTP state
+ds4-test: refused variant 2: KV checkpoint uses a different KV cache mode than this session
+ds4-test: refused variant 0: KV checkpoint was written by a different model family or shape
+ds4-test: refused variant 1: KV checkpoint was saved with --mtp; this Ornith session has no MTP state
+ds4-test: refused variant 2: KV checkpoint uses a different KV cache mode than this session
+ds4-test: refused variant 0: KV checkpoint was written by a different model family or shape
+ds4-test: refused variant 1: KV checkpoint was saved with --mtp; this Ornith session has no MTP state
+ds4-test: refused variant 2: KV checkpoint uses a different KV cache mode than this session
+qwen35-payloads: OK
+qwen35-rewind:
+ds4-test: Ornith rewind checked (mtp=0)
+qwen35-rewind: OK
+session-snapshot:
+ds4-test: snapshot prompt=21 ctx=1024 glm_mtp=0
+session-snapshot: OK
+ds4 tests: ok
