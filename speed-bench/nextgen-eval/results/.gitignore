@@ -1,0 +1,6 @@
+# compare.py --rows writes the arms' raw answers next to a report, for a human to read locally.
+# They stay out of git: the uncensor dump is 50 harmful-prompt answers per arm, and this repository
+# is pushed. Reports and summary.json files are committed; these are regenerated from a run's
+# rows.jsonl whenever they are needed again.
+*.uncensor.md
+*.writing.md
