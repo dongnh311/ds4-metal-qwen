@@ -1,7 +1,8 @@
 /* Real-model check of the M7 batched verify.
- * Usage: test_qwen35_verify_batch MODEL
+ * Usage: test_qwen35_verify_batch MODEL [--default | --knob-off]
  * Sets DS4_QWEN35_VERIFY_BATCH=1 before the engine opens (the knob is read
- * once).  150 greedy speculative cycles from a 1500-token prompt: after
+ * once); --default leaves it unset, --knob-off sets it to 0 and then expects
+ * no two-row matvec at all.  150 greedy speculative cycles from a 1500-token prompt: after
  * every cycle the logits are bit-identical to a plain session fed the
  * committed tokens, and every verify issues exactly VERIFY_ROWS two-row
  * Q8_0 matvecs (ds4_gpu_qwen35_q8_rows_dispatches): attn_q and attn_output
@@ -39,11 +40,16 @@ static void same_logits(ds4_session *spec, ds4_session *plain) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s MODEL\n", argv[0]);
+    const char *mode = argc == 3 ? argv[2] : "";
+    const bool knob_off = strcmp(mode, "--knob-off") == 0;
+    if (argc < 2 || argc > 3 || (argc == 3 && !knob_off && strcmp(mode, "--default") != 0)) {
+        fprintf(stderr, "usage: %s MODEL [--default | --knob-off]\n", argv[0]);
         return 1;
     }
-    setenv("DS4_QWEN35_VERIFY_BATCH", "1", 1);
+    if (knob_off) setenv("DS4_QWEN35_VERIFY_BATCH", "0", 1);
+    else if (argc == 3) unsetenv("DS4_QWEN35_VERIFY_BATCH");
+    else setenv("DS4_QWEN35_VERIFY_BATCH", "1", 1);
+    const uint64_t expect = knob_off ? 0u : (uint64_t)VERIFY_ROWS;
     unsetenv("DS4_QWEN35_SPEC_FORCE_ACCEPT");
     ds4_engine_options opt = {.model_path = argv[1], .context_size = CTX, .prefill_chunk = CHUNK,
                               .backend = DS4_BACKEND_METAL, .glm_mtp = true};
@@ -78,12 +84,12 @@ int main(int argc, char **argv) {
         if (n < 0) fprintf(stderr, "cycle %d: %s\n", c, err);
         assert(n >= 1 && n <= 2 && acc[0] == first);
         const uint64_t d = ds4_gpu_qwen35_q8_rows_dispatches() - before;
-        if (d != 0u && d != (uint64_t)VERIFY_ROWS) {
-            fprintf(stderr, "cycle %d: %llu two-row matvecs, expected 0 or %d\n", c, (unsigned long long)d,
-                    VERIFY_ROWS);
+        if (d != 0u && d != expect) {
+            fprintf(stderr, "cycle %d: %llu two-row matvecs, expected 0 or %llu\n", c, (unsigned long long)d,
+                    (unsigned long long)expect);
             return 1;
         }
-        verifies += d == (uint64_t)VERIFY_ROWS;
+        verifies += expect && d == expect;
         accepts += n == 2;
         for (int i = 0; i < n; i++) {
             assert(ds4_session_argmax(plain) == acc[i]);
@@ -95,9 +101,9 @@ int main(int argc, char **argv) {
         }
         same_logits(spec, plain);
     }
-    printf("  %d cycles, %d verifies with %d two-row matvecs each, %d accepted, bit-identical to plain\n",
-           CYCLES, verifies, VERIFY_ROWS, accepts);
-    assert(verifies >= CYCLES - 5 && accepts >= 10);
+    printf("  %d cycles, %d verifies with %llu two-row matvecs each, %d accepted, bit-identical to plain\n",
+           CYCLES, verifies, (unsigned long long)expect, accepts);
+    assert((knob_off ? verifies == 0 : verifies >= CYCLES - 5) && accepts >= 10);
     ds4_session_free(plain);
     ds4_session_free(spec);
     ds4_tokens_free(&tokens);
