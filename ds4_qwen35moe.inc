@@ -551,6 +551,76 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
     return ok;
 }
 
+/* A verify's 2-row GDN layer under DS4_QWEN35_VERIFY_BATCH: the sequence of
+ * two T=1 qwen4_graph_linear calls (ds4.c), with its three Q8_0 projections
+ * (lin_qkv, lin_gate, lin_out) batched over both rows through qwen35_gemv
+ * and everything recurrent -- front (conv + alpha/beta), scan and gated
+ * norm -- run one row at a time, in row order, on row views of the scratch.
+ * An MTP graph never takes the q8_pair fusion (g->mtp_R is set), so the
+ * projections are the same kernel_mul_mv_q8_0_f32 arithmetic either way.
+ * Only row 0's front and scan receive the after-first-row snapshot. */
+static ds4_gpu_tensor *qwen35_row_view(const ds4_gpu_tensor *t, uint32_t row, uint64_t n) {
+    return ds4_gpu_tensor_view(t, (uint64_t)row * n * sizeof(float), n * sizeof(float));
+}
+
+static bool qwen35_graph_linear_verify(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
+                                       uint32_t il) {
+    const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    bool ok = qwen35_gemv(g, g->qkv, m, l->lin_qkv, g->mixed, 2u);
+    sub_seal(SUB_GDN_QKV);
+    ok = ok && qwen35_gemv(g, g->z, m, l->lin_gate, g->mixed, 2u);
+    sub_seal(SUB_GDN_Z);
+    for (uint32_t t = 0; t < 2u && ok; t++) {
+        ds4_gpu_tensor *qkv = qwen35_row_view(g->qkv, t, conv_dim);
+        ds4_gpu_tensor *z = qwen35_row_view(g->z, t, v_dim);
+        ds4_gpu_tensor *ga = qwen35_row_view(g->ga, t, DS4_N_LIN_V_HEAD);
+        ds4_gpu_tensor *gb = qwen35_row_view(g->gb, t, DS4_N_LIN_V_HEAD);
+        ds4_gpu_tensor *lo = qwen35_row_view(g->lin_o, t, v_dim);
+        ds4_gpu_tensor *mx = qwen35_row_view(g->mixed, t, DS4_N_EMBD);
+        const bool snap = t == 0u && g->snap_after_first;
+        ok = qkv && z && ga && gb && lo && mx;
+        if (ok && qwen4_graph_fused(g, 1u)) {
+            ok = ds4_gpu_qwen4_gdn_front_tensor(qkv, g->layer_lin_hist[il], mx, ga, gb, m->map, m->size,
+                                                l->lin_conv->abs_offset, l->lin_alpha->abs_offset,
+                                                l->lin_beta->abs_offset, l->lin_a->abs_offset,
+                                                l->lin_dt_bias->abs_offset, l->lin_alpha->type, 1u,
+                                                DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
+                                                DS4_N_LIN_CONV, DS4_N_EMBD, snap ? g->snap_lin_hist[il] : NULL, 0u,
+                                                NULL, 1u) != 0;
+        } else if (ok) {
+            ok = qwen4_gemv(ga, m, l->lin_alpha, mx, 1u) &&
+                 qwen4_gemv(gb, m, l->lin_beta, mx, 1u) &&
+                 ds4_gpu_qwen4_conv_stream_tensor(qkv, g->layer_lin_hist[il], m->map, m->size,
+                                                  l->lin_conv->abs_offset, 1u, (uint32_t)conv_dim, DS4_N_LIN_CONV,
+                                                  true) &&
+                 ds4_gpu_qwen4_gdn_prep_tensor(qkv, ga, gb, m->map, m->size, l->lin_a->abs_offset,
+                                               l->lin_dt_bias->abs_offset, 1u, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
+                                               DS4_N_LIN_HEAD_DIM);
+        }
+        sub_seal(SUB_GDN_FRONT);
+        if (ok) {
+            ok = ds4_gpu_qwen4_gdn_scan_tensor(lo, g->layer_lin_state[il], qkv, ga, gb, 1u, DS4_N_LIN_K_HEAD,
+                                               DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
+                                               snap ? g->snap_lin_state[il] : NULL, 0u, NULL, 1u) != 0;
+        }
+        sub_seal(SUB_GDN_SCAN);
+        if (ok) {
+            ok = g->gdn_silu
+                 ? ds4_gpu_qwen35_gdn_out_tensor(lo, z, m->map, m->size, l->lin_norm->abs_offset, 1u,
+                                                 DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0
+                 : ds4_gpu_qwen4_gdn_out_tensor(lo, z, m->map, m->size, l->lin_norm->abs_offset, 1u,
+                                                DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_RMS_EPS) != 0;
+        }
+        sub_seal(SUB_GDN_OUT);
+        ds4_gpu_tensor_free(qkv); ds4_gpu_tensor_free(z); ds4_gpu_tensor_free(ga);
+        ds4_gpu_tensor_free(gb); ds4_gpu_tensor_free(lo); ds4_gpu_tensor_free(mx);
+    }
+    ok = ok && qwen35_gemv(g, g->blk, m, l->lin_out, g->lin_o, 2u);
+    sub_seal(SUB_GDN_PROJ);
+    return ok;
+}
+
 /* qwen4_graph_linear (shared with Qwen3.8, ds4.c) has no x/out parameters
  * of its own: it reads g->mixed and writes g->blk directly, using g->qkv,
  * g->z, g->ga, g->gb and g->lin_o purely as scratch it fills and consumes
@@ -562,7 +632,9 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
  * sets g->snap_after_first only for the row-0 call (qwen4_graph_linear
  * snapshots the GDN state after the call's row 0, so a 1-row call's
  * snapshot is already the state after that row) -- restoring all three
- * fields on every path, success or failure. */
+ * fields on every path, success or failure.  With DS4_QWEN35_VERIFY_BATCH a
+ * 2-row verify takes qwen35_graph_linear_verify instead (projections
+ * batched, the recurrence still one row at a time). */
 static bool qwen35_graph_linear_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                      uint32_t il, uint32_t T) {
     if (!g->verify_rows_exact || T <= 1u) return qwen4_graph_linear(g, m, l, il, T);
@@ -575,6 +647,7 @@ static bool qwen35_graph_linear_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         fprintf(stderr, "ds4: Ornith per-row verify supports only the after-first-row snapshot\n");
         return false;
     }
+    if (T == 2u && qwen35_verify_batch_env()) return qwen35_graph_linear_verify(g, m, l, il);
     ds4_gpu_tensor *const mixed0 = g->mixed, *const blk0 = g->blk;
     const bool snap0 = g->snap_after_first;
     const uint64_t row = (uint64_t)DS4_N_EMBD * sizeof(float);
