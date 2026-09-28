@@ -211,11 +211,78 @@ static bool qwen35_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m
  * matvec (ds4_gpu_qwen35_matmul_q8_0_rows_tensor) that loads each weight
  * block once and keeps kernel_mul_mv_q8_0_f32's arithmetic for every row,
  * so each row stays bit-identical to the T=1 dispatch qwen35_gemv would
- * otherwise issue for it.  Other weight types keep the per-row loop. */
+ * otherwise issue for it.  Other weight types keep the per-row loop.  The
+ * self-check below, or a failing two-row call, turns it off for the rest of
+ * the process (qwen35_verify_batch_disable). */
+static int g_qwen35_verify_batch = -1;   /* -1 = knob not read yet */
+
 static bool qwen35_verify_batch_env(void) {
-    static int v = -1;
-    if (v < 0) { const char *e = getenv("DS4_QWEN35_VERIFY_BATCH"); v = !(e && strcmp(e, "0") == 0); }
-    return v;
+    if (g_qwen35_verify_batch < 0) {
+        const char *e = getenv("DS4_QWEN35_VERIFY_BATCH");
+        g_qwen35_verify_batch = !(e && strcmp(e, "0") == 0);
+    }
+    return g_qwen35_verify_batch;
+}
+
+static void qwen35_verify_batch_disable(const char *why) {
+    if (qwen35_verify_batch_env())
+        fprintf(stderr, "ds4: Ornith batched verify off: %s; the verify dispatches one row at a time\n", why);
+    g_qwen35_verify_batch = 0;
+}
+
+/* Row r of one two-row matvec over two rows of x against two T=1 qwen4_gemv
+ * calls, byte for byte. */
+static bool qwen35_rows_match_t1(const ds4_model *m, const ds4_tensor *w, const ds4_gpu_tensor *x) {
+    const uint64_t in_dim = w->dim[0], out_dim = w->dim[1];
+    const uint64_t xrow = in_dim * sizeof(float), orow = out_dim * sizeof(float);
+    ds4_gpu_tensor *o2 = ds4_gpu_tensor_alloc(2u * orow), *o1 = ds4_gpu_tensor_alloc(2u * orow);
+    bool ok = o2 && o1 &&
+              ds4_gpu_qwen35_matmul_q8_0_rows_tensor(o2, m->map, m->size, w->abs_offset, in_dim, out_dim, x, 2u);
+    for (uint32_t t = 0; t < 2u && ok; t++) {
+        ds4_gpu_tensor *xr = ds4_gpu_tensor_view(x, (uint64_t)t * xrow, xrow);
+        ds4_gpu_tensor *or_ = ds4_gpu_tensor_view(o1, (uint64_t)t * orow, orow);
+        ok = xr && or_ && qwen4_gemv(or_, m, w, xr, 1u);
+        ds4_gpu_tensor_free(xr);
+        ds4_gpu_tensor_free(or_);
+    }
+    ok = ok && ds4_gpu_synchronize();
+    float *a = ok ? malloc(2u * orow) : NULL, *b = ok ? malloc(2u * orow) : NULL;
+    ok = ok && a && b && ds4_gpu_tensor_read(o2, 0, a, 2u * orow) && ds4_gpu_tensor_read(o1, 0, b, 2u * orow) &&
+         memcmp(a, b, 2u * orow) == 0;
+    free(a);
+    free(b);
+    ds4_gpu_tensor_free(o2);
+    ds4_gpu_tensor_free(o1);
+    return ok;
+}
+
+/* Once per process, when an MTP session is created: the shader library is
+ * compiled from source at run time with fast math, so the two-row matvec's
+ * per-row equality with the one-row kernel -- pinned by the kernel tests on
+ * the development toolchain -- is checked again on this machine's Metal
+ * compiler, on the lm head (NSG 8) and layer 0's lin_qkv (NSG 4) with two
+ * fixed input rows.  A mismatch or a failure turns the batched verify off,
+ * so --mtp stays byte-identical to plain decoding either way. */
+static void qwen35_verify_batch_selfcheck(const ds4_model *m, const ds4_weights *w) {
+    static bool done = false;
+    if (done || !qwen35_verify_batch_env()) return;
+    done = true;
+    const uint64_t n = 2u * (uint64_t)DS4_N_EMBD;
+    float *h = malloc(n * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc(n * sizeof(float));
+    bool ok = h && x;
+    uint32_t r = 0x9e3779b9u;
+    for (uint64_t i = 0; ok && i < n; i++) {
+        r = r * 1664525u + 1013904223u;
+        h[i] = (float)((int32_t)(r >> 8) - (1 << 23)) / (float)(1 << 21);
+    }
+    ok = ok && ds4_gpu_tensor_write(x, 0, h, n * sizeof(float));
+    const ds4_tensor *ws[2] = { w->output, w->layer[0].lin_qkv };
+    for (uint32_t i = 0; i < 2u && ok; i++)
+        if (ws[i] && ws[i]->type == DS4_TENSOR_Q8_0 && ws[i]->ndim >= 2) ok = qwen35_rows_match_t1(m, ws[i], x);
+    free(h);
+    ds4_gpu_tensor_free(x);
+    if (!ok) qwen35_verify_batch_disable("the two-row matvec failed its startup check against the one-row kernel");
 }
 
 /* qwen4_gemv's batched dispatch (qwen4_gemv_rows, ds4.c) picks its Q8_0/F16
@@ -240,8 +307,9 @@ static bool qwen35_gemv(ds4_qwen4_gpu_graph *g, ds4_gpu_tensor *out, const ds4_m
     if (T == 2u && w->type == DS4_TENSOR_Q8_0 && qwen35_verify_batch_env()) {
         if (ds4_gpu_qwen35_matmul_q8_0_rows_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, T))
             return true;
-        fprintf(stderr, "ds4: Ornith two-row verify matvec failed for %.*s\n", (int)w->name.len, w->name.ptr);
-        return false;
+        /* the wrapper refuses before it encodes anything (arguments, pipeline,
+         * buffers): fall back to the exact per-row dispatch below */
+        qwen35_verify_batch_disable("a two-row matvec failed");
     }
     bool ok = true;
     for (uint32_t t = 0; t < T && ok; t++) {
