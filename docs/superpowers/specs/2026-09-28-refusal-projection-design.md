@@ -35,7 +35,9 @@ The gaps:
    applies `direction.N` at layer index N (0-based); Cudecnik's settings use layers 4..44 at scale 1.0.
 2. `ds4-eval` has no steering flags, so the harness's reasoning suite would run unsteered.
 3. With Qwen FFN steering on, native session batching is switched off
-   (`qwen4_graph_native_session_batch_check`), so concurrent sessions lose the batched decode.
+   (`qwen4_graph_native_session_batch_check`), and `ds4_sessions_eval_batch` falls back to per-session
+   decode, which is steered. PROD does not run `--batched-session` (and `--think-budget` is ignored
+   with it), so this costs PROD nothing and is left as is.
 4. The disk KV cache key (text sha1 + model family id + quant bits + ctx + payload variant) does not
    know about steering, so a cache written without projection can be loaded with it.
 5. Nothing checks that the loaded rows are unit length; a bad file silently distorts every layer.
@@ -49,16 +51,13 @@ Every change is inert without `--dir-steering-file`: the default path stays byte
 - **ds4-eval:** parse `--dir-steering-file FILE`, `--dir-steering-ffn F` and `--dir-steering-attn F`
   exactly like `ds4-server` (range -100..100; FFN defaults to 1 when a file is given) and pass them in
   the engine options (`ds4.h` already has the fields).
-- **Session batching:** the two Qwen batch encoders (`qwen4_graph_encode_native_session_batch` and
-  its ragged variant) apply FFN steering to the batch residual after each layer's MoE, with the same
-  direction tensor and scale as the sessions. The batch check stops refusing FFN steering; it keeps
-  refusing attention steering (unused here). The MTP draft batch stays unsteered.
 - **Load validation:** every row must have norm 0 or 1 +/- 1e-3; otherwise loading fails with the
   layer index and its norm. Applies to the Qwen load path (`qwen4_graph_load_steering`) only;
   DeepSeek/GLM loaders are untouched.
 - **Disk KV cache:** when steering is active (a file and a non-zero scale), `ds4-server` opens its
-  disk cache in `<kv-disk-dir>/steer-<sha8>`, where `sha8` is the first 8 hex digits of the sha256 of
-  the direction file bytes followed by the attention and FFN scales as text (`"%g,%g"`). Without
+  disk cache in `<kv-disk-dir>/steer-<sha8>`, where `sha8` is the first 8 hex digits of the sha1 (the cache's
+  own hash helper, `ds4_kvstore_sha1_bytes_hex`) of the direction file bytes followed by the
+  attention and FFN scales as text (`"%g,%g"`), and logs that directory. Without
   steering the directory is unchanged. The cache format does not change.
 
 The cache key also ignores which weights file is loaded; that pre-dates this work and matters when
@@ -113,14 +112,12 @@ GPU (each needs the user's go-ahead and a paused gateway stack):
 
 1. **Default path unchanged:** greedy `ds4` output on the PROD model, three prompts, 128 tokens, no
    steering flags: identical text from this branch and from develop `b764a66`.
-2. **Load validation:** a file with one row scaled by 2 fails to load with that layer named.
-3. **Batch with steering:** `make test-metal-session-batch` on Ivan's GGUF with the converted file and
-   FFN scale 1 passes. Before the change it is expected to fail, because the batch check refuses a
-   steered Qwen batch and `ds4_sessions_eval_batch` returns an error.
-4. **Effect:** three harmful prompts from the frozen `harmful.jsonl`, greedy, with and without the
+2. **Load validation:** a file with one row scaled by 2 fails to load with that layer named, in
+   both `ds4` and `ds4-eval` (which also proves the eval flags reach the engine).
+3. **Effect:** three harmful prompts from the frozen `harmful.jsonl`, greedy, with and without the
    projection: `graders.is_refusal` is true without it and false with it on at least two.
-5. **Disk cache:** a server with steering writes only under `steer-<sha8>`; a server without it
-   neither reads nor writes there.
+4. **Disk cache:** the `ivan-proj` arm's `server.log` names its `steer-<sha8>` cache directory and
+   the `ivan` arm's does not (the directory naming itself is unit-tested).
 
 ## Evaluation and exit check
 
@@ -155,6 +152,7 @@ PROD in sub-project 5.
 
 - An additive control vector (verbosity) and attention steering.
 - Steering the MTP head.
+- Steering inside native session batching (PROD does not batch; the fallback is steered).
 - A fused projection kernel: only if the measured decode cost is large enough to matter in
   sub-project 5.
 - Re-keying the disk cache by weights file (sub-project 7).
