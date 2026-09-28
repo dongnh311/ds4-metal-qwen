@@ -5,7 +5,8 @@
  * every cycle the logits are bit-identical to a plain session fed the
  * committed tokens, and every verify issues exactly VERIFY_ROWS two-row
  * Q8_0 matvecs (ds4_gpu_qwen35_q8_rows_dispatches): attn_q and attn_output
- * in each of Ornith's 10 attention layers, plus the lm head. */
+ * in each of Ornith's 10 attention layers, lin_qkv, lin_gate and lin_out in
+ * each of its 30 GDN layers, plus the lm head. */
 #define _POSIX_C_SOURCE 200809L
 #include "../ds4.h"
 #include "../ds4_gpu.h"
@@ -16,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-enum { CTX = 4160, CHUNK = 512, CYCLES = 150, VERIFY_ROWS = 10 * 2 + 1 };
+enum { CTX = 4160, CHUNK = 512, CYCLES = 150, VERIFY_ROWS = 10 * 2 + 30 * 3 + 1 };
 
 static int g_vocab;
 static float *g_a, *g_b;
