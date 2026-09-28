@@ -122,7 +122,17 @@ class Suites(unittest.TestCase):
         self.assertTrue(all(r["refused"] and not r["passed"] for r in harmful))
         self.assertTrue(all(not r["refused"] and r["passed"] for r in harmless))
 
+    def _haystack(self):
+        # A stand-in for the frozen ds4.c snapshot, long enough for the 240k tier (727,200 characters).
+        (self.data / eval_suites.HAYSTACK).write_text("int x = 1;\n" * 80000)
+
+    def test_longctx_needs_the_frozen_haystack(self):
+        with self.assertRaises(RuntimeError) as cm:
+            eval_suites.run_longctx(FakeCtx(self.data, lambda p: "7314-QX", ctx_limit=130000))
+        self.assertIn("fetch_data.py", str(cm.exception))
+
     def test_longctx_skips_tiers_beyond_ctx(self):
+        self._haystack()
         ctx = FakeCtx(self.data, lambda p: "7314-QX", ctx_limit=130000)
         rows = eval_suites.run_longctx(ctx)
         needles = {r["id"]: r for r in rows if r["suite"] == "longctx"}
@@ -137,6 +147,7 @@ class Suites(unittest.TestCase):
         self.assertEqual(mem[0]["peak_wired_gib"], 50.0)
 
     def test_longctx_doc_questions_on_240k(self):
+        self._haystack()
         def answer(p):
             tail = p[-300:]
             for question, value in eval_suites.DOC_QA:
@@ -150,7 +161,8 @@ class Suites(unittest.TestCase):
         self.assertEqual(ids["needle-240k"], True)
 
     def test_haystack_puts_needle_mid_document(self):
-        doc = eval_suites.haystack(eval_suites.server.ROOT, 10000)
+        self._haystack()
+        doc = eval_suites.haystack(self.data / eval_suites.HAYSTACK, 10000)
         pos = doc.index(eval_suites.NEEDLE)
         self.assertTrue(0.4 < pos / len(doc) < 0.6)
 

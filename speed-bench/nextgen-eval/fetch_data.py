@@ -6,7 +6,8 @@ Subsets are deterministic:
 - MBPP+: first 50 by numeric task_id;
 - IFEval: first 60 by key among prompts whose every instruction id is supported;
 - harmful / harmless: first 50 rows of each test split;
-- mcp_tools.json: the gateway's MCP tool catalog, frozen (run this while the gateway stack is up).
+- mcp_tools.json: the gateway's MCP tool catalog, frozen (run this while the gateway stack is up);
+- haystack.c: this checkout's ds4.c, frozen as the long-context document.
 """
 import hashlib
 import json
@@ -19,6 +20,7 @@ import urllib.parse
 import urllib.request
 
 HERE = pathlib.Path(__file__).resolve().parent
+ROOT = HERE.parents[1]
 sys.path.insert(0, str(HERE))
 import graders  # noqa: E402
 import ifeval_checks  # noqa: E402
@@ -76,6 +78,11 @@ def select_first(rows, n):
     return [{"text": r["text"]} for r in rows[:n]]
 
 
+def snapshot_haystack(root=ROOT):
+    """ds4.c as the long-context haystack, frozen so baseline and candidate read the same document."""
+    return (pathlib.Path(root) / "ds4.c").read_bytes()
+
+
 def fetch_mcp_catalog(client=None):
     """The gateway's MCP tool catalog (tools/list response). ds4-server has no /mcp, so the toolcall
     suite grades every arm against this frozen copy. Needs the gateway stack up."""
@@ -107,6 +114,10 @@ def main():
         (DATA / name).write_bytes(blob)
         manifest[name] = {"rows": len(rows), "sha256": hashlib.sha256(blob).hexdigest()}
         print("%-16s %3d rows" % (name, len(rows)))
+    blob = snapshot_haystack()
+    (DATA / "haystack.c").write_bytes(blob)
+    manifest["haystack.c"] = {"bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()}
+    print("%-16s %d bytes" % ("haystack.c", len(blob)))
     blob = (json.dumps(catalog, indent=1, sort_keys=True, ensure_ascii=False) + "\n").encode()
     (DATA / "mcp_tools.json").write_bytes(blob)
     tools = len(catalog["result"]["tools"])

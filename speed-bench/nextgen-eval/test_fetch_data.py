@@ -1,6 +1,7 @@
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -48,6 +49,13 @@ class McpCatalog(unittest.TestCase):
     def test_empty_catalog_is_refused(self):
         with self.assertRaises(SystemExit):
             fetch_data.fetch_mcp_catalog(self.Client({"result": {"tools": []}}))
+
+
+class Haystack(unittest.TestCase):
+    def test_snapshot_is_ds4_c(self):
+        with tempfile.TemporaryDirectory() as d:
+            (pathlib.Path(d) / "ds4.c").write_bytes(b"int main(void) { return 0; }\n")
+            self.assertEqual(fetch_data.snapshot_haystack(pathlib.Path(d)), b"int main(void) { return 0; }\n")
 
 
 class ViData(unittest.TestCase):

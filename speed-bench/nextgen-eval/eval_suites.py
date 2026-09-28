@@ -202,18 +202,24 @@ def run_tools(ctx):
     return rows
 
 
-def haystack(root, tokens, depth=0.5):
-    """The first tokens*CHARS_PER_TOKEN characters of ds4.c, with the needle at `depth`."""
-    src = (pathlib.Path(root) / "ds4.c").read_text(errors="replace")
+HAYSTACK = "haystack.c"  # ds4.c frozen by fetch_data.py: later sub-projects edit ds4.c on this branch
+
+
+def haystack(path, tokens, depth=0.5):
+    """The first tokens*CHARS_PER_TOKEN characters of the frozen ds4.c, with the needle at `depth`."""
+    src = pathlib.Path(path).read_text(errors="replace")
     n = int(tokens * CHARS_PER_TOKEN)
     if n > len(src):
-        raise ValueError("ds4.c has %d characters, need %d" % (len(src), n))
+        raise ValueError("%s has %d characters, need %d" % (path, len(src), n))
     text = src[:n]
     cut = text.rfind("\n", 0, int(n * depth)) + 1
     return text[:cut] + NEEDLE + text[cut:]
 
 
 def run_longctx(ctx):
+    source = ctx.data_dir / HAYSTACK
+    if not source.exists():
+        raise RuntimeError("%s missing: run fetch_data.py" % source)
     rows = []
     sampler = ctx.sampler_factory()
     sampler.start()
@@ -223,7 +229,7 @@ def run_longctx(ctx):
                 rows.append({"suite": "longctx", "id": "needle-" + label, "passed": None,
                              "skipped": "ctx limit %d" % ctx.ctx_limit})
                 continue
-            doc = "Here is a C source file.\n\n" + haystack(ctx.root, tokens) + "\n\n"
+            doc = "Here is a C source file.\n\n" + haystack(source, tokens) + "\n\n"
             r = ctx.ask(doc + NEEDLE_Q, max_tokens=512, extra=NO_THINK)
             rows.append(dict(_speed(r), suite="longctx", id="needle-" + label,
                              passed=graders.needle_hit(r["content"], NEEDLE_VALUE),
