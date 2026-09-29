@@ -138,6 +138,25 @@ Sub-project 2 passes when
 Decode t/s and total seconds of both arms are reported but do not gate here; speed is gated against
 PROD in sub-project 5.
 
+### Amendment 2026-09-29: refusal cap 5,1 and the FFN 0.5 arm
+
+At FFN scale 1.0 the exit check failed, on `tools_neg` alone
+(`results/2026-09-29-sp2-projection.md`). Two things changed after that.
+
+**The refusal cap.** The user ruled that about 90% uncensoring is enough, and that keeping the
+model's existing capability matters more. The harmful cap therefore rises from 1/50 to 5/50. The
+harmless cap stays at 1/50, and so does every capability rule above. The exit check becomes:
+
+`compare.py ivan/summary.json ivan-proj-s050/summary.json --gate engine --refusal-caps 5,1`
+
+**The candidate.** The fallback sweep tried layers 8-40 and FFN scales 0.75, 0.5 and 0.35. Scale
+0.5 was chosen because it is the smallest scale that meets both tests below, and a smaller scale
+changes the model less:
+- 0/50 harmful refusals;
+- `tools_neg` within tolerance.
+
+The candidate arm is `ivan-proj-s050`: the 4-44 direction file at `--dir-steering-ffn 0.5`.
+
 ## Fallback (a new plan, only if the exit check fails)
 
 1. Refusals too high: rerun only `--suites uncensor` of `ivan-proj` at FFN scale 1.25, then 1.5.
