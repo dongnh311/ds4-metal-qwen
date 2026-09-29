@@ -236,3 +236,56 @@ between the arms.
 
 Sub-project 2 therefore still does not pass its own rule. Summaries:
 `2026-09-29-sp2-ivan-proj-s050.summary.json`, report `2026-09-29-sp2-ivan-proj-s050-vs-ivan.md`.
+
+## Grown sets (2026-09-30 night) — ifeval clears, tools_neg fails
+
+Two cases decided the 0.5 arm's ifeval failure, and `tools_neg` had six cases, so the user asked for
+bigger sets before judging (commit d29d59c):
+- `ifeval` now has the first 200 supported IFEval prompts by key; the old 60 are its first 60;
+- `tools_neg` now has 30 cases: the gateway's 6 plus 24 of our own (`data/tools_neg_extra.json`), 15
+  requests for an action the model cannot perform (run, install, delete, push...) and 15 questions it
+  answers from the prompt alone, all graded by the gateway's `grade_negative`.
+
+Both arms reran `--suites ifeval,tools` into their existing run directories with the same binaries
+(ivan 23:08-01:36, 0.5 01:36-04:19, gateway stack paused 23:07-04:19). Every other suite keeps its rows.
+
+`compare.py ... --gate engine --refusal-caps 5,1` still exits 1, now on `tools_neg` alone:
+
+| suite | ivan | 0.5 | verdict | lost / gained | McNemar p |
+|---|---|---|---|---|---|
+| ifeval | 193/200 | 194/200 | same | 3 / 4 | 1.00 |
+| tools_pos | 7/8 | 6/8 | same | 1 / 0 | 1.00 |
+| tools_neg | 21/30 | 17/30 | **regressed** | 6 / 2 | 0.29 |
+| tools_xfer | 0/6 | 0/6 | same | 0 / 0 | — |
+| faithfulness | 9/9 | 9/9 | same | 0 / 0 | — |
+
+"Lost / gained" counts the cases `ivan` passes and the 0.5 arm fails, and the reverse. The p-value is
+the exact two-sided McNemar test on those counts, reported for reading and not part of the gate.
+
+**ifeval: no loss.** On 200 prompts the 0.5 arm passes one more than `ivan`. It loses three
+(19, 1236, 2035: word, paragraph and sentence counts) and gains four. The rerun also measured noise.
+`ivan` reproduced all 89 cases it shares with its earlier rows (60 ifeval, 29 tools). The 0.5 arm
+flipped two of its own 89 between runs: case 30 now passes and case 201 now fails. Case 30 was one
+of the two cases behind yesterday's failure. A two-case swing on 60 prompts is within what one arm
+does between runs, so the 60-case ifeval failure was noise.
+
+**tools_neg: a real, narrow loss.** Splitting the 30 cases by kind:
+
+| kind | ivan | 0.5 |
+|---|---|---|
+| question answerable from the prompt | 14/15 | 14/15 |
+| request for an action the model cannot perform | 7/15 | 3/15 |
+
+All six lost cases are action requests (`neg_cargo`, `neg_mkdir`, `negx_kill`, `negx_pip`,
+`negx_restart`, `negx_rm_file`). The two gained cases are action requests too (`neg_git`,
+`negx_fmt`). The stock model already calls a gateway tool on 8 of 15 action requests, and the
+projection raises that to 12 of 15. On plain questions nothing changes. This matches the mechanism
+measured at scale 1.0: the refusal direction also carries "decline to act". At n = 30 the paired
+test alone is not conclusive (p = 0.29). Still, the losses all have one shape and appear at every
+steered scale tried (1.0, 0.75, 0.5), so this report treats the loss as real.
+
+**Speed on the grown ifeval:** 8476.5 s -> 9409.2 s (+11%). The median think tokens over all rows
+went from 276 to 327.5, and decode stayed flat at 40.84 -> 40.59 t/s.
+
+Summaries: `2026-09-30-sp2-ivan-grown.summary.json`, `2026-09-30-sp2-ivan-proj-s050-grown.summary.json`;
+report `2026-09-30-sp2-ivan-proj-s050-vs-ivan-grown.md`.
