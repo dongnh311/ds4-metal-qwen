@@ -130,6 +130,7 @@ overlap once 1 exists.
 | 5 | candidate selection | ISTA IQ3_XXS + projection vs PROD through the harness (lighter ISTA tiers if speed or memory fails; the verbosity vector as an optional arm) | 1-4 | the gate below passes or the candidate is rejected |
 | 6 | prompt-lookup drafts in the MTP round | lookup chain with a cost gate and sushi's line rule, max 8 drafts | 5 | copy/edit/write_file tasks faster, prose and new code within noise, greedy output identical |
 | 7 | deploy | `prod/nextgen-YYYYMMDD` through `deploy-ai-gateway.sh` (the pending think-budget deploy folds in here unless the user deploys it earlier) | 5 (6 optional) | smoke per docs/DEPLOY_AI_GATEWAY.md; rollback entry recorded |
+| 8 | PLE gather and prefix-reuse speed spike | a measurement, not a feature: how much of decode and prefill the host-side PLE gather costs, an A/B of `DS4_QWEN4_PLE_RANDOM=1` on PROD's model, and whether a session switch recomputes the unaligned KV tail (see the section below) | — (runs on PROD's model whenever the GPU is free) | numbers recorded and one decision per lever; any follow-up gets its own plan |
 
 Research items outside this program (no plan yet): retraining the MTP head (Litwein's self-distillation),
 and an FP8 PLE sidecar.
@@ -292,3 +293,51 @@ arms use the same grader.
 - Concurrency and throughput benchmarks.
 - KLD against BF16 (no BF16 teacher fits this machine).
 - Automatic stack pause.
+
+## Sub-project 8: PLE gather and prefix-reuse speed spike
+
+Added on 2026-09-29, after a review of the jundot/omlx release notes up to v0.7.0rc1. The user
+approved the probe and asked for it to run later. Most of oMLX's Qwen3.8-Flash-Next speedups either
+remove oMLX's own Python host overhead or are already in ds4, sometimes tested and dropped: adaptive
+MTP depth, prompt-lookup drafts, gathered QSA, router fusion, FP8 KV and MTP prompt priming. Three
+ideas remain untested here, and this spike measures them before anything is built.
+
+**Question.** In PROD, the 30 GB Q4_1 PLE sidecar is demand-paged from SSD
+(`DS4_QWEN4_PLE_PREFETCH_FULL=0`). A single host thread gathers its rows in
+`qwen4_graph_stage_inputs`, so every cold row is a serial SSD fault on the critical path. Three things
+are unknown:
+- how much of a decode step and of a prefill chunk that gather costs;
+- whether `DS4_QWEN4_PLE_RANDOM=1` helps PROD's model (it gave +13% on the 31-layer build at the
+  paging cliff, but PROD never measured it);
+- whether switching sessions recomputes the unaligned KV tail. The disk cache aligns to 2048
+  tokens.
+
+oMLX measured +8-20% prefill on this model from parallel cold-page PLE reads plus prefetch (#3287,
+#3534). It also cut next-turn prefill from 1,174 to 37 tokens by reusing a partial final cache block
+(#3835).
+
+**Probe** (about 45 minutes of GPU with the gateway paused, on PROD's registry command and model):
+
+1. Gather timing. Add a throwaway, env-gated timer around the PLE gather in
+   `qwen4_graph_stage_inputs`. For each decode step and each 2048-token prefill chunk, it records
+   wall time and the `getrusage` major-fault delta. Run a 4K prompt and a 64K prompt, with 256
+   generated tokens each, `--mtp`, at temperature 0.
+2. `DS4_QWEN4_PLE_RANDOM` A/B, 0 against 1. The runs are paired and alternate the order, three per
+   setting at 4K and at 64K, because server start drifts by 6-12%. Record decode t/s, prefill t/s
+   and whether the greedy output is identical.
+3. Prefix tail. Read the kvstore code to see whether a request's unaligned tail is stored. If it is
+   not, time the first token for session A, then B, then A again, with prompts of about 20K tokens.
+
+**Decisions:**
+- If the gather is at least 10% of a decode step or of a prefill chunk, write a plan for a threaded
+  gather with prefetch. It would fetch the next chunk's rows while the GPU runs the current chunk,
+  and fault a verify step's rows in parallel.
+- If `PLE_RANDOM=1` gives at least 3% more decode, prefill is no worse, and the output is identical,
+  propose it as a PROD registry change through the deploy path. That change needs the user's
+  approval.
+- If the tail is recomputed and costs at least 1 s to first token, write a plan for storing partial
+  blocks.
+- Otherwise, record the numbers and close the lever.
+
+The timer code is throwaway. It lives in a worktree and is never merged. Results go to
+`speed-bench/nextgen-eval/results/<date>-sp8-ple-spike.md`.
