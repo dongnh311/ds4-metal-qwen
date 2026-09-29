@@ -110,7 +110,7 @@ ds4-eval only the flags in `ds4eval.EVAL_*`. A flag that is neither there nor in
 The directional steering flags (`--dir-steering-file`, `--dir-steering-ffn`, `--dir-steering-attn`)
 go to ds4-eval too, so the reasoning suite runs with the same projection as the server. `ivan.json`
 and `ivan-proj.json` are Ivan's stock IQ2 without and with Cudecnik's refusal projection (sub-project
-2).
+2). The projection runs at FFN scale 0.5 (arm `ivan-proj-s050`), the setting accepted on 2026-09-30.
 
 ## Comparing arms
 
@@ -141,8 +141,8 @@ An engine change on one set of weights (the refusal projection on Ivan's stock I
 engine gate:
 
 ```bash
-python3 speed-bench/nextgen-eval/compare.py RUNS/ivan-X/summary.json RUNS/ivan-proj-Y/summary.json \
-  --gate engine --refusal-caps 1,1 --out speed-bench/nextgen-eval/results/<date>-sp2-projection.md
+python3 speed-bench/nextgen-eval/compare.py RUNS/ivan-X/summary.json RUNS/ivan-proj-s050-Y/summary.json \
+  --gate engine --refusal-caps 5,1 --out speed-bench/nextgen-eval/results/<date>-sp2-projection.md
 ```
 
 - **What it keeps:** the accuracy rule, `complete_runs`, `longctx_no_regression` and `vi_cjk_leaks`.

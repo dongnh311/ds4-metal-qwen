@@ -97,10 +97,12 @@ class Summarize(unittest.TestCase):
         self.assertTrue(ivan["model"].endswith("/gguf/ivan/Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf"))
         self.assertEqual(ivan["args_add"], [])
         self.assertEqual(dict(proj, name="ivan", args_add=[]), ivan)
-        self.assertEqual(proj["name"], "ivan-proj")
+        # The setting accepted for sub-project 2 on 2026-09-30: FFN scale 0.5. The name matches that
+        # arm's run directory, so the config can rerun suites there.
+        self.assertEqual(proj["name"], "ivan-proj-s050")
         self.assertEqual(proj["args_add"][0], "--dir-steering-file")
         self.assertTrue(proj["args_add"][1].endswith("/steering/refusal-4-44.f32"))
-        self.assertEqual(proj["args_add"][2:], ["--dir-steering-ffn", "1"])
+        self.assertEqual(proj["args_add"][2:], ["--dir-steering-ffn", "0.5"])
 
 
 class Rerun(unittest.TestCase):

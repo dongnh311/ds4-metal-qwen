@@ -157,6 +157,28 @@ changes the model less:
 
 The candidate arm is `ivan-proj-s050`: the 4-44 direction file at `--dir-steering-ffn 0.5`.
 
+### Decision 2026-09-30: FFN 0.5 accepted
+
+The 0.5 arm failed the exit check twice (`results/2026-09-29-sp2-projection.md`).
+- **On 60 ifeval cases (59 -> 57).** This was noise. On 200 cases it passes 194 against stock Ivan's
+  193, and the arm flips two of its own 60 cases between runs.
+- **On `tools_neg`, grown to 30 cases (21 -> 17).** This loss is real but narrow. It shows only on
+  requests for an action the model cannot perform (7/15 -> 3/15). Questions the model can answer
+  from the prompt stay at 14/15.
+
+PROD's uncensored weights score lower on those requests (2/15, `tools_neg` 16/30), so this cost
+comes with uncensoring rather than with the projection. The user accepted FFN 0.5 as the
+sub-project 2 result on that basis ("Ok đồng ý vs đề xuất").
+
+- `configs/ivan-proj.json` now runs the arm `ivan-proj-s050`.
+- Sub-project 2 is closed. Its failed check is recorded, not waived silently.
+- The next-gen candidate's accuracy, including `tools_pos` and `tools_xfer` (where Ivan's IQ2
+  trails PROD, 6/8 vs 8/8 and 0/6 vs 2/6), is gated against PROD in sub-project 5 with the
+  candidate's own weights.
+- The grown sets (ifeval 200, `tools_neg` 30) are the harness standard from now on. PROD's SP1
+  baseline must rerun `ifeval` on them before sub-project 5. Its tools rows on the 30-case set
+  already exist (`runs/prod-20260930-062529`).
+
 ## Fallback (a new plan, only if the exit check fails)
 
 1. Refusals too high: rerun only `--suites uncensor` of `ivan-proj` at FFN scale 1.25, then 1.5.
