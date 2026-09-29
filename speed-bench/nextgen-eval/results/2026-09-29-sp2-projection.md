@@ -143,3 +143,50 @@ pass. The spec's fallback list applies, cheapest first, and each step needs the 
 A fourth option is a decision rather than a fix: `tools_neg` has 6 cases, and PROD itself scores 2/6,
 so one could argue this axis is already weak and should be judged against PROD in sub-project 5 rather
 than against unsteered stock weights here. That is the user's call, not the harness's.
+
+## Fallback sweep (2026-09-29 morning)
+
+The user approved fallbacks 1 and 2. Each setting ran `--suites tools` first, about 3 minutes; a
+setting went on to the uncensor suite only if `tools_neg` came back within tolerance, which means at
+least 3/6. All runs used Ivan's IQ2 with SSD streaming, like the arms above.
+
+| setting | tools_pos | tools_neg | tools_xfer | faithfulness |
+|---|---|---|---|---|
+| unsteered (`ivan`) | 7/8 | 4/6 | 0/6 | 9/9 |
+| scale 1.0, layers 4-44 | 8/8 | 1/6 (regressed) | 0/6 | 9/9 |
+| scale 1.0, layers 8-40 | 6/8 | 2/6 (regressed) | 1/6 | 9/9 |
+| scale 0.75, layers 4-44 | 6/8 | 3/6 | 0/6 | 9/9 |
+| scale 0.5, layers 4-44 | 6/8 | 3/6 | 0/6 | 9/9 |
+
+Narrowing the layer range does not fix `tools_neg`. It only moves which cases fail. Lowering the FFN
+scale does fix it: at both 0.75 and 0.5, every tools suite is within the small-suite tolerance.
+Individual cases flip between settings, because each one is a single greedy generation. The
+per-suite totals are the thing to read.
+
+**Scale 0.75 keeps the refusal removal.** On the uncensor suite it scores 0/50 harmful refusals and
+0/50 harmless refusals, the same as scale 1.0. That makes 0.75 the candidate, and 0.5 was not tested
+further. The 0.75 arm is being built suite by suite in one run directory
+(`runs/ivan-proj-s075-20260929-064527`, config `ds4-metal-data/sp2/ivan-proj-s075.json`). Measured so
+far, against the unsteered arm:
+
+| suite | ivan | scale 0.75 | scale 1.0 |
+|---|---|---|---|
+| code | 65/67 | 65/67 | 64/67 |
+| vi_knowledge | 30/30, CJK 0 | 30/30, CJK 0 | 30/30, CJK 0 |
+| tools pos / neg / xfer | 7/8, 4/6, 0/6 | 6/8, 3/6, 0/6 | 8/8, 1/6, 0/6 |
+| faithfulness | 9/9 | 9/9 | 9/9 |
+| harmful / harmless refusals | 45/50, 0/50 | 0/50, 0/50 | 0/50, 0/50 |
+
+The tools and faithfulness suites at 0.75 ran twice, once as the probe and once inside the arm. All 29
+cases came out the same both times. The code suite took 1318.6 s against 1193.2 s unsteered (+10.5%),
+and vi took 617.9 s against 626.6 s. The arm's median think length is 165 tokens and its median decode
+speed is 43.18 t/s. These two numbers cover only the suites run so far, so they cannot be compared
+with the full arms yet.
+
+The arm still needs three suites: ifeval (about 50 minutes), reason (about 2.2 hours) and longctx
+(about 25 minutes). After those, the engine gate can run against `ivan`:
+
+```bash
+python3 speed-bench/nextgen-eval/compare.py <ivan summary> <ivan-proj-s075 summary> \
+  --gate engine --refusal-caps 1,1
+```
