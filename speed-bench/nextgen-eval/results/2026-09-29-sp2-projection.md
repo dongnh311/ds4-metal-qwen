@@ -289,3 +289,33 @@ went from 276 to 327.5, and decode stayed flat at 40.84 -> 40.59 t/s.
 
 Summaries: `2026-09-30-sp2-ivan-grown.summary.json`, `2026-09-30-sp2-ivan-proj-s050-grown.summary.json`;
 report `2026-09-30-sp2-ivan-proj-s050-vs-ivan-grown.md`.
+
+### PROD on the grown tools suite (2026-09-30 06:25)
+
+The engine gate compares against stock Ivan, which is censored. Sub-project 5 compares against PROD
+(`configs/prod.json`, the registry's unc48L, uncensored in its weights). To place the `tools_neg`
+loss against what users run today, PROD ran `--suites tools` alone into
+`runs/prod-20260930-062529`. It used the current binary. The SP1 baseline directory is untouched.
+PROD reproduced all 29 tool cases it shares with its SP1 baseline rows, which were run with the older
+binary 252aaa10.
+
+| arm | tools_pos | tools_neg | action requests | answerable | tools_xfer | faithfulness |
+|---|---|---|---|---|---|---|
+| PROD (unc48L) | 8/8 | 16/30 | 2/15 | 14/15 | 2/6 | 9/9 |
+| ivan (stock) | 7/8 | 21/30 | 7/15 | 14/15 | 0/6 | 9/9 |
+| ivan + 0.5 | 6/8 | 17/30 | 3/15 | 14/15 | 0/6 | 9/9 |
+
+PROD's uncensored weights call a tool on action requests even more often than the 0.5 projection
+does (13 of 15 against 12 of 15). Against PROD the 0.5 arm loses two negative cases (`negx_pip`,
+`negx_restart`) and gains three (`neg_git`, `negx_fmt`, `negx_touch`). The "act instead of decline"
+cost therefore comes with uncensoring itself and is not specific to the projection.
+
+The same table shows two other gaps to PROD:
+- `tools_pos` 6/8 against 8/8: the 0.5 arm misses `pos_manifest` (stock Ivan misses it too) and
+  `pos_callers`;
+- `tools_xfer` 0/6 against 2/6, the same as unsteered Ivan, so that one comes from the weights.
+
+Under the harness's small-suite rule both would count as regressions against PROD. They come from
+Ivan's IQ2 test bed. Sub-project 5 measures them on the ISTA candidate, whose weights differ.
+
+Summary: `2026-09-30-sp2-prod-tools30.summary.json`.
