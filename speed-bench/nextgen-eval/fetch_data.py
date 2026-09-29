@@ -1,14 +1,16 @@
 """Download the public evaluation datasets into $NEXTGEN_EVAL_DATA (stdlib only).
 
-python3 speed-bench/nextgen-eval/fetch_data.py
+python3 speed-bench/nextgen-eval/fetch_data.py [--only ifeval]
 
 Subsets are deterministic:
 - MBPP+: first 50 by numeric task_id;
-- IFEval: first 60 by key among prompts whose every instruction id is supported;
+- IFEval: first 200 by key among prompts whose every instruction id is supported (437 of 541 are;
+  the first 60, the set until 2026-09-29, are its prefix);
 - harmful / harmless: first 50 rows of each test split;
 - mcp_tools.json: the gateway's MCP tool catalog, frozen (run this while the gateway stack is up);
 - haystack.c: this checkout's ds4.c, frozen as the long-context document.
 """
+import argparse
 import hashlib
 import json
 import os
@@ -69,7 +71,7 @@ def select_mbpp(rows, n=50):
     return out[:n]
 
 
-def select_ifeval(rows, n=60):
+def select_ifeval(rows, n=200):
     ok = [r for r in rows if set(r["instruction_id_list"]) <= ifeval_checks.SUPPORTED]
     return sorted(ok, key=lambda r: r["key"])[:n]
 
@@ -98,22 +100,38 @@ def fetch_mcp_catalog(client=None):
     return response
 
 
-def main():
-    DATA.mkdir(parents=True, exist_ok=True)
-    catalog = fetch_mcp_catalog()
-    ifeval_rows = [json.loads(line) for line in _get(IFEVAL_URL).decode().splitlines() if line.strip()]
-    sets = {
-        "mbpp.jsonl": select_mbpp(fetch_rows("evalplus/mbppplus", "test")),
-        "ifeval.jsonl": select_ifeval(ifeval_rows),
-        "harmful.jsonl": select_first(fetch_rows("mlabonne/harmful_behaviors", "test", limit=50), 50),
-        "harmless.jsonl": select_first(fetch_rows("mlabonne/harmless_alpaca", "test", limit=50), 50),
-    }
-    manifest = {}
+def _fetch_ifeval():
+    return select_ifeval([json.loads(line) for line in _get(IFEVAL_URL).decode().splitlines() if line.strip()])
+
+
+def _write_sets(sets, manifest):
     for name, rows in sets.items():
         blob = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows).encode()
         (DATA / name).write_bytes(blob)
         manifest[name] = {"rows": len(rows), "sha256": hashlib.sha256(blob).hexdigest()}
         print("%-16s %3d rows" % (name, len(rows)))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--only", choices=["ifeval"],
+                    help="regrow this set alone and update its manifest entry; everything else stays frozen")
+    args = ap.parse_args(argv)
+    DATA.mkdir(parents=True, exist_ok=True)
+    if args.only == "ifeval":
+        manifest = json.loads((DATA / "manifest.json").read_text())
+        _write_sets({"ifeval.jsonl": _fetch_ifeval()}, manifest)
+        (DATA / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
+        return
+    catalog = fetch_mcp_catalog()
+    sets = {
+        "mbpp.jsonl": select_mbpp(fetch_rows("evalplus/mbppplus", "test")),
+        "ifeval.jsonl": _fetch_ifeval(),
+        "harmful.jsonl": select_first(fetch_rows("mlabonne/harmful_behaviors", "test", limit=50), 50),
+        "harmless.jsonl": select_first(fetch_rows("mlabonne/harmless_alpaca", "test", limit=50), 50),
+    }
+    manifest = {}
+    _write_sets(sets, manifest)
     blob = snapshot_haystack()
     (DATA / "haystack.c").write_bytes(blob)
     manifest["haystack.c"] = {"bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()}

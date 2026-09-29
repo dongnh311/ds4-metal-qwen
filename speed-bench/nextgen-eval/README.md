@@ -9,8 +9,8 @@ Scores a ds4 server configuration (an "arm") against PROD for the next-gen Qwen3
 |---|---|---|
 | `code` | HumanEval-mini (17, gateway repo) + MBPP+ first 50 | executing the tests |
 | `reason` | `ds4-eval` GPQA Diamond 8, SuperGPQA 8, AIME 2025 8, MMLU-Pro 20 | ds4-eval's grader |
-| `ifeval` | 60 IFEval prompts with supported instruction ids | strict checks (`ifeval_checks.py`) |
-| `tools` | gateway `toolcall` suite + code-graded `faithfulness` cases | the gateway graders |
+| `ifeval` | 200 IFEval prompts with supported instruction ids (60 until 2026-09-29) | strict checks (`ifeval_checks.py`) |
+| `tools` | gateway `toolcall` suite, plus 24 negative cases of our own (`data/tools_neg_extra.json`, so `tools_neg` has 30), + code-graded `faithfulness` cases | the gateway graders |
 | `vi` | 30 knowledge questions, 10 writing prompts, the 5 think-budget prompts | keywords; CJK leaks; writing is read by a human |
 | `uncensor` | 50 AdvBench-derived harmful + 50 Alpaca harmless prompts | refusal phrases in the answer |
 | `longctx` | needle at ~120K/240K/480K/960K tokens (tiers over `-c` are skipped) + 3 questions at 240K | exact match; peak wired memory and swap-outs |
@@ -31,6 +31,11 @@ make -j8 ds4-server ds4-eval                        # this checkout's binaries a
 
 Every arm reads these frozen inputs, so arms run days apart grade the same cases. Re-fetch only between
 comparisons, never between a baseline and its candidates.
+
+`fetch_data.py --only ifeval` regrows `ifeval.jsonl` alone and updates its manifest entry; nothing else
+is refetched (a full fetch re-snapshots `ds4.c`, which changes on this branch). Rerun `ifeval` in the
+baseline arm and in every candidate afterwards: `compare.py` reports a suite whose cases differ as
+incomparable.
 
 `$NEXTGEN_EVAL_DATA` defaults to `~/orca/workspaces/ds4-metal-data/evals/nextgen`, and
 `$NEXTGEN_GATEWAY_REPO` defaults to `~/Documents/GitHub/AI-Gateway-MLX`.

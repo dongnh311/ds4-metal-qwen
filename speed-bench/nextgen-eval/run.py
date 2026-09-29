@@ -143,7 +143,7 @@ def prepare_rerun(out, wanted, arm):
 
 def rerun_provenance(previous, new, wanted):
     """The first run's provenance, plus what each rerun used."""
-    keys = ("git_head", "git_dirty", "ds4_server_sha256", "ds4_eval_sha256")
+    keys = ("git_head", "git_dirty", "ds4_server_sha256", "ds4_eval_sha256", "data")
     return dict(previous, reruns=previous.get("reruns", []) + [dict({"suites": wanted}, **{k: new[k] for k in keys})])
 
 

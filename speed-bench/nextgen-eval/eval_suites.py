@@ -156,6 +156,11 @@ def _tool_row(ctx, out, **fields):
     return dict(_speed(speed), **fields)
 
 
+# Negative tool cases on top of the gateway's six (a 6-case suite cannot tell a real loss from one
+# case flipping). Asked and graded by the gateway's toolcall suite exactly like its own neg_ cases.
+TOOLS_NEG_EXTRA = HERE / "data" / "tools_neg_extra.json"
+
+
 def run_tools(ctx):
     """The gateway's toolcall suite and the code-graded faithfulness cases, pointed at this server."""
     catalog_path = ctx.data_dir / MCP_CATALOG
@@ -173,7 +178,9 @@ def run_tools(ctx):
     ok, note = toolcall.available(client)
     if not ok:
         raise RuntimeError("gateway toolcall suite unavailable: %s" % note)
-    for case in toolcall.cases():
+    extra = [harness.Case(c["id"], {"kind": "neg", "task": c["task"]})
+             for c in json.loads(TOOLS_NEG_EXTRA.read_text())]
+    for case in toolcall.cases() + extra:
         case.suite = toolcall.name
         ctx.take_log()
         out = toolcall.run(client, case)

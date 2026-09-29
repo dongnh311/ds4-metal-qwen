@@ -139,7 +139,15 @@ class Rerun(unittest.TestCase):
         p = run.rerun_provenance({"git_head": "aaa"}, new, ["reason"])
         self.assertEqual(p["git_head"], "aaa")
         self.assertEqual(p["reruns"], [{"suites": ["reason"], "git_head": "bbb", "git_dirty": False,
-                                        "ds4_server_sha256": "s", "ds4_eval_sha256": "e"}])
+                                        "ds4_server_sha256": "s", "ds4_eval_sha256": "e", "data": {}}])
+
+    def test_rerun_provenance_records_the_data_it_read(self):
+        # A rerun after a data set grew must not leave the first run's hashes as the only record.
+        new = {"git_head": "bbb", "git_dirty": False, "ds4_server_sha256": "s", "ds4_eval_sha256": "e",
+               "gateway_head": "g", "env": {}, "argv": [], "data": {"ifeval.jsonl": "new"}}
+        p = run.rerun_provenance({"git_head": "aaa", "data": {"ifeval.jsonl": "old"}}, new, ["ifeval"])
+        self.assertEqual(p["data"], {"ifeval.jsonl": "old"})
+        self.assertEqual(p["reruns"][0]["data"], {"ifeval.jsonl": "new"})
 
 
 class FakeProc:

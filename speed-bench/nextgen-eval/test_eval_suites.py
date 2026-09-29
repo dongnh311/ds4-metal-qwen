@@ -209,6 +209,9 @@ class Suites(unittest.TestCase):
         class ToolCall:
             name = "toolcall"
 
+            def __init__(self):
+                self.seen = []
+
             def available(self, client):
                 r, _ = client.post("/mcp", {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}, timeout=30)
                 return bool(r["result"]["tools"]), ""
@@ -218,6 +221,7 @@ class Suites(unittest.TestCase):
                         Case("xfer-ok", {"kind": "xfer"})]
 
             def run(self, client, case):
+                self.seen.append(dict(case.inp))
                 txt, dt, raw = client.chat("task", max_tokens=600,
                                            chat_template_kwargs={"enable_thinking": False})
                 return {"text": txt, "raw": raw, "latency": dt}
@@ -242,15 +246,21 @@ class Suites(unittest.TestCase):
 
         harness = types.ModuleType("harness")
         harness.Client = ArmClient
+        harness.Case = Case
         suites = types.ModuleType("suites")
         suites.BY_NAME = {"toolcall": ToolCall(), "faithfulness": Faithfulness()}
         return {"harness": harness, "suites": suites}, chats
+
+    def _neg_extra(self, cases):
+        path = self.data / "tools_neg_extra.json"
+        path.write_text(json.dumps(cases))
+        return mock.patch.object(eval_suites, "TOOLS_NEG_EXTRA", path)
 
     def test_tools_adapter(self):
         catalog = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "read_file"}]}}
         (self.data / "mcp_tools.json").write_text(json.dumps(catalog))
         modules, chats = self._fake_gateway()
-        with mock.patch.dict(sys.modules, modules):
+        with mock.patch.dict(sys.modules, modules), self._neg_extra([]):
             rows = list(eval_suites.run_tools(FakeCtx(self.data, lambda p: "")))
         self.assertEqual([r["suite"] for r in rows], ["tools_pos", "tools_neg", "tools_xfer", "faithfulness"])
         self.assertEqual([r["passed"] for r in rows], [True, False, True, True])
@@ -260,6 +270,22 @@ class Suites(unittest.TestCase):
         # faithfulness does not set thinking itself; straight to ds4-server it would think inside
         # its 500-token budget, so the harness pins thinking off like toolcall does.
         self.assertEqual(chats[-1], {"max_tokens": 500, "chat_template_kwargs": {"enable_thinking": False}})
+
+    def test_tools_neg_extra_cases_run_through_the_gateway_suite(self):
+        # The gateway owns six negative cases; the harness adds its own, asked and graded exactly like
+        # the gateway's (same run() and grade()), and reports them in the same tools_neg suite.
+        catalog = {"jsonrpc": "2.0", "id": 1, "result": {"tools": [{"name": "read_file"}]}}
+        (self.data / "mcp_tools.json").write_text(json.dumps(catalog))
+        modules, _ = self._fake_gateway()
+        extra = [{"id": "negx_ok", "task": "Delete build/."}, {"id": "negx_bad", "task": "What is 2 + 2?"}]
+        with mock.patch.dict(sys.modules, modules), self._neg_extra(extra):
+            rows = list(eval_suites.run_tools(FakeCtx(self.data, lambda p: "")))
+        self.assertEqual([(r["suite"], r["id"]) for r in rows],
+                         [("tools_pos", "sel-ok"), ("tools_neg", "neg-bad"), ("tools_xfer", "xfer-ok"),
+                          ("tools_neg", "negx_ok"), ("tools_neg", "negx_bad"), ("faithfulness", "fact-ok")])
+        self.assertEqual([r["passed"] for r in rows[3:5]], [True, False])
+        self.assertEqual(modules["suites"].BY_NAME["toolcall"].seen[3:],
+                         [{"kind": "neg", "task": "Delete build/."}, {"kind": "neg", "task": "What is 2 + 2?"}])
 
     def test_tools_without_frozen_catalog_fails_clearly(self):
         modules, _ = self._fake_gateway()
