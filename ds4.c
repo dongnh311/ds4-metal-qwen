@@ -8673,9 +8673,12 @@ static bool glm_stream_selected_expert_cache_supported(
 
     if (l->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
 #ifdef __APPLE__
-        /* Metal's IQ2/Q2 selected-slot down kernel sums six experts. The
-         * separate IQ2/IQ2 address-table path below supports up to eight. */
-        if (DS4_N_EXPERT_USED != 6) return false;
+        /* Metal's IQ2/Q2 selected-slot down kernel sums six experts; other
+         * routed widths (GLM routes eight) use per-expert Q2_K address rows. */
+        if (DS4_N_EXPERT_USED != 6) {
+            return !glm_graph_env_present("DS4_ROCM_DISABLE_IQ2_STREAM_ADDR_TABLE",
+                                          "DS4_METAL_DISABLE_IQ2_STREAM_ADDR_TABLE");
+        }
 #endif
         return !glm_graph_env_present("DS4_ROCM_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
                                       "DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS");

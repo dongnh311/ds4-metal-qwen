@@ -16,8 +16,12 @@ static uint32_t quant_type = 16;
 typedef struct { uint16_t d; uint8_t qs[64]; } iq2_block;
 typedef struct { uint16_t d, dmin; uint8_t scales[12], qs[128]; } q4_block;
 typedef struct { uint8_t e, qs[16]; } mxfp4_block;
+typedef struct { uint8_t scales[16], qs[64]; uint16_t d, dmin; } q2_block;
 static uint64_t block_bytes = sizeof(iq2_block);
 static uint32_t block_values = 256;
+/* Mixed layouts (GLM Q2 recipe: IQ2_XXS gate/up, Q2_K down); 0 = same as gate. */
+static uint32_t down_quant_type = 0;
+static uint64_t down_block_bytes = 0;
 
 static uint32_t rng = 1;
 static uint32_t random_u32(void) {
@@ -226,21 +230,42 @@ int main(int argc, char **argv) {
         quant_type = 39;
         block_bytes = sizeof(mxfp4_block);
         block_values = 32;
+    } else if (argc == 2 && (!strcmp(argv[1], "--iq2-q2") ||
+                             !strcmp(argv[1], "--iq2-q2-six"))) {
+        if (!strcmp(argv[1], "--iq2-q2-six")) N = 6;
+        down_quant_type = 10;
+        down_block_bytes = sizeof(q2_block);
     } else if (argc != 1) {
-        fprintf(stderr, "usage: %s [--full-glm-shape | --q4 | --mxfp4 | --table-admission]\n", argv[0]);
+        fprintf(stderr, "usage: %s [--full-glm-shape | --q4 | --mxfp4 | --iq2-q2 | "
+                "--iq2-q2-six | --table-admission]\n", argv[0]);
         return 1;
     }
+    const uint32_t down_type = down_quant_type ? down_quant_type : quant_type;
     const uint64_t row = D / block_values * block_bytes;
-    const uint64_t down_row = H / block_values * block_bytes;
+    const uint64_t down_row = H / block_values *
+        (down_block_bytes ? down_block_bytes : block_bytes);
     const uint64_t expert = H * row;
+    const uint64_t down_expert = D * down_row;
     const uint64_t tensor = E * expert;
-    const size_t bytes = 3 * tensor;
+    const uint64_t down_tensor = E * down_expert;
+    const size_t bytes = 2 * tensor + down_tensor;
     FILE *file = tmpfile();
     if (!file || ftruncate(fileno(file), bytes)) return 1;
     void *model = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED,
                        fileno(file), 0);
     if (model == MAP_FAILED) return 1;
-    for (size_t i = 0; i < bytes / block_bytes; i++) {
+    const size_t gate_blocks = down_quant_type ? 2 * tensor / block_bytes :
+                                                 bytes / block_bytes;
+    for (size_t i = 0; i < down_tensor / sizeof(q2_block) && down_quant_type; i++) {
+        q2_block *block = (q2_block *)((char *)model + 2 * tensor) + i;
+        block->d = 0x1400;
+        block->dmin = 0x1000;
+        for (size_t j = 0; j < sizeof(block->scales); j++)
+            block->scales[j] = random_u32();
+        for (size_t j = 0; j < sizeof(block->qs); j++)
+            block->qs[j] = random_u32();
+    }
+    for (size_t i = 0; i < gate_blocks; i++) {
         if (quant_type == 12) {
             q4_block *block = (q4_block *)model + i;
             block->d = 0x0400;
@@ -267,7 +292,7 @@ int main(int argc, char **argv) {
     ds4_gpu_set_glm_model(quant_type == 16);
     ds4_gpu_set_ssd_streaming(true);
     ds4_gpu_set_streaming_expert_cache_budget(16);
-    ds4_gpu_set_streaming_expert_cache_expert_bytes(expert * 3);
+    ds4_gpu_set_streaming_expert_cache_expert_bytes(2 * expert + down_expert);
     ok = ok && ds4_gpu_set_model_map(model, bytes) &&
          ds4_gpu_set_model_fd(fileno(file));
     float x[D], weights[N], reference[D], actual[D], first_pass[STEPS][D];
@@ -306,7 +331,7 @@ int main(int argc, char **argv) {
                  ds4_gpu_begin_commands() &&
                  ds4_gpu_routed_moe_one_tensor(
                     out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
-                    quant_type, quant_type, expert, row, expert, down_row, D, H, D,
+                    quant_type, down_type, expert, row, down_expert, down_row, D, H, D,
                     it, wt, E, N, 7.0f, xt, NULL, 3, !streamed) &&
                  ds4_gpu_end_commands() &&
                  ds4_gpu_tensor_read(out, 0, streamed ? actual : reference,
@@ -326,19 +351,25 @@ int main(int argc, char **argv) {
             ok = 0;
         }
         const uint32_t cached = ds4_gpu_stream_expert_cache_current_count();
-        if (cached == 0 || cached > budget) ok = 0;
+        if (cached == 0 || cached > budget) {
+            fprintf(stderr, "SSD expert cache count %u outside 1..%u at step %d "
+                    "(streamed decode bypassed the cache)\n", cached, budget, step);
+            ok = 0;
+        }
         if (turn == STEPS / 2) ds4_gpu_stream_expert_cache_reset_route_hotness();
     }
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
-    if (ok) ok = check_batch_cache(model, bytes, expert);
-    if (ok && D == 256) ok = check_seed_release(model, bytes, expert);
+    /* The batch and seed checks assume one quant type for all three tensors. */
+    if (ok && !down_quant_type) ok = check_batch_cache(model, bytes, expert);
+    if (ok && D == 256 && !down_quant_type) ok = check_seed_release(model, bytes, expert);
     ds4_gpu_print_memory_report("SSD expert test");
     if (ok) ok = check_mapping_lifetime();
     ds4_gpu_cleanup();
     munmap(model, bytes);
     fclose(file);
-    fprintf(stderr, "Metal SSD type=%u %d-expert eviction: %s\n", quant_type, N, ok ? "PASS" : "FAIL");
+    fprintf(stderr, "Metal SSD type=%u down=%u %d-expert eviction: %s\n",
+            quant_type, down_type, N, ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }
