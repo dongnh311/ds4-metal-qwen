@@ -41,9 +41,35 @@ static void check_glm_iq2_q2(const ds4_shape *shape) {
     CHECK(glm_stream_selected_expert_cache_supported(&layer, 10));
     set_layout(DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q4_K);
     CHECK(!glm_stream_selected_expert_cache_supported(&layer, 10));
+#ifdef __APPLE__
+    /* Quality mode and two-rank TP have no IQ2 streamed-expert kernels, so
+     * those runs keep IQ2 layers mapped for the resident fused path. */
+    static const uint32_t downs[] = {DS4_TENSOR_Q2_K, DS4_TENSOR_IQ2_XXS};
+    for (size_t i = 0; i < sizeof(downs) / sizeof(*downs); i++) {
+        set_layout(DS4_TENSOR_IQ2_XXS, downs[i]);
+        glm_stream_configure_iq2_cache(true, false);
+        CHECK(!glm_stream_selected_expert_cache_supported(&layer, 10));
+        glm_stream_configure_iq2_cache(false, true);
+        CHECK(!glm_stream_selected_expert_cache_supported(&layer, 10));
+        glm_stream_configure_iq2_cache(false, false);
+        CHECK(glm_stream_selected_expert_cache_supported(&layer, 10));
+    }
+#endif
 }
 
 int main(void) {
+    /* Start from the default routed kernels whatever the caller exported. */
+    static const char *const disables[] = {
+        "DS4_METAL_MOE_WRITE_CLAMPED_ACT", "DS4_ROCM_MOE_WRITE_CLAMPED_ACT",
+        "DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION",
+        "DS4_ROCM_DISABLE_ROUTED_PAIR_SWIGLU_FUSION",
+        "DS4_METAL_GLM_DISABLE_STREAMING_EXPERT_CACHE",
+        "DS4_ROCM_GLM_DISABLE_STREAMING_EXPERT_CACHE",
+        "DS4_METAL_DISABLE_IQ2_STREAM_ADDR_TABLE", "DS4_ROCM_DISABLE_IQ2_STREAM_ADDR_TABLE",
+        "DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
+        "DS4_ROCM_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
+    };
+    for (size_t i = 0; i < sizeof(disables) / sizeof(*disables); i++) unsetenv(disables[i]);
     check_glm_iq2_q2(&DS4_SHAPE_GLM53);
     check_glm_iq2_q2(&DS4_SHAPE_GLM52);
     if (failures) {

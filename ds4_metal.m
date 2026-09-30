@@ -42050,7 +42050,9 @@ int ds4_gpu_routed_moe_one_tensor(
             getenv("DS4_METAL_DISABLE_MXFP4_SELECTED_EXPERT_VIEWS") == NULL;
         /* IQ2_XXS gate/up with IQ2_XXS or Q2_K down, one address row per
          * routed expert. Six-expert IQ2/Q2 keeps its fused slot path above;
-         * other widths (GLM-5.3 routes eight) take per-expert Q2_K rows. */
+         * other widths (GLM-5.3 routes eight) take per-expert Q2_K rows.
+         * These kernels neither split expert ownership across TP ranks nor
+         * accumulate into add_in, so TP keeps the resident fused kernels. */
         const bool iq2_stream_addr_down_ok =
             (down_type == DS4_METAL_TENSOR_IQ2_XXS &&
              g_moe_mul_mv_addr_iq2_xxs_pipeline != nil) ||
@@ -42060,6 +42062,8 @@ int ds4_gpu_routed_moe_one_tensor(
         const bool use_iq2_stream_addr_table =
             !force_resident &&
             g_ssd_streaming_mode &&
+            g_tp_split_world <= 1 &&
+            add_in == NULL &&
             gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
             iq2_stream_addr_down_ok &&
             n_expert <= DS4_METAL_MAX_ROUTED_EXPERT_USED &&
@@ -42422,7 +42426,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                                           n_expert) != 0;
             if (use_iq2_stream_addr_table && !use_stream_expert_cache) {
                 fprintf(stderr,
-                        "ds4: Metal IQ2/IQ2 streaming decode requires a non-empty expert cache\n");
+                        "ds4: Metal IQ2/%s streaming decode requires a non-empty expert cache\n",
+                        down_type == DS4_METAL_TENSOR_Q2_K ? "Q2_K" : "IQ2_XXS");
                 if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 32831);
                 return 0;
             }
@@ -42737,7 +42742,8 @@ int ds4_gpu_routed_moe_one_tensor(
                                                              &stream_down_addr_buf);
                 if (use_iq2_stream_addr_table && !use_stream_expert_addr_table) {
                     fprintf(stderr,
-                            "ds4: Metal IQ2/IQ2 streaming decode could not prepare expert address buffers\n");
+                            "ds4: Metal IQ2/%s streaming decode could not prepare expert address buffers\n",
+                            down_type == DS4_METAL_TENSOR_Q2_K ? "Q2_K" : "IQ2_XXS");
                     if (getenv("DS4_GLM_TP_DEBUG")) fprintf(stderr, "ds4: routed_moe_one silent return at line %d\n", 33123);
                     return 0;
                 }

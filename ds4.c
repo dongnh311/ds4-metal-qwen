@@ -8645,9 +8645,21 @@ static DS4_MAYBE_UNUSED bool glm_stream_expert_cache_addr_supported(
 #endif
 }
 
+/* Metal's IQ2 streamed-expert kernels are fused pair-SwiGLU (off in quality
+ * mode) and do not split expert ownership across TP ranks; such runs keep IQ2
+ * layers mapped for the resident fused kernels. */
+static bool g_glm_stream_iq2_cache_blocked;
+
+static void glm_stream_configure_iq2_cache(bool quality, bool tensor_parallel) {
+    g_glm_stream_iq2_cache_blocked = quality || tensor_parallel;
+}
+
 static bool glm_stream_selected_expert_cache_supported(
         const ds4_layer_weights *l,
         uint32_t                 il) {
+#ifdef __APPLE__
+    if (g_glm_stream_iq2_cache_blocked) return false;
+#endif
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
         !l ||
         il < DS4_N_LEADING_DENSE ||
@@ -73394,6 +73406,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->vision_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
+    glm_stream_configure_iq2_cache(opt->quality, opt->tp.role != DS4_TP_NONE);
     e->glm_mtp = opt->glm_mtp;
     e->glm_mtp_timing = opt->glm_mtp_timing;
     e->dspark = opt->dspark;

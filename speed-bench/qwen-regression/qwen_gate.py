@@ -56,7 +56,7 @@ LONG_PREFILL_GAIN = 1.10
 
 def registry_command(registry, bin_dir, port, kv_dir):
     """PROD ds4 command from the gateway registry, retargeted like the smoke.
-    PROD may serve several ds4 models: the Qwen3.8 row wins, else the first enabled one."""
+    PROD may serve several ds4 models: the Qwen3.8 row wins; a lone ds4 row is taken as is."""
     with open(registry) as fp:
         models = json.load(fp)["models"]
     enabled = [(name, m["runtimes"]["ds4"]) for name, m in models.items()
@@ -69,7 +69,12 @@ def registry_command(registry, bin_dir, port, kv_dir):
         model = cmd[cmd.index("-m") + 1] if "-m" in cmd[:-1] else ""
         return "qwen3.8" in (name + " " + os.path.basename(model)).lower()
 
-    entry = next((e for n, e in enabled if names_qwen(n, e)), enabled[0][1])
+    qwen = [(n, e) for n, e in enabled if names_qwen(n, e)]
+    if not qwen and len(enabled) > 1:
+        raise SystemExit("qwen_gate: no Qwen3.8 row among enabled ds4 runtimes: " +
+                         ", ".join(n for n, _ in enabled))
+    name, entry = (qwen or enabled)[0]
+    print(f"qwen_gate: registry row {name}", file=sys.stderr)
     cmd = list(entry["process_command"])
     for i, arg in enumerate(cmd):
         if arg == "--port":

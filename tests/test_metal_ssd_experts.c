@@ -1,5 +1,6 @@
 #define _DARWIN_C_SOURCE
 #include "ds4_gpu.h"
+#include "ds4_gpu_tp.h"
 
 #include <math.h>
 #include <mach/mach.h>
@@ -357,6 +358,36 @@ int main(int argc, char **argv) {
             ok = 0;
         }
         if (turn == STEPS / 2) ds4_gpu_stream_expert_cache_reset_route_hotness();
+    }
+    /* Two-rank TP with the streamed flag: the address-table kernels cannot
+     * split expert ownership, so each rank must still produce a partial and
+     * the two partials must sum to the last single-rank reference. */
+    if (ok && down_quant_type && N != 6) {
+        float partial[D];
+        for (int rank = 0; rank < 2 && ok; rank++) {
+            ok = ds4_gpu_tp_init(rank, NULL, 0, 0, 0, NULL, NULL) &&
+                 ds4_gpu_tensor_fill_f32(mid, NAN, N * H) &&
+                 ds4_gpu_tensor_fill_f32(out, NAN, D) &&
+                 ds4_gpu_begin_commands() &&
+                 ds4_gpu_routed_moe_one_tensor(
+                    out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
+                    quant_type, down_type, expert, row, down_expert, down_row, D, H, D,
+                    it, wt, E, N, 7.0f, xt, NULL, 3, false) &&
+                 ds4_gpu_end_commands() &&
+                 ds4_gpu_tensor_read(out, 0, rank ? actual : partial, sizeof(actual));
+            if (ds4_gpu_commands_active()) ds4_gpu_end_commands();
+            ds4_gpu_tp_shutdown();
+        }
+        for (int i = 0; i < D && ok; i++) {
+            const float sum = partial[i] + actual[i];
+            if (!isfinite(sum) ||
+                fabsf(sum - reference[i]) > 1e-4f * (1 + fabsf(reference[i]))) {
+                fprintf(stderr, "TP streamed expert split mismatch element=%d ref=%g sum=%g\n",
+                        i, reference[i], sum);
+                ok = 0;
+            }
+        }
+        if (!ok) fprintf(stderr, "TP streamed expert split: FAIL\n");
     }
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
