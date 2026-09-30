@@ -49908,7 +49908,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 ds4_gpu_device_is_m5_apple_silicon();
             const uint32_t type = specialize ?
                 ((const qwen4_moe_mm_args *)args)->weight_type : 0u;
-            if (type >= 40u) return 0;
+            if (type >= 40u && type != 42u) return 0;   /* 42: Q2_0 */
             const uint32_t tail_base = ((const qwen4_moe_mm_args *)args)->tail_base;
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_tail=%u",
                              qwen4_kernel_names[kernel], type, tail_base];
@@ -53960,6 +53960,18 @@ static ds4_gpu_tensor *qwen4_nax_half_operand(ds4_gpu_tensor **slot, uint64_t *s
     return dst;
 }
 
+/* GSQ-RCO types the tiled prefill GEMMs stage (qwen4_mm_stage8), by block
+ * width: the K-quant and IQ super-blocks, IQ4_NL's 32 and Q2_0's 64.  Zero
+ * for every other type. */
+static uint32_t qwen4_mm_gsq_block(uint32_t type) {
+    switch (type) {
+    case 13u: case 14u: case 17u: case 18u: case 21u: case 22u: case 23u: return 256u;
+    case 20u: return 32u;
+    case 42u: return 64u;
+    default: return 0u;
+    }
+}
+
 static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
     /* Remainder tiles measured on M3 Ultra for the low-bit experts and on M5
      * for Q4_K gate/up with MXFP4 down. */
@@ -53987,7 +53999,9 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[8];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u) ||
+        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u &&
+         weight_type != 2u && !qwen4_mm_gsq_block(weight_type)) ||
+        (qwen4_mm_gsq_block(weight_type) && (in_dim % qwen4_mm_gsq_block(weight_type)) != 0) ||
         (in_dim % 64) != 0 || ff_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert_bytes * n_expert, "moe gate experts") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert_bytes * n_expert, "moe up experts") ||
@@ -54071,7 +54085,9 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[6];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u) ||
+        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u &&
+         weight_type != 2u && !qwen4_mm_gsq_block(weight_type)) ||
+        (qwen4_mm_gsq_block(weight_type) && (ff_dim % qwen4_mm_gsq_block(weight_type)) != 0) ||
         (ff_dim % 64) != 0 || out_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_expert, "moe down experts") ||
         !qwen4_bind_tensor(&b[1], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||

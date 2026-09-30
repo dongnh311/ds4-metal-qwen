@@ -1842,6 +1842,95 @@ static void test_metal_qwen4_quant_moe(void) {
     test_metal_qwen4_quant_moe_case(16, 20, 23, 20);                   /* IQ2_XXS (M5 NR kernels), GSQ shared slot */
 }
 
+/* The tiled prefill GEMMs (kernel_qwen4_moe_mm_mid/down) on 3 experts and 40 tokens x 2 slots:
+ * expert 0 gets 40 pairs (two token tiles), 1 and 2 the rest. Weights and activations are staged
+ * as half, so the bound is 1.5e-3 of the magnitude. */
+static void test_metal_qwen4_quant_moe_mm_case(uint32_t gu, uint32_t dn) {
+    const uint32_t in_dim = 2560u, ff = 640u, out_dim = 2560u, n_exp = 3u, T = 40u, slots = 2u;
+    const ds4_quant_fixture *fg = test_quant_fixture(gu), *fd = test_quant_fixture(dn);
+    TEST_ASSERT(fg && fd);
+    if (!fg || !fd) return;
+    const uint64_t g_row = test_quant_row_bytes(gu, in_dim), g_exp = g_row * ff;
+    const uint64_t d_row = test_quant_row_bytes(dn, ff), d_exp = d_row * out_dim;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t off_up = test_round_up_u64(g_exp * n_exp, page);
+    const uint64_t off_dn = off_up + test_round_up_u64(g_exp * n_exp, page);
+    const uint64_t alloc = off_dn + test_round_up_u64(d_exp * n_exp, page);
+    uint8_t *w = NULL;
+    TEST_ASSERT(posix_memalign((void **)&w, (size_t)page, (size_t)alloc) == 0);
+    if (!w) return;
+    memset(w, 0, (size_t)alloc);
+    test_quant_fill_rows(w, fg, in_dim, ff * n_exp);
+    test_quant_fill_rows(w + off_up, fg, in_dim, ff * n_exp);
+    memcpy(w + off_up, w + off_up + g_row, (size_t)g_row);           /* up row 0 differs from gate row 0 */
+    test_quant_fill_rows(w + off_dn, fd, ff, out_dim * n_exp);
+    int32_t sel[80];
+    for (uint32_t t = 0; t < T; t++) { sel[t * 2u] = 0; sel[t * 2u + 1u] = (t % 3u) == 0 ? 2 : 1; }
+    float *xh = malloc((size_t)T * in_dim * sizeof(float));
+    float *mh = malloc((size_t)T * slots * ff * sizeof(float));
+    float *ph = malloc((size_t)T * slots * out_dim * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)T * in_dim * sizeof(float));
+    ds4_gpu_tensor *s = ds4_gpu_tensor_alloc(sizeof(sel));
+    ds4_gpu_tensor *lists = ds4_gpu_tensor_alloc((uint64_t)n_exp * T * sizeof(int32_t));
+    ds4_gpu_tensor *counts = ds4_gpu_tensor_alloc((uint64_t)n_exp * sizeof(int32_t));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)T * slots * ff * sizeof(float));
+    ds4_gpu_tensor *part = ds4_gpu_tensor_alloc((uint64_t)T * slots * out_dim * sizeof(float));
+    TEST_ASSERT(xh && mh && ph && x && s && lists && counts && mid && part);
+    if (xh && mh && ph && x && s && lists && counts && mid && part) {
+        for (uint32_t t = 0; t < T; t++) test_quant_x(xh + (uint64_t)t * in_dim, in_dim, t + 11u);
+        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, xh, (uint64_t)T * in_dim * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(s, 0, sel, sizeof(sel)) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(w, alloc) != 0);
+        TEST_ASSERT(ds4_gpu_qwen4_moe_build_lists_tensor(lists, counts, s, T, slots, n_exp, T) != 0);
+        TEST_ASSERT(ds4_gpu_qwen4_moe_mm_mid_tensor(mid, x, lists, counts, w, alloc, 0, off_up, gu, n_exp, T, slots,
+                                                    slots, in_dim, ff, T) != 0);
+        TEST_ASSERT(ds4_gpu_qwen4_moe_mm_down_tensor(part, mid, lists, counts, w, alloc, off_dn, dn, n_exp, T, slots,
+                                                     slots, ff, out_dim, T) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(mid, 0, mh, (uint64_t)T * slots * ff * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(part, 0, ph, (uint64_t)T * slots * out_dim * sizeof(float)) != 0);
+        uint32_t bad_mid = 0, bad_down = 0;
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t k = 0; k < slots; k++) {
+                const uint64_t e = (uint64_t)sel[t * slots + k];
+                const float *xt = xh + (uint64_t)t * in_dim, *mt = mh + ((uint64_t)t * slots + k) * ff;
+                for (uint32_t r = 0; r < ff; r++) {
+                    double mg = 0.0, mu = 0.0;
+                    const double gv = test_quant_row_ref(gu, w + e * g_exp + r * g_row, in_dim, xt, &mg);
+                    const double uv = test_quant_row_ref(gu, w + off_up + e * g_exp + r * g_row, in_dim, xt, &mu);
+                    const double silu = gv / (1.0 + exp(-gv)), ref = silu * uv;
+                    if (fabs((double)mt[r] - ref) > 1.5e-3 * (1.1 * fabs(uv) * mg + fabs(silu) * mu) + 1e-5) bad_mid++;
+                }
+                for (uint32_t r = 0; r < out_dim; r++) {
+                    double mag = 0.0;
+                    const double ref = test_quant_row_ref(dn, w + off_dn + e * d_exp + r * d_row, ff, mt, &mag);
+                    if (fabs((double)ph[((uint64_t)t * slots + k) * out_dim + r] - ref) > 1.5e-3 * mag + 1e-5) bad_down++;
+                }
+            }
+        }
+        if (bad_mid || bad_down) fprintf(stderr, "ds4-test: Qwen MoE GEMM %u/%u: mid %u, down %u rows off\n",
+                                         gu, dn, bad_mid, bad_down);
+        TEST_ASSERT(bad_mid == 0 && bad_down == 0);
+    }
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(s);
+    ds4_gpu_tensor_free(lists);
+    ds4_gpu_tensor_free(counts);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(part);
+    free(xh);
+    free(mh);
+    free(ph);
+    free(w);
+}
+
+static void test_metal_qwen4_quant_moe_mm(void) {
+    test_metal_qwen4_quant_moe_mm_case(17, 42);   /* IQ2_XS gate/up, Q2_0 down */
+    test_metal_qwen4_quant_moe_mm_case(22, 20);   /* IQ2_S, IQ4_NL */
+    test_metal_qwen4_quant_moe_mm_case(18, 42);   /* IQ3_XXS, Q2_0 */
+    test_metal_qwen4_quant_moe_mm_case(21, 20);   /* IQ3_S, IQ4_NL */
+    test_metal_qwen4_quant_moe_mm_case(16, 20);   /* IQ2_XXS (existing tiles), IQ4_NL down */
+}
+
 static void test_metal_f16_compressor_pair_state_store_exact_case(
         uint32_t width,
         uint32_t ratio,
@@ -5590,6 +5679,7 @@ static void test_metal_kernel_group(void) {
     test_metal_router_weights_batch_exact();
     test_metal_qwen4_quant_gemv();
     test_metal_qwen4_quant_moe();
+    test_metal_qwen4_quant_moe_mm();
 #endif
 }
 
