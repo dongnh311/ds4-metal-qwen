@@ -102,8 +102,11 @@ path, which is PROD's, stays byte-identical.
 - **Every needle row keeps `prompt_tokens`.** The summary gains `longctx.short_tiers`, the tiers whose
   real prompt fell more than 5% below target, and `compare.py` prints it.
 - **`--kv-cache-continued-interval-tokens` is classified** for ds4-eval (server-only), as sub-project
-  2 classified the steering flags. The reasoning suite passes `-c` to ds4-eval, so it runs with the
-  same rope as the server. The plan checks the existing classification and adds what is missing.
+  2 classified the steering flags.
+- **ds4-eval runs with the server's rope.** The harness caps ds4-eval at `-c 65536`, below the
+  native context, so ds4-eval would never derive YaRN from `-c`. The harness therefore passes it
+  the server's factor through `DS4_QWEN4_YARN_FACTOR`, using the same rule as the engine. An explicit
+  override in the arm's env wins.
 - **Arm config:** `configs/ivan-proj-yarn.json` is `configs/ivan-proj.json` (arm `ivan-proj-s050`)
   plus `-c 524288`, with the factor coming from `-c`. The arm is named `ivan-proj-s050-yarn`.
 
