@@ -7465,6 +7465,44 @@ static void test_qwen_kv_grow_policy(void) {
     TEST_ASSERT(ds4_qwen4_kv_reserve("0") == 4096);
 }
 
+static void test_qwen_yarn_policy(void) {
+    /* The factor: the environment wins when it parses, otherwise -c decides. */
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 262144, NULL) == 1.0);   /* PROD: off */
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 8192, NULL) == 1.0);
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 262145, NULL) == 2.0);
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, NULL) == 2.0);
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524289, NULL) == 4.0);
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 1048576, NULL) == 4.0);
+    TEST_ASSERT(ds4_qwen4_yarn_factor(0, 524288, NULL) == 1.0);        /* no native context */
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "1") == 1.0);    /* forced off */
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "0.5") == 1.0);
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 8192, "4") == 4.0);      /* forced on */
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "") == 2.0);     /* empty = unset */
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "junk") == 2.0); /* unparsable = unset */
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "2x") == 2.0);
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "0") == 2.0);    /* not positive = unset */
+
+    /* The table: factor 1 is plain RoPE, factor 2 blends pairs 14..22 (HF, base 1e7, 64 dims). */
+    float plain[32], yarn[32], ms = 0.0f;
+    double low = -1.0, high = -1.0;
+    ds4_qwen4_rope_table(64, 1e7, 262144, 1.0, plain, &ms, &low, &high);
+    for (int i = 0; i < 32; i++) {
+        TEST_ASSERT(plain[i] == (float)pow(1e7, -2.0 * (double)i / 64.0));
+    }
+    TEST_ASSERT(ms == 1.0f);
+    TEST_ASSERT(low == 0.0 && high == 0.0);
+    ds4_qwen4_rope_table(64, 1e7, 262144, 2.0, yarn, &ms, &low, &high);
+    TEST_ASSERT(low == 14.0 && high == 22.0);
+    TEST_ASSERT(ms == (float)(0.1 * log(2.0) + 1.0));
+    for (int i = 0; i <= 14; i++) TEST_ASSERT(yarn[i] == plain[i]);             /* extrapolated */
+    for (int i = 22; i < 32; i++) {
+        TEST_ASSERT(yarn[i] == (float)(pow(1e7, -2.0 * (double)i / 64.0) / 2.0)); /* interpolated */
+    }
+    TEST_ASSERT(yarn[18] < plain[18] && yarn[18] > plain[18] / 2.0f);          /* blended */
+    ds4_qwen4_rope_table(64, 1e7, 0, 2.0, yarn, NULL, NULL, NULL);             /* no native: plain */
+    for (int i = 0; i < 32; i++) TEST_ASSERT(yarn[i] == plain[i]);
+}
+
 /* Grow-on-demand KV, model-backed.  Needs a Qwen3.8 model and its PLE:
  *   DS4_TEST_MODEL=...gguf DS4_TEST_PLE=...PLE-Q4_1.gguf DS4_TEST_GLM_MTP=1 \
  *   DS4_TEST_SSD_STREAMING=1 DS4_TEST_SSD_STREAMING_CACHE_GB=6 \
@@ -7815,6 +7853,7 @@ typedef struct {
 
 static const ds4_test_entry test_entries[] = {
     {"--qwen-kv-grow-policy", "qwen-kv-grow-policy", "Qwen3.8 grow-on-demand KV capacity policy (no model)", test_qwen_kv_grow_policy},
+    {"--qwen-yarn-policy", "qwen-yarn-policy", "Qwen3.8 YaRN factor from -c and the rope table (no model)", test_qwen_yarn_policy},
     {"--dir-steering-rows", "dir-steering-rows", "directional steering rows must be unit length or zero (no model)", test_dir_steering_rows},
 #ifndef DS4_NO_GPU
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},

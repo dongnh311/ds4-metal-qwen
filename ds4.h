@@ -247,6 +247,20 @@ void ds4_engine_close(ds4_engine *e);
 void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 uint32_t ds4_engine_prefill_chunk(ds4_engine *e);
+/* Qwen3.8 static YaRN. The factor is DS4_QWEN4_YARN_FACTOR when that parses
+ * as a positive number (<= 1 turns YaRN off); otherwise the smallest power of
+ * two covering context_size / native_ctx when the context exceeds the native
+ * one, else 1 (off). */
+double ds4_qwen4_yarn_factor(uint32_t native_ctx, uint32_t context_size, const char *env_value);
+/* Rotary inverse frequencies of the n_rot/2 pairs (entries past n_rot/2 are 0),
+ * with HF _compute_yarn_parameters blending (beta_fast 32, beta_slow 1) when
+ * factor > 1 and native_ctx > 0. mscale, low and high may be NULL. */
+void ds4_qwen4_rope_table(uint32_t n_rot, double base, uint32_t native_ctx, double factor,
+                          float freq[32], float *mscale, double *low, double *high);
+/* The loaded model's active YaRN factor (1 when off or not Qwen3.8) and its
+ * native context (0 when the family has none). */
+float ds4_engine_rope_yarn_factor(const ds4_engine *e);
+uint32_t ds4_engine_native_context(const ds4_engine *e);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
