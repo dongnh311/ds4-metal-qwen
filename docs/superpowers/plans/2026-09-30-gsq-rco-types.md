@@ -194,6 +194,7 @@ and append to `test_quant_types` (first and last entries, read from ggml-common.
     TEST_ASSERT(ds4_iq_table_entry("iq4nl", 0) == (uint64_t)(int64_t)-127);
     TEST_ASSERT(ds4_iq_table_entry("iq4nl", 15) == 113u);
     TEST_ASSERT(ds4_iq_table_entry("iq2xs", 512) == 0);   /* out of range */
+```
 
 - [ ] **Step 2: Run it to verify it fails**
 

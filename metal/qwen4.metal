@@ -2807,7 +2807,8 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t n_slots;      /* routed slots; slot n_slots is the shared expert when has_shared */
     uint32_t in_dim;       /* row length of the expert matrix */
     uint32_t out_rows;     /* rows per expert */
-    uint32_t weight_type;  /* 0 f32, 1 f16, 8 q8_0, 10 q2_K, 12 q4_K, 16 iq2_xxs, 39 mxfp4 */
+    uint32_t weight_type;  /* 0 f32, 1 f16, 8 q8_0, 10 q2_K, 12 q4_K, 13 q5_K, 14 q6_K, 16 iq2_xxs, 17 iq2_xs,
+                            * 18 iq3_xxs, 20 iq4_nl, 21 iq3_s, 22 iq2_s, 23 iq4_xs, 39 mxfp4, 42 q2_0 */
     uint32_t row_bytes;
     uint64_t expert_bytes;
     uint32_t has_shared;
@@ -2817,6 +2818,192 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t list_cap;     /* grouped kernels: row stride of the per-expert pair lists */
     uint32_t phase;        /* *_addr kernels: 0 every pair, 1 all but pending, 2 pending only */
 };
+
+/* GSQ-RCO quant types (ggml-quants.c dequantizers @931351ea, MIT; the CPU
+ * rows in ds4_quants.h). One simdgroup per row: for 256-weight super-blocks
+ * lane t takes sub-block t % 8 of blocks t / 8, t / 8 + 4, ...; the 32/64
+ * weight blocks go round-robin. Each returns the lane's partial sum. */
+static inline float qwen4_lane_iq2_xs(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    const uint nb = in_dim / 256u, ib32 = tiisg % 8u;
+    float acc = 0.0f;
+    for (uint ib = tiisg / 8u; ib < nb; ib += 4u) {
+        device const uchar *blk = row + (uint64_t)ib * 74u;
+        const float d = (float)(*(device const half *)blk);
+        const uint sc = blk[66u + ib32];
+        const float db0 = d * (0.5f + (float)(sc & 0xfu)) * 0.25f, db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+        device const ushort *qs = (device const ushort *)(blk + 2u) + 4u * ib32;
+        device const float *y = x + ib * 256u + ib32 * 32u;
+        for (uint l = 0; l < 4u; l++) {
+            const uint q = qs[l];
+            constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xs_grid + (q & 511u));
+            const uint signs = ds4_metal_ksigns_iq2xs[q >> 9];
+            float part = 0.0f;
+            for (uint j = 0; j < 8u; j++) part += (float)grid[j] * (((signs >> j) & 1u) ? -y[l * 8u + j] : y[l * 8u + j]);
+            acc += (l < 2u ? db0 : db1) * part;
+        }
+    }
+    return acc;
+}
+
+static inline float qwen4_lane_iq2_s(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    const uint nb = in_dim / 256u, ib32 = tiisg % 8u;
+    float acc = 0.0f;
+    for (uint ib = tiisg / 8u; ib < nb; ib += 4u) {
+        device const uchar *blk = row + (uint64_t)ib * 82u;
+        const float d = (float)(*(device const half *)blk);
+        device const uchar *qs = blk + 2u + 4u * ib32, *signs = blk + 34u + 4u * ib32;
+        const uint qh = blk[66u + ib32], sc = blk[74u + ib32];
+        const float db0 = d * (0.5f + (float)(sc & 0xfu)) * 0.25f, db1 = d * (0.5f + (float)(sc >> 4)) * 0.25f;
+        device const float *y = x + ib * 256u + ib32 * 32u;
+        for (uint l = 0; l < 4u; l++) {
+            constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2s_grid + ((uint)qs[l] | ((qh << (8u - 2u * l)) & 0x300u)));
+            const uint s = signs[l];
+            float part = 0.0f;
+            for (uint j = 0; j < 8u; j++) part += (float)grid[j] * (((s >> j) & 1u) ? -y[l * 8u + j] : y[l * 8u + j]);
+            acc += (l < 2u ? db0 : db1) * part;
+        }
+    }
+    return acc;
+}
+
+static inline float qwen4_lane_iq3_xxs(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    const uint nb = in_dim / 256u, ib32 = tiisg % 8u;
+    float acc = 0.0f;
+    for (uint ib = tiisg / 8u; ib < nb; ib += 4u) {
+        device const uchar *blk = row + (uint64_t)ib * 98u;
+        const float d = (float)(*(device const half *)blk);
+        device const uchar *qs = blk + 2u + 8u * ib32;
+        device const ushort *ss = (device const ushort *)(blk + 66u) + 2u * ib32;
+        const uint aux = (uint)ss[0] | ((uint)ss[1] << 16);
+        const float db = d * (0.5f + (float)(aux >> 28)) * 0.5f;
+        device const float *y = x + ib * 256u + ib32 * 32u;
+        for (uint l = 0; l < 4u; l++) {
+            const uint signs = ds4_metal_ksigns_iq2xs[(aux >> (7u * l)) & 127u];
+            constant const uchar *g1 = (constant const uchar *)(ds4_metal_iq3xxs_grid + qs[2u * l]);
+            constant const uchar *g2 = (constant const uchar *)(ds4_metal_iq3xxs_grid + qs[2u * l + 1u]);
+            float part = 0.0f;
+            for (uint j = 0; j < 4u; j++) {
+                part += (float)g1[j] * (((signs >> j) & 1u) ? -y[l * 8u + j] : y[l * 8u + j]);
+                part += (float)g2[j] * (((signs >> (j + 4u)) & 1u) ? -y[l * 8u + 4u + j] : y[l * 8u + 4u + j]);
+            }
+            acc += db * part;
+        }
+    }
+    return acc;
+}
+
+static inline float qwen4_lane_iq3_s(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    const uint nb = in_dim / 256u, ib32 = tiisg % 8u;
+    float acc = 0.0f;
+    for (uint ib = tiisg / 8u; ib < nb; ib += 4u) {
+        device const uchar *blk = row + (uint64_t)ib * 110u;
+        const float d = (float)(*(device const half *)blk);
+        device const uchar *qs = blk + 2u + 8u * ib32, *signs = blk + 74u + 4u * ib32;
+        const uint qh = blk[66u + ib32];
+        const float db = d * (float)(1u + 2u * ((blk[106u + ib32 / 2u] >> (4u * (ib32 & 1u))) & 0xfu));
+        device const float *y = x + ib * 256u + ib32 * 32u;
+        for (uint l = 0; l < 4u; l++) {
+            constant const uchar *g1 = (constant const uchar *)(ds4_metal_iq3s_grid + ((uint)qs[2u * l] | ((qh << (8u - 2u * l)) & 256u)));
+            constant const uchar *g2 = (constant const uchar *)(ds4_metal_iq3s_grid + ((uint)qs[2u * l + 1u] | ((qh << (7u - 2u * l)) & 256u)));
+            const uint s = signs[l];
+            float part = 0.0f;
+            for (uint j = 0; j < 4u; j++) {
+                part += (float)g1[j] * (((s >> j) & 1u) ? -y[l * 8u + j] : y[l * 8u + j]);
+                part += (float)g2[j] * (((s >> (j + 4u)) & 1u) ? -y[l * 8u + 4u + j] : y[l * 8u + 4u + j]);
+            }
+            acc += db * part;
+        }
+    }
+    return acc;
+}
+
+static inline float qwen4_lane_iq4_nl(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    float acc = 0.0f;
+    for (uint ib = tiisg; ib < in_dim / 32u; ib += 32u) {
+        device const uchar *blk = row + (uint64_t)ib * 18u;
+        device const float *y = x + ib * 32u;
+        float part = 0.0f;
+        for (uint j = 0; j < 16u; j++) {
+            part += (float)ds4_metal_kvalues_iq4nl[blk[2u + j] & 0xfu] * y[j] +
+                    (float)ds4_metal_kvalues_iq4nl[blk[2u + j] >> 4] * y[j + 16u];
+        }
+        acc += (float)(*(device const half *)blk) * part;
+    }
+    return acc;
+}
+
+static inline float qwen4_lane_iq4_xs(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    const uint nb = in_dim / 256u, ib32 = tiisg % 8u;
+    float acc = 0.0f;
+    for (uint ib = tiisg / 8u; ib < nb; ib += 4u) {
+        device const uchar *blk = row + (uint64_t)ib * 136u;
+        const uint scales_h = (uint)*(device const ushort *)(blk + 2u);
+        const int ls = (int)(((blk[4u + ib32 / 2u] >> (4u * (ib32 % 2u))) & 0xfu) | (((scales_h >> (2u * ib32)) & 3u) << 4));
+        device const uchar *qs = blk + 8u + 16u * ib32;
+        device const float *y = x + ib * 256u + ib32 * 32u;
+        float part = 0.0f;
+        for (uint j = 0; j < 16u; j++) {
+            part += (float)ds4_metal_kvalues_iq4nl[qs[j] & 0xfu] * y[j] +
+                    (float)ds4_metal_kvalues_iq4nl[qs[j] >> 4] * y[j + 16u];
+        }
+        acc += (float)(*(device const half *)blk) * (float)(ls - 32) * part;
+    }
+    return acc;
+}
+
+static inline float qwen4_lane_q2_0(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    float acc = 0.0f;
+    for (uint ib = tiisg; ib < in_dim / 64u; ib += 32u) {
+        device const uchar *blk = row + (uint64_t)ib * 18u;
+        device const float *y = x + ib * 64u;
+        float part = 0.0f;
+        for (uint j = 0; j < 64u; j++) part += (float)((int)((blk[2u + j / 4u] >> ((j % 4u) * 2u)) & 3u) - 1) * y[j];
+        acc += (float)(*(device const half *)blk) * part;
+    }
+    return acc;
+}
+
+static inline float qwen4_lane_q5_k(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    const uint nb = in_dim / 256u, g = tiisg % 8u;
+    float acc = 0.0f;
+    for (uint ib = tiisg / 8u; ib < nb; ib += 4u) {
+        device const uchar *blk = row + (uint64_t)ib * 176u;
+        const float d = (float)(*(device const half *)blk), dmin = (float)(*(device const half *)(blk + 2u));
+        device const uchar *sc = blk + 4u;
+        uint s, m;
+        if (g < 4u) { s = sc[g] & 63u; m = sc[g + 4u] & 63u; }
+        else { s = (sc[g + 4u] & 0xfu) | ((sc[g - 4u] >> 6) << 4); m = (sc[g + 4u] >> 4) | ((sc[g] >> 6) << 4); }
+        device const uchar *qh = blk + 16u, *ql = blk + 48u + 32u * (g / 2u);
+        device const float *y = x + ib * 256u + g * 32u;
+        float part = 0.0f, ysum = 0.0f;
+        for (uint l = 0; l < 32u; l++) {
+            const uint lo = (g & 1u) ? (uint)(ql[l] >> 4) : (uint)(ql[l] & 0xfu);
+            part += (float)(lo + (((qh[l] >> g) & 1u) << 4)) * y[l];
+            ysum += y[l];
+        }
+        acc += d * (float)s * part - dmin * (float)m * ysum;
+    }
+    return acc;
+}
+
+static inline float qwen4_lane_q6_k(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    const uint nb = in_dim / 256u, g = tiisg % 8u, h = g / 4u, k = g % 4u;
+    float acc = 0.0f;
+    for (uint ib = tiisg / 8u; ib < nb; ib += 4u) {
+        device const uchar *blk = row + (uint64_t)ib * 210u;
+        device const uchar *ql = blk + 64u * h + ((k & 1u) ? 32u : 0u), *qh = blk + 128u + 32u * h;
+        device const char *sc = (device const char *)(blk + 192u + 8u * h);
+        device const float *y = x + ib * 256u + 128u * h + 32u * k;
+        float part0 = 0.0f, part1 = 0.0f;
+        for (uint l = 0; l < 32u; l++) {
+            const uint lo = (k < 2u) ? (uint)(ql[l] & 0xfu) : (uint)(ql[l] >> 4);
+            const float q = (float)((int)(lo | (((qh[l] >> (2u * k)) & 3u) << 4)) - 32);
+            if (l < 16u) part0 += q * y[l]; else part1 += q * y[l];
+        }
+        acc += (float)(*(device const half *)(blk + 208u)) * ((float)sc[2u * k] * part0 + (float)sc[2u * k + 1u] * part1);
+    }
+    return acc;
+}
 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
  * ix = block stride, it = element pair inside the block */
@@ -2920,6 +3107,24 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
             for (uint i = 0; i < 8; i++) part += (float)grid[i] * ((signs >> i) & 1u ? -y[i] : y[i]);
             acc += dl * part;
         }
+    } else if (weight_type == 17) {
+        acc = qwen4_lane_iq2_xs((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 22) {
+        acc = qwen4_lane_iq2_s((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 18) {
+        acc = qwen4_lane_iq3_xxs((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 21) {
+        acc = qwen4_lane_iq3_s((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 20) {
+        acc = qwen4_lane_iq4_nl((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 23) {
+        acc = qwen4_lane_iq4_xs((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 42) {
+        acc = qwen4_lane_q2_0((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 13) {
+        acc = qwen4_lane_q5_k((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 14) {
+        acc = qwen4_lane_q6_k((device const uchar *)row, x, in_dim, tiisg);
     } else if (weight_type == 30) {
         device const ushort *w = (device const ushort *)row;
         for (uint i = tiisg * 4; i < in_dim; i += 128) {

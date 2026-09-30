@@ -5033,6 +5033,7 @@ static NSString *ds4_gpu_full_source(void) {
         @[@"DS4_METAL_NORM_SOURCE",       @"metal/norm.metal"],
         @[@"DS4_METAL_BIN_SOURCE",        @"metal/bin.metal"],
         @[@"DS4_METAL_SET_ROWS_SOURCE",   @"metal/set_rows.metal"],
+        @[@"DS4_METAL_IQ_TABLES_SOURCE",  @"metal/iq_tables.metal"],
         @[@"DS4_METAL_QWEN4_SOURCE",      @"metal/qwen4.metal"],
         @[@"DS4_METAL_QWEN35_SOURCE",     @"metal/qwen35.metal"],
         @[@"DS4_METAL_QWEN4_VISION_SOURCE", @"metal/qwen4_vision.metal"],
@@ -50001,6 +50002,15 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     case 1u:  return in_dim * 2u;            /* f16 */
     case 30u: return in_dim * 2u;            /* bf16 */
     case 0u:  return in_dim * 4u;            /* f32 */
+    case 13u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 176u;   /* q5_K */
+    case 14u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 210u;   /* q6_K */
+    case 17u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 74u;    /* iq2_xs */
+    case 18u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 98u;    /* iq3_xxs */
+    case 20u: return (in_dim / 32u) * 18u;                            /* iq4_nl */
+    case 21u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 110u;   /* iq3_s */
+    case 22u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 82u;    /* iq2_s */
+    case 23u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 136u;   /* iq4_xs */
+    case 42u: return (in_dim % 64u) ? 0u : (in_dim / 64u) * 18u;      /* q2_0 */
     default:  return 0;
     }
 }

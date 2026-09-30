@@ -256,6 +256,17 @@ double ds4_qwen4_yarn_factor(uint32_t native_ctx, uint32_t context_size, const c
 /* The factor DS4_QWEN4_YARN_FACTOR asks for (>= 1), or 0 when the value is
  * unset or unusable (the engine warns and ignores it). */
 double ds4_qwen4_yarn_env_factor(const char *env_value);
+/* Block geometry of a GGUF tensor type (weights per block, bytes per block);
+ * returns 0, or -1 for a type ds4 does not know. */
+int ds4_gguf_type_block(uint32_t type, uint32_t *block_elems, uint32_t *block_bytes);
+/* Test hook: entry i of a GSQ-RCO grid table ("iq2xs", "iq2s", "iq3xxs", "iq3s", "iq4nl"), or 0. */
+uint64_t ds4_iq_table_entry(const char *table, uint32_t i);
+/* Dequantizes n weights (whole blocks) of a Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+ * IQ4_NL, IQ4_XS or Q2_0 row into out; returns 0, or -1 for another type or a partial block. */
+int ds4_dequant_row(uint32_t type, const void *src, uint64_t n, float *out);
+/* Test hook: 1 when the loader accepts `type` for routed experts of Qwen3.8
+ * (qwen4 != 0) or of the DeepSeek/GLM/DSpark families. */
+int ds4_test_routed_expert_type_ok(uint32_t type, int qwen4);
 /* Rotary inverse frequencies of the n_rot/2 pairs (entries past n_rot/2 are 0),
  * with HF _compute_yarn_parameters blending (beta_fast 32, beta_slow 1) when
  * factor > 1 and native_ctx > 0. mscale, low and high may be NULL. */

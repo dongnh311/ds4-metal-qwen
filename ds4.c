@@ -1338,6 +1338,9 @@ static void iq2xxs_signed_grid_init(void) {
     }
 }
 
+/* the GSQ-RCO grids: IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL/IQ4_XS */
+#include "ds4_iq_tables.h"
+
 static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
@@ -2433,8 +2436,8 @@ static const gguf_type_info gguf_types[] = {
     [16] = {"iq2_xxs",256,  66},
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
+    [19] = {"iq1_s",  256,  50},
+    [20] = {"iq4_nl",  32,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -2446,6 +2449,7 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    [42] = {"q2_0",    64,  18},
 };
 
 enum {
@@ -2460,10 +2464,17 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ2_XS   = 17,
+    DS4_TENSOR_IQ3_XXS  = 18,
+    DS4_TENSOR_IQ4_NL   = 20,
+    DS4_TENSOR_IQ3_S    = 21,
+    DS4_TENSOR_IQ2_S    = 22,
+    DS4_TENSOR_IQ4_XS   = 23,
     DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    DS4_TENSOR_Q2_0     = 42,
 };
 
 typedef struct {
@@ -2571,6 +2582,30 @@ static const gguf_type_info *tensor_type(uint32_t type) {
     uint32_t n = sizeof(gguf_types) / sizeof(gguf_types[0]);
     if (type >= n || gguf_types[type].name == NULL) return NULL;
     return &gguf_types[type];
+}
+
+/* The GSQ-RCO types: CPU rows (ds4_quants.h) and the Metal qwen4_row_dot. */
+static bool qwen4_type_is_gsq(uint32_t type) {
+    return type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_Q6_K || type == DS4_TENSOR_IQ2_XS ||
+           type == DS4_TENSOR_IQ2_S || type == DS4_TENSOR_IQ3_XXS || type == DS4_TENSOR_IQ3_S ||
+           type == DS4_TENSOR_IQ4_NL || type == DS4_TENSOR_IQ4_XS || type == DS4_TENSOR_Q2_0;
+}
+
+int ds4_gguf_type_block(uint32_t type, uint32_t *block_elems, uint32_t *block_bytes) {
+    const gguf_type_info *info = tensor_type(type);
+    if (!info || info->block_elems == 0) return -1;
+    if (block_elems) *block_elems = info->block_elems;
+    if (block_bytes) *block_bytes = info->block_bytes;
+    return 0;
+}
+
+uint64_t ds4_iq_table_entry(const char *table, uint32_t i) {
+    if (!strcmp(table, "iq2xs") && i < 512) return iq2xs_grid[i];
+    if (!strcmp(table, "iq2s") && i < 1024) return iq2s_grid[i];
+    if (!strcmp(table, "iq3xxs") && i < 256) return iq3xxs_grid[i];
+    if (!strcmp(table, "iq3s") && i < 512) return iq3s_grid[i];
+    if (!strcmp(table, "iq4nl") && i < 16) return (uint64_t)(int64_t)kvalues_iq4nl[i];
+    return 0;
 }
 
 static const char *tensor_type_name(uint32_t type) {
@@ -5102,6 +5137,13 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
+    case DS4_TENSOR_IQ2_XS:  return 74;
+    case DS4_TENSOR_IQ2_S:   return 82;
+    case DS4_TENSOR_IQ3_XXS: return 98;
+    case DS4_TENSOR_IQ3_S:   return 110;
+    case DS4_TENSOR_IQ4_NL:  return 18;
+    case DS4_TENSOR_IQ4_XS:  return 136;
+    case DS4_TENSOR_Q2_0:    return 18;
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
@@ -5591,10 +5633,12 @@ static bool weights_qwen35moe_layer_has_required(const ds4_layer_weights *l, uin
     return true;
 }
 
-/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF. */
+/* Dense Qwen projections: Q8_0, F16 or F32, plus BF16 and Q4_0 from the upstream GGUF,
+ * plus the GSQ-RCO types. */
 static bool tensor_type_is_qwen4_dense(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 ||
-           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q4_K;
+           type == DS4_TENSOR_BF16 || type == DS4_TENSOR_Q4_0 || type == DS4_TENSOR_Q4_K ||
+           qwen4_type_is_gsq(type);
 }
 
 static void tensor_expect_qwen4_dense_layout(
@@ -5608,12 +5652,19 @@ static void tensor_expect_qwen4_dense_layout(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
+static bool qwen4_expert_type_ok(uint32_t type) {
+    return tensor_is_routed_expert_type(type) || qwen4_type_is_gsq(type) ||
+           type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 || type == DS4_TENSOR_Q4_0;
+}
+
+int ds4_test_routed_expert_type_ok(uint32_t type, int qwen4) {
+    return qwen4 ? qwen4_expert_type_ok(type) : tensor_is_routed_expert_type(type);
+}
+
 static void tensor_expect_qwen4_expert_layout(
         const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (!tensor_is_routed_expert_type(t->type) &&
-        t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32 &&
-        t->type != DS4_TENSOR_Q4_0) {
+    if (!qwen4_expert_type_ok(t->type)) {
         fprintf(stderr, "ds4: routed expert tensor %.*s has unsupported type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
@@ -59551,9 +59602,20 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t mtp_h_rows;
 } ds4_qwen4_gpu_graph;
 
+/* GSQ-RCO types in the Metal graph: qwen4_row_dot has them; CUDA does not. */
+static bool qwen4_graph_gsq_ok(uint32_t type) {
+#ifdef DS4_HAS_QWEN4_METAL
+    return qwen4_type_is_gsq(type);
+#else
+    (void)type;
+    return false;
+#endif
+}
+
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_Q4_K);
+                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_Q4_K ||
+                 qwen4_graph_gsq_ok(t->type));
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
@@ -59566,14 +59628,22 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
-                  (t->dim[0] % 256u) == 0));
+                  (t->dim[0] % 256u) == 0) ||
+                 (qwen4_graph_gsq_ok(t->type) && tensor_type(t->type) &&
+                  (t->dim[0] % tensor_type(t->type)->block_elems) == 0));
 }
 
 /* The Metal graph runs a subset of what the loader accepts. */
 static bool qwen4_graph_weights_supported(const ds4_weights *w) {
     if (!qwen4_graph_dense_ok(w->token_embd) || !qwen4_graph_dense_ok(w->output) ||
         !qwen4_graph_dense_ok(w->output_hc_down) || !qwen4_graph_dense_ok(w->output_hc_up)) {
-        fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
+        fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights, or a GSQ-RCO type\n");
+        return false;
+    }
+    /* decode rows mix through the hc gate kernel, which reads F16/F32/Q8_0 only */
+    if (w->output_hc_up->type != DS4_TENSOR_F16 && w->output_hc_up->type != DS4_TENSOR_F32 &&
+        w->output_hc_up->type != DS4_TENSOR_Q8_0) {
+        fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F16/F32/Q8_0 output hc up weights\n");
         return false;
     }
     if (!w->ple_embd || (w->ple_embd->type != DS4_TENSOR_BF16 &&
@@ -60343,6 +60413,9 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     case DS4_TENSOR_F32:  rc = ds4_gpu_matmul_f32_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_Q4_0: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_Q4_K: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
+    case DS4_TENSOR_Q5_K: case DS4_TENSOR_Q6_K: case DS4_TENSOR_IQ2_XS: case DS4_TENSOR_IQ2_S:
+    case DS4_TENSOR_IQ3_XXS: case DS4_TENSOR_IQ3_S: case DS4_TENSOR_IQ4_NL: case DS4_TENSOR_IQ4_XS:
+    case DS4_TENSOR_Q2_0:
     case DS4_TENSOR_BF16: {
         ds4_gpu_tensor *outs[1] = { out };
         const uint64_t offs[1] = { w->abs_offset };
@@ -61116,9 +61189,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     /* A decode batch runs the shared expert as dense projections over its
      * rows, as the prefill path does: as a slot of the per-token kernels it
      * is read once per row, 5 MB of Q8 per row and layer.  Single tokens and
-     * verify rows keep the slot. */
+     * verify rows keep the slot, unless the shared gate and up differ in type:
+     * the slot kernels take one type for both (GSQ-RCO files mix them). */
 #ifdef DS4_HAS_QWEN4_METAL
-    const bool shared_dense = T > 8u &&
+    const bool shared_dense = (T > 8u || l->ffn_gate_shexp->type != l->ffn_up_shexp->type) &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
 #else
@@ -70006,6 +70080,27 @@ int ds4_engine_head_test(ds4_engine *e, const ds4_tokens *prompt) {
     return 0;
 }
 
+#include "ds4_quants.h"
+
+int ds4_dequant_row(uint32_t type, const void *src, uint64_t n, float *out) {
+    const gguf_type_info *info = tensor_type(type);
+    if (!info || info->block_elems == 0 || (n % info->block_elems) != 0) return -1;
+    const uint8_t *p = src;
+    switch (type) {
+    case DS4_TENSOR_Q5_K:    dq_q5_k(p, n, out); return 0;
+    case DS4_TENSOR_Q6_K:    dq_q6_k(p, n, out); return 0;
+    case DS4_TENSOR_IQ2_XXS: dq_iq2_xxs(p, n, out); return 0;
+    case DS4_TENSOR_IQ2_XS:  dq_iq2_xs(p, n, out); return 0;
+    case DS4_TENSOR_IQ2_S:   dq_iq2_s(p, n, out); return 0;
+    case DS4_TENSOR_IQ3_XXS: dq_iq3_xxs(p, n, out); return 0;
+    case DS4_TENSOR_IQ3_S:   dq_iq3_s(p, n, out); return 0;
+    case DS4_TENSOR_IQ4_NL:  dq_iq4_nl(p, n, out); return 0;
+    case DS4_TENSOR_IQ4_XS:  dq_iq4_xs(p, n, out); return 0;
+    case DS4_TENSOR_Q2_0:    dq_q2_0(p, n, out); return 0;
+    default:                 return -1;
+    }
+}
+
 /* ------------------------------------------------------------------------
  * Qwen3.8-Flash-Next CPU reference: f32, one token at a time, every
  * projection a plain row dot product over dequantized weights.  It is the
@@ -70114,27 +70209,13 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
         for (uint64_t k = 0; k < blocks * 256u; k++) out[k] = q2_k_value_f32(p, (uint32_t)k);
         break;
     }
-    case DS4_TENSOR_IQ2_XXS: {
-        const uint64_t blocks = n / 256u;
-        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 66u;
-        for (uint64_t b = 0; b < blocks; b++, p += 66u) {
-            uint16_t dh;
-            memcpy(&dh, p, 2);
-            const float d = f16_to_f32(dh);
-            for (uint32_t ib32 = 0; ib32 < 8u; ib32++) {
-                uint16_t q2[4];
-                memcpy(q2, p + 2 + ib32 * 8u, 8);
-                const uint32_t aux_g = (uint32_t)q2[0] | ((uint32_t)q2[1] << 16);
-                const uint32_t aux_s = (uint32_t)q2[2] | ((uint32_t)q2[3] << 16);
-                const float dl = d * (0.5f + (float)(aux_s >> 28)) * 0.25f;
-                for (uint32_t j = 0; j < 4u; j++) {
-                    const uint8_t *grid = (const uint8_t *)(iq2xxs_grid + ((aux_g >> (8u * j)) & 0xFFu));
-                    const uint32_t signs = ksigns_iq2xs[(aux_s >> (7u * j)) & 127u];
-                    for (uint32_t i = 0; i < 8u; i++) {
-                        out[b * 256u + ib32 * 32u + j * 8u + i] = dl * (float)grid[i] * (((signs >> i) & 1u) ? -1.0f : 1.0f);
-                    }
-                }
-            }
+    case DS4_TENSOR_IQ2_XXS: case DS4_TENSOR_Q5_K: case DS4_TENSOR_Q6_K:
+    case DS4_TENSOR_IQ2_XS: case DS4_TENSOR_IQ2_S: case DS4_TENSOR_IQ3_XXS: case DS4_TENSOR_IQ3_S:
+    case DS4_TENSOR_IQ4_NL: case DS4_TENSOR_IQ4_XS: case DS4_TENSOR_Q2_0: {
+        const gguf_type_info *info = tensor_type(t->type);
+        const uint64_t row_bytes = n / info->block_elems * info->block_bytes;
+        if (ds4_dequant_row(t->type, (const uint8_t *)tensor_data(m, t) + row * row_bytes, n, out) != 0) {
+            ds4_die("qwen4 reference: row is not a whole number of quant blocks");
         }
         break;
     }
