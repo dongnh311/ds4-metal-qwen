@@ -11836,6 +11836,61 @@ static void kv_cache_close(kv_disk_cache *kc) {
     ds4_kvstore_close(kc);
 }
 
+/* Cached KV encodes the residual stream and the rope it was computed with: it
+ * must never be restored under other steering (direction or scale) or another
+ * YaRN factor. The disk cache therefore lives in
+ *   <dir>                       plain,
+ *   <dir>/steer-<sha8>          steered (sha1 of the direction bytes + "attn,ffn"),
+ *   <dir>/yarn-<f>              YaRN factor f > 1,
+ *   <dir>/steer-<sha8>-yarn-<f> both.
+ * The status tells a direction file that cannot be read from a path that does
+ * not fit. */
+typedef enum { KV_DIR_OK = 0, KV_DIR_STEER_UNREADABLE, KV_DIR_TOO_LONG } kv_dir_status;
+
+static kv_dir_status kv_cache_variant_dir_status(const char *dir, const char *steer_file,
+                                                 float attn_scale, float ffn_scale, double yarn_factor,
+                                                 char *out, size_t outlen) {
+    char steer[16] = "";
+    if (steer_file && steer_file[0] && (attn_scale != 0.0f || ffn_scale != 0.0f)) {
+        FILE *fp = fopen(steer_file, "rb");
+        if (!fp) return KV_DIR_STEER_UNREADABLE;
+        long size = -1;
+        if (fseek(fp, 0, SEEK_END) == 0) size = ftell(fp);
+        if (size < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+            fclose(fp);
+            return KV_DIR_STEER_UNREADABLE;
+        }
+        char *buf = xmalloc((size_t)size + 64);
+        const bool read_ok = fread(buf, 1, (size_t)size, fp) == (size_t)size;
+        fclose(fp);
+        if (!read_ok) {
+            free(buf);
+            return KV_DIR_STEER_UNREADABLE;
+        }
+        size_t len = (size_t)size;
+        len += (size_t)snprintf(buf + len, 64, "%g,%g", (double)attn_scale, (double)ffn_scale);
+        char sha[41];
+        ds4_kvstore_sha1_bytes_hex(buf, len, sha);
+        free(buf);
+        snprintf(steer, sizeof(steer), "steer-%.8s", sha);
+    }
+    char rope[32] = "";
+    if (yarn_factor > 1.0) snprintf(rope, sizeof(rope), "yarn-%g", yarn_factor);
+    int n;
+    if (steer[0] && rope[0]) n = snprintf(out, outlen, "%s/%s-%s", dir, steer, rope);
+    else if (steer[0]) n = snprintf(out, outlen, "%s/%s", dir, steer);
+    else if (rope[0]) n = snprintf(out, outlen, "%s/%s", dir, rope);
+    else n = snprintf(out, outlen, "%s", dir);
+    return n >= 0 && n < (int)outlen ? KV_DIR_OK : KV_DIR_TOO_LONG;
+}
+
+static bool kv_cache_variant_dir(const char *dir, const char *steer_file,
+                                 float attn_scale, float ffn_scale, double yarn_factor,
+                                 char *out, size_t outlen) {
+    return kv_cache_variant_dir_status(dir, steer_file, attn_scale, ffn_scale, yarn_factor,
+                                       out, outlen) == KV_DIR_OK;
+}
+
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
     return ds4_kvstore_render_tokens_text(engine, tokens, out_len);
 }
@@ -16780,7 +16835,27 @@ int main(int argc, char **argv) {
     }
 
     if (cfg.kv_disk_dir) {
-        kv_cache_open(&s.kv, cfg.kv_disk_dir, cfg.kv_disk_space_mb,
+        char kv_dir[4096];
+        const kv_dir_status st = kv_cache_variant_dir_status(
+            cfg.kv_disk_dir, cfg.engine.directional_steering_file,
+            cfg.engine.directional_steering_attn, cfg.engine.directional_steering_ffn,
+            (double)ds4_engine_rope_yarn_factor(engine), kv_dir, sizeof(kv_dir));
+        if (st != KV_DIR_OK) {
+            if (st == KV_DIR_STEER_UNREADABLE) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: cannot key the kv cache: failed to read %s",
+                           cfg.engine.directional_steering_file);
+            } else {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: cannot key the kv cache: the directory under %s "
+                           "is longer than %zu bytes", cfg.kv_disk_dir, sizeof(kv_dir) - 1);
+            }
+            server_close_resources(&s);
+            return 1;
+        }
+        if (strcmp(kv_dir, cfg.kv_disk_dir) != 0) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: keyed kv cache directory %s", kv_dir);
+        }
+        cfg.kv_cache.continued_dense_max_tokens = (int)ds4_engine_native_context(engine);
+        kv_cache_open(&s.kv, kv_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
     if (s.disable_exact_dsml_tool_replay) {
@@ -22520,6 +22595,29 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
 }
 
+static void test_kv_cache_continued_sparse_past_dense_max(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();          /* step 10240 after the 2048 alignment */
+    TEST_ASSERT(kc.opt.continued_dense_max_tokens == 0);
+    kc.continued_last_store_tokens = 0;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 266240) == 266240);   /* no limit: dense */
+
+    kc.opt.continued_dense_max_tokens = 262144;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 256000) == 256000);   /* 25 steps, inside */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 266240) == 0);        /* 26 steps, past */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 317440) == 0);        /* 31 steps */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 327680) == 327680);   /* 32 = 2^5 steps */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 337920) == 0);        /* 33 steps */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 655360) == 655360);   /* 64 steps */
+    kc.continued_last_store_tokens = 655360;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 655360) == 0);        /* already stored */
+
+    kc.continued_last_store_tokens = 0;
+    kc.opt.continued_dense_max_tokens = 266240;                            /* the limit itself is dense */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 266240) == 266240);
+}
+
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -24482,7 +24580,44 @@ static void test_ornith_model_ids(void) {
     g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
 }
 
+static void test_kv_cache_variant_dir(void) {
+    char out[4096], other[4096];
+    TEST_ASSERT(kv_cache_variant_dir("/kv", NULL, 0.0f, 1.0f, 1.0, out, sizeof(out)));
+    TEST_ASSERT(!strcmp(out, "/kv"));
+    TEST_ASSERT(kv_cache_variant_dir("/kv", NULL, 0.0f, 1.0f, 2.0, out, sizeof(out)));
+    TEST_ASSERT(!strcmp(out, "/kv/yarn-2"));                   /* the rope is part of the key */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", NULL, 0.0f, 1.0f, 4.0, other, sizeof(other)));
+    TEST_ASSERT(!strcmp(other, "/kv/yarn-4"));
+    char path[] = "/tmp/ds4-steer-key-XXXXXX";
+    const int fd = mkstemp(path);
+    TEST_ASSERT(fd >= 0);
+    if (fd < 0) return;
+    TEST_ASSERT(write(fd, "abcdefgh", 8) == 8);
+    close(fd);
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 0.0f, 1.0, out, sizeof(out)));
+    TEST_ASSERT(!strcmp(out, "/kv"));                          /* zero scales steer nothing */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 1.0f, 1.0, out, sizeof(out)));
+    TEST_ASSERT(!strcmp(out, "/kv/steer-f113dc51"));           /* sha1("abcdefgh" "0,1") */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 1.5f, 1.0, other, sizeof(other)));
+    TEST_ASSERT(!strcmp(other, "/kv/steer-9cdec1ad"));         /* the scale is part of the key */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.5f, 0.0f, 1.0, other, sizeof(other)));
+    TEST_ASSERT(!strcmp(other, "/kv/steer-4bfb0ebf"));         /* attention-only steering is steering */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 1.0f, 2.0, out, sizeof(out)));
+    TEST_ASSERT(!strcmp(out, "/kv/steer-f113dc51-yarn-2"));    /* steering and rope together */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 1.0f, 4.0, other, sizeof(other)));
+    TEST_ASSERT(strcmp(out, other) != 0);
+    unlink(path);
+    TEST_ASSERT(!kv_cache_variant_dir("/kv", path, 0.0f, 1.0f, 1.0, out, sizeof(out)));
+    TEST_ASSERT(kv_cache_variant_dir_status("/kv", path, 0.0f, 1.0f, 1.0, out, sizeof(out)) ==
+                KV_DIR_STEER_UNREADABLE);
+    char small[8];                                             /* "/kv/yarn-2" does not fit */
+    TEST_ASSERT(kv_cache_variant_dir_status("/kv", NULL, 0.0f, 1.0f, 2.0, small, sizeof(small)) ==
+                KV_DIR_TOO_LONG);
+    TEST_ASSERT(kv_cache_variant_dir_status("/kv", NULL, 0.0f, 1.0f, 2.0, out, sizeof(out)) == KV_DIR_OK);
+}
+
 static void ds4_server_unit_tests_run(void) {
+    test_kv_cache_variant_dir();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
@@ -24643,6 +24778,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_sparse_past_dense_max();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();

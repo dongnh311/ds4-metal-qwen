@@ -1,0 +1,103 @@
+{
+ "suites": {
+  "tools_pos": {
+   "n": 8,
+   "passed": 8
+  },
+  "tools_neg": {
+   "n": 30,
+   "passed": 16
+  },
+  "tools_xfer": {
+   "n": 6,
+   "passed": 2
+  },
+  "faithfulness": {
+   "n": 9,
+   "passed": 9
+  }
+ },
+ "case_ids": {
+  "tools_pos": "3858875218066be1",
+  "tools_neg": "53345c9984b2d0bc",
+  "tools_xfer": "cf194c242de20e3b",
+  "faithfulness": "5cb605f0f0a48466"
+ },
+ "errors": [],
+ "vi_cjk_leaks": null,
+ "uncensor": {},
+ "longctx": {
+  "needle": {},
+  "docqa": {},
+  "peak_wired_gib": null,
+  "swapouts": null
+ },
+ "speed": {
+  "total_seconds": {},
+  "think_tokens_median": null,
+  "decode_tps_median": 30.78,
+  "prefill_tps_median": 230.11
+ },
+ "arm": "prod",
+ "config": {
+  "name": "prod",
+  "base": "registry",
+  "registry_model": "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2",
+  "model": null,
+  "args_add": [],
+  "args_remove": [],
+  "env": {}
+ },
+ "suites_run": [
+  "tools"
+ ],
+ "provenance": {
+  "git_head": "fae93b8f3ac79239f5facaad71c04789c2d1043d",
+  "git_dirty": false,
+  "gateway_head": "d7d682fef498350ee050fa3d849886c066e7c8cc",
+  "ds4_server_sha256": "ba4784c2acebec11a529c7b1035f08d4d3f8a86230f182bd6939830c592b5abc",
+  "ds4_eval_sha256": "e8cd9b550a2f72c775a1d762d0f623111f5992cea9cb8ee6977a67ae09e0bece",
+  "env": {
+   "DS4_QWEN4_STREAM_FULL_LAYERS": "32",
+   "DS4_QWEN4_PLE_PREFETCH_FULL": "0",
+   "DS4_QWEN4_MTP_DRAFT_VOCAB": "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt",
+   "DS4_QWEN4_KV_GROW": "1"
+  },
+  "argv": [
+   "/Users/dongnh/orca/workspaces/ds4-metal/kv-grow/ds4-server",
+   "--metal",
+   "-m",
+   "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q4KDownPad768-DenseQ4Kselimat-MTP.gguf",
+   "--ple",
+   "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+   "-c",
+   "262144",
+   "--prefill-chunk",
+   "2048",
+   "--mtp",
+   "--ssd-streaming",
+   "--ssd-streaming-cache-experts",
+   "6GB",
+   "--kv-disk-dir",
+   "/Users/dongnh/orca/workspaces/ds4-metal-data/evals/nextgen/runs/prod-20260930-062529/kv-9550gp87",
+   "--kv-disk-space-mb",
+   "32768",
+   "--kv-cache-cold-max-tokens",
+   "262144",
+   "--think-budget",
+   "4096",
+   "--host",
+   "127.0.0.1",
+   "--port",
+   "18299"
+  ],
+  "data": {
+   "mbpp.jsonl": "831bc72948221d99982f69d095a2c03f299da7605e6b964df334f3b90562af94",
+   "ifeval.jsonl": "1eb9e16cf993fc30f552cb1f8b641e89fe5e882de9fc1abdbce00cfa00f3e7e6",
+   "harmful.jsonl": "73143c124365c6412af3c080336479308cf9beb13890a7113c17e5d6d06baa8c",
+   "harmless.jsonl": "055c3667efb019ab5378ab97e4cda7d18f5cc9fb8be2c92937b6f59b2ea28670",
+   "haystack.c": "714124ef847a814d91f56d5c368a5eec08a3206647ae702b2bc0e52297241644",
+   "mcp_tools.json": "07a050f22df4926d92319b604d6474ae0865a1180a5787b73a5d9b3e522a4d21"
+  }
+ }
+}

@@ -658,6 +658,7 @@ int main(int argc, char **argv) {
         .backend = cfg.backend,
         .n_threads = cfg.threads,
         .context_size = cfg.ctx_alloc,
+        .rope_context_size = cfg.ctx_max,   /* gen slack past ctx_max must not turn YaRN on */
         .prefill_chunk = cfg.prefill_chunk,
         .ssd_streaming_cache_experts = cfg.ssd_streaming_cache_experts,
         .ssd_streaming_cache_bytes = cfg.ssd_streaming_cache_bytes,

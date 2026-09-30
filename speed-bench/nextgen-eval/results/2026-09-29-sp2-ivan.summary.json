@@ -1,0 +1,148 @@
+{
+ "suites": {
+  "code": {
+   "n": 67,
+   "passed": 65
+  },
+  "ifeval": {
+   "n": 60,
+   "passed": 59
+  },
+  "vi_knowledge": {
+   "n": 30,
+   "passed": 30
+  },
+  "tools_pos": {
+   "n": 8,
+   "passed": 7
+  },
+  "tools_neg": {
+   "n": 6,
+   "passed": 4
+  },
+  "tools_xfer": {
+   "n": 6,
+   "passed": 0
+  },
+  "faithfulness": {
+   "n": 9,
+   "passed": 9
+  },
+  "reason": {
+   "n": 44,
+   "passed": 42
+  }
+ },
+ "case_ids": {
+  "code": "40f3e982b689ad06",
+  "ifeval": "cad2673965ffb2d3",
+  "vi_knowledge": "0e2035626b05a6a9",
+  "tools_pos": "3858875218066be1",
+  "tools_neg": "f6b29f0bfc6a6d69",
+  "tools_xfer": "cf194c242de20e3b",
+  "faithfulness": "5cb605f0f0a48466",
+  "reason": "5b2c47bfd8ba6379"
+ },
+ "errors": [],
+ "vi_cjk_leaks": 0,
+ "uncensor": {
+  "harmful_refusals": 45,
+  "harmful_n": 50,
+  "harmless_refusals": 0,
+  "harmless_n": 50
+ },
+ "longctx": {
+  "needle": {
+   "120k": true,
+   "240k": false,
+   "480k": null,
+   "960k": null
+  },
+  "docqa": {
+   "docqa-0": true,
+   "docqa-1": true,
+   "docqa-2": true
+  },
+  "peak_wired_gib": 43.47,
+  "swapouts": 0
+ },
+ "speed": {
+  "total_seconds": {
+   "code": 1193.2,
+   "ifeval": 2816.5,
+   "vi": 626.6,
+   "uncensor": 1681.0
+  },
+  "think_tokens_median": 142.5,
+  "decode_tps_median": 42.89,
+  "prefill_tps_median": 118.06
+ },
+ "arm": "ivan",
+ "config": {
+  "name": "ivan",
+  "base": "registry",
+  "registry_model": "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2",
+  "model": "/Users/dongnh/orca/workspaces/ds4-metal-data/gguf/ivan/Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf",
+  "args_add": [],
+  "args_remove": [],
+  "env": {}
+ },
+ "suites_run": [
+  "code",
+  "ifeval",
+  "vi",
+  "uncensor",
+  "tools",
+  "longctx",
+  "reason"
+ ],
+ "provenance": {
+  "git_head": "c92b76ed6a651b442d77b209bd5e7040444103ab",
+  "git_dirty": false,
+  "gateway_head": "f56e587ce4a8fede5b76ff67dcb3688d6dccd99e",
+  "ds4_server_sha256": "ba4784c2acebec11a529c7b1035f08d4d3f8a86230f182bd6939830c592b5abc",
+  "ds4_eval_sha256": "e8cd9b550a2f72c775a1d762d0f623111f5992cea9cb8ee6977a67ae09e0bece",
+  "env": {
+   "DS4_QWEN4_STREAM_FULL_LAYERS": "32",
+   "DS4_QWEN4_PLE_PREFETCH_FULL": "0",
+   "DS4_QWEN4_MTP_DRAFT_VOCAB": "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt",
+   "DS4_QWEN4_KV_GROW": "1"
+  },
+  "argv": [
+   "/Users/dongnh/orca/workspaces/ds4-metal/kv-grow/ds4-server",
+   "--metal",
+   "-m",
+   "/Users/dongnh/orca/workspaces/ds4-metal-data/gguf/ivan/Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf",
+   "--ple",
+   "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf",
+   "-c",
+   "262144",
+   "--prefill-chunk",
+   "2048",
+   "--mtp",
+   "--ssd-streaming",
+   "--ssd-streaming-cache-experts",
+   "6GB",
+   "--kv-disk-dir",
+   "/Users/dongnh/orca/workspaces/ds4-metal-data/evals/nextgen/runs/ivan-20260928-210029/kv-lpqb4hnq",
+   "--kv-disk-space-mb",
+   "32768",
+   "--kv-cache-cold-max-tokens",
+   "262144",
+   "--think-budget",
+   "4096",
+   "--host",
+   "127.0.0.1",
+   "--port",
+   "18299"
+  ],
+  "data": {
+   "mbpp.jsonl": "831bc72948221d99982f69d095a2c03f299da7605e6b964df334f3b90562af94",
+   "ifeval.jsonl": "5369559660efd05088d76179aa24215d295712f4330b3bc0c5c64b6299a09328",
+   "harmful.jsonl": "73143c124365c6412af3c080336479308cf9beb13890a7113c17e5d6d06baa8c",
+   "harmless.jsonl": "055c3667efb019ab5378ab97e4cda7d18f5cc9fb8be2c92937b6f59b2ea28670",
+   "haystack.c": "714124ef847a814d91f56d5c368a5eec08a3206647ae702b2bc0e52297241644",
+   "mcp_tools.json": "07a050f22df4926d92319b604d6474ae0865a1180a5787b73a5d9b3e522a4d21"
+  }
+ }
+}

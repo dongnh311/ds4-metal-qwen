@@ -66,8 +66,10 @@ decodes sessions in order.
 
 Disk KV checkpoints include recurrent state. Rewinding to an earlier position
 replays the retained prefix on the next evaluation. The native context is
-262144 tokens; `DS4_QWEN4_YARN_FACTOR=2` or `=4` enables static YaRN for
-longer contexts, with a possible quality cost on shorter prompts.
+262144 tokens. A larger `-c` turns on static YaRN with the smallest power-of-two
+factor that covers it (2 for 524288, 4 for 1048576); `DS4_QWEN4_YARN_FACTOR=f`
+overrides the factor and `=1` turns YaRN off. YaRN may cost some quality on
+shorter prompts, so `-c 262144` stays unscaled.
 
 ## DGX Spark performance
 

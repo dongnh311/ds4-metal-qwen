@@ -2131,6 +2131,35 @@ static bool read_f32_binary_file(const char *path, float *data, uint64_t n) {
     return true;
 }
 
+int ds4_directional_steering_check_rows(const float *dirs, uint32_t n_rows, uint32_t width,
+                                        char *err, size_t errlen) {
+    for (uint32_t r = 0; r < n_rows; r++) {
+        double sum = 0.0;
+        for (uint32_t i = 0; i < width; i++) {
+            const float v = dirs[(uint64_t)r * width + i];
+            uint32_t bits;
+            memcpy(&bits, &v, sizeof(bits));
+            /* -ffast-math lets the compiler drop NaN tests, so read the exponent bits */
+            if ((bits & 0x7f800000u) == 0x7f800000u) {
+                if (err && errlen) {
+                    snprintf(err, errlen, "steering row for layer %u has a non-finite value", r);
+                }
+                return 1;
+            }
+            sum += (double)v * v;
+        }
+        const double norm = sqrt(sum);
+        if (norm == 0.0 || fabs(norm - 1.0) <= 1e-3) continue;
+        if (err && errlen) {
+            snprintf(err, errlen,
+                     "steering row for layer %u has norm %g; rows must be unit length or zero",
+                     r, norm);
+        }
+        return 1;
+    }
+    return 0;
+}
+
 static bool cpu_directional_steering_enabled(
         const float *dirs,
         float        scale);
@@ -7177,19 +7206,32 @@ static void config_read_qwen4_u64_array(
 
 static float g_qwen4_rope_freq[32];
 static float g_qwen4_rope_mscale = 1.0f;
+static float g_qwen4_rope_factor = 1.0f;
 static uint32_t g_qwen4_native_ctx = 0;
+/* The engine's context_size, set by ds4_engine_open before the model validates. */
+static uint32_t g_qwen4_rope_ctx_hint = 0;
 static bool g_qwen4_rope_yarn = false;
 
-/* Rotary inverse frequencies of the DS4_N_ROT/2 pairs.  DS4_QWEN4_YARN_FACTOR=f
- * (f > 1) applies static YaRN over the native context (HF
- * _compute_yarn_parameters with beta_fast 32 / beta_slow 1), the model card's
- * recipe for prompts beyond 262k tokens; it costs some quality on short text,
- * so it stays off unless asked for. */
-static void qwen4_rope_configure(uint32_t native_ctx) {
-    const uint32_t n_rot = DS4_N_ROT, half = n_rot / 2u;
-    const double base = DS4_ROPE_FREQ_BASE;
-    const char *env = getenv("DS4_QWEN4_YARN_FACTOR");
-    const double factor = env ? atof(env) : 0.0;
+double ds4_qwen4_yarn_env_factor(const char *env_value) {
+    if (!env_value || !env_value[0]) return 0.0;
+    char *end = NULL;
+    const double f = strtod(env_value, &end);
+    if (end == env_value || *end != '\0' || !(f > 0.0) || !isfinite(f)) return 0.0;
+    return f > 1.0 ? f : 1.0;
+}
+
+double ds4_qwen4_yarn_factor(uint32_t native_ctx, uint32_t context_size, const char *env_value) {
+    const double env = ds4_qwen4_yarn_env_factor(env_value);
+    if (env > 0.0) return env;
+    if (native_ctx == 0 || context_size <= native_ctx) return 1.0;
+    double f = 2.0;
+    while ((double)native_ctx * f < (double)context_size) f *= 2.0;
+    return f;
+}
+
+void ds4_qwen4_rope_table(uint32_t n_rot, double base, uint32_t native_ctx, double factor,
+                          float freq[32], float *mscale, double *low_out, double *high_out) {
+    const uint32_t half = n_rot / 2u;
     const bool yarn = factor > 1.0 && native_ctx > 0;
     double low = 0.0, high = 0.0;
     if (yarn) {
@@ -7203,17 +7245,39 @@ static void qwen4_rope_configure(uint32_t native_ctx) {
             const double extrap = 1.0 - fmin(1.0, fmax(0.0, ((double)i - low) / (high - low)));
             f = (f / factor) * (1.0 - extrap) + f * extrap;
         }
-        g_qwen4_rope_freq[i] = (float)f;
+        freq[i] = (float)f;
     }
-    g_qwen4_rope_mscale = yarn ? (float)(0.1 * log(factor) + 1.0) : 1.0f;
+    if (mscale) *mscale = yarn ? (float)(0.1 * log(factor) + 1.0) : 1.0f;
+    if (low_out) *low_out = low;
+    if (high_out) *high_out = high;
+}
+
+/* Static YaRN over the native context, the model card's recipe for prompts
+ * beyond 262k tokens. It is on when -c exceeds the native context (factor
+ * from ds4_qwen4_yarn_factor) or when DS4_QWEN4_YARN_FACTOR asks for it; it
+ * costs some quality on short text, so a context within the native one stays
+ * unscaled. */
+static void qwen4_rope_configure(uint32_t native_ctx) {
+    const char *env = getenv("DS4_QWEN4_YARN_FACTOR");
+    if (env && env[0] && ds4_qwen4_yarn_env_factor(env) == 0.0) {
+        fprintf(stderr, "ds4: ignoring DS4_QWEN4_YARN_FACTOR=\"%s\": not a finite positive number\n", env);
+    }
+    const double factor = ds4_qwen4_yarn_factor(native_ctx, g_qwen4_rope_ctx_hint, env);
+    const bool yarn = factor > 1.0 && native_ctx > 0;
+    double low = 0.0, high = 0.0;
+    ds4_qwen4_rope_table(DS4_N_ROT, DS4_ROPE_FREQ_BASE, native_ctx, factor,
+                         g_qwen4_rope_freq, &g_qwen4_rope_mscale, &low, &high);
     g_qwen4_native_ctx = native_ctx;
     g_qwen4_rope_yarn = yarn;
+    g_qwen4_rope_factor = yarn ? (float)factor : 1.0f;
     if (yarn) {
-        fprintf(stderr, "ds4: Qwen3.8 YaRN factor %g over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
-                factor, native_ctx, low, high, g_qwen4_rope_mscale);
+        const bool from_env = ds4_qwen4_yarn_env_factor(env) > 1.0;
+        fprintf(stderr, "ds4: Qwen3.8 YaRN factor %g (%s) over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
+                factor, from_env ? "DS4_QWEN4_YARN_FACTOR" : "from -c", native_ctx, low, high,
+                g_qwen4_rope_mscale);
     }
 #ifdef DS4_HAS_QWEN4_GPU
-    ds4_gpu_qwen4_set_rope(g_qwen4_rope_freq, half, g_qwen4_rope_mscale);
+    ds4_gpu_qwen4_set_rope(g_qwen4_rope_freq, DS4_N_ROT / 2u, g_qwen4_rope_mscale);
 #endif
 }
 
@@ -59977,8 +60041,10 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     static bool warned_ctx = false;
     if (!warned_ctx && g_qwen4_native_ctx && ctx_cap > g_qwen4_native_ctx && !g_qwen4_rope_yarn) {
         warned_ctx = true;
-        fprintf(stderr, "ds4: context %u exceeds the native %u tokens; prompts past that need "
-                "DS4_QWEN4_YARN_FACTOR (see README)\n", ctx_cap, g_qwen4_native_ctx);
+        fprintf(stderr, "ds4: context %u exceeds the native %u tokens and YaRN is off (the rope is set "
+                "when the model opens: open it with -c above %u or set DS4_QWEN4_YARN_FACTOR > 1); "
+                "prompts past %u tokens will degrade\n",
+                ctx_cap, g_qwen4_native_ctx, g_qwen4_native_ctx, g_qwen4_native_ctx);
     }
     g->sel_stride = g->k_blocks * 4u + 4u;
 
@@ -60121,6 +60187,12 @@ static bool qwen4_graph_load_steering(ds4_qwen4_gpu_graph *g,
     const uint64_t n = (uint64_t)n_layers * DS4_N_EMBD;
     float *dirs = xmalloc((size_t)n * sizeof(dirs[0]));
     bool ok = read_f32_binary_file(path, dirs, n);
+    char row_err[192];
+    if (ok && ds4_directional_steering_check_rows(dirs, n_layers, DS4_N_EMBD,
+                                                   row_err, sizeof(row_err)) != 0) {
+        fprintf(stderr, "ds4: %s: %s\n", path, row_err);
+        ok = false;
+    }
     if (ok) {
         g->steer_dirs = ds4_gpu_tensor_alloc(n * sizeof(dirs[0]));
         ok = g->steer_dirs != NULL &&
@@ -73517,6 +73589,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
+    g_qwen4_rope_ctx_hint = ds4_engine_rope_context(opt->context_size, opt->rope_context_size);
     config_validate_model(&e->model);
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
@@ -74806,6 +74879,21 @@ int ds4_engine_vocab_size(ds4_engine *e) {
 
 uint32_t ds4_engine_prefill_chunk(ds4_engine *e) {
     return e ? e->prefill_chunk : 0;
+}
+
+float ds4_engine_rope_yarn_factor(const ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_qwen4() && g_qwen4_rope_yarn ? g_qwen4_rope_factor : 1.0f;
+}
+
+uint32_t ds4_engine_native_context(const ds4_engine *e) {
+    (void)e;
+    return ds4_model_is_qwen4() ? g_qwen4_native_ctx : 0u;
+}
+
+uint32_t ds4_engine_rope_context(int context_size, int rope_context_size) {
+    if (rope_context_size > 0) return (uint32_t)rope_context_size;
+    return context_size > 0 ? (uint32_t)context_size : 0u;
 }
 
 int ds4_engine_power(ds4_engine *e) {

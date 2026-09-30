@@ -168,6 +168,7 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
         .continued_interval_tokens = KV_CACHE_DEFAULT_CONTINUED_INTERVAL_TOKENS,
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
+        .continued_dense_max_tokens = 0,
     };
 }
 
@@ -763,6 +764,10 @@ int ds4_kvstore_continued_store_target(const ds4_kvstore *kc, int live_tokens) {
     if (live_tokens < kc->opt.min_tokens) return 0;
     if (live_tokens % step != 0) return 0;
     if (live_tokens <= kc->continued_last_store_tokens) return 0;
+    if (kc->opt.continued_dense_max_tokens > 0 && live_tokens > kc->opt.continued_dense_max_tokens) {
+        const int q = live_tokens / step;
+        if (q & (q - 1)) return 0;   /* past the dense range: interval x 2^k only */
+    }
     return live_tokens;
 }
 
