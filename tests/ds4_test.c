@@ -7484,6 +7484,18 @@ static void test_quant_types(void) {
     uint32_t e = 0, b = 0;
     TEST_ASSERT(ds4_gguf_type_block(41, &e, &b) != 0);    /* no such type */
     TEST_ASSERT(ds4_gguf_type_block(1000, &e, &b) != 0);
+    /* first and last entries of the generated grid tables (ggml-common.h @931351ea) */
+    TEST_ASSERT(ds4_iq_table_entry("iq2xs", 0) == 0x0808080808080808ULL);
+    TEST_ASSERT(ds4_iq_table_entry("iq2xs", 511) == 0x2b2b2b2b2b2b2b2bULL);
+    TEST_ASSERT(ds4_iq_table_entry("iq2s", 0) == 0x0808080808080808ULL);
+    TEST_ASSERT(ds4_iq_table_entry("iq2s", 1023) == 0x2b2b2b2b2b2b2b2bULL);
+    TEST_ASSERT(ds4_iq_table_entry("iq3xxs", 0) == 0x04040404u);
+    TEST_ASSERT(ds4_iq_table_entry("iq3xxs", 255) == 0x3e341c04u);
+    TEST_ASSERT(ds4_iq_table_entry("iq3s", 0) == 0x01010101u);
+    TEST_ASSERT(ds4_iq_table_entry("iq3s", 511) == 0x0f0f0101u);
+    TEST_ASSERT(ds4_iq_table_entry("iq4nl", 0) == (uint64_t)(int64_t)-127);
+    TEST_ASSERT(ds4_iq_table_entry("iq4nl", 15) == 113u);
+    TEST_ASSERT(ds4_iq_table_entry("iq2xs", 512) == 0);   /* out of range */
 }
 
 static void test_qwen_yarn_policy(void) {

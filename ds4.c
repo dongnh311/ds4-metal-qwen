@@ -1338,6 +1338,9 @@ static void iq2xxs_signed_grid_init(void) {
     }
 }
 
+/* the GSQ-RCO grids: IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL/IQ4_XS */
+#include "ds4_iq_tables.h"
+
 static inline DS4_MAYBE_UNUSED int32_t dot_iq2_pair_16(const int8_t *grid0, const int8_t *grid1, const int8_t *q8) {
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_DOTPROD)
     const int8x16_t gv = vcombine_s8(vld1_s8(grid0), vld1_s8(grid1));
@@ -2586,6 +2589,15 @@ int ds4_gguf_type_block(uint32_t type, uint32_t *block_elems, uint32_t *block_by
     if (!info || info->block_elems == 0) return -1;
     if (block_elems) *block_elems = info->block_elems;
     if (block_bytes) *block_bytes = info->block_bytes;
+    return 0;
+}
+
+uint64_t ds4_iq_table_entry(const char *table, uint32_t i) {
+    if (!strcmp(table, "iq2xs") && i < 512) return iq2xs_grid[i];
+    if (!strcmp(table, "iq2s") && i < 1024) return iq2s_grid[i];
+    if (!strcmp(table, "iq3xxs") && i < 256) return iq3xxs_grid[i];
+    if (!strcmp(table, "iq3s") && i < 512) return iq3s_grid[i];
+    if (!strcmp(table, "iq4nl") && i < 16) return (uint64_t)(int64_t)kvalues_iq4nl[i];
     return 0;
 }
 
