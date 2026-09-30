@@ -11843,27 +11843,29 @@ static void kv_cache_close(kv_disk_cache *kc) {
  *   <dir>/steer-<sha8>          steered (sha1 of the direction bytes + "attn,ffn"),
  *   <dir>/yarn-<f>              YaRN factor f > 1,
  *   <dir>/steer-<sha8>-yarn-<f> both.
- * Returns false when the direction file cannot be read or the path does not
- * fit. */
-static bool kv_cache_variant_dir(const char *dir, const char *steer_file,
-                                 float attn_scale, float ffn_scale, double yarn_factor,
-                                 char *out, size_t outlen) {
+ * The status tells a direction file that cannot be read from a path that does
+ * not fit. */
+typedef enum { KV_DIR_OK = 0, KV_DIR_STEER_UNREADABLE, KV_DIR_TOO_LONG } kv_dir_status;
+
+static kv_dir_status kv_cache_variant_dir_status(const char *dir, const char *steer_file,
+                                                 float attn_scale, float ffn_scale, double yarn_factor,
+                                                 char *out, size_t outlen) {
     char steer[16] = "";
     if (steer_file && steer_file[0] && (attn_scale != 0.0f || ffn_scale != 0.0f)) {
         FILE *fp = fopen(steer_file, "rb");
-        if (!fp) return false;
+        if (!fp) return KV_DIR_STEER_UNREADABLE;
         long size = -1;
         if (fseek(fp, 0, SEEK_END) == 0) size = ftell(fp);
         if (size < 0 || fseek(fp, 0, SEEK_SET) != 0) {
             fclose(fp);
-            return false;
+            return KV_DIR_STEER_UNREADABLE;
         }
         char *buf = xmalloc((size_t)size + 64);
         const bool read_ok = fread(buf, 1, (size_t)size, fp) == (size_t)size;
         fclose(fp);
         if (!read_ok) {
             free(buf);
-            return false;
+            return KV_DIR_STEER_UNREADABLE;
         }
         size_t len = (size_t)size;
         len += (size_t)snprintf(buf + len, 64, "%g,%g", (double)attn_scale, (double)ffn_scale);
@@ -11879,7 +11881,14 @@ static bool kv_cache_variant_dir(const char *dir, const char *steer_file,
     else if (steer[0]) n = snprintf(out, outlen, "%s/%s", dir, steer);
     else if (rope[0]) n = snprintf(out, outlen, "%s/%s", dir, rope);
     else n = snprintf(out, outlen, "%s", dir);
-    return n >= 0 && n < (int)outlen;
+    return n >= 0 && n < (int)outlen ? KV_DIR_OK : KV_DIR_TOO_LONG;
+}
+
+static bool kv_cache_variant_dir(const char *dir, const char *steer_file,
+                                 float attn_scale, float ffn_scale, double yarn_factor,
+                                 char *out, size_t outlen) {
+    return kv_cache_variant_dir_status(dir, steer_file, attn_scale, ffn_scale, yarn_factor,
+                                       out, outlen) == KV_DIR_OK;
 }
 
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
@@ -16827,14 +16836,18 @@ int main(int argc, char **argv) {
 
     if (cfg.kv_disk_dir) {
         char kv_dir[4096];
-        if (!kv_cache_variant_dir(cfg.kv_disk_dir, cfg.engine.directional_steering_file,
-                                  cfg.engine.directional_steering_attn,
-                                  cfg.engine.directional_steering_ffn,
-                                  (double)ds4_engine_rope_yarn_factor(engine),
-                                  kv_dir, sizeof(kv_dir))) {
-            server_log(DS4_LOG_DEFAULT,
-                       "ds4-server: cannot key the kv cache: failed to read %s",
-                       cfg.engine.directional_steering_file);
+        const kv_dir_status st = kv_cache_variant_dir_status(
+            cfg.kv_disk_dir, cfg.engine.directional_steering_file,
+            cfg.engine.directional_steering_attn, cfg.engine.directional_steering_ffn,
+            (double)ds4_engine_rope_yarn_factor(engine), kv_dir, sizeof(kv_dir));
+        if (st != KV_DIR_OK) {
+            if (st == KV_DIR_STEER_UNREADABLE) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: cannot key the kv cache: failed to read %s",
+                           cfg.engine.directional_steering_file);
+            } else {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: cannot key the kv cache: the directory under %s "
+                           "is longer than %zu bytes", cfg.kv_disk_dir, sizeof(kv_dir) - 1);
+            }
             server_close_resources(&s);
             return 1;
         }
@@ -24595,6 +24608,12 @@ static void test_kv_cache_variant_dir(void) {
     TEST_ASSERT(strcmp(out, other) != 0);
     unlink(path);
     TEST_ASSERT(!kv_cache_variant_dir("/kv", path, 0.0f, 1.0f, 1.0, out, sizeof(out)));
+    TEST_ASSERT(kv_cache_variant_dir_status("/kv", path, 0.0f, 1.0f, 1.0, out, sizeof(out)) ==
+                KV_DIR_STEER_UNREADABLE);
+    char small[8];                                             /* "/kv/yarn-2" does not fit */
+    TEST_ASSERT(kv_cache_variant_dir_status("/kv", NULL, 0.0f, 1.0f, 2.0, small, sizeof(small)) ==
+                KV_DIR_TOO_LONG);
+    TEST_ASSERT(kv_cache_variant_dir_status("/kv", NULL, 0.0f, 1.0f, 2.0, out, sizeof(out)) == KV_DIR_OK);
 }
 
 static void ds4_server_unit_tests_run(void) {

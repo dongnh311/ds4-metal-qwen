@@ -7212,12 +7212,17 @@ static uint32_t g_qwen4_native_ctx = 0;
 static uint32_t g_qwen4_rope_ctx_hint = 0;
 static bool g_qwen4_rope_yarn = false;
 
+double ds4_qwen4_yarn_env_factor(const char *env_value) {
+    if (!env_value || !env_value[0]) return 0.0;
+    char *end = NULL;
+    const double f = strtod(env_value, &end);
+    if (end == env_value || *end != '\0' || !(f > 0.0) || !isfinite(f)) return 0.0;
+    return f > 1.0 ? f : 1.0;
+}
+
 double ds4_qwen4_yarn_factor(uint32_t native_ctx, uint32_t context_size, const char *env_value) {
-    if (env_value && env_value[0]) {
-        char *end = NULL;
-        const double f = strtod(env_value, &end);
-        if (end != env_value && *end == '\0' && f > 0.0) return f > 1.0 ? f : 1.0;
-    }
+    const double env = ds4_qwen4_yarn_env_factor(env_value);
+    if (env > 0.0) return env;
     if (native_ctx == 0 || context_size <= native_ctx) return 1.0;
     double f = 2.0;
     while ((double)native_ctx * f < (double)context_size) f *= 2.0;
@@ -7254,6 +7259,9 @@ void ds4_qwen4_rope_table(uint32_t n_rot, double base, uint32_t native_ctx, doub
  * unscaled. */
 static void qwen4_rope_configure(uint32_t native_ctx) {
     const char *env = getenv("DS4_QWEN4_YARN_FACTOR");
+    if (env && env[0] && ds4_qwen4_yarn_env_factor(env) == 0.0) {
+        fprintf(stderr, "ds4: ignoring DS4_QWEN4_YARN_FACTOR=\"%s\": not a finite positive number\n", env);
+    }
     const double factor = ds4_qwen4_yarn_factor(native_ctx, g_qwen4_rope_ctx_hint, env);
     const bool yarn = factor > 1.0 && native_ctx > 0;
     double low = 0.0, high = 0.0;
@@ -7263,7 +7271,7 @@ static void qwen4_rope_configure(uint32_t native_ctx) {
     g_qwen4_rope_yarn = yarn;
     g_qwen4_rope_factor = yarn ? (float)factor : 1.0f;
     if (yarn) {
-        const bool from_env = ds4_qwen4_yarn_factor(native_ctx, 0, env) > 1.0;
+        const bool from_env = ds4_qwen4_yarn_env_factor(env) > 1.0;
         fprintf(stderr, "ds4: Qwen3.8 YaRN factor %g (%s) over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
                 factor, from_env ? "DS4_QWEN4_YARN_FACTOR" : "from -c", native_ctx, low, high,
                 g_qwen4_rope_mscale);
@@ -60033,9 +60041,10 @@ static bool qwen4_graph_alloc(ds4_qwen4_gpu_graph *g, const ds4_weights *w, uint
     static bool warned_ctx = false;
     if (!warned_ctx && g_qwen4_native_ctx && ctx_cap > g_qwen4_native_ctx && !g_qwen4_rope_yarn) {
         warned_ctx = true;
-        fprintf(stderr, "ds4: context %u exceeds the native %u tokens and YaRN is off "
-                "(DS4_QWEN4_YARN_FACTOR <= 1); prompts past %u tokens will degrade\n",
-                ctx_cap, g_qwen4_native_ctx, g_qwen4_native_ctx);
+        fprintf(stderr, "ds4: context %u exceeds the native %u tokens and YaRN is off (the rope is set "
+                "when the model opens: open it with -c above %u or set DS4_QWEN4_YARN_FACTOR > 1); "
+                "prompts past %u tokens will degrade\n",
+                ctx_cap, g_qwen4_native_ctx, g_qwen4_native_ctx, g_qwen4_native_ctx);
     }
     g->sel_stride = g->k_blocks * 4u + 4u;
 

@@ -249,10 +249,13 @@ void ds4_engine_summary(ds4_engine *e);
 int ds4_engine_vocab_size(ds4_engine *e);
 uint32_t ds4_engine_prefill_chunk(ds4_engine *e);
 /* Qwen3.8 static YaRN. The factor is DS4_QWEN4_YARN_FACTOR when that parses
- * as a positive number (<= 1 turns YaRN off); otherwise the smallest power of
- * two covering context_size / native_ctx when the context exceeds the native
- * one, else 1 (off). */
+ * as a finite positive number (<= 1 turns YaRN off); otherwise the smallest
+ * power of two covering context_size / native_ctx when the context exceeds the
+ * native one, else 1 (off). */
 double ds4_qwen4_yarn_factor(uint32_t native_ctx, uint32_t context_size, const char *env_value);
+/* The factor DS4_QWEN4_YARN_FACTOR asks for (>= 1), or 0 when the value is
+ * unset or unusable (the engine warns and ignores it). */
+double ds4_qwen4_yarn_env_factor(const char *env_value);
 /* Rotary inverse frequencies of the n_rot/2 pairs (entries past n_rot/2 are 0),
  * with HF _compute_yarn_parameters blending (beta_fast 32, beta_slow 1) when
  * factor > 1 and native_ctx > 0. mscale, low and high may be NULL. */

@@ -7481,6 +7481,17 @@ static void test_qwen_yarn_policy(void) {
     TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "junk") == 2.0); /* unparsable = unset */
     TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "2x") == 2.0);
     TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "0") == 2.0);    /* not positive = unset */
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "inf") == 2.0);  /* not finite = unset */
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 8192, "1e999") == 1.0);
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 524288, "nan") == 2.0);
+    /* The env value alone: 0 when unusable (the engine then warns and ignores it). */
+    TEST_ASSERT(ds4_qwen4_yarn_env_factor(NULL) == 0.0);
+    TEST_ASSERT(ds4_qwen4_yarn_env_factor("") == 0.0);
+    TEST_ASSERT(ds4_qwen4_yarn_env_factor("2x") == 0.0);
+    TEST_ASSERT(ds4_qwen4_yarn_env_factor("inf") == 0.0);
+    TEST_ASSERT(ds4_qwen4_yarn_env_factor("-2") == 0.0);
+    TEST_ASSERT(ds4_qwen4_yarn_env_factor("0.5") == 1.0);              /* usable: forces YaRN off */
+    TEST_ASSERT(ds4_qwen4_yarn_env_factor("4") == 4.0);
 
     /* The table: factor 1 is plain RoPE, factor 2 blends pairs 14..22 (HF, base 1e7, 64 dims). */
     float plain[32], yarn[32], ms = 0.0f;
