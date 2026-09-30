@@ -11884,7 +11884,7 @@ static kv_dir_status kv_cache_variant_dir_status(const char *dir, const char *st
     return n >= 0 && n < (int)outlen ? KV_DIR_OK : KV_DIR_TOO_LONG;
 }
 
-static bool kv_cache_variant_dir(const char *dir, const char *steer_file,
+static DS4_SERVER_MAYBE_UNUSED bool kv_cache_variant_dir(const char *dir, const char *steer_file,
                                  float attn_scale, float ffn_scale, double yarn_factor,
                                  char *out, size_t outlen) {
     return kv_cache_variant_dir_status(dir, steer_file, attn_scale, ffn_scale, yarn_factor,
