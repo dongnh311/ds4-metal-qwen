@@ -59621,7 +59621,26 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
 static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS;
+           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS || qwen4_graph_gsq_ok(type);
+}
+
+/* GSQ-RCO and BF16 dense rows take the tiled dense GEMM once a batch has more
+ * than 8 rows; the multi-row gemv reads their weights once per token.
+ * Decode and MTP verify rows keep the gemv. */
+static bool qwen4_dense_mm_rows_ok(uint32_t type, uint32_t n_tok, uint64_t in_dim) {
+#ifdef DS4_HAS_QWEN4_METAL
+    if (n_tok <= 8u || (in_dim % 8u) != 0 || in_dim > UINT32_MAX) return false;
+    if (type == DS4_TENSOR_BF16) return true;
+    return qwen4_graph_gsq_ok(type) && tensor_type(type) && (in_dim % tensor_type(type)->block_elems) == 0;
+#else
+    (void)type; (void)n_tok; (void)in_dim;
+    return false;
+#endif
+}
+
+int ds4_test_qwen4_expert_has_mm(uint32_t type) { return qwen4_expert_type_has_mm(type) ? 1 : 0; }
+int ds4_test_qwen4_dense_mm_rows(uint32_t type, uint32_t n_tok, uint64_t in_dim) {
+    return qwen4_dense_mm_rows_ok(type, n_tok, in_dim) ? 1 : 0;
 }
 
 static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
@@ -60379,6 +60398,11 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
         n_tok <= 64u && (out_dim <= 512u || n_tok > 8u);
     if (((n_tok > 8u && w->type == DS4_TENSOR_F32) || f16_batch) &&
         (in_dim % 32) == 0) {
+        rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset, w->type, n_tok,
+                                           (uint32_t)in_dim, (uint32_t)out_dim);
+        if (rc) return true;
+    }
+    if (!legacy && qwen4_dense_mm_rows_ok(w->type, n_tok, in_dim)) {
         rc = ds4_gpu_qwen4_dense_mm_tensor(out, x, m->map, m->size, w->abs_offset, w->type, n_tok,
                                            (uint32_t)in_dim, (uint32_t)out_dim);
         if (rc) return true;

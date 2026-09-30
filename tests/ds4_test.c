@@ -7886,6 +7886,20 @@ static void test_quant_types(void) {
         TEST_ASSERT(!ds4_test_routed_expert_type_ok(gsq[i], 0));
     }
     TEST_ASSERT(ds4_test_routed_expert_type_ok(16, 0) && ds4_test_routed_expert_type_ok(16, 1));   /* IQ2_XXS */
+#if defined(__APPLE__)
+    /* prefill routing: GSQ-RCO experts take the tiled MoE GEMM, GSQ-RCO and BF16 dense rows the
+     * tiled dense GEMM above 8 rows; PROD's types keep their kernels */
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(16) == 1);
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(18) == 1);
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(42) == 1);
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(30) == 0);
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 40, 2560) == 1);
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(30, 40, 2560) == 1);
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 8, 2560) == 0);   /* decode and MTP verify rows */
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 40, 2600) == 0);  /* not whole super-blocks */
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(8, 40, 2560) == 0);   /* Q8_0 keeps its kernels */
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(12, 40, 2560) == 0);  /* Q4_K keeps the ggml GEMM */
+#endif
     TEST_ASSERT(ds4_gguf_type_block(41, &e, &b) != 0);    /* not in ds4's table (upstream Q1_0) */
     TEST_ASSERT(ds4_gguf_type_block(1000, &e, &b) != 0);
     /* first and last entries of the generated grid tables (ggml-common.h @931351ea) */

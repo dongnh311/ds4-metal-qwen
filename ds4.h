@@ -267,6 +267,8 @@ int ds4_dequant_row(uint32_t type, const void *src, uint64_t n, float *out);
 /* Test hook: 1 when the loader accepts `type` for routed experts of Qwen3.8
  * (qwen4 != 0) or of the DeepSeek/GLM/DSpark families. */
 int ds4_test_routed_expert_type_ok(uint32_t type, int qwen4);
+int ds4_test_qwen4_expert_has_mm(uint32_t type);
+int ds4_test_qwen4_dense_mm_rows(uint32_t type, uint32_t n_tok, uint64_t in_dim);
 /* Rotary inverse frequencies of the n_rot/2 pairs (entries past n_rot/2 are 0),
  * with HF _compute_yarn_parameters blending (beta_fast 32, beta_slow 1) when
  * factor > 1 and native_ctx > 0. mscale, low and high may be NULL. */
