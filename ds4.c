@@ -59602,9 +59602,20 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t mtp_h_rows;
 } ds4_qwen4_gpu_graph;
 
+/* GSQ-RCO types in the Metal graph: qwen4_row_dot has them; CUDA does not. */
+static bool qwen4_graph_gsq_ok(uint32_t type) {
+#ifdef DS4_HAS_QWEN4_METAL
+    return qwen4_type_is_gsq(type);
+#else
+    (void)type;
+    return false;
+#endif
+}
+
 static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_F32 ||
-                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_Q4_K);
+                 t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_Q4_0 || t->type == DS4_TENSOR_Q4_K ||
+                 qwen4_graph_gsq_ok(t->type));
 }
 
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
@@ -59617,14 +59628,22 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
     return t && (t->type == DS4_TENSOR_Q8_0 || t->type == DS4_TENSOR_MXFP4 || t->type == DS4_TENSOR_Q4_0 ||
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
-                  (t->dim[0] % 256u) == 0));
+                  (t->dim[0] % 256u) == 0) ||
+                 (qwen4_graph_gsq_ok(t->type) && tensor_type(t->type) &&
+                  (t->dim[0] % tensor_type(t->type)->block_elems) == 0));
 }
 
 /* The Metal graph runs a subset of what the loader accepts. */
 static bool qwen4_graph_weights_supported(const ds4_weights *w) {
     if (!qwen4_graph_dense_ok(w->token_embd) || !qwen4_graph_dense_ok(w->output) ||
         !qwen4_graph_dense_ok(w->output_hc_down) || !qwen4_graph_dense_ok(w->output_hc_up)) {
-        fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights\n");
+        fprintf(stderr, "ds4: Qwen3.8 GPU graph needs Q8_0/Q4_0/F16/BF16/F32 dense weights, or a GSQ-RCO type\n");
+        return false;
+    }
+    /* decode rows mix through the hc gate kernel, which reads F16/F32/Q8_0 only */
+    if (w->output_hc_up->type != DS4_TENSOR_F16 && w->output_hc_up->type != DS4_TENSOR_F32 &&
+        w->output_hc_up->type != DS4_TENSOR_Q8_0) {
+        fprintf(stderr, "ds4: Qwen3.8 GPU graph needs F16/F32/Q8_0 output hc up weights\n");
         return false;
     }
     if (!w->ple_embd || (w->ple_embd->type != DS4_TENSOR_BF16 &&
@@ -60394,6 +60413,9 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     case DS4_TENSOR_F32:  rc = ds4_gpu_matmul_f32_tensor(out, m->map, m->size, w->abs_offset, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_Q4_0: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_Q4_K: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
+    case DS4_TENSOR_Q5_K: case DS4_TENSOR_Q6_K: case DS4_TENSOR_IQ2_XS: case DS4_TENSOR_IQ2_S:
+    case DS4_TENSOR_IQ3_XXS: case DS4_TENSOR_IQ3_S: case DS4_TENSOR_IQ4_NL: case DS4_TENSOR_IQ4_XS:
+    case DS4_TENSOR_Q2_0:
     case DS4_TENSOR_BF16: {
         ds4_gpu_tensor *outs[1] = { out };
         const uint64_t offs[1] = { w->abs_offset };
@@ -61167,9 +61189,10 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
     /* A decode batch runs the shared expert as dense projections over its
      * rows, as the prefill path does: as a slot of the per-token kernels it
      * is read once per row, 5 MB of Q8 per row and layer.  Single tokens and
-     * verify rows keep the slot. */
+     * verify rows keep the slot, unless the shared gate and up differ in type:
+     * the slot kernels take one type for both (GSQ-RCO files mix them). */
 #ifdef DS4_HAS_QWEN4_METAL
-    const bool shared_dense = T > 8u &&
+    const bool shared_dense = (T > 8u || l->ffn_gate_shexp->type != l->ffn_up_shexp->type) &&
         qwen4_graph_dense_ok(l->ffn_gate_shexp) && qwen4_graph_dense_ok(l->ffn_up_shexp) &&
         qwen4_graph_dense_ok(l->ffn_down_shexp);
 #else
