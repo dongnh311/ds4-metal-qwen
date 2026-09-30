@@ -11836,39 +11836,50 @@ static void kv_cache_close(kv_disk_cache *kc) {
     ds4_kvstore_close(kc);
 }
 
-/* Cached KV written with directional steering encodes the edited residual
- * stream: it must never be restored without that steering, or with another
- * direction or scale. A steered server therefore keeps its disk cache in
- * <dir>/steer-<sha8>, keyed by the direction bytes and both scales; without
- * steering the directory is <dir> itself. Returns false when the direction
- * file cannot be read or the path does not fit. */
-static bool kv_cache_steering_dir(const char *dir, const char *steer_file,
-                                  float attn_scale, float ffn_scale,
-                                  char *out, size_t outlen) {
-    if (!steer_file || !steer_file[0] || (attn_scale == 0.0f && ffn_scale == 0.0f)) {
-        return snprintf(out, outlen, "%s", dir) < (int)outlen;
-    }
-    FILE *fp = fopen(steer_file, "rb");
-    if (!fp) return false;
-    long size = -1;
-    if (fseek(fp, 0, SEEK_END) == 0) size = ftell(fp);
-    if (size < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+/* Cached KV encodes the residual stream and the rope it was computed with: it
+ * must never be restored under other steering (direction or scale) or another
+ * YaRN factor. The disk cache therefore lives in
+ *   <dir>                       plain,
+ *   <dir>/steer-<sha8>          steered (sha1 of the direction bytes + "attn,ffn"),
+ *   <dir>/yarn-<f>              YaRN factor f > 1,
+ *   <dir>/steer-<sha8>-yarn-<f> both.
+ * Returns false when the direction file cannot be read or the path does not
+ * fit. */
+static bool kv_cache_variant_dir(const char *dir, const char *steer_file,
+                                 float attn_scale, float ffn_scale, double yarn_factor,
+                                 char *out, size_t outlen) {
+    char steer[16] = "";
+    if (steer_file && steer_file[0] && (attn_scale != 0.0f || ffn_scale != 0.0f)) {
+        FILE *fp = fopen(steer_file, "rb");
+        if (!fp) return false;
+        long size = -1;
+        if (fseek(fp, 0, SEEK_END) == 0) size = ftell(fp);
+        if (size < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+            fclose(fp);
+            return false;
+        }
+        char *buf = xmalloc((size_t)size + 64);
+        const bool read_ok = fread(buf, 1, (size_t)size, fp) == (size_t)size;
         fclose(fp);
-        return false;
-    }
-    char *buf = xmalloc((size_t)size + 64);
-    const bool read_ok = fread(buf, 1, (size_t)size, fp) == (size_t)size;
-    fclose(fp);
-    if (!read_ok) {
+        if (!read_ok) {
+            free(buf);
+            return false;
+        }
+        size_t len = (size_t)size;
+        len += (size_t)snprintf(buf + len, 64, "%g,%g", (double)attn_scale, (double)ffn_scale);
+        char sha[41];
+        ds4_kvstore_sha1_bytes_hex(buf, len, sha);
         free(buf);
-        return false;
+        snprintf(steer, sizeof(steer), "steer-%.8s", sha);
     }
-    size_t len = (size_t)size;
-    len += (size_t)snprintf(buf + len, 64, "%g,%g", (double)attn_scale, (double)ffn_scale);
-    char sha[41];
-    ds4_kvstore_sha1_bytes_hex(buf, len, sha);
-    free(buf);
-    return snprintf(out, outlen, "%s/steer-%.8s", dir, sha) < (int)outlen;
+    char rope[32] = "";
+    if (yarn_factor > 1.0) snprintf(rope, sizeof(rope), "yarn-%g", yarn_factor);
+    int n;
+    if (steer[0] && rope[0]) n = snprintf(out, outlen, "%s/%s-%s", dir, steer, rope);
+    else if (steer[0]) n = snprintf(out, outlen, "%s/%s", dir, steer);
+    else if (rope[0]) n = snprintf(out, outlen, "%s/%s", dir, rope);
+    else n = snprintf(out, outlen, "%s", dir);
+    return n >= 0 && n < (int)outlen;
 }
 
 static char *render_tokens_text(ds4_engine *engine, const ds4_tokens *tokens, size_t *out_len) {
@@ -16816,10 +16827,11 @@ int main(int argc, char **argv) {
 
     if (cfg.kv_disk_dir) {
         char kv_dir[4096];
-        if (!kv_cache_steering_dir(cfg.kv_disk_dir, cfg.engine.directional_steering_file,
-                                   cfg.engine.directional_steering_attn,
-                                   cfg.engine.directional_steering_ffn,
-                                   kv_dir, sizeof(kv_dir))) {
+        if (!kv_cache_variant_dir(cfg.kv_disk_dir, cfg.engine.directional_steering_file,
+                                  cfg.engine.directional_steering_attn,
+                                  cfg.engine.directional_steering_ffn,
+                                  (double)ds4_engine_rope_yarn_factor(engine),
+                                  kv_dir, sizeof(kv_dir))) {
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: cannot key the kv cache: failed to read %s",
                        cfg.engine.directional_steering_file);
@@ -16827,8 +16839,9 @@ int main(int argc, char **argv) {
             return 1;
         }
         if (strcmp(kv_dir, cfg.kv_disk_dir) != 0) {
-            server_log(DS4_LOG_DEFAULT, "ds4-server: steered kv cache directory %s", kv_dir);
+            server_log(DS4_LOG_DEFAULT, "ds4-server: keyed kv cache directory %s", kv_dir);
         }
+        cfg.kv_cache.continued_dense_max_tokens = (int)ds4_engine_native_context(engine);
         kv_cache_open(&s.kv, kv_dir, cfg.kv_disk_space_mb,
                       cfg.kv_cache_reject_different_quant, cfg.kv_cache);
     }
@@ -24554,30 +24567,38 @@ static void test_ornith_model_ids(void) {
     g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
 }
 
-static void test_kv_cache_steering_dir(void) {
+static void test_kv_cache_variant_dir(void) {
     char out[4096], other[4096];
-    TEST_ASSERT(kv_cache_steering_dir("/kv", NULL, 0.0f, 1.0f, out, sizeof(out)));
+    TEST_ASSERT(kv_cache_variant_dir("/kv", NULL, 0.0f, 1.0f, 1.0, out, sizeof(out)));
     TEST_ASSERT(!strcmp(out, "/kv"));
+    TEST_ASSERT(kv_cache_variant_dir("/kv", NULL, 0.0f, 1.0f, 2.0, out, sizeof(out)));
+    TEST_ASSERT(!strcmp(out, "/kv/yarn-2"));                   /* the rope is part of the key */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", NULL, 0.0f, 1.0f, 4.0, other, sizeof(other)));
+    TEST_ASSERT(!strcmp(other, "/kv/yarn-4"));
     char path[] = "/tmp/ds4-steer-key-XXXXXX";
     const int fd = mkstemp(path);
     TEST_ASSERT(fd >= 0);
     if (fd < 0) return;
     TEST_ASSERT(write(fd, "abcdefgh", 8) == 8);
     close(fd);
-    TEST_ASSERT(kv_cache_steering_dir("/kv", path, 0.0f, 0.0f, out, sizeof(out)));
-    TEST_ASSERT(!strcmp(out, "/kv"));                    /* zero scales steer nothing */
-    TEST_ASSERT(kv_cache_steering_dir("/kv", path, 0.0f, 1.0f, out, sizeof(out)));
-    TEST_ASSERT(!strcmp(out, "/kv/steer-f113dc51"));     /* sha1("abcdefgh" "0,1") */
-    TEST_ASSERT(kv_cache_steering_dir("/kv", path, 0.0f, 1.5f, other, sizeof(other)));
-    TEST_ASSERT(!strcmp(other, "/kv/steer-9cdec1ad"));   /* the scale is part of the key */
-    TEST_ASSERT(kv_cache_steering_dir("/kv", path, 0.5f, 0.0f, other, sizeof(other)));
-    TEST_ASSERT(!strcmp(other, "/kv/steer-4bfb0ebf"));   /* attention-only steering is steering */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 0.0f, 1.0, out, sizeof(out)));
+    TEST_ASSERT(!strcmp(out, "/kv"));                          /* zero scales steer nothing */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 1.0f, 1.0, out, sizeof(out)));
+    TEST_ASSERT(!strcmp(out, "/kv/steer-f113dc51"));           /* sha1("abcdefgh" "0,1") */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 1.5f, 1.0, other, sizeof(other)));
+    TEST_ASSERT(!strcmp(other, "/kv/steer-9cdec1ad"));         /* the scale is part of the key */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.5f, 0.0f, 1.0, other, sizeof(other)));
+    TEST_ASSERT(!strcmp(other, "/kv/steer-4bfb0ebf"));         /* attention-only steering is steering */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 1.0f, 2.0, out, sizeof(out)));
+    TEST_ASSERT(!strcmp(out, "/kv/steer-f113dc51-yarn-2"));    /* steering and rope together */
+    TEST_ASSERT(kv_cache_variant_dir("/kv", path, 0.0f, 1.0f, 4.0, other, sizeof(other)));
+    TEST_ASSERT(strcmp(out, other) != 0);
     unlink(path);
-    TEST_ASSERT(!kv_cache_steering_dir("/kv", path, 0.0f, 1.0f, out, sizeof(out)));
+    TEST_ASSERT(!kv_cache_variant_dir("/kv", path, 0.0f, 1.0f, 1.0, out, sizeof(out)));
 }
 
 static void ds4_server_unit_tests_run(void) {
-    test_kv_cache_steering_dir();
+    test_kv_cache_variant_dir();
     test_deepseek41_server_stream();
     test_deepseek41_server_tools();
     test_deepseek41_anthropic_results();
