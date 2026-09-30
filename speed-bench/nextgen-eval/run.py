@@ -64,6 +64,10 @@ def summarize(rows):
             uncensor[kind + "_n"] = len(kind_rows)
     needle = {r["id"][len("needle-"):]: r["passed"] for r in rows
               if r["suite"] == "longctx" and r["id"].startswith("needle-")}
+    short_tiers = sorted(r["id"][len("needle-"):] for r in rows
+                         if r["suite"] == "longctx" and r["id"].startswith("needle-")
+                         and r.get("prompt_tokens") and r.get("target_tokens")
+                         and r["prompt_tokens"] < eval_suites.SHORT_TIER * r["target_tokens"])
     mem = next((r for r in rows if r["suite"] == "longctx_mem"), {})
     totals = {}
     for r in rows:
@@ -76,7 +80,8 @@ def summarize(rows):
         "errors": [{"suite": r["suite"], "error": r.get("error")} for r in rows if r.get("id") == "suite-error"],
         "vi_cjk_leaks": sum(1 for r in vi_rows if (r.get("cjk") or 0) > 0) if vi_rows else None,
         "uncensor": uncensor,
-        "longctx": {"needle": needle, "docqa": docqa, "peak_wired_gib": mem.get("peak_wired_gib"), "swapouts": mem.get("swapouts")},
+        "longctx": {"needle": needle, "docqa": docqa, "peak_wired_gib": mem.get("peak_wired_gib"),
+                    "swapouts": mem.get("swapouts"), "short_tiers": short_tiers},
         "speed": {"total_seconds": totals,
                   "think_tokens_median": _median([r.get("think_tokens") for r in rows]),
                   "decode_tps_median": _median([r.get("decode_tps") for r in rows]),

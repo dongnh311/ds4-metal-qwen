@@ -175,6 +175,12 @@ class Gate(unittest.TestCase):
         self.assertIn("Chào anh", md)
         self.assertNotIn("no", md.split("vi-w01")[0])
 
+    def test_markdown_lists_short_tiers(self):
+        c = candidate()
+        c["longctx"]["short_tiers"] = ["480k"]
+        md = compare.render_markdown(BASE, c, compare.gate(BASE, c))
+        self.assertIn("| short tiers | none | 480k |", md)
+
     def test_markdown_has_verdict_and_rows(self):
         md = compare.render_markdown(BASE, candidate(), compare.gate(BASE, candidate()))
         self.assertIn("**Gate: PASS**", md)

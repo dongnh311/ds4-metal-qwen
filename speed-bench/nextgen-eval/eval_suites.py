@@ -29,9 +29,14 @@ DOC_QA = [
     ("In the C source above, what size in bytes does the static assert give for block_iq2_xxs? "
      "Reply with the number only.", "66"),
 ]
-# The 128K / 256K / 512K / 1M tiers, with margin for the tokenizer ratio's spread.
-TIERS = [("120k", 120000), ("240k", 240000), ("480k", 480000), ("960k", 960000)]
+# The 128K / 256K / 512K / 1M tiers as (label, target tokens, haystack characters). 120k/240k keep
+# tokens x CHARS_PER_TOKEN (measured on the head of ds4.c), so earlier rows stay comparable. Deeper text
+# tokenizes at ~3.6 chars/token, so 480k/960k are calibrated by calibrate_tiers.py (2026-09-30, the chat
+# template of `ds4 --dump-tokens`: 1,728,000 chars = 480,431 tokens; 3,509,226 chars = 959,948 tokens).
+TIERS = [("120k", 120000, 363600), ("240k", 240000, 727200),
+         ("480k", 480000, 1728000), ("960k", 960000, 3509226)]
 CHARS_PER_TOKEN = 3.03  # measured 2026-09-23: 685K characters of ds4.c = 226,292 tokens
+SHORT_TIER = 0.95  # a needle prompt more than 5% under its target is reported as short
 CTX_MARGIN = 8192
 SPEED_KEYS = ("seconds", "prefill_s", "prefill_tps", "think_tokens", "gen_tokens", "decode_tps", "finish",
               "total_s")
@@ -202,14 +207,13 @@ def run_tools(ctx):
 HAYSTACK = "haystack.c"  # ds4.c frozen by fetch_data.py: later sub-projects edit ds4.c on this branch
 
 
-def haystack(path, tokens, depth=0.5):
-    """The first tokens*CHARS_PER_TOKEN characters of the frozen ds4.c, with the needle at `depth`."""
+def haystack(path, chars, depth=0.5):
+    """The first `chars` characters of the frozen ds4.c, with the needle at `depth`."""
     src = pathlib.Path(path).read_text(errors="replace")
-    n = int(tokens * CHARS_PER_TOKEN)
-    if n > len(src):
-        raise ValueError("%s has %d characters, need %d" % (path, len(src), n))
-    text = src[:n]
-    cut = text.rfind("\n", 0, int(n * depth)) + 1
+    if chars > len(src):
+        raise ValueError("%s has %d characters, need %d" % (path, len(src), chars))
+    text = src[:chars]
+    cut = text.rfind("\n", 0, int(chars * depth)) + 1
     return text[:cut] + NEEDLE + text[cut:]
 
 
@@ -220,16 +224,17 @@ def run_longctx(ctx):
     sampler = ctx.sampler_factory()
     sampler.start()
     try:
-        for label, tokens in TIERS:
+        for label, tokens, chars in TIERS:
             if tokens + CTX_MARGIN > ctx.ctx_limit:
                 yield ({"suite": "longctx", "id": "needle-" + label, "passed": None,
                              "skipped": "ctx limit %d" % ctx.ctx_limit})
                 continue
-            doc = "Here is a C source file.\n\n" + haystack(source, tokens) + "\n\n"
+            doc = "Here is a C source file.\n\n" + haystack(source, chars) + "\n\n"
             r = ctx.ask(doc + NEEDLE_Q, max_tokens=512, extra=NO_THINK)
             yield (dict(_speed(r), suite="longctx", id="needle-" + label,
                              passed=graders.needle_hit(r["content"], NEEDLE_VALUE),
-                             prompt_tokens=r["usage"].get("prompt_tokens"), answer=r["content"][:200]))
+                             prompt_tokens=r["usage"].get("prompt_tokens"), target_tokens=tokens,
+                             answer=r["content"][:200]))
             if label == "240k":
                 for j, (question, value) in enumerate(DOC_QA):
                     r = ctx.ask(doc + question, max_tokens=512, extra=NO_THINK)

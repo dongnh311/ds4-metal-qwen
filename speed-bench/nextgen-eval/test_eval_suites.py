@@ -174,6 +174,23 @@ class Suites(unittest.TestCase):
         self.assertEqual(ids["docqa-2"], True)
         self.assertEqual(ids["needle-240k"], True)
 
+    def test_tiers_keep_the_old_sizes_and_calibrate_the_deep_ones(self):
+        tiers = {label: (tokens, chars) for label, tokens, chars in eval_suites.TIERS}
+        self.assertEqual(tiers["120k"], (120000, 363600))   # tokens x 3.03, unchanged
+        self.assertEqual(tiers["240k"], (240000, 727200))
+        self.assertEqual(tiers["480k"][0], 480000)
+        self.assertEqual(tiers["960k"][0], 960000)
+        self.assertTrue(1_650_000 <= tiers["480k"][1] <= 1_800_000)  # ~3.6 chars/token deep in ds4.c
+        self.assertTrue(3_400_000 <= tiers["960k"][1] <= 3_700_000)
+
+    def test_needle_rows_carry_their_target(self):
+        src = self.data / eval_suites.HAYSTACK
+        src.write_text("x = 1;\n" * 700000)
+        rows = list(eval_suites.run_longctx(FakeCtx(self.data, lambda p: "7314-QX", ctx_limit=262144)))
+        needles = [r for r in rows if r["id"].startswith("needle-") and r.get("passed") is not None]
+        self.assertEqual([(r["id"], r["target_tokens"]) for r in needles],
+                         [("needle-120k", 120000), ("needle-240k", 240000)])
+
     def test_haystack_puts_needle_mid_document(self):
         self._haystack()
         doc = eval_suites.haystack(self.data / eval_suites.HAYSTACK, 10000)

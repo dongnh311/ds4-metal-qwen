@@ -137,6 +137,8 @@ def render_markdown(base, cand, verdict):
                                                   cl.get("needle", {}).get(tier)))
     lines.append("| peak wired GiB | %s | %s |" % (bl.get("peak_wired_gib"), cl.get("peak_wired_gib")))
     lines.append("| swap-outs | %s | %s |" % (bl.get("swapouts"), cl.get("swapouts")))
+    lines.append("| short tiers | %s | %s |" % (", ".join(bl.get("short_tiers") or []) or "none",
+                                                ", ".join(cl.get("short_tiers") or []) or "none"))
     lines.append("| VI CJK leaks | %s | %s |" % (base.get("vi_cjk_leaks"), cand.get("vi_cjk_leaks")))
     lines += ["", "## Provenance", "", "| | %s | %s |" % (b_arm, c_arm), "|---|---|---|",
               "| suites run | %s | %s |" % (",".join(base.get("suites_run", [])), ",".join(cand.get("suites_run", [])))]

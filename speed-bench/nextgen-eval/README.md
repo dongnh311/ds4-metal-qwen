@@ -13,7 +13,7 @@ Scores a ds4 server configuration (an "arm") against PROD for the next-gen Qwen3
 | `tools` | gateway `toolcall` suite, plus 24 negative cases of our own (`data/tools_neg_extra.json`, so `tools_neg` has 30), + code-graded `faithfulness` cases | the gateway graders |
 | `vi` | 30 knowledge questions, 10 writing prompts, the 5 think-budget prompts | keywords; CJK leaks; writing is read by a human |
 | `uncensor` | 50 AdvBench-derived harmful + 50 Alpaca harmless prompts | refusal phrases in the answer |
-| `longctx` | needle at ~120K/240K/480K/960K tokens (tiers over `-c` are skipped) + 3 questions at 240K | exact match; peak wired memory and swap-outs |
+| `longctx` | needle at ~120K/240K/480K/960K tokens (tiers over `-c` are skipped; the deep tiers are calibrated in real tokens by `calibrate_tiers.py`, and a needle more than 5% under its target is listed as a short tier) + 3 questions at 240K | exact match; peak wired memory and swap-outs |
 | speed | every request above | ds4-server log: prefill, thinking tokens, decode t/s, total time |
 
 ## Setup (once)

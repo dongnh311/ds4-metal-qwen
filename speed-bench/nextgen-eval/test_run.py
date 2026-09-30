@@ -28,6 +28,14 @@ ROWS = [
 
 
 class Summarize(unittest.TestCase):
+    def test_short_tiers_flag_needles_more_than_5_percent_under_target(self):
+        rows = [{"suite": "longctx", "id": "needle-240k", "passed": True, "prompt_tokens": 239714,
+                 "target_tokens": 240000},
+                {"suite": "longctx", "id": "needle-480k", "passed": True, "prompt_tokens": 415227,
+                 "target_tokens": 480000},
+                {"suite": "longctx", "id": "needle-960k", "passed": None, "skipped": "ctx limit 524288"}]
+        self.assertEqual(run.summarize(rows)["longctx"]["short_tiers"], ["480k"])
+
     def test_summary_shape(self):
         s = run.summarize(ROWS)
         self.assertEqual(s["suites"]["code"], {"n": 2, "passed": 1})
@@ -38,7 +46,7 @@ class Summarize(unittest.TestCase):
         self.assertEqual(s["uncensor"], {"harmful_refusals": 1, "harmful_n": 2,
                                          "harmless_refusals": 0, "harmless_n": 1})
         self.assertEqual(s["longctx"], {"needle": {"120k": True, "480k": None}, "docqa": {},
-                                        "peak_wired_gib": 49.1, "swapouts": 0})
+                                        "peak_wired_gib": 49.1, "swapouts": 0, "short_tiers": []})
         self.assertEqual(s["speed"]["total_seconds"], {"code": 30.0, "vi": 12.0, "uncensor": 5.0})
         self.assertEqual(s["speed"]["think_tokens_median"], 200)
         self.assertEqual(s["speed"]["decode_tps_median"], 41.0)
