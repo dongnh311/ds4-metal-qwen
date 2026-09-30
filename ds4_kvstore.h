@@ -67,6 +67,10 @@ typedef struct {
     int continued_interval_tokens;
     int boundary_trim_tokens;
     int boundary_align_tokens;
+    /* Past this many live tokens a continued checkpoint is stored only at
+     * interval x 2^k: each one is a full-prefix snapshot, gigabytes deep into a
+     * long context. 0 = no limit. ds4-server sets it to the native context. */
+    int continued_dense_max_tokens;
 } ds4_kvstore_options;
 
 typedef struct {

@@ -22569,6 +22569,29 @@ static void test_kv_cache_continued_uses_aligned_frontiers(void) {
     TEST_ASSERT(kv_cache_continued_store_target(&kc, 30000) == 30000);
 }
 
+static void test_kv_cache_continued_sparse_past_dense_max(void) {
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();          /* step 10240 after the 2048 alignment */
+    TEST_ASSERT(kc.opt.continued_dense_max_tokens == 0);
+    kc.continued_last_store_tokens = 0;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 266240) == 266240);   /* no limit: dense */
+
+    kc.opt.continued_dense_max_tokens = 262144;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 256000) == 256000);   /* 25 steps, inside */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 266240) == 0);        /* 26 steps, past */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 317440) == 0);        /* 31 steps */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 327680) == 327680);   /* 32 = 2^5 steps */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 337920) == 0);        /* 33 steps */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 655360) == 655360);   /* 64 steps */
+    kc.continued_last_store_tokens = 655360;
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 655360) == 0);        /* already stored */
+
+    kc.continued_last_store_tokens = 0;
+    kc.opt.continued_dense_max_tokens = 266240;                            /* the limit itself is dense */
+    TEST_ASSERT(kv_cache_continued_store_target(&kc, 266240) == 266240);
+}
+
 static void test_kv_cache_cold_store_suppresses_duplicate_continued_boundary(void) {
     kv_disk_cache kc = {0};
     kc.enabled = true;
@@ -24715,6 +24738,7 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_chat_anchor_uses_last_user_before_assistant();
     test_kv_cache_chat_anchor_ignores_multiturn_tail();
     test_kv_cache_continued_uses_aligned_frontiers();
+    test_kv_cache_continued_sparse_past_dense_max();
     test_kv_cache_cold_store_suppresses_duplicate_continued_boundary();
     test_kv_cache_file_size_must_fit_budget();
     test_sha1_bytes_hex_matches_known_vector();
