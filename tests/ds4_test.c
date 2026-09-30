@@ -1664,7 +1664,15 @@ static void test_quant_fill_rows(uint8_t *dst, const ds4_quant_fixture *f, uint3
 static double test_quant_row_ref(uint32_t type, const uint8_t *row, uint32_t in_dim, const float *x, double *mag) {
     float *w = malloc((size_t)in_dim * sizeof(float));
     double acc = 0.0, m = 0.0;
-    if (w && ds4_dequant_row(type, row, in_dim, w) == 0) {
+    if (w && type == 30u) {                                   /* BF16: ds4_dequant_row has no BF16 rows */
+        for (uint32_t i = 0; i < in_dim; i++) {
+            uint16_t h;
+            memcpy(&h, row + (uint64_t)i * 2u, sizeof(h));
+            const uint32_t u = (uint32_t)h << 16;
+            memcpy(&w[i], &u, sizeof(u));
+        }
+        for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
+    } else if (w && ds4_dequant_row(type, row, in_dim, w) == 0) {
         for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
     }
     free(w);
@@ -1929,6 +1937,84 @@ static void test_metal_qwen4_quant_moe_mm(void) {
     test_metal_qwen4_quant_moe_mm_case(18, 42);   /* IQ3_XXS, Q2_0 */
     test_metal_qwen4_quant_moe_mm_case(21, 20);   /* IQ3_S, IQ4_NL */
     test_metal_qwen4_quant_moe_mm_case(16, 20);   /* IQ2_XXS (existing tiles), IQ4_NL down */
+}
+
+/* The tiled dense GEMM on 37 rows: 40 tokens (one full and one partial token tile) and 9 tokens
+ * (few threadgroups, so the k-split planes and their reduce run). fp32 staging, fp32 bound. */
+static void test_metal_qwen4_dense_mm_case(uint32_t type, const uint8_t *rows_bytes, uint64_t row_bytes,
+                                           uint32_t in_dim, uint32_t rows) {
+    const uint64_t page = (uint64_t)getpagesize(), alloc = test_round_up_u64(row_bytes * rows, page);
+    void *wraw = NULL;
+    TEST_ASSERT(posix_memalign(&wraw, (size_t)page, (size_t)alloc) == 0);
+    if (!wraw) return;
+    memcpy(wraw, rows_bytes, (size_t)(row_bytes * rows));
+    const uint32_t toks[2] = { 40u, 9u };
+    for (int ti = 0; ti < 2; ti++) {
+        const uint32_t n_tok = toks[ti];
+        float *xh = malloc((size_t)n_tok * in_dim * sizeof(float));
+        float *oh = malloc((size_t)n_tok * rows * sizeof(float));
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tok * in_dim * sizeof(float));
+        ds4_gpu_tensor *o = ds4_gpu_tensor_alloc((uint64_t)n_tok * rows * sizeof(float));
+        TEST_ASSERT(xh && oh && x && o);
+        if (xh && oh && x && o) {
+            for (uint32_t t = 0; t < n_tok; t++) test_quant_x(xh + (uint64_t)t * in_dim, in_dim, t + 3u);
+            TEST_ASSERT(ds4_gpu_tensor_write(x, 0, xh, (uint64_t)n_tok * in_dim * sizeof(float)) != 0);
+            TEST_ASSERT(ds4_gpu_set_model_map(wraw, alloc) != 0);
+            TEST_ASSERT(ds4_gpu_qwen4_dense_mm_tensor(o, x, wraw, alloc, 0, type, n_tok, in_dim, rows) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(o, 0, oh, (uint64_t)n_tok * rows * sizeof(float)) != 0);
+            uint32_t bad = 0;
+            for (uint32_t t = 0; t < n_tok; t++) {
+                for (uint32_t r = 0; r < rows; r++) {
+                    double mag = 0.0;
+                    const double ref = test_quant_row_ref(type, (const uint8_t *)wraw + r * row_bytes, in_dim,
+                                                          xh + (uint64_t)t * in_dim, &mag);
+                    if (fabs((double)oh[(uint64_t)t * rows + r] - ref) > 1e-5 * mag + 1e-6) bad++;
+                }
+            }
+            if (bad) fprintf(stderr, "ds4-test: Qwen dense GEMM type %u dim %u tokens %u: %u/%u rows off\n",
+                             type, in_dim, n_tok, bad, n_tok * rows);
+            TEST_ASSERT(bad == 0);
+        }
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(o);
+        free(xh);
+        free(oh);
+    }
+    free(wraw);
+}
+
+static void test_metal_qwen4_quant_dense_mm(void) {
+    const uint32_t rows = 37u;
+    for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
+        const ds4_quant_fixture *f = &quant_fixtures[i];
+        if (f->type == 16) continue;                        /* IQ2_XXS dense rows keep their kernels */
+        const uint32_t in_dim = (f->type == 20 || f->type == 42) ? 640u : 2560u;
+        const uint64_t row_bytes = test_quant_row_bytes(f->type, in_dim);
+        uint8_t *buf = malloc((size_t)(row_bytes * rows));
+        TEST_ASSERT(buf != NULL);
+        if (!buf) return;
+        test_quant_fill_rows(buf, f, in_dim, rows);
+        test_metal_qwen4_dense_mm_case(f->type, buf, row_bytes, in_dim, rows);
+        free(buf);
+    }
+    /* BF16 rows 2568 wide: the last k tile ends mid-tile */
+    const uint32_t in_dim = 2568u;
+    uint16_t *bf = malloc((size_t)in_dim * rows * sizeof(uint16_t));
+    float *v = malloc((size_t)in_dim * sizeof(float));
+    TEST_ASSERT(bf && v);
+    if (bf && v) {
+        for (uint32_t r = 0; r < rows; r++) {
+            test_quant_x(v, in_dim, r + 101u);
+            for (uint32_t k = 0; k < in_dim; k++) {
+                uint32_t u;
+                memcpy(&u, &v[k], sizeof(u));
+                bf[(uint64_t)r * in_dim + k] = (uint16_t)(u >> 16);
+            }
+        }
+        test_metal_qwen4_dense_mm_case(30u, (const uint8_t *)bf, (uint64_t)in_dim * 2u, in_dim, rows);
+    }
+    free(bf);
+    free(v);
 }
 
 static void test_metal_f16_compressor_pair_state_store_exact_case(
@@ -5680,6 +5766,7 @@ static void test_metal_kernel_group(void) {
     test_metal_qwen4_quant_gemv();
     test_metal_qwen4_quant_moe();
     test_metal_qwen4_quant_moe_mm();
+    test_metal_qwen4_quant_dense_mm();
 #endif
 }
 
