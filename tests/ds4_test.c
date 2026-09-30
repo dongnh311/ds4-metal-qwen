@@ -7501,6 +7501,13 @@ static void test_qwen_yarn_policy(void) {
     TEST_ASSERT(yarn[18] < plain[18] && yarn[18] > plain[18] / 2.0f);          /* blended */
     ds4_qwen4_rope_table(64, 1e7, 0, 2.0, yarn, NULL, NULL, NULL);             /* no native: plain */
     for (int i = 0; i < 32; i++) TEST_ASSERT(yarn[i] == plain[i]);
+
+    /* The rope follows the context a caller runs, not its allocation slack: ds4-bench at
+     * --ctx-max 262144 allocates 262144 + gen + 1 and must stay unscaled. */
+    TEST_ASSERT(ds4_engine_rope_context(262273, 262144) == 262144);
+    TEST_ASSERT(ds4_engine_rope_context(524288, 0) == 524288);
+    TEST_ASSERT(ds4_engine_rope_context(0, 0) == 0);
+    TEST_ASSERT(ds4_qwen4_yarn_factor(262144, ds4_engine_rope_context(262273, 262144), NULL) == 1.0);
 }
 
 /* Grow-on-demand KV, model-backed.  Needs a Qwen3.8 model and its PLE:

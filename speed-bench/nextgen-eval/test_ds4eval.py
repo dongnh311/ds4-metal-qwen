@@ -58,6 +58,11 @@ class Argv(unittest.TestCase):
                          {"DS4_QWEN4_YARN_FACTOR": "1"})   # an explicit override is kept
         self.assertEqual(ds4eval.eval_env({"A": "b"}, ["ds4-server"]), {"A": "b"})
 
+    def test_eval_env_keeps_a_factor_exported_by_the_shell(self):
+        # The server runs with {**os.environ, **env}; a shell export must reach ds4-eval the same way.
+        with mock.patch.dict(ds4eval.os.environ, {"DS4_QWEN4_YARN_FACTOR": "4"}):
+            self.assertNotIn("DS4_QWEN4_YARN_FACTOR", ds4eval.eval_env({}, ["ds4-server", "-c", "524288"]))
+
     def test_continued_interval_is_server_only(self):
         argv = ds4eval.eval_argv(["ds4-server", "--kv-cache-continued-interval-tokens", "0"],
                                  "/r", "core", "-", 1, "/t")

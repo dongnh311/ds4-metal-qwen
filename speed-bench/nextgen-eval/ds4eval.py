@@ -26,9 +26,10 @@ QWEN4_NATIVE_CTX = 262144  # qwen4exp.context_length of every Qwen3.8-Flash-Next
 def eval_env(env, server_argv):
     """The arm's env for ds4-eval. ds4-eval runs at -c <= CTX_CAP, below the native context, so it
     would never derive YaRN from -c the way the server does: hand it the server's factor, by ds4.c's
-    rule (the smallest power of two covering -c / native). An explicit DS4_QWEN4_YARN_FACTOR wins."""
+    rule (the smallest power of two covering -c / native). An explicit DS4_QWEN4_YARN_FACTOR wins,
+    from the arm's env or from the shell (the server runs with {**os.environ, **env} too)."""
     out = dict(env)
-    if out.get("DS4_QWEN4_YARN_FACTOR"):
+    if out.get("DS4_QWEN4_YARN_FACTOR") or os.environ.get("DS4_QWEN4_YARN_FACTOR"):
         return out
     ctx = int(server.argv_value(server_argv, "-c") or 0)
     if ctx <= QWEN4_NATIVE_CTX:

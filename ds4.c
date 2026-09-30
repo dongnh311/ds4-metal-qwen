@@ -73580,7 +73580,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
         *out = NULL;
         return 1;
     }
-    g_qwen4_rope_ctx_hint = opt->context_size > 0 ? (uint32_t)opt->context_size : 0u;
+    g_qwen4_rope_ctx_hint = ds4_engine_rope_context(opt->context_size, opt->rope_context_size);
     config_validate_model(&e->model);
     if (ds4_model_is_qwen4() && !opt->inspect_only) {
         const bool backend_ok =
@@ -74880,6 +74880,11 @@ float ds4_engine_rope_yarn_factor(const ds4_engine *e) {
 uint32_t ds4_engine_native_context(const ds4_engine *e) {
     (void)e;
     return ds4_model_is_qwen4() ? g_qwen4_native_ctx : 0u;
+}
+
+uint32_t ds4_engine_rope_context(int context_size, int rope_context_size) {
+    if (rope_context_size > 0) return (uint32_t)rope_context_size;
+    return context_size > 0 ? (uint32_t)context_size : 0u;
 }
 
 int ds4_engine_power(ds4_engine *e) {

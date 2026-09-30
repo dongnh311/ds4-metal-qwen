@@ -136,6 +136,7 @@ typedef struct {
     ds4_backend backend;
     int n_threads;
     int context_size;
+    int rope_context_size;      /* 0 = context_size; see ds4_engine_rope_context */
     uint32_t prefill_chunk;
     int mtp_draft_tokens;
     float mtp_margin;
@@ -261,6 +262,10 @@ void ds4_qwen4_rope_table(uint32_t n_rot, double base, uint32_t native_ctx, doub
  * native context (0 when the family has none). */
 float ds4_engine_rope_yarn_factor(const ds4_engine *e);
 uint32_t ds4_engine_native_context(const ds4_engine *e);
+/* The context the rope is chosen for: rope_context_size when set (> 0), else
+ * context_size. Callers that allocate slack past the context they run (ds4-bench)
+ * set rope_context_size so the slack does not turn YaRN on. */
+uint32_t ds4_engine_rope_context(int context_size, int rope_context_size);
 int ds4_engine_power(ds4_engine *e);
 int ds4_engine_set_power(ds4_engine *e, int power_percent);
 const char *ds4_engine_model_name(ds4_engine *e);
