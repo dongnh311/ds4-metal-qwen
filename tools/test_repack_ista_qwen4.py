@@ -29,6 +29,7 @@ class RepackTest(unittest.TestCase):
             {"name": "blk.0.hc_ffn_inject.weight", "dims": [32], "type": 30, "nbytes": 64,
              "data": bf16([1e-7] + [1.0] * 31)},   # 1e-7 is subnormal in F16: not exact
             {"name": "output_hc_down.weight", "dims": [32], "type": 30, "nbytes": 64, "data": bf16([3.0] * 32)},
+            {"name": "output_hc_up.weight", "dims": [32], "type": 30, "nbytes": 64, "data": self.hc},
         ]
         g.write(self.p / "ista.gguf", ista_kv, ista_t, 32)
         ivan_kv = {"general.architecture": (g.T_STR, "qwen4exp"), "qwen4exp.block_count": (g.T_U32, 3),
@@ -88,6 +89,13 @@ class RepackTest(unittest.TestCase):
         with open(self.p / "out.gguf", "rb") as f:
             f.seek(t["abs"])
             self.assertEqual(list(np.frombuffer(f.read(64), dtype=np.float16)), [0.5, -2.0, 1.5, 0.25] * 8)
+
+    def test_output_hc_up_to_f16(self):
+        # the output head's hc mixer takes the same F16/F32/Q8_0 kernel as the layers' hc up
+        r, man = self.repack()
+        t = next(t for t in r.tensors if t["name"] == "output_hc_up.weight")
+        self.assertEqual(t["type"], 1)
+        self.assertEqual(man["tensors"]["output_hc_up.weight"]["converted_from"], "BF16")
 
     def test_hc_falls_back_to_f32(self):
         r, _ = self.repack()

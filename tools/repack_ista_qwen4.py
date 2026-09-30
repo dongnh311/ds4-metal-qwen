@@ -18,7 +18,7 @@ IVAN_KEYS = ["general.alignment", "qwen4exp.nextn_predict_layers", "qwen4exp.voc
              "qwen4exp.ple.vocab_base", "qwen4exp.ple.vocab_divisor"]
 DROP = {"split.count", "split.no", "split.tensors.count"}
 TO_F32 = re.compile(r"^blk\.\d+\.ffn_gate_inp(_shexp)?\.weight$")          # the loader requires F32
-TO_F16 = re.compile(r"^blk\.\d+\.hc_(attn|ffn)_(up|inject)\.weight$")      # the graph takes F16/F32/Q8_0
+TO_F16 = re.compile(r"^(blk\.\d+\.hc_(attn|ffn)_(up|inject)|output_hc_up)\.weight$")   # the hc mixer takes F16/F32/Q8_0
 BF16 = 30
 
 
