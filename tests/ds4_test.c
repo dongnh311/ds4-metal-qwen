@@ -7465,6 +7465,27 @@ static void test_qwen_kv_grow_policy(void) {
     TEST_ASSERT(ds4_qwen4_kv_reserve("0") == 4096);
 }
 
+static void test_quant_types(void) {
+    /* ggml-common.h @931351ea block sizes of every quant type ds4 sizes tensors with */
+    static const struct { uint32_t type, elems, bytes; } want[] = {
+        {2, 32, 18}, {3, 32, 20}, {8, 32, 34}, {10, 256, 84}, {12, 256, 144}, {13, 256, 176},
+        {14, 256, 210}, {16, 256, 66}, {17, 256, 74}, {18, 256, 98}, {19, 256, 50}, {20, 32, 18},
+        {21, 256, 110}, {22, 256, 82}, {23, 256, 136}, {29, 256, 56}, {39, 32, 17}, {42, 64, 18},
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        uint32_t e = 0, b = 0;
+        TEST_ASSERT(ds4_gguf_type_block(want[i].type, &e, &b) == 0);
+        if (e != want[i].elems || b != want[i].bytes) {
+            fprintf(stderr, "ds4-test: type %u is %u/%u, ggml has %u/%u\n",
+                    want[i].type, e, b, want[i].elems, want[i].bytes);
+        }
+        TEST_ASSERT(e == want[i].elems && b == want[i].bytes);
+    }
+    uint32_t e = 0, b = 0;
+    TEST_ASSERT(ds4_gguf_type_block(41, &e, &b) != 0);    /* no such type */
+    TEST_ASSERT(ds4_gguf_type_block(1000, &e, &b) != 0);
+}
+
 static void test_qwen_yarn_policy(void) {
     /* The factor: the environment wins when it parses, otherwise -c decides. */
     TEST_ASSERT(ds4_qwen4_yarn_factor(262144, 262144, NULL) == 1.0);   /* PROD: off */
@@ -7873,6 +7894,7 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen-kv-grow-policy", "qwen-kv-grow-policy", "Qwen3.8 grow-on-demand KV capacity policy (no model)", test_qwen_kv_grow_policy},
     {"--qwen-yarn-policy", "qwen-yarn-policy", "Qwen3.8 YaRN factor from -c and the rope table (no model)", test_qwen_yarn_policy},
     {"--dir-steering-rows", "dir-steering-rows", "directional steering rows must be unit length or zero (no model)", test_dir_steering_rows},
+    {"--quant-types", "quant-types", "GGUF quant block sizes match ggml (no model)", test_quant_types},
 #ifndef DS4_NO_GPU
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},

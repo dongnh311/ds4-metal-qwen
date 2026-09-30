@@ -2433,8 +2433,8 @@ static const gguf_type_info gguf_types[] = {
     [16] = {"iq2_xxs",256,  66},
     [17] = {"iq2_xs", 256,  74},
     [18] = {"iq3_xxs",256,  98},
-    [19] = {"iq1_s",  256, 110},
-    [20] = {"iq4_nl", 256,  50},
+    [19] = {"iq1_s",  256,  50},
+    [20] = {"iq4_nl",  32,  18},
     [21] = {"iq3_s",  256, 110},
     [22] = {"iq2_s",  256,  82},
     [23] = {"iq4_xs", 256, 136},
@@ -2446,6 +2446,7 @@ static const gguf_type_info gguf_types[] = {
     [29] = {"iq1_m",  256,  56},
     [30] = {"bf16",     1,   2},
     [39] = {"mxfp4",   32,  17},
+    [42] = {"q2_0",    64,  18},
 };
 
 enum {
@@ -2460,10 +2461,17 @@ enum {
     DS4_TENSOR_Q6_K     = 14,
     DS4_TENSOR_Q8_K     = 15,
     DS4_TENSOR_IQ2_XXS  = 16,
+    DS4_TENSOR_IQ2_XS   = 17,
+    DS4_TENSOR_IQ3_XXS  = 18,
+    DS4_TENSOR_IQ4_NL   = 20,
+    DS4_TENSOR_IQ3_S    = 21,
+    DS4_TENSOR_IQ2_S    = 22,
+    DS4_TENSOR_IQ4_XS   = 23,
     DS4_TENSOR_I8       = 24,
     DS4_TENSOR_I32      = 26,
     DS4_TENSOR_BF16     = 30,
     DS4_TENSOR_MXFP4    = 39,
+    DS4_TENSOR_Q2_0     = 42,
 };
 
 typedef struct {
@@ -2571,6 +2579,14 @@ static const gguf_type_info *tensor_type(uint32_t type) {
     uint32_t n = sizeof(gguf_types) / sizeof(gguf_types[0]);
     if (type >= n || gguf_types[type].name == NULL) return NULL;
     return &gguf_types[type];
+}
+
+int ds4_gguf_type_block(uint32_t type, uint32_t *block_elems, uint32_t *block_bytes) {
+    const gguf_type_info *info = tensor_type(type);
+    if (!info || info->block_elems == 0) return -1;
+    if (block_elems) *block_elems = info->block_elems;
+    if (block_bytes) *block_bytes = info->block_bytes;
+    return 0;
 }
 
 static const char *tensor_type_name(uint32_t type) {
@@ -5090,7 +5106,14 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
-           type == DS4_TENSOR_MXFP4;
+           type == DS4_TENSOR_MXFP4 ||
+           type == DS4_TENSOR_IQ2_XS ||
+           type == DS4_TENSOR_IQ2_S ||
+           type == DS4_TENSOR_IQ3_XXS ||
+           type == DS4_TENSOR_IQ3_S ||
+           type == DS4_TENSOR_IQ4_NL ||
+           type == DS4_TENSOR_IQ4_XS ||
+           type == DS4_TENSOR_Q2_0;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -5102,6 +5125,13 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     case DS4_TENSOR_Q5_K:    return sizeof(block_q5_K);
     case DS4_TENSOR_Q6_K:    return sizeof(block_q6_K);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
+    case DS4_TENSOR_IQ2_XS:  return 74;
+    case DS4_TENSOR_IQ2_S:   return 82;
+    case DS4_TENSOR_IQ3_XXS: return 98;
+    case DS4_TENSOR_IQ3_S:   return 110;
+    case DS4_TENSOR_IQ4_NL:  return 18;
+    case DS4_TENSOR_IQ4_XS:  return 136;
+    case DS4_TENSOR_Q2_0:    return 18;
     default:                 ds4_die("unsupported routed expert tensor type");
     }
     return 0;
