@@ -49932,6 +49932,15 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     case 1u:  return in_dim * 2u;            /* f16 */
     case 30u: return in_dim * 2u;            /* bf16 */
     case 0u:  return in_dim * 4u;            /* f32 */
+    case 13u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 176u;   /* q5_K */
+    case 14u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 210u;   /* q6_K */
+    case 17u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 74u;    /* iq2_xs */
+    case 18u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 98u;    /* iq3_xxs */
+    case 20u: return (in_dim / 32u) * 18u;                            /* iq4_nl */
+    case 21u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 110u;   /* iq3_s */
+    case 22u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 82u;    /* iq2_s */
+    case 23u: return (in_dim % 256u) ? 0u : (in_dim / 256u) * 136u;   /* iq4_xs */
+    case 42u: return (in_dim % 64u) ? 0u : (in_dim / 64u) * 18u;      /* q2_0 */
     default:  return 0;
     }
 }
