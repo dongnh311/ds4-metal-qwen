@@ -7701,7 +7701,15 @@ static void test_quant_types(void) {
         TEST_ASSERT(e == want[i].elems && b == want[i].bytes);
     }
     uint32_t e = 0, b = 0;
-    TEST_ASSERT(ds4_gguf_type_block(41, &e, &b) != 0);    /* no such type */
+    /* GSQ-RCO expert types load for Qwen3.8 only; the DeepSeek/GLM/DSpark loaders,
+     * whose graphs cannot run them, keep refusing them at load time */
+    static const uint32_t gsq[] = { 17, 18, 20, 21, 22, 23, 42 };
+    for (size_t i = 0; i < sizeof(gsq) / sizeof(gsq[0]); i++) {
+        TEST_ASSERT(ds4_test_routed_expert_type_ok(gsq[i], 1));
+        TEST_ASSERT(!ds4_test_routed_expert_type_ok(gsq[i], 0));
+    }
+    TEST_ASSERT(ds4_test_routed_expert_type_ok(16, 0) && ds4_test_routed_expert_type_ok(16, 1));   /* IQ2_XXS */
+    TEST_ASSERT(ds4_gguf_type_block(41, &e, &b) != 0);    /* not in ds4's table (upstream Q1_0) */
     TEST_ASSERT(ds4_gguf_type_block(1000, &e, &b) != 0);
     /* first and last entries of the generated grid tables (ggml-common.h @931351ea) */
     TEST_ASSERT(ds4_iq_table_entry("iq2xs", 0) == 0x0808080808080808ULL);

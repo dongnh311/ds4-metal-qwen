@@ -5125,14 +5125,7 @@ static bool tensor_is_routed_expert_type(uint32_t type) {
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_Q5_K ||
            type == DS4_TENSOR_Q6_K ||
-           type == DS4_TENSOR_MXFP4 ||
-           type == DS4_TENSOR_IQ2_XS ||
-           type == DS4_TENSOR_IQ2_S ||
-           type == DS4_TENSOR_IQ3_XXS ||
-           type == DS4_TENSOR_IQ3_S ||
-           type == DS4_TENSOR_IQ4_NL ||
-           type == DS4_TENSOR_IQ4_XS ||
-           type == DS4_TENSOR_Q2_0;
+           type == DS4_TENSOR_MXFP4;
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
@@ -5659,12 +5652,19 @@ static void tensor_expect_qwen4_dense_layout(
     tensor_expect_layout(t, t->type, ndim, d0, d1, d2);
 }
 
+static bool qwen4_expert_type_ok(uint32_t type) {
+    return tensor_is_routed_expert_type(type) || qwen4_type_is_gsq(type) ||
+           type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 || type == DS4_TENSOR_Q4_0;
+}
+
+int ds4_test_routed_expert_type_ok(uint32_t type, int qwen4) {
+    return qwen4 ? qwen4_expert_type_ok(type) : tensor_is_routed_expert_type(type);
+}
+
 static void tensor_expect_qwen4_expert_layout(
         const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (!tensor_is_routed_expert_type(t->type) &&
-        t->type != DS4_TENSOR_F16 && t->type != DS4_TENSOR_F32 &&
-        t->type != DS4_TENSOR_Q4_0) {
+    if (!qwen4_expert_type_ok(t->type)) {
         fprintf(stderr, "ds4: routed expert tensor %.*s has unsupported type %u\n",
                 (int)t->name.len, t->name.ptr, t->type);
         exit(1);
