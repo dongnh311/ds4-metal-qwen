@@ -2,6 +2,7 @@
 #define DS4_SERVER_TEST_NO_MAIN
 #include <inttypes.h>
 #include "../ds4_server.c"
+#include "quant_fixtures.h"
 #ifndef DS4_NO_GPU
 #include "../ds4_gpu.h"
 #include <math.h>
@@ -7465,6 +7466,28 @@ static void test_qwen_kv_grow_policy(void) {
     TEST_ASSERT(ds4_qwen4_kv_reserve("0") == 4096);
 }
 
+static void test_quant_dequant(void) {
+    for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
+        const ds4_quant_fixture *f = &quant_fixtures[i];
+        float *got = calloc(f->n, sizeof(float));
+        TEST_ASSERT(got != NULL);
+        if (!got) return;
+        TEST_ASSERT(ds4_dequant_row(f->type, f->bytes, f->n, got) == 0);
+        uint32_t bad = 0;
+        for (uint32_t j = 0; j < f->n; j++) {
+            /* 2 ulp: -ffast-math may contract, and ggml's C and Python differ at that level */
+            if (fabsf(got[j] - f->want[j]) > fabsf(f->want[j]) * 2.4e-7f) bad++;
+        }
+        if (bad) fprintf(stderr, "ds4-test: type %u: %u/%u values differ from ggml\n", f->type, bad, f->n);
+        TEST_ASSERT(bad == 0);
+        free(got);
+    }
+    float out[64];
+    const uint8_t zero[18] = {0};
+    TEST_ASSERT(ds4_dequant_row(42, zero, 63, out) != 0);   /* not a whole block */
+    TEST_ASSERT(ds4_dequant_row(8, zero, 32, out) != 0);    /* Q8_0 is not in this table */
+}
+
 static void test_quant_types(void) {
     /* ggml-common.h @931351ea block sizes of every quant type ds4 sizes tensors with */
     static const struct { uint32_t type, elems, bytes; } want[] = {
@@ -7907,6 +7930,7 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen-yarn-policy", "qwen-yarn-policy", "Qwen3.8 YaRN factor from -c and the rope table (no model)", test_qwen_yarn_policy},
     {"--dir-steering-rows", "dir-steering-rows", "directional steering rows must be unit length or zero (no model)", test_dir_steering_rows},
     {"--quant-types", "quant-types", "GGUF quant block sizes match ggml (no model)", test_quant_types},
+    {"--quant-dequant", "quant-dequant", "GSQ-RCO row dequantizers match ggml (no model)", test_quant_dequant},
 #ifndef DS4_NO_GPU
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
