@@ -97,6 +97,32 @@ active `qwen4exp` schema. Finish older main-only conversions with
 `gguf-tools/qwen4_native_ngrams.py`, using the original HF n-gram shards.
 Expanding an old quantized table to BF16 does not restore its lost precision.
 
+### GSQ-RCO files (ISTA-DASLab)
+
+ds4 reads the tensor types of ISTA-DASLab's GSQ-RCO quantizations: IQ2_XS,
+IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS and Q2_0 (ggml type 42), besides Q5_K,
+Q6_K and IQ2_XXS. Their files need a repack before ds4 opens them. The
+repack keeps every quantized tensor byte for byte and changes only these:
+
+- BF16 routers become F32, and BF16 hc up/inject and `output_hc_up` become
+  F16 when every value fits exactly, otherwise F32;
+- the MTP layer and the ds4 metadata (PLE, vocabulary, down widths) come
+  from a ds4 GGUF of the same model.
+
+```sh
+python3 tools/repack_ista_qwen4.py \
+  Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-00001-of-00002.gguf \
+  Qwen3.8-Flash-Next-IQ2XXSImatrix-Q2KDownPad768-MTP.gguf \
+  Qwen3.8-Flash-Next-GSQ-RCO-IQ3_XXS-DS4-MTP.gguf
+```
+
+It writes the output and a manifest (`.json`) with each tensor's sha256.
+The Metal graph runs these types through one-row kernels. Not supported yet:
+the tiled prefill GEMM (routed experts of these types run per token in
+prefill), the SSD expert cache (it serves only IQ2_XXS layers with Q2_K or
+Q4_K down rows; other layers stay mapped, so these files run resident), and
+the CUDA backend, whose graph refuses them.
+
 ## Vision
 
 Images go through the model's Qwen3-VL vision tower. Download the encoder
