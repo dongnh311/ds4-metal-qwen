@@ -98,6 +98,14 @@ class Summarize(unittest.TestCase):
     def test_all_suites(self):
         self.assertEqual(run.ALL_SUITES, ["code", "ifeval", "vi", "uncensor", "tools", "longctx", "reason"])
 
+    def test_yarn_config_is_the_projection_arm_at_512k(self):
+        proj = json.loads((HERE / "configs" / "ivan-proj.json").read_text())
+        yarn = json.loads((HERE / "configs" / "ivan-proj-yarn.json").read_text())
+        self.assertEqual(yarn["name"], "ivan-proj-s050-yarn")
+        self.assertEqual(yarn["args_add"], proj["args_add"] + ["-c", "524288"])
+        self.assertEqual(dict(yarn, name=proj["name"], args_add=proj["args_add"]), proj)
+        self.assertNotIn("DS4_QWEN4_YARN_FACTOR", yarn["env"])   # the server derives it from -c
+
     def test_ivan_configs_differ_only_by_the_projection(self):
         ivan = json.loads((HERE / "configs" / "ivan.json").read_text())
         proj = json.loads((HERE / "configs" / "ivan-proj.json").read_text())

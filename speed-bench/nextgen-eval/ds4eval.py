@@ -13,12 +13,31 @@ EVAL_NO_VALUE = {"--metal", "--ssd-streaming", "--ssd-streaming-cold", "--qualit
 # Serving flags that do not apply to ds4-eval's offline runs. Every other flag must be classified here
 # or above: a new candidate flag (runtime projection, YaRN, ...) is refused, never dropped silently.
 SERVER_ONLY_WITH_VALUE = {"-c", "--ctx", "--host", "--port", "--kv-disk-dir", "--kv-disk-space-mb",
-                          "--kv-cache-cold-max-tokens", "--think-budget"}
+                          "--kv-cache-cold-max-tokens", "--kv-cache-continued-interval-tokens",
+                          "--think-budget"}
 SERVER_ONLY_NO_VALUE = {"--mtp"}
 REASON_RUNS = [("core", "GPQA Diamond", 8), ("core", "SuperGPQA", 8), ("core", "AIME2025", 8),
                ("hard", "MMLU-Pro", 20)]
 TOKENS = 32768
 CTX_CAP = 65536
+QWEN4_NATIVE_CTX = 262144  # qwen4exp.context_length of every Qwen3.8-Flash-Next GGUF this harness runs
+
+
+def eval_env(env, server_argv):
+    """The arm's env for ds4-eval. ds4-eval runs at -c <= CTX_CAP, below the native context, so it
+    would never derive YaRN from -c the way the server does: hand it the server's factor, by ds4.c's
+    rule (the smallest power of two covering -c / native). An explicit DS4_QWEN4_YARN_FACTOR wins."""
+    out = dict(env)
+    if out.get("DS4_QWEN4_YARN_FACTOR"):
+        return out
+    ctx = int(server.argv_value(server_argv, "-c") or 0)
+    if ctx <= QWEN4_NATIVE_CTX:
+        return out
+    factor = 2
+    while QWEN4_NATIVE_CTX * factor < ctx:
+        factor *= 2
+    out["DS4_QWEN4_YARN_FACTOR"] = str(factor)
+    return out
 _STATES = {"PASSED", "FAILED", "INCOMPLETE", "SKIPPED", "STOPPED", "PREFILL", "RUNNING", "PENDING"}
 _GRADED = {"PASSED", "FAILED", "INCOMPLETE"}  # INCOMPLETE counts as a fail; anything else means the run broke
 # C pads %-20.20s by bytes, so the report is matched as bytes and each field decoded afterwards.
@@ -90,7 +109,7 @@ def run_reason(env, server_argv, root, out_dir):
         trace = pathlib.Path(out_dir) / (stem + ".trace")
         argv = eval_argv(server_argv, root, suite, source, questions, trace)
         print("   %s" % " ".join(argv), flush=True)
-        code, out, err = _run(argv, str(root), {**os.environ, **env})
+        code, out, err = _run(argv, str(root), {**os.environ, **eval_env(env, server_argv)})
         (pathlib.Path(out_dir) / (stem + ".log")).write_text(
             " ".join(argv) + "\n" + _text(out) + "\n--- stderr ---\n" + _text(err))
         parsed = parse_report(out)

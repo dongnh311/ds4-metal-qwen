@@ -48,6 +48,21 @@ class FakePopen:
 
 
 class Argv(unittest.TestCase):
+    def test_eval_env_carries_the_server_rope(self):
+        # ds4-eval runs at -c <= 65536, below the native context, so it never derives YaRN from -c:
+        # the harness hands it the factor the server derives from its own -c.
+        self.assertNotIn("DS4_QWEN4_YARN_FACTOR", ds4eval.eval_env({}, ["ds4-server", "-c", "262144"]))
+        self.assertEqual(ds4eval.eval_env({}, ["ds4-server", "-c", "524288"])["DS4_QWEN4_YARN_FACTOR"], "2")
+        self.assertEqual(ds4eval.eval_env({}, ["ds4-server", "-c", "1048576"])["DS4_QWEN4_YARN_FACTOR"], "4")
+        self.assertEqual(ds4eval.eval_env({"DS4_QWEN4_YARN_FACTOR": "1"}, ["ds4-server", "-c", "524288"]),
+                         {"DS4_QWEN4_YARN_FACTOR": "1"})   # an explicit override is kept
+        self.assertEqual(ds4eval.eval_env({"A": "b"}, ["ds4-server"]), {"A": "b"})
+
+    def test_continued_interval_is_server_only(self):
+        argv = ds4eval.eval_argv(["ds4-server", "--kv-cache-continued-interval-tokens", "0"],
+                                 "/r", "core", "-", 1, "/t")
+        self.assertNotIn("--kv-cache-continued-interval-tokens", argv)
+
     def test_eval_argv_whitelists_and_caps_ctx(self):
         argv = ds4eval.eval_argv(SERVER_ARGV, pathlib.Path("/repo"), "core", "GPQA Diamond", 8, "/t/x.trace")
         self.assertEqual(argv, [
@@ -105,6 +120,18 @@ class Run(unittest.TestCase):
         source = argv[argv.index("--source") + 1]
         states = states or ["PASSED" if i % 2 == 0 else "FAILED" for i in range(n)]
         return [(source, states[i], "A", "A") for i in range(n + count_delta)]
+
+    def test_run_reason_hands_ds4_eval_the_rope(self):
+        seen = []
+
+        def fake_run(argv, cwd, env):
+            seen.append(env.get("DS4_QWEN4_YARN_FACTOR"))
+            return 1, b"", b""
+
+        with mock.patch.object(ds4eval, "_run", fake_run), tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(Exception):
+                list(ds4eval.run_reason({}, ["ds4-server", "-c", "524288"], "/r", d))
+        self.assertEqual(seen[:1], ["2"])
 
     def test_run_reason_collects_every_run(self):
         rows = self._run(lambda argv: (1, report(self._rows(argv))))

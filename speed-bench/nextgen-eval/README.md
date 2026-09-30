@@ -111,6 +111,9 @@ The directional steering flags (`--dir-steering-file`, `--dir-steering-ffn`, `--
 go to ds4-eval too, so the reasoning suite runs with the same projection as the server. `ivan.json`
 and `ivan-proj.json` are Ivan's stock IQ2 without and with Cudecnik's refusal projection (sub-project
 2). The projection runs at FFN scale 0.5 (arm `ivan-proj-s050`), the setting accepted on 2026-09-30.
+`ivan-proj-yarn.json` is the same arm at `-c 524288`, with YaRN factor 2 derived from `-c`
+(sub-project 4). ds4-eval gets the factor through `DS4_QWEN4_YARN_FACTOR`, because its `-c` is capped
+below the native context.
 
 ## Comparing arms
 
