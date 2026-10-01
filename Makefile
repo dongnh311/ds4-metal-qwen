@@ -217,6 +217,8 @@ test-metal-ssd-experts: tests/test_metal_ssd_experts
 	./tests/test_metal_ssd_experts
 	./tests/test_metal_ssd_experts --q4
 	./tests/test_metal_ssd_experts --mxfp4
+	./tests/test_metal_ssd_experts --iq2-q2-six
+	./tests/test_metal_ssd_experts --iq2-q2
 
 tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
@@ -817,6 +819,20 @@ endif
 test-qwen4-prefill-pipe: tests/test_qwen4_prefill_pipe
 	./tests/test_qwen4_prefill_pipe
 
+tests/test_glm53_stream_layout.o: tests/test_glm53_stream_layout.c ds4.c ds4.h ds4_gpu.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_glm53_stream_layout: tests/test_glm53_stream_layout.o $(filter-out ds4.o,$(CORE_OBJS))
+ifeq ($(UNAME_S),Darwin)
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(METAL_LDLIBS)
+else
+	$(DS4_LINK) -o $@ $^ $(DS4_LINK_LIBS)
+endif
+
+.PHONY: test-glm53-stream-layout
+test-glm53-stream-layout: tests/test_glm53_stream_layout
+	./tests/test_glm53_stream_layout
+
 tests/test_qwen4_prefill.o: tests/test_qwen4_prefill.c ds4.h
 	$(CC) $(QUALITY_CFLAGS) -I. -c -o $@ $<
 
@@ -1159,6 +1175,7 @@ clean:
 	rm -f tests/test_qwen4_ngrams
 	rm -f tests/test_qwen4_ngram_state
 	rm -f tests/test_qwen4_prefill_pipe
+	rm -f tests/test_glm53_stream_layout
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_command_memory

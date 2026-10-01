@@ -8760,9 +8760,21 @@ static DS4_MAYBE_UNUSED bool glm_stream_expert_cache_addr_supported(
 #endif
 }
 
+/* Metal's IQ2 streamed-expert kernels are fused pair-SwiGLU (off in quality
+ * mode) and do not split expert ownership across TP ranks; such runs keep IQ2
+ * layers mapped for the resident fused kernels. */
+static bool g_glm_stream_iq2_cache_blocked;
+
+static void glm_stream_configure_iq2_cache(bool quality, bool tensor_parallel) {
+    g_glm_stream_iq2_cache_blocked = quality || tensor_parallel;
+}
+
 static bool glm_stream_selected_expert_cache_supported(
         const ds4_layer_weights *l,
         uint32_t                 il) {
+#ifdef __APPLE__
+    if (g_glm_stream_iq2_cache_blocked) return false;
+#endif
     if (DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_GLM_DSA ||
         !l ||
         il < DS4_N_LEADING_DENSE ||
@@ -8788,9 +8800,12 @@ static bool glm_stream_selected_expert_cache_supported(
 
     if (l->ffn_down_exps->type == DS4_TENSOR_Q2_K) {
 #ifdef __APPLE__
-        /* Metal's IQ2/Q2 selected-slot down kernel sums six experts. The
-         * separate IQ2/IQ2 address-table path below supports up to eight. */
-        if (DS4_N_EXPERT_USED != 6) return false;
+        /* Metal's IQ2/Q2 selected-slot down kernel sums six experts; other
+         * routed widths (GLM routes eight) use per-expert Q2_K address rows. */
+        if (DS4_N_EXPERT_USED != 6) {
+            return !glm_graph_env_present("DS4_ROCM_DISABLE_IQ2_STREAM_ADDR_TABLE",
+                                          "DS4_METAL_DISABLE_IQ2_STREAM_ADDR_TABLE");
+        }
 #endif
         return !glm_graph_env_present("DS4_ROCM_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
                                       "DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS");
@@ -73568,6 +73583,7 @@ static int ds4_engine_open_internal(ds4_engine **out,
     e->vision_model.fd = -1;
     e->backend = opt->backend;
     e->quality = opt->quality;
+    glm_stream_configure_iq2_cache(opt->quality, opt->tp.role != DS4_TP_NONE);
     e->glm_mtp = opt->glm_mtp;
     e->glm_mtp_timing = opt->glm_mtp_timing;
     e->dspark = opt->dspark;

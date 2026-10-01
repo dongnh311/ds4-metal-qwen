@@ -55,13 +55,26 @@ LONG_PREFILL_GAIN = 1.10
 
 
 def registry_command(registry, bin_dir, port, kv_dir):
-    """PROD ds4 command from the gateway registry, retargeted like the smoke."""
+    """PROD ds4 command from the gateway registry, retargeted like the smoke.
+    PROD may serve several ds4 models: the Qwen3.8 row wins; a lone ds4 row is taken as is."""
     with open(registry) as fp:
         models = json.load(fp)["models"]
-    entry = next((m["runtimes"]["ds4"] for m in models.values()
-                  if m.get("runtimes", {}).get("ds4", {}).get("enabled")), None)
-    if entry is None:
+    enabled = [(name, m["runtimes"]["ds4"]) for name, m in models.items()
+               if m.get("runtimes", {}).get("ds4", {}).get("enabled")]
+    if not enabled:
         raise SystemExit("qwen_gate: no enabled ds4 runtime in " + registry)
+
+    def names_qwen(name, entry):
+        cmd = [str(a) for a in entry.get("process_command", [])]
+        model = cmd[cmd.index("-m") + 1] if "-m" in cmd[:-1] else ""
+        return "qwen3.8" in (name + " " + os.path.basename(model)).lower()
+
+    qwen = [(n, e) for n, e in enabled if names_qwen(n, e)]
+    if not qwen and len(enabled) > 1:
+        raise SystemExit("qwen_gate: no Qwen3.8 row among enabled ds4 runtimes: " +
+                         ", ".join(n for n, _ in enabled))
+    name, entry = (qwen or enabled)[0]
+    print(f"qwen_gate: registry row {name}", file=sys.stderr)
     cmd = list(entry["process_command"])
     for i, arg in enumerate(cmd):
         if arg == "--port":

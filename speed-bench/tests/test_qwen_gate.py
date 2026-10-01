@@ -46,6 +46,35 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("/prod/ds4-metal/ds4-server", cmd)
         self.assertEqual(cwd, "/prod/ds4-metal")
 
+    def test_prefers_qwen_row_over_earlier_ds4_rows(self):
+        # PROD serves several ds4 models (Ornith first); the gate is for Qwen3.8.
+        # Ornith's command also names a Qwen3.8 draft-vocab file; only -m counts.
+        other = dict(ENTRY, process_command=["/usr/bin/env",
+                                             "DS4_QWEN35_MTP_DRAFT_VOCAB=/m/Qwen3.8-vocab.txt",
+                                             "/prod/ds4-metal/ds4-server", "-m",
+                                             "/models/Ornith-1.5-35B.gguf", "--port", "18087"])
+        qwen = dict(ENTRY, process_command=["/prod/ds4-metal/ds4-server", "-m",
+                                            "/models/Qwen3.8-Flash-Next-X.gguf", "--port", "18086"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "registry.json")
+            with open(path, "w") as fp:
+                json.dump({"models": {"ornith": {"runtimes": {"ds4": other}},
+                                      "qwen": {"runtimes": {"ds4": qwen}}}}, fp)
+            cmd, _ = qwen_gate.registry_command(path, None, 1, "/kv")
+        self.assertIn("/models/Qwen3.8-Flash-Next-X.gguf", cmd)
+
+    def test_several_ds4_rows_without_qwen_is_an_error(self):
+        # Guessing the first row would record or gate the wrong model.
+        other = dict(ENTRY, process_command=["/prod/ds4-metal/ds4-server", "-m",
+                                             "/models/Ornith-1.5-35B.gguf", "--port", "18087"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "registry.json")
+            with open(path, "w") as fp:
+                json.dump({"models": {"ornith": {"runtimes": {"ds4": other}},
+                                      "b": {"runtimes": {"ds4": ENTRY}}}}, fp)
+            with self.assertRaises(SystemExit):
+                qwen_gate.registry_command(path, None, 1, "/kv")
+
     def test_no_enabled_ds4_runtime(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(SystemExit):
