@@ -49497,6 +49497,7 @@ enum {
     QWEN4_K_HC_GATE_MIX_PAIR_F32,
     QWEN4_K_HC_GATE_MIX_PAIR_Q8,
     QWEN4_K_MULTI_GEMV,
+    QWEN4_K_GSQ_MV_R1, QWEN4_K_GSQ_MV_R2, QWEN4_K_GSQ_MV_R3, QWEN4_K_GSQ_MV_R4,
     QWEN4_K_HC_COMBINE,
     QWEN4_K_CONV_STREAM,
     QWEN4_K_GDN_PREP,
@@ -49650,6 +49651,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_gate_mix_pair_f32",
     "kernel_qwen4_hc_gate_mix_pair_q8",
     "kernel_qwen4_multi_gemv",
+    "kernel_qwen4_gsq_mv_r1", "kernel_qwen4_gsq_mv_r2", "kernel_qwen4_gsq_mv_r3", "kernel_qwen4_gsq_mv_r4",
     "kernel_qwen4_hc_combine",
     "kernel_qwen4_conv_stream",
     "kernel_qwen4_gdn_prep",
@@ -54428,6 +54430,20 @@ int ds4_gpu_qwen4_gdn_front_tensor(
                           MTLSizeMake(n_k_head, 1, 1), MTLSizeMake((NSUInteger)(nth / 32u * 32u), 1, 1), 0);
 }
 
+/* Dense GSQ-RCO and BF16 rows at 1-8 tokens take kernel_qwen4_gsq_mv (one
+ * dequant per chunk for every token); larger batches take the dense GEMM.
+ * DS4_QWEN4_GSQ_MV_LEGACY=1 keeps the per-token multi-row gemv. */
+static bool qwen4_gsq_mv_ok(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types) {
+    if (n_tokens == 0 || n_tokens > 8u || (in_dim % 16u) != 0 || getenv("DS4_QWEN4_GSQ_MV_LEGACY")) return false;
+    for (uint32_t i = 0; i < n_out; i++)
+        if (!qwen4_mm_gsq_block(types[i]) && types[i] != 30u) return false;
+    return true;
+}
+
+int ds4_gpu_qwen4_gsq_mv_selected(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types) {
+    return qwen4_gsq_mv_ok(n_tokens, in_dim, n_out, types) ? 1 : 0;
+}
+
 int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
@@ -54460,6 +54476,11 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
             b[1 + i] = b[1];
             b[5 + i] = b[5];
         }
+    }
+    if (qwen4_gsq_mv_ok(n_tokens, in_dim, n_out, types)) {
+        const uint32_t r1 = n_tokens < 4u ? n_tokens : 4u;
+        return qwen4_dispatch(QWEN4_K_GSQ_MV_R1 + (int)r1 - 1, &args, sizeof(args), b, 9,
+                              MTLSizeMake((total + 3) / 4, (n_tokens + r1 - 1) / r1, 1), MTLSizeMake(128, 1, 1), 0);
     }
     return qwen4_dispatch(QWEN4_K_MULTI_GEMV, &args, sizeof(args), b, 9,
                           MTLSizeMake((total + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);

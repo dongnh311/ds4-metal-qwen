@@ -3189,6 +3189,93 @@ kernel void kernel_qwen4_multi_gemv(
     }
 }
 
+static inline void qwen4_gsq_deq8(device const char *row, uint b, uint q, uint type, thread float *v);
+
+/* one row of kernel_qwen4_gsq_mv for a constant type: lane = 16-value chunk */
+/* `opaque` is a runtime zero: the weights pass through it as opaque values, so
+ * the compiler cannot fuse the dequantization into the dot product differently
+ * for one token than for several, and a column's sum is the same in every R1. */
+template <uint TYPE, uint R1>
+static inline void qwen4_gsq_mv_loop(device const char *row, device const float *x, uint in_dim, uint t0, uint nt,
+                                     uint opaque, ushort tiisg, thread float *acc) {
+    for (uint t = 0; t < R1; t++) acc[t] = 0.0f;
+    for (uint c = tiisg; c < in_dim / 16u; c += 32u) {
+        float wv[16];
+        qwen4_gsq_deq8(row, c / 2u, (c % 2u) * 2u, TYPE, wv);
+        qwen4_gsq_deq8(row, c / 2u, (c % 2u) * 2u + 1u, TYPE, wv + 8);
+        for (uint i = 0; i < 16u; i++) wv[i] = as_type<float>(as_type<uint>(wv[i]) ^ opaque);
+        for (uint t = 0; t < R1; t++) {
+            if (t < nt) {
+                device const float4 *xv = (device const float4 *)(x + (uint64_t)(t0 + t) * in_dim + c * 16u);
+                float s = 0.0f;
+                for (uint j = 0; j < 4u; j++) {
+                    const float4 y = xv[j];
+                    s += wv[4u * j] * y.x + wv[4u * j + 1u] * y.y + wv[4u * j + 2u] * y.z + wv[4u * j + 3u] * y.w;
+                }
+                acc[t] += s;
+            }
+        }
+    }
+}
+
+/* Dense GSQ-RCO and BF16 rows over R1 tokens (decode, MTP verify, batches up
+ * to 8): each lane dequantizes a 16-value chunk once into registers and dots
+ * it with the R1 activation columns; one simdgroup per row.  A column's sum
+ * does not depend on R1, so a verify row matches the one-token row. */
+template <uint R1>
+kernel void kernel_qwen4_gsq_mv(
+        constant ds4_metal_args_qwen4_gemv & args,
+        device const float *x,          /* [T][in_dim] */
+        device const char  *w0,
+        device const char  *w1,
+        device const char  *w2,
+        device const char  *w3,
+        device float       *o0,         /* [T][out_rows[i]] */
+        device float       *o1,
+        device float       *o2,
+        device float       *o3,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint total = args.out_rows[0] + args.out_rows[1] + args.out_rows[2] + args.out_rows[3];
+    const uint r = tgpig.x * 4 + (uint)sgitg;
+    if (r >= total) return;
+    uint i = 0, local = r;
+    while (i + 1 < args.n_out && local >= args.out_rows[i]) { local -= args.out_rows[i]; i++; }
+    device const char *row = (i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3) + (uint64_t)local * args.row_bytes[i];
+    device float *o = i == 0 ? o0 : i == 1 ? o1 : i == 2 ? o2 : o3;
+    const uint t0 = tgpig.y * R1;
+    const uint nt = min(R1, args.n_tokens - t0);
+    float acc[R1];
+    /* the type is constant inside each loop, so the dequantizer folds to one
+     * type and its two halves of a chunk share their block header reads */
+    switch (args.types[i]) {
+    case 13: qwen4_gsq_mv_loop<13, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    case 14: qwen4_gsq_mv_loop<14, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    case 17: qwen4_gsq_mv_loop<17, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    case 18: qwen4_gsq_mv_loop<18, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    case 20: qwen4_gsq_mv_loop<20, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    case 21: qwen4_gsq_mv_loop<21, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    case 22: qwen4_gsq_mv_loop<22, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    case 23: qwen4_gsq_mv_loop<23, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    case 42: qwen4_gsq_mv_loop<42, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    default: qwen4_gsq_mv_loop<30, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    }
+    for (uint t = 0; t < R1; t++) {
+        const float v = simd_sum(acc[t]);
+        if (tiisg == 0 && t < nt) o[(uint64_t)(t0 + t) * args.out_rows[i] + local] = v;
+    }
+}
+
+#define QWEN4_GSQ_MV_SIG constant ds4_metal_args_qwen4_gemv &, device const float *, device const char *, \
+    device const char *, device const char *, device const char *, device float *, device float *, \
+    device float *, device float *, uint3, ushort, ushort
+template [[host_name("kernel_qwen4_gsq_mv_r1")]] kernel void kernel_qwen4_gsq_mv<1>(QWEN4_GSQ_MV_SIG);
+template [[host_name("kernel_qwen4_gsq_mv_r2")]] kernel void kernel_qwen4_gsq_mv<2>(QWEN4_GSQ_MV_SIG);
+template [[host_name("kernel_qwen4_gsq_mv_r3")]] kernel void kernel_qwen4_gsq_mv<3>(QWEN4_GSQ_MV_SIG);
+template [[host_name("kernel_qwen4_gsq_mv_r4")]] kernel void kernel_qwen4_gsq_mv<4>(QWEN4_GSQ_MV_SIG);
+#undef QWEN4_GSQ_MV_SIG
+
 /* Decode specialization keeps the original per-lane accumulation order. */
 constant uint qwen4_mv_type [[function_constant(901)]];
 constant uint qwen4_mv_shared_type [[function_constant(902)]];
@@ -4440,10 +4527,12 @@ static inline void qwen4_gsq_deq8(device const char *row, uint b, uint q, uint t
         if (g < 4) { s = sc[g] & 63u; mn = sc[g + 4] & 63u; }
         else { s = (sc[g + 4] & 0xFu) | ((sc[g - 4] >> 6) << 4); mn = (sc[g + 4] >> 4) | ((sc[g] >> 6) << 4); }
         const float ds = d * (float)s, dm = dmin * (float)mn;
-        device const uchar *qh = blk + 16 + l, *ql = blk + 48 + 32 * (g / 2) + l;
+        /* 176-byte blocks in 32-aligned tensors: qh and ql are 8-byte aligned */
+        const uint2 hq = *(device const uint2 *)(blk + 16 + l), lq = *(device const uint2 *)(blk + 48 + 32 * (g / 2) + l);
         for (uint i = 0; i < 8; i++) {
-            const uint lo = (g & 1u) ? (uint)(ql[i] >> 4) : (uint)(ql[i] & 0xFu);
-            v[i] = ds * (float)(lo + (((qh[i] >> g) & 1u) << 4)) - dm;
+            const uint hb = (hq[i >> 2] >> (8u * (i & 3u))) & 0xFFu, lb = (lq[i >> 2] >> (8u * (i & 3u))) & 0xFFu;
+            const uint lo = (g & 1u) ? (lb >> 4) : (lb & 0xFu);
+            v[i] = ds * (float)(lo + (((hb >> g) & 1u) << 4)) - dm;
         }
         return;
     }
