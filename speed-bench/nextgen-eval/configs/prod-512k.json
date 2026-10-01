@@ -1,0 +1,2 @@
+{"name": "prod-512k", "base": "registry", "registry_model": "ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2",
+ "model": null, "args_add": ["-c", "524288"], "args_remove": [], "env": {}}

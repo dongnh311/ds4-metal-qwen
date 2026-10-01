@@ -117,11 +117,16 @@ python3 tools/repack_ista_qwen4.py \
 ```
 
 It writes the output and a manifest (`.json`) with each tensor's sha256.
-The Metal graph runs these types through one-row kernels. Not supported yet:
-the tiled prefill GEMM (routed experts of these types run per token in
-prefill), the SSD expert cache (it serves only IQ2_XXS layers with Q2_K or
-Q4_K down rows; other layers stay mapped, so these files run resident), and
-the CUDA backend, whose graph refuses them.
+The Metal graph runs these types through one-row kernels in decode and MTP
+verify. In prefill they take the tiled GEMMs: routed experts once a chunk has
+more than 64 rows, and dense tensors of these types, or BF16 ones, above 8
+rows. Not supported yet:
+
+- the Metal 4 tensor-op tiles, which take only Q4_K, Q2_K, IQ2_XXS and
+  MXFP4 experts;
+- the SSD expert cache, which serves only IQ2_XXS layers with Q2_K or Q4_K
+  down rows; other layers stay mapped, so these files run resident;
+- the CUDA backend, whose graph refuses them.
 
 ## Vision
 

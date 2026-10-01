@@ -49497,6 +49497,7 @@ enum {
     QWEN4_K_HC_GATE_MIX_PAIR_F32,
     QWEN4_K_HC_GATE_MIX_PAIR_Q8,
     QWEN4_K_MULTI_GEMV,
+    QWEN4_K_GSQ_MV_R1, QWEN4_K_GSQ_MV_R2, QWEN4_K_GSQ_MV_R3, QWEN4_K_GSQ_MV_R4,
     QWEN4_K_HC_COMBINE,
     QWEN4_K_CONV_STREAM,
     QWEN4_K_GDN_PREP,
@@ -49650,6 +49651,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_gate_mix_pair_f32",
     "kernel_qwen4_hc_gate_mix_pair_q8",
     "kernel_qwen4_multi_gemv",
+    "kernel_qwen4_gsq_mv_r1", "kernel_qwen4_gsq_mv_r2", "kernel_qwen4_gsq_mv_r3", "kernel_qwen4_gsq_mv_r4",
     "kernel_qwen4_hc_combine",
     "kernel_qwen4_conv_stream",
     "kernel_qwen4_gdn_prep",
@@ -49908,7 +49910,7 @@ static int qwen4_dispatch_resident(int kernel, const void *args, size_t args_len
                 ds4_gpu_device_is_m5_apple_silicon();
             const uint32_t type = specialize ?
                 ((const qwen4_moe_mm_args *)args)->weight_type : 0u;
-            if (type >= 40u) return 0;
+            if (type >= 40u && type != 42u) return 0;   /* 42: Q2_0 */
             const uint32_t tail_base = ((const qwen4_moe_mm_args *)args)->tail_base;
             NSString *key = [NSString stringWithFormat:@"%s_type=%u_tail=%u",
                              qwen4_kernel_names[kernel], type, tail_base];
@@ -53875,6 +53877,18 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
     return nt == 1u || nt == 2u || nt == 4u || nt == 8u ? nt : default_nt;
 }
 
+/* GSQ-RCO types the tiled prefill GEMMs stage (qwen4_mm_stage8), by block
+ * width: the K-quant and IQ super-blocks, IQ4_NL's 32 and Q2_0's 64.  Zero
+ * for every other type. */
+static uint32_t qwen4_mm_gsq_block(uint32_t type) {
+    switch (type) {
+    case 13u: case 14u: case 17u: case 18u: case 21u: case 22u: case 23u: return 256u;
+    case 20u: return 32u;
+    case 42u: return 64u;
+    default: return 0u;
+    }
+}
+
 /* Routed tiles on the Metal 4 tensor ops (drift class: the cooperative
  * matmul's accumulation order differs from the simdgroup tiles; needs the
  * tensor API).  DS4_QWEN4_MOE_MM_NAX: 0 simdgroup tiles; 1 tensor-op
@@ -53897,16 +53911,19 @@ static long qwen4_moe_mm_nax_level(uint32_t type) {
      * 0.20505, Q2 0.30418 vs 0.30346), while it carries the full prefill
      * gain (+48/+51% Q4, +29/+36% Q2).  The compensated level 5 keeps the
      * best absolute NLL and stays one env variable away. */
-    if (!v || !v[0]) return (type == 12u || type == 39u || type == 16u || type == 10u) ? 2 : 0;
+    if (!v || !v[0]) return (type == 12u || type == 39u || type == 16u || type == 10u || qwen4_mm_gsq_block(type)) ? 2 : 0;
     return strtol(v, NULL, 10);
 }
 static uint32_t qwen4_moe_mm_nax(uint32_t type) {
     if (!ds4_gpu_mpp_available()) return 0;
-    if (!(type == 12u || type == 39u || type == 16u || type == 10u)) return 0;
+    if (!(type == 12u || type == 39u || type == 16u || type == 10u) && !qwen4_mm_gsq_block(type)) return 0;
     const long n = qwen4_moe_mm_nax_level(type);
     if (n <= 0) return 0;
     return (n == 1 || n == 4 || n == 6) ? 32u : 64u;
 }
+/* token width of the tensor-op tiles the MoE GEMM runs for a type, 0 for the
+ * simdgroup tiles (tests) */
+int ds4_gpu_qwen4_moe_mm_nax_width(uint32_t type) { return (int)qwen4_moe_mm_nax(type); }
 /* float-activation tensor tiles (levels 3 and 4) */
 static bool qwen4_moe_mm_nax_fx(uint32_t type) {
     const long n = qwen4_moe_mm_nax_level(type);
@@ -53987,7 +54004,9 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[8];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u) ||
+        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u &&
+         weight_type != 2u && !qwen4_mm_gsq_block(weight_type)) ||
+        (qwen4_mm_gsq_block(weight_type) && (in_dim % qwen4_mm_gsq_block(weight_type)) != 0) ||
         (in_dim % 64) != 0 || ff_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, gate_offset, expert_bytes * n_expert, "moe gate experts") ||
         !qwen4_bind_weight(&b[1], model_map, model_size, up_offset, expert_bytes * n_expert, "moe up experts") ||
@@ -54071,7 +54090,9 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     if (tails) args.tail_base = nt * 8u;
     qwen4_bind b[6];
     if (n_tokens == 0 || n_slots == 0 || n_out < n_slots || row_bytes == 0 ||
-        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u && weight_type != 2u) ||
+        (weight_type != 8u && weight_type != 39u && weight_type != 12u && weight_type != 10u && weight_type != 16u &&
+         weight_type != 2u && !qwen4_mm_gsq_block(weight_type)) ||
+        (qwen4_mm_gsq_block(weight_type) && (ff_dim % qwen4_mm_gsq_block(weight_type)) != 0) ||
         (ff_dim % 64) != 0 || out_dim == 0 || n_expert == 0 || n_expert > 512 ||
         !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_expert, "moe down experts") ||
         !qwen4_bind_tensor(&b[1], lists, (uint64_t)n_expert * list_cap * sizeof(int32_t), "moe lists") ||
@@ -54412,11 +54433,26 @@ int ds4_gpu_qwen4_gdn_front_tensor(
                           MTLSizeMake(n_k_head, 1, 1), MTLSizeMake((NSUInteger)(nth / 32u * 32u), 1, 1), 0);
 }
 
+/* Dense GSQ-RCO and BF16 rows at 1-8 tokens take kernel_qwen4_gsq_mv (one
+ * dequant per chunk for every token); larger batches take the dense GEMM.
+ * DS4_QWEN4_GSQ_MV_LEGACY=1 keeps the per-token multi-row gemv. */
+static bool qwen4_gsq_mv_ok(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types) {
+    if (n_tokens == 0 || n_tokens > 8u || (in_dim % 16u) != 0 || getenv("DS4_QWEN4_GSQ_MV_LEGACY")) return false;
+    for (uint32_t i = 0; i < n_out; i++)
+        if (!qwen4_mm_gsq_block(types[i]) && types[i] != 30u) return false;
+    return true;
+}
+
+int ds4_gpu_qwen4_gsq_mv_selected(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types) {
+    return qwen4_gsq_mv_ok(n_tokens, in_dim, n_out, types) ? 1 : 0;
+}
+
 int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
         const uint64_t *offsets, const uint32_t *types, const uint32_t *out_rows) {
-    struct { uint32_t n_tokens, in_dim, n_out, pad0, rows[4], types[4], row_bytes[4]; } args = {0};
+    /* `zero` must stay 0: kernel_qwen4_gsq_mv XORs every weight with it. */
+    struct { uint32_t n_tokens, in_dim, n_out, zero, rows[4], types[4], row_bytes[4]; } args = {0};
     qwen4_bind b[9];
     if (!x || n_tokens == 0 || in_dim == 0 || (in_dim % 32) != 0 || n_out == 0 || n_out > 4 ||
         !qwen4_bind_tensor(&b[0], x, (uint64_t)n_tokens * in_dim * sizeof(float), "multi gemv input")) {
@@ -54444,6 +54480,11 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
             b[1 + i] = b[1];
             b[5 + i] = b[5];
         }
+    }
+    if (qwen4_gsq_mv_ok(n_tokens, in_dim, n_out, types)) {
+        const uint32_t r1 = n_tokens < 4u ? n_tokens : 4u;
+        return qwen4_dispatch(QWEN4_K_GSQ_MV_R1 + (int)r1 - 1, &args, sizeof(args), b, 9,
+                              MTLSizeMake((total + 3) / 4, (n_tokens + r1 - 1) / r1, 1), MTLSizeMake(128, 1, 1), 0);
     }
     return qwen4_dispatch(QWEN4_K_MULTI_GEMV, &args, sizeof(args), b, 9,
                           MTLSizeMake((total + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
@@ -54482,13 +54523,17 @@ int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
-    const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u : weight_type == 1u ? in_dim * 2u :
+    const uint32_t gsq = qwen4_mm_gsq_block(weight_type);
+    const uint32_t row_bytes = weight_type == 0u ? in_dim * 4u :
+                               (weight_type == 1u || weight_type == 30u) ? in_dim * 2u :
                                qwen4_expert_row_bytes(weight_type, in_dim);
     struct { uint32_t n_tokens, in_dim, out_rows, weight_type, row_bytes, n_split, pad1, pad2; } args =
         { n_tokens, in_dim, out_rows, weight_type, row_bytes, 1, 0, 0 };
     qwen4_bind b[3];
-    if (n_tokens == 0 || row_bytes == 0 || (weight_type != 0u && weight_type != 1u && weight_type != 8u) ||
-        (weight_type == 8u && (in_dim % 32) != 0) || (in_dim % 8) != 0 || out_rows == 0) {
+    if (n_tokens == 0 || row_bytes == 0 ||
+        (weight_type != 0u && weight_type != 1u && weight_type != 8u && weight_type != 30u && !gsq) ||
+        (weight_type == 8u && (in_dim % 32) != 0) || (gsq && (in_dim % gsq) != 0) ||
+        (in_dim % 8) != 0 || out_rows == 0) {
         fprintf(stderr, "ds4: Qwen3.8 dense mm rejected type %u in %u out %u tokens %u\n",
                 weight_type, in_dim, out_rows, n_tokens);
         return 0;

@@ -3535,6 +3535,8 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
         const uint64_t *offsets, const uint32_t *types, const uint32_t *out_rows);
+/* 1 when the call above runs kernel_qwen4_gsq_mv (dense GSQ-RCO/BF16 rows, 1-8 tokens) */
+int ds4_gpu_qwen4_gsq_mv_selected(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types);
 /* softmax top-k router; with in_dim != 0 also the shared expert gate logit
  * (one row of gate_type at gate_offset dotted with x) into shared_gate [T] */
 int ds4_gpu_qwen4_router_topk_tensor(
@@ -3805,6 +3807,8 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap);
+/* token width of the tensor-op tiles the MoE GEMM runs for a type, 0 for the simdgroup tiles */
+int ds4_gpu_qwen4_moe_mm_nax_width(uint32_t type);
 /* weight_type covers both the alpha and the beta projection */
 int ds4_gpu_qwen4_gdn_front_tensor(
         ds4_gpu_tensor *qkv, ds4_gpu_tensor *state, const ds4_gpu_tensor *mixed,
@@ -3820,7 +3824,7 @@ int ds4_gpu_qwen4_gdn_front_tensor(
 int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *pos_embed, uint32_t n_patches,
                                 uint32_t grid_w, const void *model_map, uint64_t model_size,
                                 const ds4_qwen4_vision_weights *w);
-/* prefill dense GEMM (f32/f16/q8_0 rows, 32x32 tiles) and the batched hc mix
+/* prefill dense GEMM (f32/f16/bf16/q8_0 and GSQ-RCO rows, 32x32 tiles) and the batched hc mix
  * pieces */
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,

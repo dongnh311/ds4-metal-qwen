@@ -1664,7 +1664,15 @@ static void test_quant_fill_rows(uint8_t *dst, const ds4_quant_fixture *f, uint3
 static double test_quant_row_ref(uint32_t type, const uint8_t *row, uint32_t in_dim, const float *x, double *mag) {
     float *w = malloc((size_t)in_dim * sizeof(float));
     double acc = 0.0, m = 0.0;
-    if (w && ds4_dequant_row(type, row, in_dim, w) == 0) {
+    if (w && type == 30u) {                                   /* BF16: ds4_dequant_row has no BF16 rows */
+        for (uint32_t i = 0; i < in_dim; i++) {
+            uint16_t h;
+            memcpy(&h, row + (uint64_t)i * 2u, sizeof(h));
+            const uint32_t u = (uint32_t)h << 16;
+            memcpy(&w[i], &u, sizeof(u));
+        }
+        for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
+    } else if (w && ds4_dequant_row(type, row, in_dim, w) == 0) {
         for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
     }
     free(w);
@@ -1840,6 +1848,278 @@ static void test_metal_qwen4_quant_moe(void) {
     test_metal_qwen4_quant_moe_case(18, 42, 21, 20);                   /* IQ3_XXS, Q2_0; shared IQ3_S / IQ4_NL */
     test_metal_qwen4_quant_moe_case(21, 20, 23, 42);                   /* IQ3_S, IQ4_NL; shared IQ4_XS / Q2_0 */
     test_metal_qwen4_quant_moe_case(16, 20, 23, 20);                   /* IQ2_XXS (M5 NR kernels), GSQ shared slot */
+}
+
+/* The tiled prefill GEMMs (kernel_qwen4_moe_mm_mid/down) on 3 experts and 40 tokens x 2 slots:
+ * expert 0 gets 40 pairs (two token tiles), 1 and 2 the rest. Weights and activations are staged
+ * as half, so the bound is 1.5e-3 of the magnitude. */
+static void test_metal_qwen4_quant_moe_mm_case(uint32_t gu, uint32_t dn) {
+    const uint32_t in_dim = 2560u, ff = 640u, out_dim = 2560u, n_exp = 3u, T = 40u, slots = 2u;
+    const ds4_quant_fixture *fg = test_quant_fixture(gu), *fd = test_quant_fixture(dn);
+    TEST_ASSERT(fg && fd);
+    if (!fg || !fd) return;
+    const uint64_t g_row = test_quant_row_bytes(gu, in_dim), g_exp = g_row * ff;
+    const uint64_t d_row = test_quant_row_bytes(dn, ff), d_exp = d_row * out_dim;
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t off_up = test_round_up_u64(g_exp * n_exp, page);
+    const uint64_t off_dn = off_up + test_round_up_u64(g_exp * n_exp, page);
+    const uint64_t alloc = off_dn + test_round_up_u64(d_exp * n_exp, page);
+    uint8_t *w = NULL;
+    TEST_ASSERT(posix_memalign((void **)&w, (size_t)page, (size_t)alloc) == 0);
+    if (!w) return;
+    memset(w, 0, (size_t)alloc);
+    test_quant_fill_rows(w, fg, in_dim, ff * n_exp);
+    test_quant_fill_rows(w + off_up, fg, in_dim, ff * n_exp);
+    memcpy(w + off_up, w + off_up + g_row, (size_t)g_row);           /* up row 0 differs from gate row 0 */
+    test_quant_fill_rows(w + off_dn, fd, ff, out_dim * n_exp);
+    int32_t sel[80];
+    for (uint32_t t = 0; t < T; t++) { sel[t * 2u] = 0; sel[t * 2u + 1u] = (t % 3u) == 0 ? 2 : 1; }
+    float *xh = malloc((size_t)T * in_dim * sizeof(float));
+    float *mh = malloc((size_t)T * slots * ff * sizeof(float));
+    float *ph = malloc((size_t)T * slots * out_dim * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)T * in_dim * sizeof(float));
+    ds4_gpu_tensor *s = ds4_gpu_tensor_alloc(sizeof(sel));
+    ds4_gpu_tensor *lists = ds4_gpu_tensor_alloc((uint64_t)n_exp * T * sizeof(int32_t));
+    ds4_gpu_tensor *counts = ds4_gpu_tensor_alloc((uint64_t)n_exp * sizeof(int32_t));
+    ds4_gpu_tensor *mid = ds4_gpu_tensor_alloc((uint64_t)T * slots * ff * sizeof(float));
+    ds4_gpu_tensor *part = ds4_gpu_tensor_alloc((uint64_t)T * slots * out_dim * sizeof(float));
+    TEST_ASSERT(xh && mh && ph && x && s && lists && counts && mid && part);
+    if (xh && mh && ph && x && s && lists && counts && mid && part) {
+        for (uint32_t t = 0; t < T; t++) test_quant_x(xh + (uint64_t)t * in_dim, in_dim, t + 11u);
+        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, xh, (uint64_t)T * in_dim * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_write(s, 0, sel, sizeof(sel)) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(w, alloc) != 0);
+        TEST_ASSERT(ds4_gpu_qwen4_moe_build_lists_tensor(lists, counts, s, T, slots, n_exp, T) != 0);
+        TEST_ASSERT(ds4_gpu_qwen4_moe_mm_mid_tensor(mid, x, lists, counts, w, alloc, 0, off_up, gu, n_exp, T, slots,
+                                                    slots, in_dim, ff, T) != 0);
+        TEST_ASSERT(ds4_gpu_qwen4_moe_mm_down_tensor(part, mid, lists, counts, w, alloc, off_dn, dn, n_exp, T, slots,
+                                                     slots, ff, out_dim, T) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(mid, 0, mh, (uint64_t)T * slots * ff * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_tensor_read(part, 0, ph, (uint64_t)T * slots * out_dim * sizeof(float)) != 0);
+        uint32_t bad_mid = 0, bad_down = 0;
+        for (uint32_t t = 0; t < T; t++) {
+            for (uint32_t k = 0; k < slots; k++) {
+                const uint64_t e = (uint64_t)sel[t * slots + k];
+                const float *xt = xh + (uint64_t)t * in_dim, *mt = mh + ((uint64_t)t * slots + k) * ff;
+                for (uint32_t r = 0; r < ff; r++) {
+                    double mg = 0.0, mu = 0.0;
+                    const double gv = test_quant_row_ref(gu, w + e * g_exp + r * g_row, in_dim, xt, &mg);
+                    const double uv = test_quant_row_ref(gu, w + off_up + e * g_exp + r * g_row, in_dim, xt, &mu);
+                    const double silu = gv / (1.0 + exp(-gv)), ref = silu * uv;
+                    if (fabs((double)mt[r] - ref) > 1.5e-3 * (1.1 * fabs(uv) * mg + fabs(silu) * mu) + 1e-5) bad_mid++;
+                }
+                for (uint32_t r = 0; r < out_dim; r++) {
+                    double mag = 0.0;
+                    const double ref = test_quant_row_ref(dn, w + off_dn + e * d_exp + r * d_row, ff, mt, &mag);
+                    if (fabs((double)ph[((uint64_t)t * slots + k) * out_dim + r] - ref) > 1.5e-3 * mag + 1e-5) bad_down++;
+                }
+            }
+        }
+        if (bad_mid || bad_down) fprintf(stderr, "ds4-test: Qwen MoE GEMM %u/%u: mid %u, down %u rows off\n",
+                                         gu, dn, bad_mid, bad_down);
+        TEST_ASSERT(bad_mid == 0 && bad_down == 0);
+    }
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(s);
+    ds4_gpu_tensor_free(lists);
+    ds4_gpu_tensor_free(counts);
+    ds4_gpu_tensor_free(mid);
+    ds4_gpu_tensor_free(part);
+    free(xh);
+    free(mh);
+    free(ph);
+    free(w);
+}
+
+static void test_metal_qwen4_quant_moe_mm(void) {
+    /* with the tensor API (IQ2_XXS takes the tensor-op tiles), the GSQ-RCO experts take them too;
+     * the cases below then run those tiles */
+    if (ds4_gpu_qwen4_moe_mm_nax_width(16) != 0) {
+        static const uint32_t gsq[6] = { 17, 18, 20, 21, 22, 42 };
+        for (int i = 0; i < 6; i++)
+            TEST_ASSERT(ds4_gpu_qwen4_moe_mm_nax_width(gsq[i]) == ds4_gpu_qwen4_moe_mm_nax_width(16));
+    }
+    test_metal_qwen4_quant_moe_mm_case(17, 42);   /* IQ2_XS gate/up, Q2_0 down */
+    test_metal_qwen4_quant_moe_mm_case(22, 20);   /* IQ2_S, IQ4_NL */
+    test_metal_qwen4_quant_moe_mm_case(18, 42);   /* IQ3_XXS, Q2_0 */
+    test_metal_qwen4_quant_moe_mm_case(21, 20);   /* IQ3_S, IQ4_NL */
+    test_metal_qwen4_quant_moe_mm_case(16, 20);   /* IQ2_XXS (existing tiles), IQ4_NL down */
+}
+
+/* The tiled dense GEMM on 37 rows: 40 tokens (one full and one partial token tile) and 9 tokens
+ * (few threadgroups, so the k-split planes and their reduce run). fp32 staging, fp32 bound. */
+static void test_metal_qwen4_dense_mm_case(uint32_t type, const uint8_t *rows_bytes, uint64_t row_bytes,
+                                           uint32_t in_dim, uint32_t rows) {
+    const uint64_t page = (uint64_t)getpagesize(), alloc = test_round_up_u64(row_bytes * rows, page);
+    void *wraw = NULL;
+    TEST_ASSERT(posix_memalign(&wraw, (size_t)page, (size_t)alloc) == 0);
+    if (!wraw) return;
+    memcpy(wraw, rows_bytes, (size_t)(row_bytes * rows));
+    const uint32_t toks[2] = { 40u, 9u };
+    for (int ti = 0; ti < 2; ti++) {
+        const uint32_t n_tok = toks[ti];
+        float *xh = malloc((size_t)n_tok * in_dim * sizeof(float));
+        float *oh = malloc((size_t)n_tok * rows * sizeof(float));
+        ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)n_tok * in_dim * sizeof(float));
+        ds4_gpu_tensor *o = ds4_gpu_tensor_alloc((uint64_t)n_tok * rows * sizeof(float));
+        TEST_ASSERT(xh && oh && x && o);
+        if (xh && oh && x && o) {
+            for (uint32_t t = 0; t < n_tok; t++) test_quant_x(xh + (uint64_t)t * in_dim, in_dim, t + 3u);
+            TEST_ASSERT(ds4_gpu_tensor_write(x, 0, xh, (uint64_t)n_tok * in_dim * sizeof(float)) != 0);
+            TEST_ASSERT(ds4_gpu_set_model_map(wraw, alloc) != 0);
+            TEST_ASSERT(ds4_gpu_qwen4_dense_mm_tensor(o, x, wraw, alloc, 0, type, n_tok, in_dim, rows) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(o, 0, oh, (uint64_t)n_tok * rows * sizeof(float)) != 0);
+            uint32_t bad = 0;
+            for (uint32_t t = 0; t < n_tok; t++) {
+                for (uint32_t r = 0; r < rows; r++) {
+                    double mag = 0.0;
+                    const double ref = test_quant_row_ref(type, (const uint8_t *)wraw + r * row_bytes, in_dim,
+                                                          xh + (uint64_t)t * in_dim, &mag);
+                    if (fabs((double)oh[(uint64_t)t * rows + r] - ref) > 1e-5 * mag + 1e-6) bad++;
+                }
+            }
+            if (bad) fprintf(stderr, "ds4-test: Qwen dense GEMM type %u dim %u tokens %u: %u/%u rows off\n",
+                             type, in_dim, n_tok, bad, n_tok * rows);
+            TEST_ASSERT(bad == 0);
+        }
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(o);
+        free(xh);
+        free(oh);
+    }
+    free(wraw);
+}
+
+static void test_metal_qwen4_quant_dense_mm(void) {
+    const uint32_t rows = 37u;
+    for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
+        const ds4_quant_fixture *f = &quant_fixtures[i];
+        if (f->type == 16) continue;                        /* IQ2_XXS dense rows keep their kernels */
+        const uint32_t in_dim = (f->type == 20 || f->type == 42) ? 640u : 2560u;
+        const uint64_t row_bytes = test_quant_row_bytes(f->type, in_dim);
+        uint8_t *buf = malloc((size_t)(row_bytes * rows));
+        TEST_ASSERT(buf != NULL);
+        if (!buf) return;
+        test_quant_fill_rows(buf, f, in_dim, rows);
+        test_metal_qwen4_dense_mm_case(f->type, buf, row_bytes, in_dim, rows);
+        free(buf);
+    }
+    /* BF16 rows 2568 wide: the last k tile ends mid-tile */
+    const uint32_t in_dim = 2568u;
+    uint16_t *bf = malloc((size_t)in_dim * rows * sizeof(uint16_t));
+    float *v = malloc((size_t)in_dim * sizeof(float));
+    TEST_ASSERT(bf && v);
+    if (bf && v) {
+        for (uint32_t r = 0; r < rows; r++) {
+            test_quant_x(v, in_dim, r + 101u);
+            for (uint32_t k = 0; k < in_dim; k++) {
+                uint32_t u;
+                memcpy(&u, &v[k], sizeof(u));
+                bf[(uint64_t)r * in_dim + k] = (uint16_t)(u >> 16);
+            }
+        }
+        test_metal_qwen4_dense_mm_case(30u, (const uint8_t *)bf, (uint64_t)in_dim * 2u, in_dim, rows);
+    }
+    free(bf);
+    free(v);
+}
+
+/* kernel_qwen4_gsq_mv: dense GSQ-RCO and BF16 rows at 1-8 tokens dequantize each chunk once.
+ * Against the CPU rows, and column for column bit-equal to the one-token call. */
+static void test_metal_qwen4_gsq_mv_case(uint32_t type, const uint8_t *rows_bytes, uint64_t row_bytes,
+                                         uint32_t in_dim, uint32_t rows) {
+    const uint64_t page = (uint64_t)getpagesize(), alloc = test_round_up_u64(row_bytes * rows, page);
+    void *wraw = NULL;
+    TEST_ASSERT(posix_memalign(&wraw, (size_t)page, (size_t)alloc) == 0);
+    if (!wraw) return;
+    memcpy(wraw, rows_bytes, (size_t)(row_bytes * rows));
+    const uint32_t nmax = 6u;
+    float *xh = malloc((size_t)nmax * in_dim * sizeof(float));
+    float *one = malloc((size_t)nmax * rows * sizeof(float));
+    float *many = malloc((size_t)nmax * rows * sizeof(float));
+    ds4_gpu_tensor *x = ds4_gpu_tensor_alloc((uint64_t)nmax * in_dim * sizeof(float));
+    ds4_gpu_tensor *x1 = ds4_gpu_tensor_alloc((uint64_t)in_dim * sizeof(float));
+    ds4_gpu_tensor *o = ds4_gpu_tensor_alloc((uint64_t)nmax * rows * sizeof(float));
+    TEST_ASSERT(xh && one && many && x && x1 && o);
+    if (xh && one && many && x && x1 && o) {
+        for (uint32_t t = 0; t < nmax; t++) test_quant_x(xh + (uint64_t)t * in_dim, in_dim, t + 17u);
+        TEST_ASSERT(ds4_gpu_tensor_write(x, 0, xh, (uint64_t)nmax * in_dim * sizeof(float)) != 0);
+        TEST_ASSERT(ds4_gpu_set_model_map(wraw, alloc) != 0);
+        ds4_gpu_tensor *outs[1] = { o };
+        const uint64_t offs[1] = { 0 };
+        const uint32_t types[1] = { type }, out_rows[1] = { rows };
+        for (uint32_t t = 0; t < nmax; t++) {           /* one-token decode rows */
+            TEST_ASSERT(ds4_gpu_tensor_write(x1, 0, xh + (uint64_t)t * in_dim, (uint64_t)in_dim * sizeof(float)) != 0);
+            TEST_ASSERT(ds4_gpu_qwen4_multi_gemv_tensor(x1, 1, in_dim, 1, outs, wraw, alloc, offs, types, out_rows) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(o, 0, one + (uint64_t)t * rows, (uint64_t)rows * sizeof(float)) != 0);
+        }
+        uint32_t bad = 0;
+        for (uint32_t t = 0; t < nmax; t++)
+            for (uint32_t r = 0; r < rows; r++) {
+                double mag = 0.0;
+                const double ref = test_quant_row_ref(type, (const uint8_t *)wraw + r * row_bytes, in_dim,
+                                                      xh + (uint64_t)t * in_dim, &mag);
+                if (fabs((double)one[(uint64_t)t * rows + r] - ref) > 1e-5 * mag + 1e-6) bad++;
+            }
+        const uint32_t ns[3] = { 2u, 3u, 6u };
+        uint32_t differ = 0;
+        for (int k = 0; k < 3; k++) {
+            TEST_ASSERT(ds4_gpu_qwen4_multi_gemv_tensor(x, ns[k], in_dim, 1, outs, wraw, alloc, offs, types, out_rows) != 0);
+            TEST_ASSERT(ds4_gpu_tensor_read(o, 0, many, (uint64_t)ns[k] * rows * sizeof(float)) != 0);
+            if (memcmp(many, one, (size_t)ns[k] * rows * sizeof(float)) != 0) differ++;
+        }
+        if (bad || differ) fprintf(stderr, "ds4-test: GSQ mv type %u dim %u: %u rows off, %u batch sizes differ from one-token rows\n",
+                                   type, in_dim, bad, differ);
+        TEST_ASSERT(bad == 0 && differ == 0);
+    }
+    ds4_gpu_tensor_free(x);
+    ds4_gpu_tensor_free(x1);
+    ds4_gpu_tensor_free(o);
+    free(xh);
+    free(one);
+    free(many);
+    free(wraw);
+}
+
+static void test_metal_qwen4_gsq_mv(void) {
+    const uint32_t gsq[2] = { 21u, 14u }, prod[2] = { 8u, 12u };
+    TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(1, 2560, 1, gsq) == 1);
+    TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(3, 2560, 2, gsq) == 1);
+    TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(8, 2560, 1, gsq) == 1);
+    TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(9, 2560, 1, gsq) == 0);      /* the dense GEMM's batch sizes */
+    TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(3, 2560, 1, prod) == 0);     /* Q8_0 keeps its kernels */
+    const uint32_t bf[1] = { 30u };
+    TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(3, 2568, 1, bf) == 0);       /* not whole 16-value chunks */
+    const uint32_t rows = 37u;
+    for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
+        const ds4_quant_fixture *f = &quant_fixtures[i];
+        if (f->type == 16) continue;
+        const uint32_t in_dim = (f->type == 20 || f->type == 42) ? 640u : 2560u;
+        const uint64_t row_bytes = test_quant_row_bytes(f->type, in_dim);
+        uint8_t *buf = malloc((size_t)(row_bytes * rows));
+        TEST_ASSERT(buf != NULL);
+        if (!buf) return;
+        test_quant_fill_rows(buf, f, in_dim, rows);
+        test_metal_qwen4_gsq_mv_case(f->type, buf, row_bytes, in_dim, rows);
+        free(buf);
+    }
+    const uint32_t in_dim = 2560u;                     /* BF16 rows */
+    uint16_t *bfr = malloc((size_t)in_dim * rows * sizeof(uint16_t));
+    float *v = malloc((size_t)in_dim * sizeof(float));
+    TEST_ASSERT(bfr && v);
+    if (bfr && v) {
+        for (uint32_t r = 0; r < rows; r++) {
+            test_quant_x(v, in_dim, r + 211u);
+            for (uint32_t k = 0; k < in_dim; k++) {
+                uint32_t u;
+                memcpy(&u, &v[k], sizeof(u));
+                bfr[(uint64_t)r * in_dim + k] = (uint16_t)(u >> 16);
+            }
+        }
+        test_metal_qwen4_gsq_mv_case(30u, (const uint8_t *)bfr, (uint64_t)in_dim * 2u, in_dim, rows);
+    }
+    free(bfr);
+    free(v);
 }
 
 static void test_metal_f16_compressor_pair_state_store_exact_case(
@@ -5589,7 +5869,10 @@ static void test_metal_kernel_group(void) {
     test_metal_router_simd_finalize_exact();
     test_metal_router_weights_batch_exact();
     test_metal_qwen4_quant_gemv();
+    test_metal_qwen4_gsq_mv();
     test_metal_qwen4_quant_moe();
+    test_metal_qwen4_quant_moe_mm();
+    test_metal_qwen4_quant_dense_mm();
 #endif
 }
 
@@ -7709,6 +7992,20 @@ static void test_quant_types(void) {
         TEST_ASSERT(!ds4_test_routed_expert_type_ok(gsq[i], 0));
     }
     TEST_ASSERT(ds4_test_routed_expert_type_ok(16, 0) && ds4_test_routed_expert_type_ok(16, 1));   /* IQ2_XXS */
+#if defined(__APPLE__)
+    /* prefill routing: GSQ-RCO experts take the tiled MoE GEMM, GSQ-RCO and BF16 dense rows the
+     * tiled dense GEMM above 8 rows; PROD's types keep their kernels */
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(16) == 1);
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(18) == 1);
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(42) == 1);
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(30) == 0);
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 40, 2560) == 1);
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(30, 40, 2560) == 1);
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 8, 2560) == 0);   /* decode and MTP verify rows */
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 40, 2600) == 0);  /* not whole super-blocks */
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(8, 40, 2560) == 0);   /* Q8_0 keeps its kernels */
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(12, 40, 2560) == 0);  /* Q4_K keeps the ggml GEMM */
+#endif
     TEST_ASSERT(ds4_gguf_type_block(41, &e, &b) != 0);    /* not in ds4's table (upstream Q1_0) */
     TEST_ASSERT(ds4_gguf_type_block(1000, &e, &b) != 0);
     /* first and last entries of the generated grid tables (ggml-common.h @931351ea) */

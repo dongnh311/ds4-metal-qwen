@@ -3151,7 +3151,7 @@ struct ds4_metal_args_qwen4_gemv {
     uint32_t n_tokens;
     uint32_t in_dim;
     uint32_t n_out;
-    uint32_t pad0;
+    uint32_t zero;      /* must stay 0: kernel_qwen4_gsq_mv XORs every weight with it */
     uint32_t out_rows[4];
     uint32_t types[4];
     uint32_t row_bytes[4];
@@ -3188,6 +3188,93 @@ kernel void kernel_qwen4_multi_gemv(
         if (tiisg == 0) o[(uint64_t)tok * args.out_rows[i] + local] = v;
     }
 }
+
+static inline void qwen4_gsq_deq8(device const char *row, uint b, uint q, uint type, thread float *v);
+
+/* one row of kernel_qwen4_gsq_mv for a constant type: lane = 16-value chunk */
+/* `opaque` is a runtime zero: the weights pass through it as opaque values, so
+ * the compiler cannot fuse the dequantization into the dot product differently
+ * for one token than for several, and a column's sum is the same in every R1. */
+template <uint TYPE, uint R1>
+static inline void qwen4_gsq_mv_loop(device const char *row, device const float *x, uint in_dim, uint t0, uint nt,
+                                     uint opaque, ushort tiisg, thread float *acc) {
+    for (uint t = 0; t < R1; t++) acc[t] = 0.0f;
+    for (uint c = tiisg; c < in_dim / 16u; c += 32u) {
+        float wv[16];
+        qwen4_gsq_deq8(row, c / 2u, (c % 2u) * 2u, TYPE, wv);
+        qwen4_gsq_deq8(row, c / 2u, (c % 2u) * 2u + 1u, TYPE, wv + 8);
+        for (uint i = 0; i < 16u; i++) wv[i] = as_type<float>(as_type<uint>(wv[i]) ^ opaque);
+        for (uint t = 0; t < R1; t++) {
+            if (t < nt) {
+                device const float4 *xv = (device const float4 *)(x + (uint64_t)(t0 + t) * in_dim + c * 16u);
+                float s = 0.0f;
+                for (uint j = 0; j < 4u; j++) {
+                    const float4 y = xv[j];
+                    s += wv[4u * j] * y.x + wv[4u * j + 1u] * y.y + wv[4u * j + 2u] * y.z + wv[4u * j + 3u] * y.w;
+                }
+                acc[t] += s;
+            }
+        }
+    }
+}
+
+/* Dense GSQ-RCO and BF16 rows over R1 tokens (decode, MTP verify, batches up
+ * to 8): each lane dequantizes a 16-value chunk once into registers and dots
+ * it with the R1 activation columns; one simdgroup per row.  A column's sum
+ * does not depend on R1, so a verify row matches the one-token row. */
+template <uint R1>
+kernel void kernel_qwen4_gsq_mv(
+        constant ds4_metal_args_qwen4_gemv & args,
+        device const float *x,          /* [T][in_dim] */
+        device const char  *w0,
+        device const char  *w1,
+        device const char  *w2,
+        device const char  *w3,
+        device float       *o0,         /* [T][out_rows[i]] */
+        device float       *o1,
+        device float       *o2,
+        device float       *o3,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint total = args.out_rows[0] + args.out_rows[1] + args.out_rows[2] + args.out_rows[3];
+    const uint r = tgpig.x * 4 + (uint)sgitg;
+    if (r >= total) return;
+    uint i = 0, local = r;
+    while (i + 1 < args.n_out && local >= args.out_rows[i]) { local -= args.out_rows[i]; i++; }
+    device const char *row = (i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3) + (uint64_t)local * args.row_bytes[i];
+    device float *o = i == 0 ? o0 : i == 1 ? o1 : i == 2 ? o2 : o3;
+    const uint t0 = tgpig.y * R1;
+    const uint nt = min(R1, args.n_tokens - t0);
+    float acc[R1];
+    /* the type is constant inside each loop, so the dequantizer folds to one
+     * type and its two halves of a chunk share their block header reads */
+    switch (args.types[i]) {
+    case 13: qwen4_gsq_mv_loop<13, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 14: qwen4_gsq_mv_loop<14, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 17: qwen4_gsq_mv_loop<17, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 18: qwen4_gsq_mv_loop<18, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 20: qwen4_gsq_mv_loop<20, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 21: qwen4_gsq_mv_loop<21, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 22: qwen4_gsq_mv_loop<22, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 23: qwen4_gsq_mv_loop<23, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 42: qwen4_gsq_mv_loop<42, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    default: qwen4_gsq_mv_loop<30, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    }
+    for (uint t = 0; t < R1; t++) {
+        const float v = simd_sum(acc[t]);
+        if (tiisg == 0 && t < nt) o[(uint64_t)(t0 + t) * args.out_rows[i] + local] = v;
+    }
+}
+
+#define QWEN4_GSQ_MV_SIG constant ds4_metal_args_qwen4_gemv &, device const float *, device const char *, \
+    device const char *, device const char *, device const char *, device float *, device float *, \
+    device float *, device float *, uint3, ushort, ushort
+template [[host_name("kernel_qwen4_gsq_mv_r1")]] kernel void kernel_qwen4_gsq_mv<1>(QWEN4_GSQ_MV_SIG);
+template [[host_name("kernel_qwen4_gsq_mv_r2")]] kernel void kernel_qwen4_gsq_mv<2>(QWEN4_GSQ_MV_SIG);
+template [[host_name("kernel_qwen4_gsq_mv_r3")]] kernel void kernel_qwen4_gsq_mv<3>(QWEN4_GSQ_MV_SIG);
+template [[host_name("kernel_qwen4_gsq_mv_r4")]] kernel void kernel_qwen4_gsq_mv<4>(QWEN4_GSQ_MV_SIG);
+#undef QWEN4_GSQ_MV_SIG
 
 /* Decode specialization keeps the original per-lane accumulation order. */
 constant uint qwen4_mv_type [[function_constant(901)]];
@@ -4340,6 +4427,129 @@ kernel void kernel_qwen4_moe_build_lists(
     }
 }
 
+/* 8 consecutive values (quarter q of 32-wide block b) of a GSQ-RCO or BF16
+ * row into registers: ggml-quants.c dequantizers @931351ea (MIT), the same
+ * coordinates as the qwen4_lane_* helpers (super-block b / 8, 32-wide
+ * sub-block b % 8).  The tiled GEMMs stage through it and
+ * kernel_qwen4_gsq_mv dots it in registers. */
+static inline void qwen4_gsq_deq8(device const char *row, uint b, uint q, uint type, thread float *v) {
+    if (type == 30) {   /* BF16 */
+        device const ushort *w = (device const ushort *)row + b * 32 + q * 8;
+        for (uint i = 0; i < 8; i++) v[i] = as_type<float>((uint)w[i] << 16);
+        return;
+    }
+    if (type == 17) {   /* IQ2_XS */
+        const uint ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 74);
+        const uint sc = blk[66 + ib32];
+        const float db = (float)(*(device const half *)blk) * (0.5f + (float)(q < 2 ? (sc & 0xFu) : (sc >> 4))) * 0.25f;
+        const uint gi = ((device const ushort *)(blk + 2))[4 * ib32 + q];
+        constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xs_grid + (gi & 511u));
+        const uint signs = ds4_metal_ksigns_iq2xs[gi >> 9];
+        for (uint i = 0; i < 8; i++) v[i] = db * (float)grid[i] * ((signs >> i) & 1u ? -1.0f : 1.0f);
+        return;
+    }
+    if (type == 22) {   /* IQ2_S */
+        const uint ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 82);
+        const uint qh = blk[66 + ib32], sc = blk[74 + ib32];
+        const float db = (float)(*(device const half *)blk) * (0.5f + (float)(q < 2 ? (sc & 0xFu) : (sc >> 4))) * 0.25f;
+        constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2s_grid +
+            ((uint)blk[2 + 4 * ib32 + q] | ((qh << (8u - 2u * q)) & 0x300u)));
+        const uint s = blk[34 + 4 * ib32 + q];
+        for (uint i = 0; i < 8; i++) v[i] = db * (float)grid[i] * ((s >> i) & 1u ? -1.0f : 1.0f);
+        return;
+    }
+    if (type == 18) {   /* IQ3_XXS */
+        const uint ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 98);
+        device const ushort *ss = (device const ushort *)(blk + 66) + 2 * ib32;
+        const uint aux = (uint)ss[0] | ((uint)ss[1] << 16);
+        const float db = (float)(*(device const half *)blk) * (0.5f + (float)(aux >> 28)) * 0.5f;
+        const uint signs = ds4_metal_ksigns_iq2xs[(aux >> (7u * q)) & 127u];
+        device const uchar *qs = blk + 2 + 8 * ib32 + 2 * q;
+        constant const uchar *g1 = (constant const uchar *)(ds4_metal_iq3xxs_grid + qs[0]);
+        constant const uchar *g2 = (constant const uchar *)(ds4_metal_iq3xxs_grid + qs[1]);
+        for (uint i = 0; i < 4; i++) {
+            v[i] = db * (float)g1[i] * ((signs >> i) & 1u ? -1.0f : 1.0f);
+            v[4 + i] = db * (float)g2[i] * ((signs >> (i + 4u)) & 1u ? -1.0f : 1.0f);
+        }
+        return;
+    }
+    if (type == 21) {   /* IQ3_S */
+        const uint ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 110);
+        const uint qh = blk[66 + ib32], s = blk[74 + 4 * ib32 + q];
+        const float db = (float)(*(device const half *)blk) *
+                         (float)(1u + 2u * ((blk[106 + ib32 / 2] >> (4u * (ib32 & 1u))) & 0xFu));
+        device const uchar *qs = blk + 2 + 8 * ib32 + 2 * q;
+        constant const uchar *g1 = (constant const uchar *)(ds4_metal_iq3s_grid + ((uint)qs[0] | ((qh << (8u - 2u * q)) & 256u)));
+        constant const uchar *g2 = (constant const uchar *)(ds4_metal_iq3s_grid + ((uint)qs[1] | ((qh << (7u - 2u * q)) & 256u)));
+        for (uint i = 0; i < 4; i++) {
+            v[i] = db * (float)g1[i] * ((s >> i) & 1u ? -1.0f : 1.0f);
+            v[4 + i] = db * (float)g2[i] * ((s >> (i + 4u)) & 1u ? -1.0f : 1.0f);
+        }
+        return;
+    }
+    if (type == 20 || type == 23) {   /* IQ4_NL (18-byte blocks of 32), IQ4_XS (136-byte super-blocks) */
+        device const uchar *qs;
+        float dl;
+        if (type == 20) {
+            device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 18);
+            dl = (float)(*(device const half *)blk);
+            qs = blk + 2;
+        } else {
+            const uint ib32 = b % 8;
+            device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 136);
+            const uint scales_h = (uint)*(device const ushort *)(blk + 2);
+            const int ls = (int)(((blk[4 + ib32 / 2] >> (4u * (ib32 % 2u))) & 0xFu) | (((scales_h >> (2u * ib32)) & 3u) << 4));
+            dl = (float)(*(device const half *)blk) * (float)(ls - 32);
+            qs = blk + 8 + 16 * ib32;
+        }
+        qs += (q & 1u) * 8;
+        const bool hi = q >= 2;
+        for (uint i = 0; i < 8; i++) v[i] = dl * (float)ds4_metal_kvalues_iq4nl[hi ? (qs[i] >> 4) : (qs[i] & 0xFu)];
+        return;
+    }
+    if (type == 42) {   /* Q2_0: 18-byte blocks of 64, 2-bit codes minus one, four per byte */
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 2) * 18);
+        const float d = (float)(*(device const half *)blk);
+        device const uchar *qs = blk + 2 + ((b % 2) * 32 + q * 8) / 4;
+        for (uint i = 0; i < 8; i++) v[i] = d * (float)((int)((qs[i / 4] >> ((i % 4) * 2)) & 3u) - 1);
+        return;
+    }
+    if (type == 13) {   /* Q5_K */
+        const uint g = b % 8, l = q * 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 176);
+        const float d = (float)(*(device const half *)blk), dmin = (float)(*(device const half *)(blk + 2));
+        device const uchar *sc = blk + 4;
+        uint s, mn;
+        if (g < 4) { s = sc[g] & 63u; mn = sc[g + 4] & 63u; }
+        else { s = (sc[g + 4] & 0xFu) | ((sc[g - 4] >> 6) << 4); mn = (sc[g + 4] >> 4) | ((sc[g] >> 6) << 4); }
+        const float ds = d * (float)s, dm = dmin * (float)mn;
+        /* 176-byte blocks in 32-aligned tensors: qh and ql are 8-byte aligned */
+        const uint2 hq = *(device const uint2 *)(blk + 16 + l), lq = *(device const uint2 *)(blk + 48 + 32 * (g / 2) + l);
+        for (uint i = 0; i < 8; i++) {
+            const uint hb = (hq[i >> 2] >> (8u * (i & 3u))) & 0xFFu, lb = (lq[i >> 2] >> (8u * (i & 3u))) & 0xFFu;
+            const uint lo = (g & 1u) ? (lb >> 4) : (lb & 0xFu);
+            v[i] = ds * (float)(lo + (((hb >> g) & 1u) << 4)) - dm;
+        }
+        return;
+    }
+    if (type == 14) {   /* Q6_K */
+        const uint g = b % 8, h = g / 4, k = g % 4, l = q * 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 210);
+        device const uchar *ql = blk + 64 * h + ((k & 1u) ? 32 : 0) + l, *qh = blk + 128 + 32 * h + l;
+        const float ds = (float)(*(device const half *)(blk + 208)) *
+                         (float)((device const char *)(blk + 192 + 8 * h))[2 * k + (l >= 16 ? 1 : 0)];
+        for (uint i = 0; i < 8; i++) {
+            const uint lo = (k < 2) ? (uint)(ql[i] & 0xFu) : (uint)(ql[i] >> 4);
+            v[i] = ds * (float)((int)(lo | (((qh[i] >> (2u * k)) & 3u) << 4)) - 32);
+        }
+        return;
+    }
+}
+
 /* dequantize 8 consecutive values (quarter q of 32-wide block b of a row) */
 template <typename D>
 static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint type, threadgroup D *dst) {
@@ -4368,6 +4578,12 @@ static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint 
         device const uchar *qs = blk + 16 + (group >> 1) * 32 + l;
         const uint shift = (group & 1u) * 4u;
         for (uint i = 0; i < 8; i++) dst[i] = (D)(ds * (float)((qs[i] >> shift) & 0xFu) - dm);
+        return;
+    }
+    if (type == 13 || type == 14 || type == 17 || type == 18 || (type >= 20 && type <= 23) || type == 42) {
+        float v[8];
+        qwen4_gsq_deq8(row, b, q, type, v);
+        for (uint i = 0; i < 8; i++) dst[i] = (D)v[i];
         return;
     }
     if (type == 10) {
@@ -4916,18 +5132,27 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
         const bool a_row = row0 + ar < args.out_rows;
         device const char *grow = gbase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
         device const char *urow = ubase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
-        qwen4_raw16 rg = qwen4_load_raw16(grow, 0, aq * 2, type), ru = qwen4_load_raw16(urow, 0, aq * 2, type);
+        /* the register prefetch covers Q4_K, Q2_K, IQ2_XXS and MXFP4; other
+         * types (GSQ-RCO) stage straight from their rows */
+        const bool raw = type == 12u || type == 10u || type == 16u || type == 39u;
+        qwen4_raw16 rg{}, ru{};
+        if (raw) { rg = qwen4_load_raw16(grow, 0, aq * 2, type); ru = qwen4_load_raw16(urow, 0, aq * 2, type); }
         for (uint kb = 0; kb < nk; kb++) {
             {
                 threadgroup half *dg = Ag + ar * NK + aq * 16;
                 threadgroup half *du = Au + ar * NK + aq * 16;
                 if (a_row) {
-                    qwen4_dequant_raw16(rg, kb, aq * 2, type, dg);
-                    qwen4_dequant_raw16(ru, kb, aq * 2, type, du);
+                    if (raw) {
+                        qwen4_dequant_raw16(rg, kb, aq * 2, type, dg);
+                        qwen4_dequant_raw16(ru, kb, aq * 2, type, du);
+                    } else {
+                        qwen4_mm_stage16(grow, kb, aq * 2, type, dg);
+                        qwen4_mm_stage16(urow, kb, aq * 2, type, du);
+                    }
                 } else {
                     for (uint i = 0; i < 16; i++) { dg[i] = 0.0h; du[i] = 0.0h; }
                 }
-                if (kb + 1 < nk) { rg = qwen4_load_raw16(grow, kb + 1, aq * 2, type); ru = qwen4_load_raw16(urow, kb + 1, aq * 2, type); }
+                if (raw && kb + 1 < nk) { rg = qwen4_load_raw16(grow, kb + 1, aq * 2, type); ru = qwen4_load_raw16(urow, kb + 1, aq * 2, type); }
             }
 #pragma unroll
             for (int b = 0; b < NB; b++) {
@@ -5071,13 +5296,17 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const bool a_row = row0 + ar < args.out_rows;
         device const char *drow = dbase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
-        qwen4_raw16 rd = qwen4_load_raw16(drow, 0, aq * 2, type);
+        /* register prefetch for Q4_K, Q2_K, IQ2_XXS and MXFP4 only, as in the mid tiles */
+        const bool raw = type == 12u || type == 10u || type == 16u || type == 39u;
+        qwen4_raw16 rd{};
+        if (raw) rd = qwen4_load_raw16(drow, 0, aq * 2, type);
         for (uint kb = 0; kb < nk; kb++) {
             {
                 threadgroup half *dd = As + ar * NK + aq * 16;
-                if (a_row) qwen4_dequant_raw16(rd, kb, aq * 2, type, dd);
+                if (a_row && raw) qwen4_dequant_raw16(rd, kb, aq * 2, type, dd);
+                else if (a_row) qwen4_mm_stage16(drow, kb, aq * 2, type, dd);
                 else for (uint i = 0; i < 16; i++) dd[i] = 0.0h;
-                if (kb + 1 < nk) rd = qwen4_load_raw16(drow, kb + 1, aq * 2, type);
+                if (raw && kb + 1 < nk) rd = qwen4_load_raw16(drow, kb + 1, aq * 2, type);
             }
 #pragma unroll
             for (int b = 0; b < NB; b++) {
@@ -5137,13 +5366,13 @@ template [[host_name("kernel_qwen4_moe_mm_down_naxc64")]] kernel void kernel_qwe
 #undef QWEN4_NAX_DOWN_SIG_HALF
 #undef QWEN4_NAX_DOWN_SIG_FLOAT
 #endif /* DS4_METAL_HAS_TENSOR */
-/* --- prefill: dense tiled GEMM for f32/f16/q8_0 weights ----------------- */
+/* --- prefill: dense tiled GEMM for f32/f16/bf16/q8_0 and GSQ-RCO weights - */
 
 struct ds4_metal_args_qwen4_dense_mm {
     uint32_t n_tokens;
     uint32_t in_dim;
     uint32_t out_rows;
-    uint32_t weight_type;   /* 0 f32, 1 f16, 8 q8_0 */
+    uint32_t weight_type;   /* 0 f32, 1 f16, 8 q8_0, 30 bf16, or a GSQ-RCO type */
     uint32_t row_bytes;
     /* Number of k-splits.  One (or zero) writes straight to out; more makes
      * each grid slice cover a slice of k and write its own partial plane,
@@ -5157,16 +5386,20 @@ struct ds4_metal_args_qwen4_dense_mm {
 #define QWEN4_DM_K 32
 
 /* 8 consecutive weights of row `row` starting at element k0 (k0 % 8 == 0);
- * f32/f16 rows may end mid-tile (in_dim % 32 != 0), q8_0 rows cannot */
+ * f32/f16/bf16 rows may end mid-tile (in_dim % 32 != 0), quantized rows
+ * (q8_0, the GSQ-RCO types) cannot */
 static inline void qwen4_dm_stage8(device const char *row, uint k0, uint k_end, uint type, threadgroup float *dst) {
-    if (type == 8) {
-        qwen4_mm_stage8<float>(row, k0 / 32, (k0 % 32) / 8, 8u, dst);
-    } else if (type == 1) {
+    if (type == 1) {
         device const half *w = (device const half *)row + k0;
         for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? (float)w[i] : 0.0f;
-    } else {
+    } else if (type == 0) {
         device const float *w = (device const float *)row + k0;
         for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? w[i] : 0.0f;
+    } else if (type == 30) {
+        device const ushort *w = (device const ushort *)row + k0;
+        for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? as_type<float>((uint)w[i] << 16) : 0.0f;
+    } else {
+        qwen4_mm_stage8<float>(row, k0 / 32, (k0 % 32) / 8, type, dst);
     }
 }
 
