@@ -150,3 +150,24 @@ un-hidden pread and resolution remain for SP2. Expected: ~75-85 ms/token, **~12-
 - Slab preallocation: gates need all slabs; a cold start runs ~65 tokens on the drain path.
 - The shared-core extraction touches PROD code; mitigated by doing it first and gating on Qwen full.
 - The remaining pread (~20 ms/token) caps SP1 near 13-14 t/s; SP2 has to hide it.
+
+## Planning amendments (2026-10-01, from reading the code for the SP1 plan)
+
+Plan: `docs/superpowers/plans/2026-10-01-glm53-decode-gates.md`.
+
+1. **Per-gate tables in both passes.** Gated layers never read the layer's address table. Pass 1 holds
+   every expert, or only the cached ones when the gate is split; pass 2 holds the misses. The routed
+   kernels skip an address of 0, so split gates need no kernel change.
+2. **Failure scope.** A gate failure disables gates for the process (the existing qgate latch), not
+   only for the session. There is one model per process.
+3. **Start condition.** A token is gated only with the static decode map, which the measured config
+   uses.
+4. **Cold start.** The slab sizing already keys on qgate being requested, so the cache is one slab.
+   Gates start after the first decode miss, not after ~65 tokens.
+5. **Cache ownership.** `end_commands` also waits for the service thread to go idle, so the
+   bookkeeping it does after a release is finished. qwen4 gets this too; it is a host wait only.
+6. **Fallback.** GLM's fallback has 8 slots (~54 MiB); qwen4 keeps 64. Altogether, gates add about
+   104 MiB for GLM.
+7. **Lookahead prefetch** stays qwen4-only; GLM prefetch is SP2.
+8. **Testing metric.** "Waited command buffers per token" is replaced by GPU busy % and gated layers
+   per token (`DS4_GLM_STREAM_TIMING`).
