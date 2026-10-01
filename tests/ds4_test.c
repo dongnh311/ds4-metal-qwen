@@ -1932,6 +1932,13 @@ static void test_metal_qwen4_quant_moe_mm_case(uint32_t gu, uint32_t dn) {
 }
 
 static void test_metal_qwen4_quant_moe_mm(void) {
+    /* with the tensor API (IQ2_XXS takes the tensor-op tiles), the GSQ-RCO experts take them too;
+     * the cases below then run those tiles */
+    if (ds4_gpu_qwen4_moe_mm_nax_width(16) != 0) {
+        static const uint32_t gsq[6] = { 17, 18, 20, 21, 22, 42 };
+        for (int i = 0; i < 6; i++)
+            TEST_ASSERT(ds4_gpu_qwen4_moe_mm_nax_width(gsq[i]) == ds4_gpu_qwen4_moe_mm_nax_width(16));
+    }
     test_metal_qwen4_quant_moe_mm_case(17, 42);   /* IQ2_XS gate/up, Q2_0 down */
     test_metal_qwen4_quant_moe_mm_case(22, 20);   /* IQ2_S, IQ4_NL */
     test_metal_qwen4_quant_moe_mm_case(18, 42);   /* IQ3_XXS, Q2_0 */

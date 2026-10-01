@@ -53877,6 +53877,18 @@ static uint32_t qwen4_moe_mm_nt(uint32_t n_tokens, uint32_t type, const char *en
     return nt == 1u || nt == 2u || nt == 4u || nt == 8u ? nt : default_nt;
 }
 
+/* GSQ-RCO types the tiled prefill GEMMs stage (qwen4_mm_stage8), by block
+ * width: the K-quant and IQ super-blocks, IQ4_NL's 32 and Q2_0's 64.  Zero
+ * for every other type. */
+static uint32_t qwen4_mm_gsq_block(uint32_t type) {
+    switch (type) {
+    case 13u: case 14u: case 17u: case 18u: case 21u: case 22u: case 23u: return 256u;
+    case 20u: return 32u;
+    case 42u: return 64u;
+    default: return 0u;
+    }
+}
+
 /* Routed tiles on the Metal 4 tensor ops (drift class: the cooperative
  * matmul's accumulation order differs from the simdgroup tiles; needs the
  * tensor API).  DS4_QWEN4_MOE_MM_NAX: 0 simdgroup tiles; 1 tensor-op
@@ -53899,16 +53911,19 @@ static long qwen4_moe_mm_nax_level(uint32_t type) {
      * 0.20505, Q2 0.30418 vs 0.30346), while it carries the full prefill
      * gain (+48/+51% Q4, +29/+36% Q2).  The compensated level 5 keeps the
      * best absolute NLL and stays one env variable away. */
-    if (!v || !v[0]) return (type == 12u || type == 39u || type == 16u || type == 10u) ? 2 : 0;
+    if (!v || !v[0]) return (type == 12u || type == 39u || type == 16u || type == 10u || qwen4_mm_gsq_block(type)) ? 2 : 0;
     return strtol(v, NULL, 10);
 }
 static uint32_t qwen4_moe_mm_nax(uint32_t type) {
     if (!ds4_gpu_mpp_available()) return 0;
-    if (!(type == 12u || type == 39u || type == 16u || type == 10u)) return 0;
+    if (!(type == 12u || type == 39u || type == 16u || type == 10u) && !qwen4_mm_gsq_block(type)) return 0;
     const long n = qwen4_moe_mm_nax_level(type);
     if (n <= 0) return 0;
     return (n == 1 || n == 4 || n == 6) ? 32u : 64u;
 }
+/* token width of the tensor-op tiles the MoE GEMM runs for a type, 0 for the
+ * simdgroup tiles (tests) */
+int ds4_gpu_qwen4_moe_mm_nax_width(uint32_t type) { return (int)qwen4_moe_mm_nax(type); }
 /* float-activation tensor tiles (levels 3 and 4) */
 static bool qwen4_moe_mm_nax_fx(uint32_t type) {
     const long n = qwen4_moe_mm_nax_level(type);
@@ -53960,18 +53975,6 @@ static ds4_gpu_tensor *qwen4_nax_half_operand(ds4_gpu_tensor **slot, uint64_t *s
     if (!qwen4_dispatch(QWEN4_K_ROWS_F32_TO_F16, &args, sizeof(args), b, 2,
                         MTLSizeMake((n_threads + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0)) return NULL;
     return dst;
-}
-
-/* GSQ-RCO types the tiled prefill GEMMs stage (qwen4_mm_stage8), by block
- * width: the K-quant and IQ super-blocks, IQ4_NL's 32 and Q2_0's 64.  Zero
- * for every other type. */
-static uint32_t qwen4_mm_gsq_block(uint32_t type) {
-    switch (type) {
-    case 13u: case 14u: case 17u: case 18u: case 21u: case 22u: case 23u: return 256u;
-    case 20u: return 32u;
-    case 42u: return 64u;
-    default: return 0u;
-    }
 }
 
 static bool qwen4_moe_mm_tails(uint32_t type, uint32_t nt) {
