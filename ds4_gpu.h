@@ -430,6 +430,15 @@ int ds4_gpu_glm_stream_expert_cache_begin_selected_load_tensor(
  * the caller retries synchronously). */
 void ds4_gpu_stream_expert_cache_note_service_thread(void);
 #endif
+#ifdef __APPLE__
+/* Stream gates, tests only. mode: -1 follows DS4_QWEN4_STREAM_GATE /
+ * DS4_GLM_STREAM_GATE, 0 forces the per-layer drain, 1 forces gates; split
+ * likewise for two-pass gates. Stats are cumulative since start and are read
+ * once the gate service thread is idle. */
+void ds4_gpu_stream_gate_test_set_mode(int mode, int split);
+void ds4_gpu_stream_gate_stats(uint64_t *committed, uint64_t *split,
+                               uint64_t *fallback, int *failed);
+#endif
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         const ds4_gpu_stream_expert_table *table,

@@ -52772,8 +52772,14 @@ static uint64_t g_qgate_stat_poll_n[3], g_qgate_stat_poll_waited[3];
 static double g_qgate_stat_poll_line[3];     /* sum of the line each poll found its release at */
 static uint8_t g_qgate_ring_missed[QGATE_RING]; /* split gate in this ring slot had misses */
 static double g_qgate_stat_miss_load_ms, g_qgate_stat_miss_count; /* split gates with misses */
+static uint64_t g_qgate_stat_committed;      /* gates committed (main thread) */
+/* tests/test_metal_stream_gate.c: -1 follows the env switches, 0/1 force
+ * gates (both clients) or two-pass gates off/on. */
+static int g_qgate_test_mode = -1;
+static int g_qgate_test_split = -1;
 
 static int qgate_requested(void) {
+    if (g_qgate_test_mode >= 0) return g_qgate_test_mode;
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DS4_QWEN4_STREAM_GATE");
@@ -52896,6 +52902,7 @@ static int qgate_staged_requested(void) {
 }
 
 static int qgate_split_requested(void) {
+    if (g_qgate_test_split >= 0) return g_qgate_test_split;
     static int v = -1;
     if (v < 0) {
         const char *e = getenv("DS4_QWEN4_STREAM_SPLIT");
@@ -53443,6 +53450,26 @@ static int qgate_check_after_wait(void) {
     return 1;
 }
 
+void ds4_gpu_stream_gate_test_set_mode(int mode, int split) {
+    g_qgate_test_mode = mode < 0 ? -1 : mode != 0;
+    g_qgate_test_split = split < 0 ? -1 : split != 0;
+}
+
+void ds4_gpu_stream_gate_stats(uint64_t *committed, uint64_t *split, uint64_t *fallback, int *failed) {
+    /* The service thread keeps counting after a gate's release: let it go idle. */
+    for (;;) {
+        pthread_mutex_lock(&g_qgate_mutex);
+        const uint32_t pending = g_qgate_queue_count;
+        pthread_mutex_unlock(&g_qgate_mutex);
+        if (pending == 0) break;
+        sched_yield();
+    }
+    if (committed) *committed = g_qgate_stat_committed;
+    if (split) *split = g_qgate_stat_split_gates;
+    if (fallback) *fallback = g_qgate_stat_fallback;
+    if (failed) *failed = g_qgate_failed != 0;
+}
+
 /*
  * Encodes a gate for this layer and queues its service. On success the
  * caller dispatches the expert kernels with res[0..*n_res) resident.
@@ -53536,6 +53563,7 @@ static int qgate_encode(const ds4_gpu_tensor *selected, const ds4_gpu_tensor *x,
     pthread_cond_signal(&g_qgate_cond);
     pthread_mutex_unlock(&g_qgate_mutex);
     g_qgate_last_seq = seq;
+    g_qgate_stat_committed++;
 
     uint32_t n = 0;
     for (uint32_t s = 0; s < n_slabs; s++) { res[n].buf = g_stream_expert_cache_slabs[s]; res[n].off = 0; n++; }

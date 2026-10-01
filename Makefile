@@ -220,6 +220,16 @@ test-metal-ssd-experts: tests/test_metal_ssd_experts
 	./tests/test_metal_ssd_experts --iq2-q2-six
 	./tests/test_metal_ssd_experts --iq2-q2
 
+tests/test_metal_stream_gate.o: tests/test_metal_stream_gate.c ds4_gpu.h
+	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
+
+tests/test_metal_stream_gate: tests/test_metal_stream_gate.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: test-metal-stream-gate
+test-metal-stream-gate: tests/test_metal_stream_gate
+	./tests/test_metal_stream_gate --qwen4
+
 tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
 
@@ -1178,6 +1188,7 @@ clean:
 	rm -f tests/test_glm53_stream_layout
 	rm -f tests/test_web_recovery
 	rm -f tests/test_metal_ssd_experts
+	rm -f tests/test_metal_stream_gate
 	rm -f tests/test_metal_command_memory
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_cuda
