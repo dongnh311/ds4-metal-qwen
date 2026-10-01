@@ -93,3 +93,44 @@ the same text, and against ISTA's own llama.cpp build if one runs here.
   dense GSQ-RCO tensor-op tiles, and `hc_*_up` in F16.
 - The AI-Gateway repo should carry the 512K row, the `--think-budget 4096` drift fix and LLM port 18088.
   The AI-Gateway owner was asked to do this.
+
+## Perplexity: weights or port? (17:32-18:09)
+
+Teacher-forced NLL (`./ds4 --perplexity-file`, the decode path, 2048 scored tokens after a 32-token
+prefix, `-c 4096`) on six texts:
+- Three public texts, likely seen in training: wikitext-2 test, CPython's `argparse.py`, and the
+  Vietnamese Wikipedia article "Hà Nội".
+- Three texts written this week, which no model has seen: today's results notes, the GSQ-RCO Metal
+  kernels, and this session's Vietnamese status messages.
+
+Ivan and PROD run with the registry's streaming flags; ISTA is resident. Average NLL per token (lower is
+better):
+
+| model | en | code | vi | en-new | code-new | vi-new |
+|---|---|---|---|---|---|---|
+| ISTA | **0.5955** | **0.0219** | **1.1935** | 2.0923 | **0.7344** | **2.0490** |
+| ISTA + proj | 0.6360 | 0.0252 | 1.2108 | **2.0888** | 0.7481 | 2.0568 |
+| Ivan | 0.7844 | 0.0370 | 1.3049 | 2.1457 | 0.7905 | 2.1867 |
+| Ivan + proj | 0.8235 | 0.0373 | 1.3250 | 2.1635 | 0.8004 | 2.1587 |
+| PROD | 0.7338 | 0.0377 | 1.2579 | 2.1585 | 0.7860 | 2.1363 |
+
+- **ISTA models text better than Ivan and PROD on all six texts.**
+  - Against Ivan, both without projection: −0.094 nats per token on average, about 9% lower perplexity.
+  - With the projection on both: ISTA + proj is still better than Ivan + proj on every text.
+- **The projection costs both models about the same:** +0.013 (ISTA) and +0.010 (Ivan) nats per token
+  on average. It is not mistuned for ISTA.
+- **No sign of a port error.** A wrong dequant or graph would make the 3-bit ISTA worse than the 2-bit
+  Ivan, and it is better everywhere.
+  - The dequantizers were already checked against ggml's references (`tests/quant_fixtures.h`, SP3).
+  - GSQ-RCO needs no runtime transform: GSQ sets the quant values, and RCO picks a type per tensor.
+
+So the capability gap in the harness does not come from modelling quality. Where the 7 ifeval items
+that ISTA lost come from:
+- 4 hit the 4096-token think budget in BOTH arms. The forced `</think>` makes their outcome close to
+  a coin flip, and 30 (ISTA) and 38 (Ivan) of the 200 ifeval items hit that budget.
+- 3 have shorter ISTA thinking (83/317, 486/1197, 293/367 tokens).
+- Overall thinking length matches: median 590 vs 606 tokens, with ISTA shorter on 100 of 200 items.
+
+The reason suite runs through ds4-eval with no think budget, so its 0 vs 5 (p = 0.06) is not
+explained this way. Separating noise from a real gap needs repeat runs: a second reason pass for both
+arms, or a larger reason set.
