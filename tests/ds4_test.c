@@ -7965,6 +7965,45 @@ static void test_quant_dequant(void) {
     const uint8_t zero[18] = {0};
     TEST_ASSERT(ds4_dequant_row(42, zero, 63, out) != 0);   /* not a whole block */
     TEST_ASSERT(ds4_dequant_row(8, zero, 32, out) != 0);    /* Q8_0 is not in this table */
+
+    /* ds4_quant_row_to_q8_0 (MTP draft heads of any type): each 32-weight block of the converted row
+     * holds the source row's values to within half a Q8_0 step, plus the fp16 rounding of the step
+     * (|q| <= 127 times the scale error). */
+    for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
+        const ds4_quant_fixture *f = &quant_fixtures[i];
+        uint8_t *q8 = calloc(f->n / 32u, 34u);
+        TEST_ASSERT(q8 != NULL);
+        if (!q8) return;
+        TEST_ASSERT(ds4_quant_row_to_q8_0(f->type, f->bytes, f->n, q8) == 0);
+        uint32_t bad = 0;
+        for (uint32_t b = 0; b < f->n / 32u; b++) {
+            const uint8_t *blk = q8 + (uint64_t)b * 34u;
+            const float d = test_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            float amax = 0.0f;
+            for (uint32_t j = 0; j < 32u; j++) amax = fmaxf(amax, fabsf(f->want[b * 32u + j]));
+            const float d_exact = amax / 127.0f;
+            const float bound = 0.5f * d_exact + 127.0f * fabsf(d - d_exact) + 1e-6f * amax + 1e-7f;
+            for (uint32_t j = 0; j < 32u; j++) {
+                const float got = d * (float)(int8_t)blk[2 + j];
+                if (fabsf(got - f->want[b * 32u + j]) > bound) bad++;
+            }
+        }
+        if (bad) fprintf(stderr, "ds4-test: type %u: %u/%u Q8_0 values off by more than half a step\n",
+                         f->type, bad, f->n);
+        TEST_ASSERT(bad == 0);
+        free(q8);
+    }
+    uint8_t q8_src[2 * 34], q8_dst[2 * 34];
+    for (uint32_t i = 0; i < sizeof(q8_src); i++) q8_src[i] = (uint8_t)(i * 37u + 11u);
+    TEST_ASSERT(ds4_quant_row_to_q8_0(8, q8_src, 64, q8_dst) == 0);  /* Q8_0 rows copy unchanged */
+    TEST_ASSERT(memcmp(q8_src, q8_dst, sizeof(q8_src)) == 0);
+    uint8_t q8_zero[34];
+    memset(q8_zero, 0xAB, sizeof(q8_zero));
+    const uint8_t q2_zero[18] = {0};                                  /* Q2_0 zero scale: all weights 0 */
+    TEST_ASSERT(ds4_quant_row_to_q8_0(42, q2_zero, 64, q8_dst) == 0);
+    for (uint32_t j = 0; j < 2u * 34u; j++) TEST_ASSERT(q8_dst[j] == 0);
+    TEST_ASSERT(ds4_quant_row_to_q8_0(42, q2_zero, 63, q8_zero) != 0); /* not a whole block */
+    TEST_ASSERT(ds4_quant_row_to_q8_0(12, q2_zero, 256, q8_zero) != 0); /* Q4_K has no row dequantizer */
 }
 
 static void test_quant_types(void) {
@@ -7999,6 +8038,13 @@ static void test_quant_types(void) {
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(18) == 1);
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(42) == 1);
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(30) == 0);
+    /* MTP draft heads: Q8_0 rows gather as they are, the row-dequantizer types convert to Q8_0 */
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(8) == 1);
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(13) == 1);  /* ISTA's Q5_K output head */
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(16) == 1);
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(42) == 1);
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(12) == 0);  /* Q4_K: no row dequantizer */
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(30) == 0);
     TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 40, 2560) == 1);
     TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(30, 40, 2560) == 1);
     TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 8, 2560) == 0);   /* decode and MTP verify rows */
