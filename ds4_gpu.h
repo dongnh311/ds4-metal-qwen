@@ -449,6 +449,10 @@ int ds4_gpu_glm_stream_gate_publish(const ds4_gpu_stream_expert_table *table,
 int ds4_gpu_glm_stream_gate_commit(void);
 /* Tests: resolve every gated expert through the fallback buffer. */
 void ds4_gpu_stream_gate_test_force_fallback(int on);
+/* Tests: the service thread holds the nth gate published from now for ms
+ * milliseconds before releasing it (0 clears); clear a latched failure. */
+void ds4_gpu_stream_gate_test_stall(uint64_t nth, uint32_t ms);
+void ds4_gpu_stream_gate_test_clear_failure(void);
 #endif
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(

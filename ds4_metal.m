@@ -52849,6 +52849,24 @@ static struct {
     ds4_gpu_stream_expert_table table;
 } g_qgate_glm;
 static int g_qgate_test_force_fallback;
+static uint64_t g_qgate_test_stall_seq;   /* gate sequence to hold, 0: none */
+static uint32_t g_qgate_test_stall_ms;
+
+static void qgate_test_stall_maybe(uint64_t seq) {
+    const uint64_t at = __atomic_load_n(&g_qgate_test_stall_seq, __ATOMIC_ACQUIRE);
+    if (at && seq == at) usleep((useconds_t)g_qgate_test_stall_ms * 1000u);
+}
+
+void ds4_gpu_stream_gate_test_stall(uint64_t nth, uint32_t ms) {
+    g_qgate_test_stall_ms = ms;
+    __atomic_store_n(&g_qgate_test_stall_seq, nth ? g_qgate_seq + nth : 0, __ATOMIC_RELEASE);
+}
+
+void ds4_gpu_stream_gate_test_clear_failure(void) {
+    if (g_qgate_thread_running) qgate_wait_idle();
+    g_qgate_failed = 0;
+    g_qgate_failed_reported = 0;
+}
 
 static int glm_gate_requested(void) {
     if (g_qgate_test_mode >= 0) return g_qgate_test_mode;
@@ -53491,6 +53509,7 @@ static void glm_gate_service(const qgate_req *r) {
     uint32_t n_unique = 0;
     double t1 = t0;
     int ok = qgate_wait_mailbox(r, unique_ids, &n_unique, &t1);
+    qgate_test_stall_maybe(r->seq);
     uint8_t is_miss[QGATE_MAX_IDS];
     memset(is_miss, 0, sizeof(is_miss));
     uint32_t n_miss = 0;
@@ -53883,6 +53902,15 @@ static int glm_gate_setup(uint64_t slot_bytes) {
                 g_qgate_glmtab[r][p][k] = b;
             }
         }
+    }
+    /* Server-level timeout check: DS4_GLM_STREAM_GATE_TEST_STALL=N:MS holds
+     * the Nth GLM gate for MS milliseconds. */
+    const char *stall = getenv("DS4_GLM_STREAM_GATE_TEST_STALL");
+    unsigned long long stall_n = 0;
+    unsigned stall_ms = 0;
+    if (stall && sscanf(stall, "%llu:%u", &stall_n, &stall_ms) == 2 && stall_n) {
+        ds4_gpu_stream_gate_test_stall((uint64_t)stall_n, stall_ms);
+        fprintf(stderr, "ds4: GLM stream gate %llu will be held %u ms (test)\n", stall_n, stall_ms);
     }
     g_qgate_glm_ready = 1;
     return 1;

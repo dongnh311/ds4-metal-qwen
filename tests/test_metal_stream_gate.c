@@ -262,15 +262,48 @@ static int glm_suite(int split) {
     return ok;
 }
 
+/* A gate held past the poll's ~600 ms window must fail its batch, latch
+ * gates off, and leave later steps exact on the drain path. */
+static int check_timeout(void) {
+    uint64_t c0 = 0, c1 = 0;
+    int failed = 0;
+    ds4_gpu_set_glm_model(true);
+    out_elems = D;
+    ds4_gpu_stream_gate_test_set_mode(1, 0);
+    int ok = write_routes(0) && run_step(glm_layer, 1, got);   /* warm: slabs and gates up */
+    ds4_gpu_stream_gate_test_stall(2, 900);
+    const int stalled_ok = ok && write_routes(1) && run_step(glm_layer, 1, got);
+    ds4_gpu_stream_gate_test_stall(0, 0);
+    ds4_gpu_stream_gate_stats(&c0, NULL, NULL, &failed);
+    if (ok && (stalled_ok || !failed)) {
+        fprintf(stderr, "glm timeout: the held gate was not reported (step ok %d, failed %d)\n",
+                stalled_ok, failed);
+        ok = 0;
+    }
+    ok = ok && write_routes(2) && run_step(glm_layer, 1, got);
+    ds4_gpu_stream_gate_test_set_mode(0, 0);
+    ok = ok && run_step(glm_layer, 0, ref) && same_outputs("glm after timeout", 2);
+    ds4_gpu_stream_gate_stats(&c1, NULL, NULL, &failed);
+    if (ok && c1 != c0) {
+        fprintf(stderr, "glm timeout: %llu gates ran after the failure\n",
+                (unsigned long long)(c1 - c0));
+        ok = 0;
+    }
+    ds4_gpu_stream_gate_test_clear_failure();
+    fprintf(stderr, "glm timeout: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc == 2 ? argv[1] : "";
-    if (strcmp(mode, "--qwen4") && strcmp(mode, "--glm")) {
-        fprintf(stderr, "usage: %s --qwen4 | --glm\n", argv[0]);
+    if (strcmp(mode, "--qwen4") && strcmp(mode, "--glm") && strcmp(mode, "--glm-timeout")) {
+        fprintf(stderr, "usage: %s --qwen4 | --glm | --glm-timeout\n", argv[0]);
         return 1;
     }
     int ok = setup();
     if (ok && !strcmp(mode, "--qwen4")) ok = qwen4_suite();
     if (ok && !strcmp(mode, "--glm")) ok = glm_suite(0);
+    if (ok && !strcmp(mode, "--glm-timeout")) ok = check_timeout();
     ds4_gpu_stream_gate_test_set_mode(-1, -1);
     ds4_gpu_cleanup();
     if (model && model != MAP_FAILED) munmap(model, model_bytes);
