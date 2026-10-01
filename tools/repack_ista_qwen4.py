@@ -27,9 +27,9 @@ HC_F16_MAX_ABS_ERR = 1e-6
 
 def hc_f16(f32):
     """F32 values -> F16 bytes when every value is within HC_F16_MAX_ABS_ERR, else None."""
-    with np.errstate(over="ignore"):
+    with np.errstate(over="ignore", invalid="ignore"):
         f16 = f32.astype(np.float16)
-    err = np.abs(f16.astype(np.float32) - f32)
+        err = np.abs(f16.astype(np.float32) - f32)
     if f32.size and not (np.all(np.isfinite(err)) and err.max() <= HC_F16_MAX_ABS_ERR):
         return None
     return f16.tobytes()

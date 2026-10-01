@@ -1,8 +1,9 @@
+import hashlib
 import json
 import pathlib
-import struct
 import tempfile
 import unittest
+import warnings
 
 import numpy as np
 
@@ -35,7 +36,8 @@ class HcToF16Test(unittest.TestCase):
              "data": np.full(32, 0.75, dtype=np.float16).tobytes()},
         ]
         g.write(self.p / "in.gguf", self.kv, tensors, 32)
-        (self.p / "in.gguf.json").write_text(json.dumps({"tensors": {
+        self.prior_sources = {"ista": {"path": "/x/ista.gguf", "bytes": 47039860096}}
+        (self.p / "in.gguf.json").write_text(json.dumps({"sources": self.prior_sources, "tensors": {
             "blk.0.ffn_gate_inp.weight": {"converted_from": "BF16"},
             "blk.0.hc_attn_up.weight": {"converted_from": "BF16"}}}))
 
@@ -85,6 +87,8 @@ class HcToF16Test(unittest.TestCase):
     def test_manifest(self):
         r, man = self.run_tool()
         self.assertEqual(man["sources"]["input"]["path"], str(self.p / "in.gguf"))
+        self.assertEqual(man["sources"]["input"]["sources"], self.prior_sources)   # provenance kept
+        self.assertEqual(man["hc_f16_max_abs_err"], hc.rp.HC_F16_MAX_ABS_ERR)
         self.assertEqual(man["bytes"], (self.p / "out.gguf").stat().st_size)
         ent = man["tensors"]
         self.assertEqual(ent["blk.0.hc_attn_up.weight"]["converted_from"], "BF16")   # carried from the input
@@ -93,8 +97,23 @@ class HcToF16Test(unittest.TestCase):
         self.assertIsNone(ent["blk.0.ffn_down_exps.weight"]["converted_from"])
         self.assertEqual(ent["blk.0.hc_attn_up.weight"]["type"], 1)
         _, d = self.data(r, "blk.0.ffn_down_exps.weight")
-        import hashlib
         self.assertEqual(ent["blk.0.ffn_down_exps.weight"]["sha256"], hashlib.sha256(d).hexdigest())
+
+    def test_nan_stays_f32(self):
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            self.assertIsNone(hc.rp.hc_f16(np.array([np.nan, 1.0], dtype=np.float32)))
+            self.assertIsNone(hc.rp.hc_f16(np.array([np.inf, 1.0], dtype=np.float32)))
+
+    def test_nothing_to_convert_refused(self):
+        self.run_tool()
+        with self.assertRaises(SystemExit):
+            hc.main(["x", str(self.p / "out.gguf"), str(self.p / "again.gguf")])
+        self.assertFalse((self.p / "again.gguf").exists())
+
+    def test_usage_on_missing_arguments(self):
+        with self.assertRaises(SystemExit):
+            hc.main(["x"])
 
     def test_truncated_input_refused(self):
         data = (self.p / "in.gguf").read_bytes()

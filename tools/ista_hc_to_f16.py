@@ -35,12 +35,17 @@ def plan(src):
 
 
 def main(argv):
+    if len(argv) != 3:
+        sys.exit(__doc__)
     in_path, out_path = argv[1], argv[2]
     src = g.Reader(in_path)   # refuses a truncated file
-    prior = {}
+    prior_manifest = {}
     if os.path.exists(in_path + ".json"):
-        prior = json.loads(pathlib.Path(in_path + ".json").read_text()).get("tensors", {})
+        prior_manifest = json.loads(pathlib.Path(in_path + ".json").read_text())
+    prior = prior_manifest.get("tensors", {})
     tensors, converted = plan(src)
+    if not converted:
+        sys.exit("%s: no F32 hc mixer tensor to convert; nothing written" % in_path)
     tmp = out_path + ".partial"
     try:
         shas = g.write(tmp, src.kv, tensors, src.alignment)
@@ -55,7 +60,8 @@ def main(argv):
         return was if was or name not in converted else "F32"
 
     manifest = {
-        "sources": {"input": {"path": in_path, "bytes": src.size}},
+        "sources": {"input": {"path": in_path, "bytes": src.size, "sources": prior_manifest.get("sources")}},
+        "hc_f16_max_abs_err": rp.HC_F16_MAX_ABS_ERR,
         "tensors": {t["name"]: {"type": t["type"], "bytes": t["nbytes"], "sha256": shas[t["name"]],
                                 "converted_from": origin(t["name"])} for t in tensors},
         "bytes": os.path.getsize(out_path),
