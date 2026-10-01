@@ -1949,14 +1949,14 @@ static void test_metal_qwen4_quant_moe_mm(void) {
 /* The tiled dense GEMM on 37 rows: 40 tokens (one full and one partial token tile) and 9 tokens
  * (few threadgroups, so the k-split planes and their reduce run). fp32 staging, fp32 bound. */
 static void test_metal_qwen4_dense_mm_case(uint32_t type, const uint8_t *rows_bytes, uint64_t row_bytes,
-                                           uint32_t in_dim, uint32_t rows) {
+                                           uint32_t in_dim, uint32_t rows, const uint32_t *toks, int n_toks,
+                                           double tol) {
     const uint64_t page = (uint64_t)getpagesize(), alloc = test_round_up_u64(row_bytes * rows, page);
     void *wraw = NULL;
     TEST_ASSERT(posix_memalign(&wraw, (size_t)page, (size_t)alloc) == 0);
     if (!wraw) return;
     memcpy(wraw, rows_bytes, (size_t)(row_bytes * rows));
-    const uint32_t toks[2] = { 40u, 9u };
-    for (int ti = 0; ti < 2; ti++) {
+    for (int ti = 0; ti < n_toks; ti++) {
         const uint32_t n_tok = toks[ti];
         float *xh = malloc((size_t)n_tok * in_dim * sizeof(float));
         float *oh = malloc((size_t)n_tok * rows * sizeof(float));
@@ -1975,7 +1975,7 @@ static void test_metal_qwen4_dense_mm_case(uint32_t type, const uint8_t *rows_by
                     double mag = 0.0;
                     const double ref = test_quant_row_ref(type, (const uint8_t *)wraw + r * row_bytes, in_dim,
                                                           xh + (uint64_t)t * in_dim, &mag);
-                    if (fabs((double)oh[(uint64_t)t * rows + r] - ref) > 1e-5 * mag + 1e-6) bad++;
+                    if (fabs((double)oh[(uint64_t)t * rows + r] - ref) > tol * mag + 1e-6) bad++;
                 }
             }
             if (bad) fprintf(stderr, "ds4-test: Qwen dense GEMM type %u dim %u tokens %u: %u/%u rows off\n",
@@ -1991,7 +1991,19 @@ static void test_metal_qwen4_dense_mm_case(uint32_t type, const uint8_t *rows_by
 }
 
 static void test_metal_qwen4_quant_dense_mm(void) {
-    const uint32_t rows = 37u;
+    const uint32_t rows = 37u, nax_rows = 64u;
+    static const uint32_t float_toks[2] = { 40u, 9u }, nax_toks[3] = { 64u, 128u, 96u };
+    /* Tensor-op tiles: prefill batches of whole 32-token tiles over 64-row multiples, GSQ-RCO and BF16 only,
+     * when the device has the tensor API and DS4_QWEN4_DENSE_NAX is not 0 */
+    const char *nax_env = getenv("DS4_QWEN4_DENSE_NAX");
+    const int nax = ds4_gpu_tensor_api_available() && !(nax_env && strcmp(nax_env, "0") == 0);
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(13, 128u, 2560u, 64u) == nax);
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(30, 64u, 2560u, 128u) == nax);
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(13, 40u, 2560u, 64u) == 0);   /* not whole 32-token tiles */
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(13, 8u, 2560u, 64u) == 0);    /* decode / verify rows */
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(13, 64u, 2560u, 37u) == 0);   /* rows not a 64 multiple */
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(12, 64u, 2560u, 64u) == 0);   /* Q4_K keeps its kernels */
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(8, 64u, 2560u, 64u) == 0);    /* Q8_0 keeps its kernels */
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
         if (f->type == 16) continue;                        /* IQ2_XXS dense rows keep their kernels */
@@ -2001,8 +2013,16 @@ static void test_metal_qwen4_quant_dense_mm(void) {
         TEST_ASSERT(buf != NULL);
         if (!buf) return;
         test_quant_fill_rows(buf, f, in_dim, rows);
-        test_metal_qwen4_dense_mm_case(f->type, buf, row_bytes, in_dim, rows);
+        test_metal_qwen4_dense_mm_case(f->type, buf, row_bytes, in_dim, rows, float_toks, 2, 1e-5);
         free(buf);
+        /* 64 rows at 64 and 128 tokens take the tensor-op tiles (operands staged as half) */
+        uint8_t *nbuf = malloc((size_t)(row_bytes * nax_rows));
+        TEST_ASSERT(nbuf != NULL);
+        if (!nbuf) return;
+        test_quant_fill_rows(nbuf, f, in_dim, nax_rows);
+        TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(f->type, 64u, in_dim, nax_rows) == nax);
+        test_metal_qwen4_dense_mm_case(f->type, nbuf, row_bytes, in_dim, nax_rows, nax_toks, 3, 1.5e-3);
+        free(nbuf);
     }
     /* BF16 rows 2568 wide: the last k tile ends mid-tile */
     const uint32_t in_dim = 2568u;
@@ -2018,10 +2038,30 @@ static void test_metal_qwen4_quant_dense_mm(void) {
                 bf[(uint64_t)r * in_dim + k] = (uint16_t)(u >> 16);
             }
         }
-        test_metal_qwen4_dense_mm_case(30u, (const uint8_t *)bf, (uint64_t)in_dim * 2u, in_dim, rows);
+        test_metal_qwen4_dense_mm_case(30u, (const uint8_t *)bf, (uint64_t)in_dim * 2u, in_dim, rows,
+                                       float_toks, 2, 1e-5);
     }
     free(bf);
     free(v);
+    /* BF16 on the tensor-op tiles: 64 rows 2560 wide */
+    const uint32_t nax_dim = 2560u;
+    uint16_t *nbf = malloc((size_t)nax_dim * nax_rows * sizeof(uint16_t));
+    float *nv = malloc((size_t)nax_dim * sizeof(float));
+    TEST_ASSERT(nbf && nv);
+    if (nbf && nv) {
+        for (uint32_t r = 0; r < nax_rows; r++) {
+            test_quant_x(nv, nax_dim, r + 211u);
+            for (uint32_t k = 0; k < nax_dim; k++) {
+                uint32_t u;
+                memcpy(&u, &nv[k], sizeof(u));
+                nbf[(uint64_t)r * nax_dim + k] = (uint16_t)(u >> 16);
+            }
+        }
+        test_metal_qwen4_dense_mm_case(30u, (const uint8_t *)nbf, (uint64_t)nax_dim * 2u, nax_dim, nax_rows,
+                                       nax_toks, 3, 1.5e-3);
+    }
+    free(nbf);
+    free(nv);
 }
 
 /* kernel_qwen4_gsq_mv: dense GSQ-RCO and BF16 rows at 1-8 tokens dequantize each chunk once.
@@ -7965,6 +8005,45 @@ static void test_quant_dequant(void) {
     const uint8_t zero[18] = {0};
     TEST_ASSERT(ds4_dequant_row(42, zero, 63, out) != 0);   /* not a whole block */
     TEST_ASSERT(ds4_dequant_row(8, zero, 32, out) != 0);    /* Q8_0 is not in this table */
+
+    /* ds4_quant_row_to_q8_0 (MTP draft heads of any type): each 32-weight block of the converted row
+     * holds the source row's values to within half a Q8_0 step, plus the fp16 rounding of the step
+     * (|q| <= 127 times the scale error). */
+    for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
+        const ds4_quant_fixture *f = &quant_fixtures[i];
+        uint8_t *q8 = calloc(f->n / 32u, 34u);
+        TEST_ASSERT(q8 != NULL);
+        if (!q8) return;
+        TEST_ASSERT(ds4_quant_row_to_q8_0(f->type, f->bytes, f->n, q8) == 0);
+        uint32_t bad = 0;
+        for (uint32_t b = 0; b < f->n / 32u; b++) {
+            const uint8_t *blk = q8 + (uint64_t)b * 34u;
+            const float d = test_f16_to_f32((uint16_t)(blk[0] | (blk[1] << 8)));
+            float amax = 0.0f;
+            for (uint32_t j = 0; j < 32u; j++) amax = fmaxf(amax, fabsf(f->want[b * 32u + j]));
+            const float d_exact = amax / 127.0f;
+            const float bound = 0.5f * d_exact + 127.0f * fabsf(d - d_exact) + 1e-6f * amax + 1e-7f;
+            for (uint32_t j = 0; j < 32u; j++) {
+                const float got = d * (float)(int8_t)blk[2 + j];
+                if (fabsf(got - f->want[b * 32u + j]) > bound) bad++;
+            }
+        }
+        if (bad) fprintf(stderr, "ds4-test: type %u: %u/%u Q8_0 values off by more than half a step\n",
+                         f->type, bad, f->n);
+        TEST_ASSERT(bad == 0);
+        free(q8);
+    }
+    uint8_t q8_src[2 * 34], q8_dst[2 * 34];
+    for (uint32_t i = 0; i < sizeof(q8_src); i++) q8_src[i] = (uint8_t)(i * 37u + 11u);
+    TEST_ASSERT(ds4_quant_row_to_q8_0(8, q8_src, 64, q8_dst) == 0);  /* Q8_0 rows copy unchanged */
+    TEST_ASSERT(memcmp(q8_src, q8_dst, sizeof(q8_src)) == 0);
+    uint8_t q8_zero[34];
+    memset(q8_zero, 0xAB, sizeof(q8_zero));
+    const uint8_t q2_zero[18] = {0};                                  /* Q2_0 zero scale: all weights 0 */
+    TEST_ASSERT(ds4_quant_row_to_q8_0(42, q2_zero, 64, q8_dst) == 0);
+    for (uint32_t j = 0; j < 2u * 34u; j++) TEST_ASSERT(q8_dst[j] == 0);
+    TEST_ASSERT(ds4_quant_row_to_q8_0(42, q2_zero, 63, q8_zero) != 0); /* not a whole block */
+    TEST_ASSERT(ds4_quant_row_to_q8_0(12, q2_zero, 256, q8_zero) != 0); /* Q4_K has no row dequantizer */
 }
 
 static void test_quant_types(void) {
@@ -7999,6 +8078,13 @@ static void test_quant_types(void) {
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(18) == 1);
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(42) == 1);
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(30) == 0);
+    /* MTP draft heads: Q8_0 rows gather as they are, the row-dequantizer types convert to Q8_0 */
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(8) == 1);
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(13) == 1);  /* ISTA's Q5_K output head */
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(16) == 1);
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(42) == 1);
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(12) == 0);  /* Q4_K: no row dequantizer */
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(30) == 0);
     TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 40, 2560) == 1);
     TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(30, 40, 2560) == 1);
     TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(21, 8, 2560) == 0);   /* decode and MTP verify rows */
