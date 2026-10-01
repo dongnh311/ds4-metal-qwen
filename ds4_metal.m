@@ -52727,7 +52727,10 @@ static int qwen4_stream_resolve(const void *model_map, uint64_t model_size, uint
 #define QGATE_HIDDEN_MAX 16384u     /* floats of router input copied per gate (rows x in_dim) */
 #define QGATE_PENDING_WORDS (QGATE_MAX_EXPERT / 32u)
 
+enum { QGATE_CLIENT_QWEN4 = 0, QGATE_CLIENT_GLM = 1 };
+
 typedef struct {
+    uint32_t client;                           /* QGATE_CLIENT_* */
     uint64_t seq;
     const void *model_map;
     uint64_t model_size;
@@ -52753,6 +52756,7 @@ static uint64_t g_qgate_stat_pf_loaded, g_qgate_stat_pf_used, g_qgate_stat_pf_ga
 static double g_qgate_stat_pf_ms;
 static uint8_t g_qgate_ring_split[QGATE_RING]; /* gate in this ring slot encoded a second poll */
 static uint64_t g_qgate_fallback_slot_bytes;
+static uint32_t g_qgate_fallback_slots;          /* fallback experts, per client at setup */
 static uint64_t g_qgate_seq;
 static uint64_t g_qgate_last_seq;              /* last gate encoded (main thread) */
 static pthread_t g_qgate_thread;
@@ -52777,6 +52781,18 @@ static uint64_t g_qgate_stat_committed;      /* gates committed (main thread) */
  * gates (both clients) or two-pass gates off/on. */
 static int g_qgate_test_mode = -1;
 static int g_qgate_test_split = -1;
+
+/* The caller of end_commands owns the expert cache afterwards: wait until
+ * the service thread has finished the bookkeeping it does after a release. */
+static void qgate_wait_idle(void) {
+    for (;;) {
+        pthread_mutex_lock(&g_qgate_mutex);
+        const uint32_t pending = g_qgate_queue_count;
+        pthread_mutex_unlock(&g_qgate_mutex);
+        if (pending == 0) return;
+        sched_yield();
+    }
+}
 
 static int qgate_requested(void) {
     if (g_qgate_test_mode >= 0) return g_qgate_test_mode;
@@ -52935,6 +52951,10 @@ static int qgate_status_timed_out(uint32_t region_index) {
     return __atomic_load_n(&st[region_index * 2u], __ATOMIC_ACQUIRE) == 0xffffffffu;
 }
 
+static const char *qgate_client_name(const qgate_req *r) {
+    return r->client == QGATE_CLIENT_GLM ? "GLM" : "qwen4";
+}
+
 /* Pass-2 address table of a ring slot: gate, up, down rows of QGATE_MAX_EXPERT. */
 static uint64_t *qgate_misstab(uint32_t ring) {
     return (uint64_t *)[g_qgate_misstab contents] + (size_t)ring * 3u * QGATE_MAX_EXPERT;
@@ -52971,7 +52991,7 @@ static int qgate_misstab_set(uint32_t ring, uint32_t expert,
  * buffer and points the address table there (the gate's pass-2 table when
  * split, else the layer's). */
 static int qgate_fallback(const qgate_req *r, const int32_t *ids, uint32_t n) {
-    if (!g_qgate_fallback || n > QGATE_MAX_IDS ||
+    if (!g_qgate_fallback || n > g_qgate_fallback_slots ||
         g_qgate_fallback_slot_bytes < r->gate_expert_bytes * 2ull + r->down_expert_bytes) {
         return 0;
     }
@@ -53094,13 +53114,16 @@ static int qgate_staged_misses(const qgate_req *r, uint32_t ring, const int32_t 
     return 1;
 }
 
-static void qgate_service(const qgate_req *r) {
+/* Spins until the GPU has published gate r (every mailbox word carries its
+ * tag once the committed batch's lines are in memory), then collects the
+ * unique selected ids. 0: the gate never arrived (latched as a failure) or
+ * an id is out of range. */
+static int qgate_wait_mailbox(const qgate_req *r, int32_t *unique_ids, uint32_t *n_unique,
+                              double *t_arrived) {
     const double t0 = ds4_gpu_now_ms();
     const uint32_t ring = (uint32_t)(r->seq % QGATE_RING);
     const uint32_t tag = (uint32_t)(r->seq & 0xffffu);
     volatile const uint32_t *mb = (volatile const uint32_t *)[g_qgate_mailbox contents] + (size_t)ring * QGATE_MAX_IDS;
-    /* Wait for the GPU to reach this gate: every word carries the tag once the
-     * committed batch's lines are in memory. */
     uint32_t spins = 0;
     for (;;) {
         uint32_t i = 0;
@@ -53110,26 +53133,61 @@ static void qgate_service(const qgate_req *r) {
             sched_yield();
             spins = 0;
             if (ds4_gpu_now_ms() - t0 > 20000.0) {
-                fprintf(stderr, "ds4: qwen4 stream gate %llu (layer %u) never arrived\n",
-                        (unsigned long long)r->seq, r->layer);
+                fprintf(stderr, "ds4: %s stream gate %llu (layer %u) never arrived\n",
+                        qgate_client_name(r), (unsigned long long)r->seq, r->layer);
                 g_qgate_failed = 1;
                 break;
             }
         }
     }
-    const double t1 = ds4_gpu_now_ms();
-    const uint64_t guard_clock = g_stream_expert_cache_clock;
+    *t_arrived = ds4_gpu_now_ms();
     g_qgate_seen_host[ring] = ds4_gpu_host_seconds();
-    int32_t unique_ids[QGATE_MAX_IDS];
-    uint32_t n_unique = 0;
     uint8_t seen[DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
     memset(seen, 0, sizeof(seen));
+    *n_unique = 0;
     int ok = !g_qgate_failed;
     for (uint32_t i = 0; ok && i < r->n_sel; i++) {
         const uint32_t e = mb[i] & 0xffffu;
         if (e >= r->n_total_expert) { ok = 0; break; }
-        if (!seen[e]) { seen[e] = 1; unique_ids[n_unique++] = (int32_t)e; }
+        if (!seen[e]) { seen[e] = 1; unique_ids[(*n_unique)++] = (int32_t)e; }
     }
+    return ok;
+}
+
+/* A poll that timed out let the GPU run the previous gate's experts on a
+ * stale address table. Its buffer has completed by now, so the status is
+ * final. Also feeds the poll statistics. */
+static void qgate_check_prev(const qgate_req *r) {
+    if (r->seq <= 1u) return;
+    const uint32_t prev = (uint32_t)((r->seq - 1u) % QGATE_RING);
+    const uint32_t *st = (const uint32_t *)[g_qgate_status contents];
+    for (uint32_t k = 0; k < (g_qgate_ring_split[prev] == 2u ? 3u : g_qgate_ring_split[prev] ? 2u : 1u); k++) {
+        const uint32_t line = __atomic_load_n(&st[(k * QGATE_RING + prev) * 2u], __ATOMIC_ACQUIRE);
+        /* slot 1: second polls of gates without misses, 2: with misses */
+        const uint32_t slot = k == 0 ? 0u : (g_qgate_ring_missed[prev] ? 2u : 1u);
+        if (line != 0xffffffffu) {
+            g_qgate_stat_poll_n[slot]++;
+            g_qgate_stat_poll_line[slot] += (double)line;
+            if (line >= 32u) g_qgate_stat_poll_waited[slot]++;
+        }
+    }
+    if (qgate_status_timed_out(prev) ||
+        (g_qgate_ring_split[prev] && qgate_status_timed_out(QGATE_RING + prev)) ||
+        (g_qgate_ring_split[prev] == 2u && qgate_status_timed_out(2u * QGATE_RING + prev))) {
+        fprintf(stderr, "ds4: %s stream gate %llu poll timed out\n", qgate_client_name(r),
+                (unsigned long long)(r->seq - 1u));
+        g_qgate_failed = 1;
+    }
+}
+
+static void qgate_service(const qgate_req *r) {
+    const double t0 = ds4_gpu_now_ms();
+    const uint32_t ring = (uint32_t)(r->seq % QGATE_RING);
+    int32_t unique_ids[QGATE_MAX_IDS];
+    uint32_t n_unique = 0;
+    double t1 = t0;
+    int ok = qgate_wait_mailbox(r, unique_ids, &n_unique, &t1);
+    const uint64_t guard_clock = g_stream_expert_cache_clock;
     const double tr0 = ds4_gpu_now_ms();
     int released_a = 0, polls_done = 0;
     double ta = 0.0;
@@ -53239,29 +53297,7 @@ static void qgate_service(const qgate_req *r) {
         fprintf(stderr, "ds4: qwen4 stream gate layer %u: invalid selected ids\n", r->layer);
     }
     if (!ok) g_qgate_failed = 1;
-    /* A poll that timed out let the GPU run the previous layer's experts on a
-     * stale address table. Its buffer has completed by now, so the status is
-     * final. */
-    if (r->seq > 1u) {
-        const uint32_t prev = (uint32_t)((r->seq - 1u) % QGATE_RING);
-        const uint32_t *st = (const uint32_t *)[g_qgate_status contents];
-        for (uint32_t k = 0; k < (g_qgate_ring_split[prev] == 2u ? 3u : g_qgate_ring_split[prev] ? 2u : 1u); k++) {
-            const uint32_t line = __atomic_load_n(&st[(k * QGATE_RING + prev) * 2u], __ATOMIC_ACQUIRE);
-            /* slot 1: second polls of gates without misses, 2: with misses */
-            const uint32_t slot = k == 0 ? 0u : (g_qgate_ring_missed[prev] ? 2u : 1u);
-            if (line != 0xffffffffu) {
-                g_qgate_stat_poll_n[slot]++;
-                g_qgate_stat_poll_line[slot] += (double)line;
-                if (line >= 32u) g_qgate_stat_poll_waited[slot]++;
-            }
-        }
-        if (qgate_status_timed_out(prev) ||
-            (g_qgate_ring_split[prev] && qgate_status_timed_out(QGATE_RING + prev)) ||
-            (g_qgate_ring_split[prev] == 2u && qgate_status_timed_out(2u * QGATE_RING + prev))) {
-            fprintf(stderr, "ds4: qwen4 stream gate %llu poll timed out\n", (unsigned long long)(r->seq - 1u));
-            g_qgate_failed = 1;
-        }
-    }
+    qgate_check_prev(r);
     /* Release even on failure so the GPU drains; the failure surfaces at the
      * next end_commands. */
     const double tl0 = ds4_gpu_now_ms();
@@ -53369,11 +53405,12 @@ static void *qgate_thread_main(void *arg) {
 }
 
 /* Allocates the gate buffers and thread once; 0 keeps the drain path. */
-static int qgate_setup(uint64_t slot_bytes) {
+static int qgate_setup(uint64_t slot_bytes, uint32_t fallback_slots, const char *label) {
     if (g_qgate_failed) return 0;
-    if (g_qgate_thread_running) return g_qgate_fallback_slot_bytes >= slot_bytes;
+    if (g_qgate_thread_running) return g_qgate_fallback_slot_bytes >= slot_bytes && g_qgate_fallback_slots >= fallback_slots;
     const uint64_t page = (uint64_t)getpagesize();
     g_qgate_fallback_slot_bytes = round_up_u64(slot_bytes, page ? page : 4096u);
+    g_qgate_fallback_slots = fallback_slots;
     g_qgate_mailbox = [g_device newBufferWithLength:(NSUInteger)QGATE_RING * QGATE_MAX_IDS * sizeof(uint32_t)
                                             options:MTLResourceStorageModeShared];
     /* Three poll regions per ring slot: the first pass, the misses' mid and
@@ -53388,14 +53425,14 @@ static int qgate_setup(uint64_t slot_bytes) {
                                             options:MTLResourceStorageModeShared];
     g_qgate_hidden = [g_device newBufferWithLength:(NSUInteger)QGATE_RING * QGATE_HIDDEN_MAX * sizeof(float)
                                            options:MTLResourceStorageModeShared];
-    g_qgate_fallback = [g_device newBufferWithLength:(NSUInteger)(QGATE_MAX_IDS * g_qgate_fallback_slot_bytes)
+    g_qgate_fallback = [g_device newBufferWithLength:(NSUInteger)((uint64_t)fallback_slots * g_qgate_fallback_slot_bytes)
                                              options:MTLResourceStorageModeShared];
     if (!g_qgate_mailbox || !g_qgate_region || !g_qgate_status || !g_qgate_fallback ||
         !g_qgate_pending || !g_qgate_misstab || !g_qgate_hidden ||
         !ds4_gpu_get_pipeline("kernel_qwen4_stream_gate_publish") ||
         !ds4_gpu_get_pipeline("kernel_qwen4_stream_gate_hidden") ||
         !ds4_gpu_get_pipeline("kernel_dsv4_tp_poll_release")) {
-        fprintf(stderr, "ds4: qwen4 stream gates unavailable; keeping the per-layer drain\n");
+        fprintf(stderr, "ds4: %s stream gates unavailable; keeping the per-layer drain\n", label);
         g_qgate_failed = 1;
         g_qgate_failed_reported = 1;
         return 0;
@@ -53418,14 +53455,14 @@ static int qgate_setup(uint64_t slot_bytes) {
     const int rc = pthread_create(&g_qgate_thread, &attr, qgate_thread_main, NULL);
     pthread_attr_destroy(&attr);
     if (rc != 0) {
-        fprintf(stderr, "ds4: qwen4 stream gate thread failed to start; keeping the per-layer drain\n");
+        fprintf(stderr, "ds4: %s stream gate thread failed to start; keeping the per-layer drain\n", label);
         g_qgate_failed = 1;
         g_qgate_failed_reported = 1;
         return 0;
     }
     g_qgate_thread_running = 1;
-    fprintf(stderr, "ds4: qwen4 stream gates on (fallback %.1f MiB)\n",
-            (double)QGATE_MAX_IDS * (double)g_qgate_fallback_slot_bytes / 1048576.0);
+    fprintf(stderr, "ds4: %s stream gates on (fallback %.1f MiB)\n", label,
+            (double)fallback_slots * (double)g_qgate_fallback_slot_bytes / 1048576.0);
     return 1;
 }
 
@@ -53433,6 +53470,7 @@ static int qgate_setup(uint64_t slot_bytes) {
  * table, so the batch reports failure once and later layers drain again. */
 static int qgate_check_after_wait(void) {
     if (!g_qgate_thread_running) return 1;
+    qgate_wait_idle();
     if (g_qgate_last_seq != 0 && !g_qgate_failed) {
         const uint32_t last = (uint32_t)(g_qgate_last_seq % QGATE_RING);
         if (qgate_status_timed_out(last) ||
@@ -53457,17 +53495,65 @@ void ds4_gpu_stream_gate_test_set_mode(int mode, int split) {
 
 void ds4_gpu_stream_gate_stats(uint64_t *committed, uint64_t *split, uint64_t *fallback, int *failed) {
     /* The service thread keeps counting after a gate's release: let it go idle. */
-    for (;;) {
-        pthread_mutex_lock(&g_qgate_mutex);
-        const uint32_t pending = g_qgate_queue_count;
-        pthread_mutex_unlock(&g_qgate_mutex);
-        if (pending == 0) break;
-        sched_yield();
-    }
+    if (g_qgate_thread_running) qgate_wait_idle();
     if (committed) *committed = g_qgate_stat_committed;
     if (split) *split = g_qgate_stat_split_gates;
     if (fallback) *fallback = g_qgate_stat_fallback;
     if (failed) *failed = g_qgate_failed != 0;
+}
+
+/* Encodes the publish kernel of a new gate into the open batch: the selected
+ * ids go to the gate's mailbox slot, each word tagged with its sequence. */
+static uint64_t qgate_publish(const ds4_gpu_tensor *selected, uint32_t n_sel) {
+    id<MTLBuffer> selbuf = ds4_gpu_tensor_buffer(selected);
+    if (!selbuf || ds4_gpu_tensor_bytes(selected) < (uint64_t)n_sel * sizeof(int32_t)) return 0;
+    const uint64_t seq = ++g_qgate_seq;
+    const uint32_t ring = (uint32_t)(seq % QGATE_RING);
+    const uint32_t tag = (uint32_t)(seq & 0xffffu);
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+        [enc setComputePipelineState:ds4_gpu_get_pipeline("kernel_qwen4_stream_gate_publish")];
+        [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:0];
+        [enc setBuffer:g_qgate_mailbox offset:(NSUInteger)ring * QGATE_MAX_IDS * sizeof(uint32_t) atIndex:1];
+        [enc setBytes:&n_sel length:sizeof(n_sel) atIndex:2];
+        [enc setBytes:&tag length:sizeof(tag) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(QGATE_MAX_IDS, 1, 1)];
+        ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+    }
+    return seq;
+}
+
+/* Commits the batch that ends in gate seq's publish (committing is what
+ * writes the mailbox back to memory), opens the next batch with the gate's
+ * poll and queues its service. */
+static int qgate_commit(uint64_t seq, qgate_req *req) {
+    const uint32_t ring = (uint32_t)(seq % QGATE_RING);
+    const uint32_t value = (uint32_t)seq;
+    const uint32_t nlines = QGATE_POLL_LINES;
+    if (!ds4_gpu_flush_commands()) return 0;
+    @autoreleasepool {
+        /* First work of the new batch, so no line of its region is cached. */
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
+        [enc setComputePipelineState:ds4_gpu_get_pipeline("kernel_dsv4_tp_poll_release")];
+        [enc setBuffer:g_qgate_region offset:(NSUInteger)ring * QGATE_POLL_LINES * QGATE_POLL_LINE_BYTES atIndex:0];
+        [enc setBytes:&value length:sizeof(value) atIndex:1];
+        [enc setBytes:&nlines length:sizeof(nlines) atIndex:2];
+        [enc setBuffer:g_qgate_status offset:(NSUInteger)ring * 2u * sizeof(uint32_t) atIndex:3];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        ds4_gpu_end_compute_encoder(g_batch_cb, enc);
+        ds4_gpu_close_batch_encoder();
+    }
+    g_qgate_ring_split[ring] = (uint8_t)(req->split ? (req->staged ? 2u : 1u) : 0u);
+    req->seq = seq;
+    pthread_mutex_lock(&g_qgate_mutex);
+    const uint32_t tail = (g_qgate_queue_head + g_qgate_queue_count) % QGATE_QUEUE;
+    g_qgate_queue[tail] = *req;
+    g_qgate_queue_count++;
+    pthread_cond_signal(&g_qgate_cond);
+    pthread_mutex_unlock(&g_qgate_mutex);
+    g_qgate_last_seq = seq;
+    g_qgate_stat_committed++;
+    return 1;
 }
 
 /*
@@ -53486,31 +53572,16 @@ static int qgate_encode(const ds4_gpu_tensor *selected, const ds4_gpu_tensor *x,
         budget == 0 || g_stream_expert_cache_slab_total_slots < budget) {
         return 0;   /* the cache has not filled its slabs yet */
     }
-    if (!qgate_setup(gate_expert_bytes * 2ull + down_expert_bytes)) return 0;
+    if (!qgate_setup(gate_expert_bytes * 2ull + down_expert_bytes, QGATE_MAX_IDS, "qwen4")) return 0;
     id<MTLBuffer> ga = nil, ua = nil, da = nil;
     if (!ds4_gpu_stream_expert_cache_addr_buffers(layer, &ga, &ua, &da)) return 0;
     pthread_mutex_lock(&g_qgate_mutex);
     const int full = g_qgate_queue_count >= QGATE_QUEUE;
     pthread_mutex_unlock(&g_qgate_mutex);
     if (full) return 0;
-    id<MTLBuffer> selbuf = ds4_gpu_tensor_buffer(selected);
-    if (!selbuf || ds4_gpu_tensor_bytes(selected) < (uint64_t)n_sel * sizeof(int32_t)) return 0;
-
-    const uint64_t seq = ++g_qgate_seq;
+    const uint64_t seq = qgate_publish(selected, n_sel);
+    if (!seq) return 0;
     const uint32_t ring = (uint32_t)(seq % QGATE_RING);
-    const uint32_t tag = (uint32_t)(seq & 0xffffu);
-    const uint32_t value = (uint32_t)seq;
-    const uint32_t nlines = QGATE_POLL_LINES;
-    @autoreleasepool {
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
-        [enc setComputePipelineState:ds4_gpu_get_pipeline("kernel_qwen4_stream_gate_publish")];
-        [enc setBuffer:selbuf offset:ds4_gpu_tensor_offset(selected) atIndex:0];
-        [enc setBuffer:g_qgate_mailbox offset:(NSUInteger)ring * QGATE_MAX_IDS * sizeof(uint32_t) atIndex:1];
-        [enc setBytes:&n_sel length:sizeof(n_sel) atIndex:2];
-        [enc setBytes:&tag length:sizeof(tag) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(QGATE_MAX_IDS, 1, 1)];
-        ds4_gpu_end_compute_encoder(g_batch_cb, enc);
-    }
     /* Lookahead: copy this layer's router input for the service thread. */
     const uint32_t la_floats = n_rows * in_dim;
     const int la = g_qgate_la.top && x && la_floats && la_floats <= QGATE_HIDDEN_MAX &&
@@ -53528,28 +53599,12 @@ static int qgate_encode(const ds4_gpu_tensor *selected, const ds4_gpu_tensor *x,
     }
     if (getenv("DS4_QWEN4_STREAM_TIMING"))
         objc_setAssociatedObject(g_batch_cb, &kQgateSeqKey, @(seq), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    /* Committing is what writes the mailbox back to memory. */
-    if (!ds4_gpu_flush_commands()) return 0;
-    @autoreleasepool {
-        /* First work of the new batch, so no line of its region is cached. */
-        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_batch_cb);
-        [enc setComputePipelineState:ds4_gpu_get_pipeline("kernel_dsv4_tp_poll_release")];
-        [enc setBuffer:g_qgate_region offset:(NSUInteger)ring * QGATE_POLL_LINES * QGATE_POLL_LINE_BYTES atIndex:0];
-        [enc setBytes:&value length:sizeof(value) atIndex:1];
-        [enc setBytes:&nlines length:sizeof(nlines) atIndex:2];
-        [enc setBuffer:g_qgate_status offset:(NSUInteger)ring * 2u * sizeof(uint32_t) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-        ds4_gpu_end_compute_encoder(g_batch_cb, enc);
-        ds4_gpu_close_batch_encoder();
-    }
     const uint32_t n_slabs = g_stream_expert_cache_slab_count;
     const int split = qgate_split_requested() && n_total_expert <= QGATE_MAX_EXPERT;
     const int staged = split && qgate_staged_requested();
-    g_qgate_ring_split[ring] = (uint8_t)(split ? (staged ? 2u : 1u) : 0u);
-    pthread_mutex_lock(&g_qgate_mutex);
-    const uint32_t tail = (g_qgate_queue_head + g_qgate_queue_count) % QGATE_QUEUE;
-    g_qgate_queue[tail] = (qgate_req) {
-        .seq = seq, .model_map = model_map, .model_size = model_size,
+    qgate_req req = {
+        .client = QGATE_CLIENT_QWEN4,
+        .model_map = model_map, .model_size = model_size,
         .gate_offset = gate_offset, .up_offset = up_offset, .down_offset = down_offset,
         .gate_expert_bytes = gate_expert_bytes, .down_expert_bytes = down_expert_bytes,
         .layer = layer, .n_sel = n_sel, .n_total_expert = n_total_expert, .n_slabs = n_slabs,
@@ -53559,11 +53614,7 @@ static int qgate_encode(const ds4_gpu_tensor *selected, const ds4_gpu_tensor *x,
         .pf_router_offset = g_qgate_la.router_offset, .pf_gate_offset = g_qgate_la.gate_offset,
         .pf_up_offset = g_qgate_la.up_offset, .pf_down_offset = g_qgate_la.down_offset,
     };
-    g_qgate_queue_count++;
-    pthread_cond_signal(&g_qgate_cond);
-    pthread_mutex_unlock(&g_qgate_mutex);
-    g_qgate_last_seq = seq;
-    g_qgate_stat_committed++;
+    if (!qgate_commit(seq, &req)) return 0;
 
     uint32_t n = 0;
     for (uint32_t s = 0; s < n_slabs; s++) { res[n].buf = g_stream_expert_cache_slabs[s]; res[n].off = 0; n++; }
