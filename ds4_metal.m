@@ -11836,6 +11836,7 @@ static int qgate_glm_pending_for(uint32_t layer);
 static int qgate_glm_take(uint32_t layer, uint64_t *seq, int *split);
 static id<MTLBuffer> qgate_glm_tab(uint64_t seq, uint32_t pass, uint32_t kind);
 static void qgate_set_dispatch_resident(int on);
+static void qgate_encode_poll(uint64_t seq, uint32_t stage);
 
 int ds4_gpu_end_commands(void) {
     if (!g_batch_cb) {
@@ -44043,6 +44044,44 @@ int ds4_gpu_routed_moe_one_tensor(
                                                  down_nsg,
                                                  down_rows_per_group_is_nr0);
         }
+        if (ok && glm_gated && glm_gate_split) {
+            /* Split GLM gate, pass 2: the misses, after the gate's second
+             * poll, from the gate's pass-2 tables (0 for the cached experts,
+             * which pass 1 computed). Same act values as act_args above. */
+            const ds4_gpu_dsv4_moe_swiglu_weight_args pass2_act = {
+                .width = expert_mid_dim,
+                .rows = pair_rows,
+                .gate_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .up_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .mid_row_stride = (uint64_t)expert_mid_dim * sizeof(float),
+                .weight_stride = sizeof(float),
+                .write_clamped = 0,
+                .clamp_value = clamp,
+            };
+            qgate_encode_poll(glm_gate_seq, 1u);
+            qgate_set_dispatch_resident(1);
+            ok = ds4_gpu_encode_mul_mv_addr_iq2_pair_swiglu(cb,
+                     g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_pipeline,
+                     &gate_args, &pass2_act, stream_slot_entries, 0u,
+                     qgate_glm_tab(glm_gate_seq, 1u, 0u), qgate_glm_tab(glm_gate_seq, 1u, 1u),
+                     xbuf, ds4_gpu_tensor_offset(x),
+                     gatebuf, ds4_gpu_tensor_offset(gate),
+                     upbuf, ds4_gpu_tensor_offset(up),
+                     midbuf, ds4_gpu_tensor_offset(mid),
+                     selected_exec_buf, selected_exec_off,
+                     weightsbuf, ds4_gpu_tensor_offset(weights),
+                     gate_smem, 2, false, nil, nil) &&
+                 ds4_gpu_encode_mul_mv_addr_iq2(cb,
+                     down_type == DS4_METAL_TENSOR_Q2_K ?
+                         g_moe_mul_mv_addr_q2_k_pipeline : g_moe_mul_mv_addr_iq2_xxs_pipeline,
+                     &down_args, stream_slot_entries, 0u,
+                     qgate_glm_tab(glm_gate_seq, 1u, 2u),
+                     midbuf, ds4_gpu_tensor_offset(mid),
+                     down_dst, down_dst_off,
+                     selected_exec_buf, selected_exec_off,
+                     down_smem, 2, false, 2, nil);
+            qgate_set_dispatch_resident(0);
+        }
         DS4_METAL_PROFILE_MOE_ONE_STAGE("down");
         if (ok && n_expert > 1 && !direct_down_sum && !stream_expert_split_completed) {
             ok = ds4_gpu_encode_moe_sum_experts(cb,
@@ -52878,9 +52917,17 @@ static int glm_gate_requested(void) {
     return v;
 }
 
-/* Two-pass GLM gates arrive in a later change. */
+/* Split gates (DS4_GLM_STREAM_SPLIT=0 keeps one pass): the GPU runs the
+ * cached experts while the service thread reads the misses, then a second
+ * poll in the same command buffer waits for them. */
 static int glm_gate_split_requested(void) {
-    return 0;
+    if (g_qgate_test_split >= 0) return g_qgate_test_split;
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_GLM_STREAM_SPLIT");
+        v = !(e && e[0] == '0');
+    }
+    return v;
 }
 
 static id<MTLBuffer> qgate_glm_tab(uint64_t seq, uint32_t pass, uint32_t kind) {
