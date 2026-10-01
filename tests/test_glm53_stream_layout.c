@@ -1,6 +1,7 @@
-/* Model-free checks that GLM's standard Q2 layout (IQ2_XXS gate/up, Q2_K
- * down, eight routed experts) is served by the selected-expert streaming
- * cache instead of the per-layer mapped fallback. */
+/* Model-free GLM checks: the standard Q2 layout (IQ2_XXS gate/up, Q2_K down,
+ * eight routed experts) streams through the selected-expert cache, prefill
+ * chunks pick their read path, and live-prefix rewinds are only promised
+ * where the session can keep its state. */
 #include "../ds4.c"
 
 static int failures;
@@ -150,6 +151,37 @@ static void check_glm53_prefill_full_layer(void) {
 #endif
 }
 
+static ds4_engine engine;
+static ds4_session session;
+
+/* GLM-5.2's DSA cache is positional; GLM-5.3's recurrent KDA state only rolls
+ * back inside the MTP two-token window. */
+static void check_glm_session_can_rewind(void) {
+    g_ds4_shape = DS4_SHAPE_GLM53;
+    memset(&session, 0, sizeof(session));
+    session.engine = &engine;
+    session.checkpoint_valid = true;
+    session.checkpoint.len = 174;
+    session.glm_graph.glm53 = true;
+    CHECK(!ds4_session_glm_can_rewind(&session, 45));
+    session.glm_mtp_rollback_valid = true;
+    session.glm_mtp_rollback_pos = 172;
+    CHECK(ds4_session_glm_can_rewind(&session, 172));
+    CHECK(ds4_session_glm_can_rewind(&session, 173));
+    CHECK(!ds4_session_glm_can_rewind(&session, 171));
+    CHECK(!ds4_session_glm_can_rewind(&session, 174));
+    session.checkpoint.len = 175;
+    CHECK(!ds4_session_glm_can_rewind(&session, 173));
+    session.checkpoint.len = 174;
+    session.checkpoint_valid = false;
+    CHECK(!ds4_session_glm_can_rewind(&session, 173));
+    session.checkpoint_valid = true;
+    session.glm_graph.glm53 = false;
+    CHECK(ds4_session_glm_can_rewind(&session, 45));
+    CHECK(!ds4_session_glm_can_rewind(&session, 174));
+    CHECK(!ds4_session_glm_can_rewind(NULL, 45));
+}
+
 int main(void) {
     /* Start from the default routed kernels whatever the caller exported. */
     static const char *const disables[] = {
@@ -166,6 +198,7 @@ int main(void) {
     check_glm_iq2_q2(&DS4_SHAPE_GLM53);
     check_glm_iq2_q2(&DS4_SHAPE_GLM52);
     check_glm53_prefill_full_layer();
+    check_glm_session_can_rewind();
     if (failures) {
         fprintf(stderr, "test_glm53_stream_layout: %d failure(s)\n", failures);
         return 1;

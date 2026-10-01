@@ -12401,7 +12401,10 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         slot->session, req->images, req->image_count);
     const int rewind_to = live_prefix_rewind_target(
         ds4_engine_is_glm_dsa(s->engine), live_pos, req->prompt.len, common);
-    if (rewind_to >= 0 && token_image_prefix) {
+    /* A rewind GLM-5.3 cannot honour would invalidate the live checkpoint
+     * before the evict store could save it; fall through to a clean miss. */
+    if (rewind_to >= 0 && token_image_prefix &&
+        ds4_session_glm_can_rewind(slot->session, rewind_to)) {
         pr.kind = REUSE_MEMORY_REWIND;
         pr.reuse_tokens = rewind_to;
         return pr;
@@ -12561,6 +12564,7 @@ static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
     if (d->rewind_to >= 0) return "live-prefix-rewind";
+    if (d->common == d->prompt_len && d->prompt_len < d->old_pos) return "prompt-is-live-prefix";
     if (d->common != d->old_pos) return "token-mismatch";
     if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
     return "live-prefix-match";
@@ -13399,10 +13403,17 @@ static bool should_remember_thinking_checkpoint(const request *r,
     /* Qwen Chat Completions clients may omit reasoning even with tools.
      * Remember an alternative visible key without changing exact replay.
      * Actual tool calls have their own checkpoint path at the call site. */
-    const bool qwen_chat = r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
-                           r->api != API_RESPONSES && r->api != API_ANTHROPIC;
-    if ((r->has_tools || r->prompt_preserves_reasoning) && !qwen_chat) return false;
-    if (!ds4_think_mode_enabled(r->think_mode)) return false;
+    /* GLM renders such a turn as <think></think> plus the trimmed content in
+     * tool context too, which is exactly its visible key. */
+    const bool visible_key_chat =
+        (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN ||
+         r->model_syntax == SERVER_MODEL_SYNTAX_GLM) &&
+        r->api != API_RESPONSES && r->api != API_ANTHROPIC;
+    if ((r->has_tools || r->prompt_preserves_reasoning) && !visible_key_chat) return false;
+    if (!ds4_think_mode_enabled(r->think_mode) &&
+        r->model_syntax != SERVER_MODEL_SYNTAX_GLM) {
+        return false;
+    }
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
     return true;
@@ -13632,7 +13643,10 @@ static char *build_responses_visible_assistant_suffix(const request *r,
 static char *build_thinking_visible_text(const request *r,
                                          const char *content) {
     if (!r || !r->prompt_text) return NULL;
-    if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+    /* GLM renders a past answer as <think></think> plus the trimmed content
+     * whether thinking is on or off. */
+    const bool think = ds4_think_mode_enabled(r->think_mode);
+    if (!think && r->model_syntax != SERVER_MODEL_SYNTAX_GLM) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
     if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
@@ -13648,7 +13662,7 @@ static char *build_thinking_visible_text(const request *r,
         buf_puts(&visible, "<|im_end|>\n");
         return buf_take(&visible);
     }
-    const char *think_tag = "<think>";
+    const char *think_tag = think ? "<think>" : "<think></think>";
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
         memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
@@ -13714,19 +13728,55 @@ static char *build_qwen_tool_turn_visible_text(const request *r,
     return buf_take(&visible);
 }
 
-static bool remember_qwen_tool_turn_visible_checkpoint(server *s, server_slot *slot,
-                                                       job *j, const char *ctx,
-                                                       const char *finish,
-                                                       bool inside_thinking,
-                                                       const char *content,
-                                                       const tool_calls *calls) {
-    char *visible = build_qwen_tool_turn_visible_text(&j->req, finish,
-                                                     inside_thinking, content, calls);
+/* GLM keeps reasoning in tool context, so clients that omit reasoning_content
+ * render the past tool turn as <think></think>, the trimmed content and the
+ * sampled tool block (replayed byte-exact). GLM has no assistant end token:
+ * the <|observation|> that follows starts the next suffix. */
+static char *build_glm_tool_turn_visible_text(const request *r,
+                                              const char *finish,
+                                              bool inside_thinking,
+                                              const char *content,
+                                              const tool_calls *calls) {
+    if (!r || !calls || calls->len == 0) return NULL;
+    if (r->kind != REQ_CHAT || r->image_count != 0) return NULL;
+    if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return NULL;
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_GLM) return NULL;
+    if (!r->prompt_text || !r->prompt_text[0]) return NULL;
+    if (!calls->raw_tool_text || !calls->raw_tool_text[0]) return NULL;
+    if (!finish || strcmp(finish, "tool_calls") || inside_thinking) return NULL;
+    const bool think = ds4_think_mode_enabled(r->think_mode);
+    const char *open = think ? "<think>" : "<think></think>";
+    const size_t pt_len = strlen(r->prompt_text), open_len = strlen(open);
+    if (pt_len < open_len ||
+        memcmp(r->prompt_text + pt_len - open_len, open, open_len) != 0) {
+        return NULL;
+    }
+    buf visible = {0};
+    buf_append(&visible, r->prompt_text, pt_len - open_len);
+    buf_puts(&visible, "<think></think>");
+    append_trimmed_text(&visible, content);
+    append_tool_calls_text_for_syntax(&visible, SERVER_MODEL_SYNTAX_GLM, calls,
+                                      &r->tool_orders);
+    return buf_take(&visible);
+}
+
+static bool remember_tool_turn_visible_checkpoint(server *s, server_slot *slot,
+                                                  job *j, const char *ctx,
+                                                  const char *finish,
+                                                  bool inside_thinking,
+                                                  const char *content,
+                                                  const tool_calls *calls) {
+    const bool glm = j->req.model_syntax == SERVER_MODEL_SYNTAX_GLM;
+    char *visible = glm ?
+        build_glm_tool_turn_visible_text(&j->req, finish, inside_thinking,
+                                         content, calls) :
+        build_qwen_tool_turn_visible_text(&j->req, finish, inside_thinking,
+                                          content, calls);
     if (!visible) return false;
     thinking_live_remember(s, slot, visible, &j->req);
     server_log(DS4_LOG_KVCACHE,
-               "ds4-server: qwen tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
-               ctx, ds4_session_pos(slot->session),
+               "ds4-server: %s tool-turn visible checkpoint remembered ctx=%s live=%d visible=%zu",
+               glm ? "glm" : "qwen", ctx, ds4_session_pos(slot->session),
                strlen(visible));
     free(visible);
     return true;
@@ -15419,7 +15469,7 @@ decode_again:
                                      parsed_reasoning, &parsed_calls);
         thinking_live_clear(s, slot);
     } else if (parsed_calls.len) {
-        if (!remember_qwen_tool_turn_visible_checkpoint(
+        if (!remember_tool_turn_visible_checkpoint(
                 s, slot, j, ctx_span, finish, thinking.inside,
                 parsed_content ? parsed_content : "",
                 &parsed_calls))
@@ -19522,6 +19572,166 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
     }
 }
 
+/* Thinking off: the next user turn extends the GLM key even when the sampled
+ * answer carries whitespace the renderer trims. */
+static void test_glm_thinking_off_answer_visible_prefix(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("hello");
+    chat_msgs_push(&msgs, user);
+    request r = {0};
+    r.kind = REQ_CHAT;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_NONE;
+    r.prompt_text = render_glm_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+    char *visible = build_thinking_visible_text(&r, "\nHi there.\n");
+    TEST_ASSERT(visible != NULL);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("Hi there.");
+    chat_msgs_push(&msgs, assistant);
+    chat_msg again = {0};
+    again.role = xstrdup("user");
+    again.content = xstrdup("how are you?");
+    chat_msgs_push(&msgs, again);
+    char *next = render_glm_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+    TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
+    if (visible && !strncmp(next, visible, strlen(visible))) {
+        TEST_ASSERT(!strncmp(next + strlen(visible), "<|user|>", strlen("<|user|>")));
+    }
+    free(next);
+    free(visible);
+    free(r.prompt_text);
+    chat_msgs_free(&msgs);
+}
+
+static void test_trace_cache_miss_reason(void) {
+    trace_cache_diag d = {.valid = true, .old_pos = 174, .prompt_len = 46,
+                          .common = 46, .rewind_to = -1};
+    /* A refused or unavailable rewind: the prompt is a strict live prefix. */
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "prompt-is-live-prefix"));
+    d.rewind_to = 45;
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "live-prefix-rewind"));
+    d = (trace_cache_diag){.valid = true, .old_pos = 236, .prompt_len = 213,
+                           .common = 198, .rewind_to = -1};
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "token-mismatch"));
+    d.old_pos = 0;
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "no-live-checkpoint"));
+}
+
+/* An answer turn in a tool session: the next user turn must extend the GLM
+ * visible key when the client drops reasoning_content. */
+static void test_glm_tool_context_answer_visible_prefix(void) {
+    const char *tools = "[{\"type\":\"function\",\"function\":{\"name\":\"bash\","
+                        "\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("what is 2+2?");
+    chat_msgs_push(&msgs, user);
+    request r = {0};
+    r.kind = REQ_CHAT;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = render_glm_chat_prompt_text(&msgs, tools, NULL, r.think_mode);
+    char *visible = build_thinking_visible_text(&r, "\nThe answer is 4.\n");
+    TEST_ASSERT(visible != NULL);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("The answer is 4.");
+    chat_msgs_push(&msgs, assistant);
+    chat_msg again = {0};
+    again.role = xstrdup("user");
+    again.content = xstrdup("and 3+3?");
+    chat_msgs_push(&msgs, again);
+    char *next = render_glm_chat_prompt_text(&msgs, tools, NULL, r.think_mode);
+    TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
+    if (visible && !strncmp(next, visible, strlen(visible))) {
+        TEST_ASSERT(!strncmp(next + strlen(visible), "<|user|>", strlen("<|user|>")));
+    }
+    free(next);
+    free(visible);
+    free(r.prompt_text);
+    chat_msgs_free(&msgs);
+}
+
+/* GLM keeps reasoning in tool context, so a client that omits reasoning_content
+ * renders the past tool turn as <think></think>, the trimmed content and the
+ * sampled tool block. The observation that follows starts the next suffix. */
+static void test_glm_tool_visible_checkpoint_boundary(void) {
+    for (int thinking = 0; thinking < 2; thinking++) {
+        for (int with_content = 0; with_content < 2; with_content++) {
+            chat_msgs msgs = {0};
+            chat_msg user = {0};
+            user.role = xstrdup("user");
+            user.content = xstrdup("run it");
+            chat_msgs_push(&msgs, user);
+            request r = {0};
+            r.kind = REQ_CHAT;
+            r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+            r.think_mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+            r.prompt_text = render_glm_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+            chat_msg assistant = {0};
+            assistant.role = xstrdup("assistant");
+            assistant.content = xstrdup(with_content ? " Running.\n" : "");
+            tool_call call = {0};
+            call.name = xstrdup("bash");
+            call.arguments = xstrdup("{}");
+            tool_calls_push(&assistant.calls, call);
+            /* Raw sampled block, distinct from the JSON fallback for {}. */
+            assistant.calls.raw_tool_text = xstrdup(
+                "\n\n<tool_call>bash<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>");
+            char *visible = build_glm_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls);
+            TEST_ASSERT(visible != NULL);
+            TEST_ASSERT(build_glm_tool_turn_visible_text(
+                &r, "length", false, assistant.content, &assistant.calls) == NULL);
+            TEST_ASSERT(build_glm_tool_turn_visible_text(
+                &r, "tool_calls", true, assistant.content, &assistant.calls) == NULL);
+            r.image_count = 1;
+            TEST_ASSERT(build_glm_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
+            r.image_count = 0;
+            r.api = API_RESPONSES;
+            TEST_ASSERT(build_glm_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
+            r.api = API_ANTHROPIC;
+            TEST_ASSERT(build_glm_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
+            r.api = API_OPENAI;
+            r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+            TEST_ASSERT(build_glm_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
+            r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+            chat_msgs_push(&msgs, assistant);
+            chat_msg tool = {0};
+            tool.role = xstrdup("tool");
+            tool.content = xstrdup("ok");
+            chat_msgs_push(&msgs, tool);
+            char *next = render_glm_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+            TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
+            if (visible && !strncmp(next, visible, strlen(visible))) {
+                /* The live frontier ends at the sampled tool block. */
+                const char *tail = next + strlen(visible);
+                TEST_ASSERT(!strncmp(tail, "<|observation|>", strlen("<|observation|>")));
+            }
+            if (thinking) {
+                /* A client that resends reasoning renders it back in tool
+                 * context; that history extends the live tokens instead. */
+                msgs.v[1].reasoning = xstrdup("hidden reasoning");
+                char *with_reasoning = render_glm_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+                TEST_ASSERT(visible && strncmp(with_reasoning, visible, strlen(visible)) != 0);
+                free(with_reasoning);
+            }
+            free(next);
+            free(visible);
+            free(r.prompt_text);
+            chat_msgs_free(&msgs);
+        }
+    }
+}
+
 static void test_render_qwen_tool_round_trip(void) {
     chat_msgs msgs = {0};
     chat_msg user = {0};
@@ -22445,8 +22655,21 @@ static void test_thinking_checkpoint_remember_gate(void) {
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
     r.api = API_ANTHROPIC;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    /* GLM renders an omitted-reasoning answer in tool context exactly like
+     * its visible key, so agent sessions keep the live state too. */
+    r.api = API_OPENAI;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "length"));
+    r.api = API_RESPONSES;
+    TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.api = API_OPENAI;
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
+    /* GLM renders a thinking-off answer as <think></think> plus trimmed
+     * content; whitespace in the sampled answer would otherwise miss. */
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
 
     request_free(&r);
@@ -24655,6 +24878,10 @@ static void ds4_server_unit_tests_run(void) {
     test_render_qwen_chat_prompt_text();
     test_render_qwen_tool_round_trip();
     test_qwen_tool_visible_checkpoint_boundary();
+    test_glm_tool_visible_checkpoint_boundary();
+    test_glm_tool_context_answer_visible_prefix();
+    test_glm_thinking_off_answer_visible_prefix();
+    test_trace_cache_miss_reason();
     test_qwen_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();
