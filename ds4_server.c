@@ -12564,6 +12564,7 @@ static const char *trace_cache_miss_reason(const trace_cache_diag *d) {
     if (!d || !d->valid) return "unknown";
     if (d->old_pos == 0) return "no-live-checkpoint";
     if (d->rewind_to >= 0) return "live-prefix-rewind";
+    if (d->common == d->prompt_len && d->prompt_len < d->old_pos) return "prompt-is-live-prefix";
     if (d->common != d->old_pos) return "token-mismatch";
     if (d->prompt_len < d->old_pos) return "incoming-prompt-shorter-than-live-checkpoint";
     return "live-prefix-match";
@@ -13409,7 +13410,10 @@ static bool should_remember_thinking_checkpoint(const request *r,
          r->model_syntax == SERVER_MODEL_SYNTAX_GLM) &&
         r->api != API_RESPONSES && r->api != API_ANTHROPIC;
     if ((r->has_tools || r->prompt_preserves_reasoning) && !visible_key_chat) return false;
-    if (!ds4_think_mode_enabled(r->think_mode)) return false;
+    if (!ds4_think_mode_enabled(r->think_mode) &&
+        r->model_syntax != SERVER_MODEL_SYNTAX_GLM) {
+        return false;
+    }
     if (finish && (!strcmp(finish, "error") || !strcmp(finish, "length"))) return false;
     if (thinking && thinking->inside) return false;
     return true;
@@ -13639,7 +13643,10 @@ static char *build_responses_visible_assistant_suffix(const request *r,
 static char *build_thinking_visible_text(const request *r,
                                          const char *content) {
     if (!r || !r->prompt_text) return NULL;
-    if (!ds4_think_mode_enabled(r->think_mode)) return NULL;
+    /* GLM renders a past answer as <think></think> plus the trimmed content
+     * whether thinking is on or off. */
+    const bool think = ds4_think_mode_enabled(r->think_mode);
+    if (!think && r->model_syntax != SERVER_MODEL_SYNTAX_GLM) return NULL;
 
     size_t pt_len = strlen(r->prompt_text);
     if (r->model_syntax == SERVER_MODEL_SYNTAX_QWEN) {
@@ -13655,7 +13662,7 @@ static char *build_thinking_visible_text(const request *r,
         buf_puts(&visible, "<|im_end|>\n");
         return buf_take(&visible);
     }
-    const char *think_tag = "<think>";
+    const char *think_tag = think ? "<think>" : "<think></think>";
     size_t tag_len = strlen(think_tag);
     if (pt_len < tag_len ||
         memcmp(r->prompt_text + pt_len - tag_len, think_tag, tag_len) != 0) {
@@ -19565,9 +19572,54 @@ static void test_qwen_tool_visible_checkpoint_boundary(void) {
     }
 }
 
-/* GLM keeps reasoning in tool context, so a client that omits reasoning_content
- * renders the past tool turn as <think></think>, the trimmed content and the
- * sampled tool block. The observation that follows starts the next suffix. */
+/* Thinking off: the next user turn extends the GLM key even when the sampled
+ * answer carries whitespace the renderer trims. */
+static void test_glm_thinking_off_answer_visible_prefix(void) {
+    chat_msgs msgs = {0};
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("hello");
+    chat_msgs_push(&msgs, user);
+    request r = {0};
+    r.kind = REQ_CHAT;
+    r.model_syntax = SERVER_MODEL_SYNTAX_GLM;
+    r.think_mode = DS4_THINK_NONE;
+    r.prompt_text = render_glm_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+    char *visible = build_thinking_visible_text(&r, "\nHi there.\n");
+    TEST_ASSERT(visible != NULL);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("Hi there.");
+    chat_msgs_push(&msgs, assistant);
+    chat_msg again = {0};
+    again.role = xstrdup("user");
+    again.content = xstrdup("how are you?");
+    chat_msgs_push(&msgs, again);
+    char *next = render_glm_chat_prompt_text(&msgs, NULL, NULL, r.think_mode);
+    TEST_ASSERT(visible && !strncmp(next, visible, strlen(visible)));
+    if (visible && !strncmp(next, visible, strlen(visible))) {
+        TEST_ASSERT(!strncmp(next + strlen(visible), "<|user|>", strlen("<|user|>")));
+    }
+    free(next);
+    free(visible);
+    free(r.prompt_text);
+    chat_msgs_free(&msgs);
+}
+
+static void test_trace_cache_miss_reason(void) {
+    trace_cache_diag d = {.valid = true, .old_pos = 174, .prompt_len = 46,
+                          .common = 46, .rewind_to = -1};
+    /* A refused or unavailable rewind: the prompt is a strict live prefix. */
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "prompt-is-live-prefix"));
+    d.rewind_to = 45;
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "live-prefix-rewind"));
+    d = (trace_cache_diag){.valid = true, .old_pos = 236, .prompt_len = 213,
+                           .common = 198, .rewind_to = -1};
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "token-mismatch"));
+    d.old_pos = 0;
+    TEST_ASSERT(!strcmp(trace_cache_miss_reason(&d), "no-live-checkpoint"));
+}
+
 /* An answer turn in a tool session: the next user turn must extend the GLM
  * visible key when the client drops reasoning_content. */
 static void test_glm_tool_context_answer_visible_prefix(void) {
@@ -19604,6 +19656,9 @@ static void test_glm_tool_context_answer_visible_prefix(void) {
     chat_msgs_free(&msgs);
 }
 
+/* GLM keeps reasoning in tool context, so a client that omits reasoning_content
+ * renders the past tool turn as <think></think>, the trimmed content and the
+ * sampled tool block. The observation that follows starts the next suffix. */
 static void test_glm_tool_visible_checkpoint_boundary(void) {
     for (int thinking = 0; thinking < 2; thinking++) {
         for (int with_content = 0; with_content < 2; with_content++) {
@@ -19624,7 +19679,9 @@ static void test_glm_tool_visible_checkpoint_boundary(void) {
             call.name = xstrdup("bash");
             call.arguments = xstrdup("{}");
             tool_calls_push(&assistant.calls, call);
-            assistant.calls.raw_tool_text = xstrdup("<tool_call>bash</tool_call>");
+            /* Raw sampled block, distinct from the JSON fallback for {}. */
+            assistant.calls.raw_tool_text = xstrdup(
+                "\n\n<tool_call>bash<arg_key>cmd</arg_key><arg_value>ls -la</arg_value></tool_call>");
             char *visible = build_glm_tool_turn_visible_text(
                 &r, "tool_calls", false, assistant.content, &assistant.calls);
             TEST_ASSERT(visible != NULL);
@@ -19637,6 +19694,9 @@ static void test_glm_tool_visible_checkpoint_boundary(void) {
                 &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
             r.image_count = 0;
             r.api = API_RESPONSES;
+            TEST_ASSERT(build_glm_tool_turn_visible_text(
+                &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
+            r.api = API_ANTHROPIC;
             TEST_ASSERT(build_glm_tool_turn_visible_text(
                 &r, "tool_calls", false, assistant.content, &assistant.calls) == NULL);
             r.api = API_OPENAI;
@@ -22606,6 +22666,10 @@ static void test_thinking_checkpoint_remember_gate(void) {
     r.api = API_OPENAI;
     r.has_tools = false;
     r.think_mode = DS4_THINK_NONE;
+    /* GLM renders a thinking-off answer as <think></think> plus trimmed
+     * content; whitespace in the sampled answer would otherwise miss. */
+    TEST_ASSERT(should_remember_thinking_checkpoint(&r, &st, "stop"));
+    r.model_syntax = SERVER_MODEL_SYNTAX_DEEPSEEK;
     TEST_ASSERT(!should_remember_thinking_checkpoint(&r, &st, "stop"));
 
     request_free(&r);
@@ -24816,6 +24880,8 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_tool_visible_checkpoint_boundary();
     test_glm_tool_visible_checkpoint_boundary();
     test_glm_tool_context_answer_visible_prefix();
+    test_glm_thinking_off_answer_visible_prefix();
+    test_trace_cache_miss_reason();
     test_qwen_decode_tracker_markers();
     test_parse_qwen_tool_call_message();
     test_qwen_literal_tool_end_in_argument();

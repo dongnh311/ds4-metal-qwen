@@ -77294,9 +77294,6 @@ static int ds4_session_glm_spec_cycle_impl(
     return n_committed;
 }
 
-/* Restore the state immediately before the last two-token GLM-5.3 MTP cycle,
- * then replay the retained first row when the caller keeps it.  ds4-agent uses
- * this when a speculative block crosses into or out of greedy tool syntax. */
 /* GLM-5.3's recurrent KDA state rolls back only inside the MTP two-token
  * window saved by the last speculative step. */
 static bool ds4_session_glm_mtp_rewind_possible(const ds4_session *s, int pos) {
@@ -77306,6 +77303,9 @@ static bool ds4_session_glm_mtp_rewind_possible(const ds4_session *s, int pos) {
             pos == (int)s->glm_mtp_rollback_pos + 1);
 }
 
+/* Restore the state immediately before the last two-token GLM-5.3 MTP cycle,
+ * then replay the retained first row when the caller keeps it.  ds4-agent uses
+ * this when a speculative block crosses into or out of greedy tool syntax. */
 static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
     if (!ds4_session_glm_mtp_rewind_possible(s, pos)) return false;
     const uint32_t start = s->glm_mtp_rollback_pos;
