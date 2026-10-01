@@ -5365,6 +5365,43 @@ template [[host_name("kernel_qwen4_moe_mm_down_naxc64")]] kernel void kernel_qwe
 #undef QWEN4_NAX_MID_SIG_FLOAT
 #undef QWEN4_NAX_DOWN_SIG_HALF
 #undef QWEN4_NAX_DOWN_SIG_FLOAT
+
+/* Dense GSQ-RCO and BF16 prefill rows on the tensor-op tiles PROD's Q4_K projections use
+ * (kernel_mul_mm_mpp_direct_rhs, metal/dense.metal).  The template steps a pointer over whole blocks
+ * and asks for the il-th 16 weights of one; qwen4_gsq_deq8 gives them as two runs of eight.  A BF16
+ * "block" is 32 weights. */
+template <uint N> struct qwen4_dense_blk { uchar b[N]; };
+
+template <uint TYPE, typename block_q>
+void qwen4_dense_dequant(device const block_q *xb, short il, thread half4x4 &reg) {
+    float v[8], w[8];
+    const uint b = (uint)il / 2u, q = ((uint)il & 1u) * 2u;
+    qwen4_gsq_deq8((device const char *)xb, b, q, TYPE, v);
+    qwen4_gsq_deq8((device const char *)xb, b, q + 1u, TYPE, w);
+    reg = half4x4(half4(v[0], v[1], v[2], v[3]), half4(v[4], v[5], v[6], v[7]),
+                  half4(w[0], w[1], w[2], w[3]), half4(w[4], w[5], w[6], w[7]));
+}
+
+#define QWEN4_DENSE_NAX_ONE(NAME, NR1, TYPE, BYTES, NL) \
+    template [[host_name(NAME)]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs< \
+        NR1, half, half4x4, qwen4_dense_blk<BYTES>, NL, qwen4_dense_dequant<TYPE, qwen4_dense_blk<BYTES>>, \
+        float, float4x4, float>;
+#define QWEN4_DENSE_NAX(TNAME, TYPE, BYTES, NL) \
+    QWEN4_DENSE_NAX_ONE("kernel_qwen4_dense_nax_" TNAME, 32, TYPE, BYTES, NL) \
+    QWEN4_DENSE_NAX_ONE("kernel_qwen4_dense_nax_" TNAME "_n64", 64, TYPE, BYTES, NL) \
+    QWEN4_DENSE_NAX_ONE("kernel_qwen4_dense_nax_" TNAME "_n128", 128, TYPE, BYTES, NL)
+QWEN4_DENSE_NAX("q5_K", 13, 176, 16)
+QWEN4_DENSE_NAX("q6_K", 14, 210, 16)
+QWEN4_DENSE_NAX("iq2_xs", 17, 74, 16)
+QWEN4_DENSE_NAX("iq3_xxs", 18, 98, 16)
+QWEN4_DENSE_NAX("iq4_nl", 20, 18, 2)
+QWEN4_DENSE_NAX("iq3_s", 21, 110, 16)
+QWEN4_DENSE_NAX("iq2_s", 22, 82, 16)
+QWEN4_DENSE_NAX("iq4_xs", 23, 136, 16)
+QWEN4_DENSE_NAX("q2_0", 42, 18, 4)
+QWEN4_DENSE_NAX("bf16", 30, 64, 2)
+#undef QWEN4_DENSE_NAX
+#undef QWEN4_DENSE_NAX_ONE
 #endif /* DS4_METAL_HAS_TENSOR */
 /* --- prefill: dense tiled GEMM for f32/f16/bf16/q8_0 and GSQ-RCO weights - */
 
