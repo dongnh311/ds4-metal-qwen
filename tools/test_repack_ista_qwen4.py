@@ -27,7 +27,9 @@ class RepackTest(unittest.TestCase):
             {"name": "blk.0.ffn_gate_inp.weight", "dims": [32], "type": 30, "nbytes": 64, "data": bf16([1.0] * 32)},
             {"name": "blk.0.hc_attn_up.weight", "dims": [32], "type": 30, "nbytes": 64, "data": self.hc},
             {"name": "blk.0.hc_ffn_inject.weight", "dims": [32], "type": 30, "nbytes": 64,
-             "data": bf16([1e-7] + [1.0] * 31)},   # 1e-7 is subnormal in F16: not exact
+             "data": bf16([1e-7] + [1.0] * 31)},   # 1e-7 is subnormal in F16: rounds by ~2e-8
+            {"name": "blk.0.hc_ffn_up.weight", "dims": [32], "type": 30, "nbytes": 64,
+             "data": bf16([70000.0] + [1.0] * 31)},   # past F16's 65504
             {"name": "output_hc_down.weight", "dims": [32], "type": 30, "nbytes": 64, "data": bf16([3.0] * 32)},
             {"name": "output_hc_up.weight", "dims": [32], "type": 30, "nbytes": 64, "data": self.hc},
         ]
@@ -97,9 +99,20 @@ class RepackTest(unittest.TestCase):
         self.assertEqual(t["type"], 1)
         self.assertEqual(man["tensors"]["output_hc_up.weight"]["converted_from"], "BF16")
 
-    def test_hc_falls_back_to_f32(self):
+    def test_hc_tiny_rounding_to_f16(self):
+        # values below F16's normal range round by at most ~3e-8; that is kept as F16
         r, _ = self.repack()
         t = next(t for t in r.tensors if t["name"] == "blk.0.hc_ffn_inject.weight")
+        self.assertEqual(t["type"], 1)
+        with open(self.p / "out.gguf", "rb") as f:
+            f.seek(t["abs"])
+            got = np.frombuffer(f.read(64), dtype=np.float16).astype(np.float32)
+        want = np.frombuffer(bf16([1e-7] + [1.0] * 31), dtype=np.uint16).astype(np.uint32) << 16
+        self.assertLessEqual(float(np.abs(got - want.view(np.float32)).max()), rp.HC_F16_MAX_ABS_ERR)
+
+    def test_hc_overflow_falls_back_to_f32(self):
+        r, _ = self.repack()
+        t = next(t for t in r.tensors if t["name"] == "blk.0.hc_ffn_up.weight")
         self.assertEqual(t["type"], 0)
 
     def test_other_bf16_untouched(self):

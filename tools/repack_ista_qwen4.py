@@ -20,15 +20,28 @@ DROP = {"split.count", "split.no", "split.tensors.count"}
 TO_F32 = re.compile(r"^blk\.\d+\.ffn_gate_inp(_shexp)?\.weight$")          # the loader requires F32
 TO_F16 = re.compile(r"^(blk\.\d+\.hc_(attn|ffn)_(up|inject)|output_hc_up)\.weight$")   # the hc mixer takes F16/F32/Q8_0
 BF16 = 30
+# BF16 values inside F16's normal range are exact in F16; smaller ones round by at most ~3e-8.
+# Anything past that bound (overflow to inf, NaN) keeps F32.
+HC_F16_MAX_ABS_ERR = 1e-6
+
+
+def hc_f16(f32):
+    """F32 values -> F16 bytes when every value is within HC_F16_MAX_ABS_ERR, else None."""
+    with np.errstate(over="ignore"):
+        f16 = f32.astype(np.float16)
+    err = np.abs(f16.astype(np.float32) - f32)
+    if f32.size and not (np.all(np.isfinite(err)) and err.max() <= HC_F16_MAX_ABS_ERR):
+        return None
+    return f16.tobytes()
 
 
 def convert(raw, name):
-    """BF16 raw bytes -> (type, bytes): F32 for the router, F16 for hc up/inject when every value round-trips."""
+    """BF16 raw bytes -> (type, bytes): F32 for the router, F16 for hc up/inject unless a value overflows it."""
     f32 = (np.frombuffer(raw, dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
     if TO_F16.match(name):
-        f16 = f32.astype(np.float16)
-        if np.array_equal(f16.astype(np.float32), f32):
-            return 1, f16.tobytes()
+        f16 = hc_f16(f32)
+        if f16 is not None:
+            return 1, f16
     return 0, f32.tobytes()
 
 
