@@ -77297,13 +77297,17 @@ static int ds4_session_glm_spec_cycle_impl(
 /* Restore the state immediately before the last two-token GLM-5.3 MTP cycle,
  * then replay the retained first row when the caller keeps it.  ds4-agent uses
  * this when a speculative block crosses into or out of greedy tool syntax. */
+/* GLM-5.3's recurrent KDA state rolls back only inside the MTP two-token
+ * window saved by the last speculative step. */
+static bool ds4_session_glm_mtp_rewind_possible(const ds4_session *s, int pos) {
+    return s && s->glm_mtp_rollback_valid && s->glm_graph.glm53 &&
+           s->checkpoint.len == (int)s->glm_mtp_rollback_pos + 2 &&
+           (pos == (int)s->glm_mtp_rollback_pos ||
+            pos == (int)s->glm_mtp_rollback_pos + 1);
+}
+
 static bool ds4_session_glm_mtp_rewind(ds4_session *s, int pos) {
-    if (!s || !s->glm_mtp_rollback_valid || !s->glm_graph.glm53 ||
-        s->checkpoint.len != (int)s->glm_mtp_rollback_pos + 2 ||
-        (pos != (int)s->glm_mtp_rollback_pos &&
-         pos != (int)s->glm_mtp_rollback_pos + 1)) {
-        return false;
-    }
+    if (!ds4_session_glm_mtp_rewind_possible(s, pos)) return false;
     const uint32_t start = s->glm_mtp_rollback_pos;
     bool ok = glm53_graph_copy_spec_state(&s->glm_graph, false);
     s->glm_dense_cache_len = s->glm_mtp_rollback_dense_len;
@@ -89081,6 +89085,20 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->glm_mtp_have = 0;
     s->glm_mtp_rollback_valid = false;
     ds4_session_glm_cap_dense_cache(s);
+#endif
+}
+
+bool ds4_session_glm_can_rewind(const ds4_session *s, int pos) {
+#ifndef DS4_NO_GPU
+    if (!ds4_session_is_glm(s) || !s->checkpoint_valid ||
+        pos < 0 || pos >= s->checkpoint.len) {
+        return false;
+    }
+    return !s->glm_graph.glm53 || ds4_session_glm_mtp_rewind_possible(s, pos);
+#else
+    (void)s;
+    (void)pos;
+    return false;
 #endif
 }
 
