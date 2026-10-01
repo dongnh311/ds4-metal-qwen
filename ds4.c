@@ -60489,17 +60489,28 @@ static bool qwen4_gemv(ds4_gpu_tensor *out, const ds4_model *m, const ds4_tensor
  * those output rows, so the draft is scored over that subset and the argmax
  * maps back through the list; the verify rows still use the full head.
  * Loaded once per graph; a missing or invalid file leaves the full head. */
+/* The gathered draft head is always Q8_0: Q8_0 heads keep their rows, the row-dequantizer types
+ * (ISTA's Q5_K head) are requantized row by row, which only moves the draft's scores. */
+static bool qwen4_draft_head_type_ok(uint32_t type) {
+    return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_IQ2_XXS || qwen4_type_is_gsq(type);
+}
+
+int ds4_test_qwen4_draft_head_type_ok(uint32_t type) {
+    return qwen4_draft_head_type_ok(type) ? 1 : 0;
+}
+
 static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_tensor *w,
                                       const char *env_name) {
     if (g->draft_head_tried) return g->draft_head != NULL;
     g->draft_head_tried = true;
     const char *path = getenv(env_name);
     if (!path || !path[0]) return false;
-    if (w->type != DS4_TENSOR_Q8_0) {
-        fprintf(stderr, "ds4: %s ignored (output head is not Q8_0)\n", env_name);
+    uint32_t block_elems = 0, block_bytes = 0;
+    if (!qwen4_draft_head_type_ok(w->type) || ds4_gguf_type_block(w->type, &block_elems, &block_bytes) != 0) {
+        fprintf(stderr, "ds4: %s ignored (output head type %u has no Q8_0 row conversion)\n", env_name, w->type);
         return false;
     }
-    if (w->ndim < 2 || (w->dim[0] % 32u) != 0) return false;
+    if (w->ndim < 2 || (w->dim[0] % 32u) != 0 || (w->dim[0] % block_elems) != 0) return false;
     FILE *fp = fopen(path, "r");
     if (!fp) { fprintf(stderr, "ds4: MTP draft vocabulary %s: %s\n", path, strerror(errno)); return false; }
     const uint64_t V = w->dim[1];
@@ -60520,14 +60531,18 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
         return false;
     }
     const uint64_t row_bytes = (w->dim[0] / 32u) * 34u;
+    const uint64_t src_row_bytes = (w->dim[0] / block_elems) * block_bytes;
     const uint64_t bytes = (uint64_t)n * row_bytes;
     uint8_t *rows = malloc(bytes);
     ds4_gpu_tensor *head = rows ? ds4_gpu_tensor_alloc(bytes) : NULL;
-    if (rows && head) {
+    bool converted = rows && head;
+    if (converted) {
         const uint8_t *src = (const uint8_t *)m->map + w->abs_offset;
-        for (uint32_t i = 0; i < n; i++) memcpy(rows + (uint64_t)i * row_bytes, src + (uint64_t)ids[i] * row_bytes, row_bytes);
+        for (uint32_t i = 0; converted && i < n; i++)
+            converted = ds4_quant_row_to_q8_0(w->type, src + (uint64_t)ids[i] * src_row_bytes, w->dim[0],
+                                              rows + (uint64_t)i * row_bytes) == 0;
     }
-    const bool ok = rows && head && ds4_gpu_tensor_write(head, 0, rows, bytes);
+    const bool ok = converted && ds4_gpu_tensor_write(head, 0, rows, bytes);
     free(rows);
     if (!ok) {
         fprintf(stderr, "ds4: MTP draft head upload failed\n");
@@ -60538,8 +60553,9 @@ static bool qwen4_mtp_draft_head_load(ds4_qwen4_gpu_graph *g, const ds4_model *m
     g->draft_head = head;
     g->draft_ids = ids;
     g->draft_rows = n;
-    fprintf(stderr, "ds4: MTP draft head: %u of %" PRIu64 " vocabulary rows from %s (%.0f MiB)\n",
-            n, V, path, (double)bytes / (1024.0 * 1024.0));
+    fprintf(stderr, "ds4: MTP draft head: %u of %" PRIu64 " vocabulary rows from %s (%.0f MiB%s)\n",
+            n, V, path, (double)bytes / (1024.0 * 1024.0),
+            w->type == DS4_TENSOR_Q8_0 ? "" : ", requantized to Q8_0");
     return true;
 }
 
@@ -70138,6 +70154,34 @@ int ds4_dequant_row(uint32_t type, const void *src, uint64_t n, float *out) {
     case DS4_TENSOR_Q2_0:    dq_q2_0(p, n, out); return 0;
     default:                 return -1;
     }
+}
+
+int ds4_quant_row_to_q8_0(uint32_t type, const void *src, uint64_t n, uint8_t *dst) {
+    if ((n % 32u) != 0) return -1;
+    if (type == DS4_TENSOR_Q8_0) {
+        memcpy(dst, src, n / 32u * 34u);
+        return 0;
+    }
+    float *x = malloc(n * sizeof(float));
+    if (!x) return -1;
+    if (ds4_dequant_row(type, src, n, x) != 0) {
+        free(x);
+        return -1;
+    }
+    /* ggml's quantize_row_q8_0_ref: d = amax / 127, q = round(x / d) */
+    for (uint64_t b = 0; b < n / 32u; b++) {
+        const float *v = x + b * 32u;
+        uint8_t *blk = dst + b * 34u;
+        float amax = 0.0f;
+        for (uint32_t j = 0; j < 32u; j++) amax = fmaxf(amax, fabsf(v[j]));
+        const float d = amax / 127.0f, id = d != 0.0f ? 1.0f / d : 0.0f;
+        const uint16_t dh = f32_to_f16(d);
+        blk[0] = (uint8_t)(dh & 0xFFu);
+        blk[1] = (uint8_t)(dh >> 8);
+        for (uint32_t j = 0; j < 32u; j++) blk[2 + j] = (uint8_t)(int8_t)roundf(v[j] * id);
+    }
+    free(x);
+    return 0;
 }
 
 /* ------------------------------------------------------------------------

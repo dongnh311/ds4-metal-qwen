@@ -3825,11 +3825,14 @@ int ds4_gpu_qwen4_vision_encode(float *out, const float *patches, const float *p
                                 uint32_t grid_w, const void *model_map, uint64_t model_size,
                                 const ds4_qwen4_vision_weights *w);
 /* prefill dense GEMM (f32/f16/bf16/q8_0 and GSQ-RCO rows, 32x32 tiles) and the batched hc mix
- * pieces */
+ * pieces; GSQ-RCO and BF16 batches of whole 32-token tiles over 64-row multiples take the Metal 4
+ * tensor-op tiles where the device has them */
 int ds4_gpu_qwen4_dense_mm_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *x,
         const void *model_map, uint64_t model_size, uint64_t weight_offset, uint32_t weight_type,
         uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
+/* 1 when ds4_gpu_qwen4_dense_mm_tensor takes the tensor-op tiles for this shape */
+int ds4_gpu_qwen4_dense_nax_selected(uint32_t weight_type, uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows);
 int ds4_gpu_qwen4_hc_lo_act_tensor(ds4_gpu_tensor *lo_act, const ds4_gpu_tensor *lo,
                                    uint32_t n_tokens, uint32_t n_hc, uint32_t n_rank);
 int ds4_gpu_qwen4_hc_mix_rows_tensor(ds4_gpu_tensor *mixed, const ds4_gpu_tensor *u, const ds4_gpu_tensor *xn,

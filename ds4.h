@@ -264,11 +264,16 @@ uint64_t ds4_iq_table_entry(const char *table, uint32_t i);
 /* Dequantizes n weights (whole blocks) of a Q5_K, Q6_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
  * IQ4_NL, IQ4_XS or Q2_0 row into out; returns 0, or -1 for another type or a partial block. */
 int ds4_dequant_row(uint32_t type, const void *src, uint64_t n, float *out);
+/* Writes n weights (whole blocks) of a row of `type` as Q8_0 blocks (n/32 x 34 bytes) into dst: Q8_0
+ * rows are copied, the ds4_dequant_row types are dequantized and requantized; returns 0, or -1 for
+ * another type or a partial block. */
+int ds4_quant_row_to_q8_0(uint32_t type, const void *src, uint64_t n, uint8_t *dst);
 /* Test hook: 1 when the loader accepts `type` for routed experts of Qwen3.8
  * (qwen4 != 0) or of the DeepSeek/GLM/DSpark families. */
 int ds4_test_routed_expert_type_ok(uint32_t type, int qwen4);
 int ds4_test_qwen4_expert_has_mm(uint32_t type);
 int ds4_test_qwen4_dense_mm_rows(uint32_t type, uint32_t n_tok, uint64_t in_dim);
+int ds4_test_qwen4_draft_head_type_ok(uint32_t type);
 /* Rotary inverse frequencies of the n_rot/2 pairs (entries past n_rot/2 are 0),
  * with HF _compute_yarn_parameters blending (beta_fast 32, beta_slow 1) when
  * factor > 1 and native_ctx > 0. mscale, low and high may be NULL. */
