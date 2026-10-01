@@ -49558,9 +49558,9 @@ enum {
     QWEN4_K_HC_GATE_MIX_PAIR_Q8,
     QWEN4_K_MULTI_GEMV,
     QWEN4_K_GSQ_MV_R1, QWEN4_K_GSQ_MV_R2, QWEN4_K_GSQ_MV_R3, QWEN4_K_GSQ_MV_R4,
-    /* dense GSQ-RCO/BF16 prefill on the tensor-op tiles: 10 types x tiles 32/64/128 (qwen4_dense_nax_kernel) */
+    /* dense GSQ-RCO/BF16/F16 prefill on the tensor-op tiles: 11 types x tiles 32/64/128 (qwen4_dense_nax_kernel) */
     QWEN4_K_DENSE_NAX,
-    QWEN4_K_DENSE_NAX_LAST = QWEN4_K_DENSE_NAX + 29,
+    QWEN4_K_DENSE_NAX_LAST = QWEN4_K_DENSE_NAX + 32,
     QWEN4_K_HC_COMBINE,
     QWEN4_K_CONV_STREAM,
     QWEN4_K_GDN_PREP,
@@ -49725,6 +49725,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_dense_nax_iq4_xs", "kernel_qwen4_dense_nax_iq4_xs_n64", "kernel_qwen4_dense_nax_iq4_xs_n128",
     "kernel_qwen4_dense_nax_q2_0", "kernel_qwen4_dense_nax_q2_0_n64", "kernel_qwen4_dense_nax_q2_0_n128",
     "kernel_qwen4_dense_nax_bf16", "kernel_qwen4_dense_nax_bf16_n64", "kernel_qwen4_dense_nax_bf16_n128",
+    "kernel_mul_mm_f16_f32_mpp_direct_rhs", "kernel_mul_mm_f16_f32_mpp_direct_rhs_n64",
+    "kernel_mul_mm_f16_f32_mpp_direct_rhs_n128",
     "kernel_qwen4_hc_combine",
     "kernel_qwen4_conv_stream",
     "kernel_qwen4_gdn_prep",
@@ -54598,10 +54600,12 @@ static bool qwen4_dense_mm_partials_ensure(uint64_t bytes) {
 
 /* Dense GSQ-RCO and BF16 prefill batches on the tensor-op tiles PROD's Q4_K projections use:
  * whole 32-token tiles over 64-row multiples, on devices with Metal 4 tensors.
- * DS4_QWEN4_DENSE_NAX=0 keeps the 32x32 float tiles for A/B. */
+ * DS4_QWEN4_DENSE_NAX=0 keeps the 32x32 float tiles for A/B.  F16 (the hc up GEMM, about
+ * 4.4 TFLOP/s on the float tiles) joins only with DS4_QWEN4_DENSE_NAX_F16=1, so PROD's F16 hc
+ * up keeps its float tiles and its output unless a run opts in. */
 static int qwen4_dense_nax_kernel(uint32_t weight_type, uint32_t n_tokens) {
-    static const uint32_t types[10] = { 13u, 14u, 17u, 18u, 20u, 21u, 22u, 23u, 42u, 30u };
-    for (int i = 0; i < 10; i++) {
+    static const uint32_t types[11] = { 13u, 14u, 17u, 18u, 20u, 21u, 22u, 23u, 42u, 30u, 1u };
+    for (int i = 0; i < 11; i++) {
         if (types[i] != weight_type) continue;
         const int tile = (n_tokens % 128u) == 0 ? 2 : (n_tokens % 64u) == 0 ? 1 : 0;
         return QWEN4_K_DENSE_NAX + i * 3 + tile;
@@ -54610,7 +54614,8 @@ static int qwen4_dense_nax_kernel(uint32_t weight_type, uint32_t n_tokens) {
 }
 
 static bool qwen4_dense_nax_ok(uint32_t weight_type, uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
-    const uint32_t block = weight_type == 30u ? 32u : qwen4_mm_gsq_block(weight_type);
+    const uint32_t block = (weight_type == 30u || weight_type == 1u) ? 32u : qwen4_mm_gsq_block(weight_type);
+    if (weight_type == 1u && ds4_gpu_env_u64("DS4_QWEN4_DENSE_NAX_F16", 0u, 0u, 1u) == 0) return false;
     return block && qwen4_dense_nax_kernel(weight_type, n_tokens) >= 0 && ds4_gpu_mpp_available() &&
            n_tokens >= 32u && (n_tokens % 32u) == 0 && (in_dim % 64u) == 0 && (in_dim % block) == 0 &&
            (out_rows % 64u) == 0 && ds4_gpu_env_u64("DS4_QWEN4_DENSE_NAX", 1u, 0u, 1u) != 0;
