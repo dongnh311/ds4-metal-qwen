@@ -37,6 +37,7 @@ static ds4_gpu_tensor *ids_t[LAYERS], *out_t[LAYERS];
 static float ref[LAYERS][N * D], got[LAYERS][N * D];
 /* Elements each layer writes: qwen4 partials are N x D, GLM's summed output D. */
 static int out_elems = N * D;
+static int drain_layer = -1;   /* this layer never publishes (mixed tokens) */
 
 static int setup(void) {
     row_bytes = D / 256 * sizeof(iq2_block);
@@ -158,7 +159,8 @@ static int compare_modes(const char *name, layer_fn fn, int split, uint64_t *gat
         ok = 0;
     }
     /* Step 0 drains until the first miss allocates the cache slab. */
-    if (ok && *gated_layers < (uint64_t)(STEPS - 1) * LAYERS) {
+    const uint64_t want = (uint64_t)(STEPS - 1) * (drain_layer >= 0 ? LAYERS - 1 : LAYERS);
+    if (ok && *gated_layers < want) {
         fprintf(stderr, "%s: only %llu gated layers\n", name, (unsigned long long)*gated_layers);
         ok = 0;
     }
@@ -187,14 +189,88 @@ static int qwen4_suite(void) {
     return ok;
 }
 
+static int glm_layer(int layer, int gated) {
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model, .model_size = model_bytes, .layer = 3u + (uint32_t)layer,
+        .n_total_expert = E, .gate_offset = 0, .up_offset = tensor_bytes,
+        .down_offset = 2 * tensor_bytes, .gate_expert_bytes = expert_bytes,
+        .down_expert_bytes = down_expert_bytes,
+    };
+    const int published = gated && layer != drain_layer &&
+                          ds4_gpu_glm_stream_gate_publish(&table, ids_t[layer], N);
+    /* GPU work between publish and commit, where ds4.c encodes the shared expert. */
+    if (!ds4_gpu_add_tensor(shared_t, xt, xt, D)) return 0;
+    if (published && !ds4_gpu_glm_stream_gate_commit()) return 0;
+    return ds4_gpu_routed_moe_one_tensor(
+               out_t[layer], gate, up, mid, down, model, model_bytes,
+               0, tensor_bytes, 2 * tensor_bytes, 16u, 10u,
+               expert_bytes, row_bytes, down_expert_bytes, down_row_bytes, D, H, D,
+               ids_t[layer], wt, E, N, 7.0f, xt, NULL, 3u + (uint32_t)layer, false) != 0;
+}
+
+/* A publish whose layer fails before commit must not leak into the next batch. */
+static int check_uncommitted_publish(int split) {
+    const ds4_gpu_stream_expert_table table = {
+        .model_map = model, .model_size = model_bytes, .layer = 3u,
+        .n_total_expert = E, .gate_offset = 0, .up_offset = tensor_bytes,
+        .down_offset = 2 * tensor_bytes, .gate_expert_bytes = expert_bytes,
+        .down_expert_bytes = down_expert_bytes,
+    };
+    ds4_gpu_stream_gate_test_set_mode(1, split);
+    int ok = write_routes(STEPS) && ds4_gpu_begin_commands();
+    const int published = ok && ds4_gpu_glm_stream_gate_publish(&table, ids_t[0], N);
+    ok = ds4_gpu_end_commands() && ok && published;
+    ok = ok && run_step(glm_layer, 1, got);
+    ds4_gpu_stream_gate_test_set_mode(0, split);
+    ok = ok && run_step(glm_layer, 0, ref) && same_outputs("glm uncommitted publish", STEPS);
+    fprintf(stderr, "glm uncommitted publish: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static int glm_suite(int split) {
+    const char *tag = split ? "glm split" : "glm one pass";
+    char name[64];
+    uint64_t gated = 0, splits = 0, fallback = 0;
+    ds4_gpu_set_glm_model(true);
+    out_elems = D;
+    int ok = compare_modes(tag, glm_layer, split, &gated, &splits, &fallback);
+    if (ok && split && splits == 0) {
+        fprintf(stderr, "%s: no split gate ran\n", tag);
+        ok = 0;
+    }
+    /* Mixed token: layer 2 drains between gated layers. */
+    snprintf(name, sizeof(name), "%s mixed", tag);
+    drain_layer = 2;
+    uint64_t mixed = 0;
+    ok = ok && compare_modes(name, glm_layer, split, &mixed, NULL, NULL);
+    drain_layer = -1;
+    /* Fallback buffer: every miss (and, split, every hit) treated as uncached. */
+    snprintf(name, sizeof(name), "%s fallback", tag);
+    ds4_gpu_stream_gate_test_force_fallback(1);
+    ok = ok && compare_modes(name, glm_layer, split, &gated, NULL, &fallback);
+    ds4_gpu_stream_gate_test_force_fallback(0);
+    if (ok && fallback == 0) {
+        fprintf(stderr, "%s: the fallback buffer was never used\n", name);
+        ok = 0;
+    }
+    ok = ok && check_uncommitted_publish(split);
+    /* A larger budget adds a slab: gates pause until it exists, then resume. */
+    snprintf(name, sizeof(name), "%s budget growth", tag);
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET + 16);
+    ok = ok && compare_modes(name, glm_layer, split, &gated, NULL, NULL);
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc == 2 ? argv[1] : "";
-    if (strcmp(mode, "--qwen4")) {
-        fprintf(stderr, "usage: %s --qwen4\n", argv[0]);
+    if (strcmp(mode, "--qwen4") && strcmp(mode, "--glm")) {
+        fprintf(stderr, "usage: %s --qwen4 | --glm\n", argv[0]);
         return 1;
     }
     int ok = setup();
-    if (ok) ok = qwen4_suite();
+    if (ok && !strcmp(mode, "--qwen4")) ok = qwen4_suite();
+    if (ok && !strcmp(mode, "--glm")) ok = glm_suite(0);
     ds4_gpu_stream_gate_test_set_mode(-1, -1);
     ds4_gpu_cleanup();
     if (model && model != MAP_FAILED) munmap(model, model_bytes);

@@ -438,6 +438,17 @@ void ds4_gpu_stream_expert_cache_note_service_thread(void);
 void ds4_gpu_stream_gate_test_set_mode(int mode, int split);
 void ds4_gpu_stream_gate_stats(uint64_t *committed, uint64_t *split,
                                uint64_t *fallback, int *failed);
+/* GLM decode gates (SP1). publish: 1 when the layer's routed selection was
+ * published into the open batch; the caller then encodes the shared expert,
+ * calls commit and dispatches table->layer's routed MoE, which reads the
+ * gate's own address tables. 0: gates are off or not ready; drain as before.
+ * DS4_GLM_STREAM_GATE=0 keeps the drain. */
+int ds4_gpu_glm_stream_gate_publish(const ds4_gpu_stream_expert_table *table,
+                                    const ds4_gpu_tensor *selected,
+                                    uint32_t n_selected);
+int ds4_gpu_glm_stream_gate_commit(void);
+/* Tests: resolve every gated expert through the fallback buffer. */
+void ds4_gpu_stream_gate_test_force_fallback(int on);
 #endif
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(
