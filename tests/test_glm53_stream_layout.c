@@ -16,6 +16,12 @@ static void set_layout(uint32_t gate, uint32_t down) {
     gate_t.type = gate;
     up_t.type = gate;
     down_t.type = down;
+    /* GLM-5.3 routed shapes: 288 experts, hidden 4096, expert width 2048. */
+    gate_t.dim[0] = up_t.dim[0] = 4096;
+    gate_t.dim[1] = up_t.dim[1] = 2048;
+    down_t.dim[0] = 2048;
+    down_t.dim[1] = 4096;
+    gate_t.dim[2] = up_t.dim[2] = down_t.dim[2] = 288;
     layer.ffn_gate_exps = &gate_t;
     layer.ffn_up_exps = &up_t;
     layer.ffn_down_exps = &down_t;
@@ -77,12 +83,52 @@ static void check_glm53_prefill_full_layer(void) {
     set_layout(DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K);
     weights.layer[DS4_N_LEADING_DENSE] = layer;
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
-    /* IQ2/Q2 has no selected-expert batch prefill, so every chunk would page
-     * in whole layers anyway: read them with the pread prepare instead. */
+    /* Without an expert cache IQ2/Q2 has no selected-expert batch prefill, so
+     * every chunk would page in whole layers anyway: read them with pread. */
     CHECK(full_layer(0, 2048));
     CHECK(full_layer(2048, 2048));
     CHECK(full_layer(0, 28));
     CHECK(full_layer(4096, 40));
+    /* With a cache that holds a whole layer, chunks under 256 tokens load only
+     * their selected experts through it; larger and single-token chunks still
+     * read whole layers. */
+    ds4_gpu_set_ssd_streaming(true);
+    ds4_gpu_set_streaming_expert_cache_budget(4546);
+    const ds4_layer_weights *routed = &weights.layer[DS4_N_LEADING_DENSE];
+    CHECK(glm_graph_stream_prefill_expert_addr_supported(&graph, &weights, routed,
+                                                         DS4_N_LEADING_DENSE, 28));
+    CHECK(!full_layer(0, 28));
+    CHECK(!full_layer(4096, 40));
+    CHECK(!full_layer(0, 255));
+    CHECK(full_layer(0, 256));
+    CHECK(full_layer(2048, 2048));
+    /* A one-token tail chunk (prompt length 2048k+1, or an append) loads its
+     * eight experts instead of reading every routed layer. */
+    CHECK(glm_graph_stream_prefill_expert_addr_supported(&graph, &weights, routed,
+                                                         DS4_N_LEADING_DENSE, 1));
+    CHECK(!full_layer(4096, 1));
+    ds4_gpu_set_streaming_expert_cache_budget(100);
+    CHECK(full_layer(0, 28));
+    ds4_gpu_set_streaming_expert_cache_budget(4546);
+    /* Metal skips the cached batch whenever full-layer prefill is forced, so
+     * the forced chunk must read whole layers on the ds4.c side too. */
+    setenv("DS4_METAL_GLM_STREAMING_PREFILL_FULL_LAYER", "1", 1);
+    CHECK(!glm_graph_stream_prefill_expert_addr_supported(&graph, &weights, routed,
+                                                          DS4_N_LEADING_DENSE, 28));
+    CHECK(full_layer(0, 28));
+    unsetenv("DS4_METAL_GLM_STREAMING_PREFILL_FULL_LAYER");
+    /* The selected-expert chunk limit is tunable below the Metal bound. */
+    setenv("DS4_METAL_GLM_STREAMING_PREFILL_SELECTED_MAX_TOKENS", "64", 1);
+    CHECK(!full_layer(0, 63));
+    CHECK(full_layer(0, 64));
+    setenv("DS4_METAL_GLM_STREAMING_PREFILL_SELECTED_MAX_TOKENS", "4096", 1);
+    CHECK(!full_layer(0, 255));
+    CHECK(full_layer(0, 256));
+    unsetenv("DS4_METAL_GLM_STREAMING_PREFILL_SELECTED_MAX_TOKENS");
+    /* Only the final chunk seeds the decode expert cache from a full layer. */
+    CHECK(glm_graph_full_layer_prefill_seeds_cache(true, true));
+    CHECK(!glm_graph_full_layer_prefill_seeds_cache(true, false));
+    CHECK(!glm_graph_full_layer_prefill_seeds_cache(false, true));
     CHECK(!glm_graph_indexed_prefill_full_layer(&graph, &weights, 2048, 2048, false));
     graph.quality = true;
     CHECK(!full_layer(2048, 2048));

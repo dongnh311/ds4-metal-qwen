@@ -47834,6 +47834,23 @@ static bool glm_graph_stream_layer_expert_cache_supported(
     return glm_stream_decode_expert_cache_ready(weights, l, il);
 }
 
+#ifdef __APPLE__
+/* Chunks below this size load only their selected experts through the cache;
+ * larger ones read whole layers with the overlapped pread. Metal's cached
+ * batch stops at 256 tokens. */
+static uint32_t glm_graph_stream_prefill_selected_max_tokens(void) {
+    const char *env = glm_graph_env_value(
+            "DS4_ROCM_GLM_STREAMING_PREFILL_SELECTED_MAX_TOKENS",
+            "DS4_METAL_GLM_STREAMING_PREFILL_SELECTED_MAX_TOKENS");
+    if (!env) return 256u;
+    char *end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(env, &end, 10);
+    if (end == env || errno != 0 || v == 0) return 256u;
+    return v > 256ul ? 256u : (uint32_t)v;
+}
+#endif
+
 static bool glm_graph_stream_prefill_expert_addr_supported(
         const ds4_glm_gpu_graph *g,
         const ds4_weights       *weights,
@@ -47842,8 +47859,9 @@ static bool glm_graph_stream_prefill_expert_addr_supported(
         uint32_t                 n_tokens) {
     (void)g;
     if (il < DS4_N_LEADING_DENSE) return true;
-    if (n_tokens <= 1) return false;
+    if (n_tokens == 0) return false;
 #ifdef DS4_ROCM_BUILD
+    if (n_tokens <= 1) return false;
     /*
      * ROCm selected-address batch prefill has pointer kernels for the
      * IQ2-gate/Q2-down generic path and the uniform Q2_K GLM path. Q4_K still
@@ -47875,12 +47893,18 @@ static bool glm_graph_stream_prefill_expert_addr_supported(
                    down_expert_bytes) >= required;
 #else
 #ifdef __APPLE__
+    /* IQ2_XXS gate/up with IQ2_XXS or Q2_K down: small chunks, one token
+     * included, load their selected experts through the cache. Metal skips
+     * that cached batch whenever full-layer prefill is forced. */
     if (g && g->tp_world < 2 && l &&
         l->ffn_gate_exps && l->ffn_up_exps && l->ffn_down_exps &&
         l->ffn_gate_exps->type == DS4_TENSOR_IQ2_XXS &&
         l->ffn_up_exps->type == DS4_TENSOR_IQ2_XXS &&
-        l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS &&
-        DS4_N_EXPERT_USED == 8 && n_tokens < 256 &&
+        (l->ffn_down_exps->type == DS4_TENSOR_IQ2_XXS ||
+         l->ffn_down_exps->type == DS4_TENSOR_Q2_K) &&
+        DS4_N_EXPERT_USED == 8 &&
+        n_tokens < glm_graph_stream_prefill_selected_max_tokens() &&
+        getenv("DS4_METAL_GLM_STREAMING_PREFILL_FULL_LAYER") == NULL &&
         getenv("DS4_METAL_DISABLE_STREAMING_EXPERT_ADDR_TABLE") == NULL &&
         getenv("DS4_METAL_DISABLE_TINY_PAIR_SWIGLU_FUSION") == NULL &&
         getenv("DS4_METAL_DISABLE_STREAMING_PREFILL_BATCH_SELECTED_ADDR") == NULL &&
@@ -47891,6 +47915,7 @@ static bool glm_graph_stream_prefill_expert_addr_supported(
                 DS4_N_EXPERT) return true;
     }
 #endif
+    if (n_tokens <= 1) return false;
     return glm_stream_expert_cache_addr_supported(weights, l, il);
 #endif
 }
@@ -48037,6 +48062,8 @@ static bool glm_graph_indexed_prefill_full_layer(
         g->layer_start != 0 || g->layer_count != glm_graph_normal_layer_count()) {
         return false;
     }
+    /* One decision per chunk from the first routed layer: a mixed-precision
+     * GGUF whose boosted layers differ falls back to mapped paging there. */
     const ds4_layer_weights *routed = &weights->layer[DS4_N_LEADING_DENSE];
     /* Generic IQ2 layers without a selected-expert batch path for this chunk
      * (IQ2/Q2_K down, large chunks) map every expert of each layer anyway, so
@@ -51868,6 +51895,13 @@ static bool glm_graph_seed_streaming_expert_cache_from_prefill(
     return true;
 }
 
+/* The full-layer seed copies a chunk's hottest experts into the decode cache;
+ * only the final chunk's choice survives to decode. */
+static bool glm_graph_full_layer_prefill_seeds_cache(bool full_layer_prefill,
+                                                     bool final_chunk) {
+    return full_layer_prefill && final_chunk;
+}
+
 static bool glm_graph_seed_streaming_expert_cache_from_full_layer(
         ds4_glm_gpu_graph       *g,
         const ds4_model         *model,
@@ -52401,6 +52435,7 @@ static bool glm_graph_encode_ffn_batch(
         ds4_gpu_tensor          *next,
         uint32_t                 n_tokens,
         bool                     full_layer_prefill,
+        bool                     final_chunk,
         bool                     stage_profile,
         bool                     stage_sync,
         double                  *stage_t0) {
@@ -52649,7 +52684,8 @@ static bool glm_graph_encode_ffn_batch(
             n_tokens,
             gate_out * gate_row_bytes,
             down_out * down_row_bytes,
-            full_layer_prefill);
+            glm_graph_full_layer_prefill_seeds_cache(full_layer_prefill,
+                                                     final_chunk));
     bool shared_done = false;
 #define DS4_GLM_ENCODE_FFN_BATCH_SHARED() do { \
         if (ok) { \
@@ -53713,6 +53749,7 @@ static bool glm_graph_verify_rows(
                                                 g->batch_after_attn,
                                                 nxt,
                                                 n,
+                                                false,
                                                 false,
                                                 false,
                                                 false,
@@ -54813,6 +54850,7 @@ glm53_batch_attention_done:
                                             next,
                                             n_tokens,
                                             full_layer_prefill,
+                                            logits_out != NULL,
                                             layer_stage_profile,
                                             stage_sync,
                                             layer_stage_profile ? &layer_stage_t0 : NULL);
@@ -56474,6 +56512,7 @@ glm53_indexed_attention_done:
                                             next,
                                             n_tokens,
                                             full_layer_prefill,
+                                            logits_out != NULL,
                                             layer_stage_profile,
                                             stage_sync,
                                             layer_stage_profile ? &layer_stage_t0 : NULL);
@@ -81869,6 +81908,7 @@ static bool glm53_graph_encode_native_session_batch(
                                                 after_attn,
                                                 next,
                                                 rows,
+                                                false,
                                                 false,
                                                 false,
                                                 false,
