@@ -24177,6 +24177,12 @@ static void metal_graph_selected_async_load_run(
         }
     }
     job->ids_ok = true;
+    /* Diagnostic: leave the load to the caller's synchronous retry. */
+    static int force_retry = -1;
+    if (force_retry < 0) {
+        force_retry = getenv("DS4_METAL_STREAMING_ASYNC_LOAD_FORCE_RETRY") != NULL;
+    }
+    if (force_retry) return;
     const ds4_gpu_stream_expert_table table =
         graph_stream_expert_table_make(job->model,
                                        job->layer,
@@ -50413,6 +50419,10 @@ static bool glm_graph_use_streaming_selected_async_load(
                               "DS4_METAL_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD")) {
         return false;
     }
+    /* The worker stages the selected experts while the shared expert runs; a
+     * worker that cannot stage them is retried synchronously by the caller.
+     * Metal keeps it opt-in: on an M5 Pro GLM-5.3 IQ2/Q2 decode measured
+     * 8.98 t/s with the worker vs 9.43 t/s synchronous (2026-10-01). */
 #ifdef DS4_ROCM_BUILD
     return true;
 #else
@@ -50816,7 +50826,19 @@ static bool glm_graph_encode_sparse_ffn_one(
                 glm_graph_streaming_async_profile_ms() - stream_t0;
             stream_t0 = glm_graph_streaming_async_profile_ms();
         }
-        const bool finish_ok = metal_graph_selected_async_load_finish(&async_load);
+        bool finish_ok = metal_graph_selected_async_load_finish(&async_load);
+        if (!finish_ok && async_load.ids_ok) {
+            /* The worker may not wait on in-flight cache entries; this thread
+             * may, so stage the same load synchronously (as V4.1 does). */
+            const ds4_gpu_stream_expert_table retry =
+                graph_stream_expert_table_make(model, l, il,
+                                               gate_out * gate_row_bytes,
+                                               down_out * down_row_bytes);
+            finish_ok = ds4_gpu_stream_expert_cache_begin_selected_load(
+                            &retry, async_load.selected_ids, DS4_N_EXPERT_USED) != 0 &&
+                        ds4_gpu_routed_moe_set_selected_override(
+                            async_load.selected_ids, DS4_N_EXPERT_USED) != 0;
+        }
         ok = ok && flush_ok && finish_ok;
         if (async_profile) {
             g_glm_streaming_async_profile.async_finish_ms +=
