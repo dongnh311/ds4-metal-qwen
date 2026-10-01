@@ -96,11 +96,13 @@ static int check_mapping_lifetime(void) {
     return ok;
 }
 
-static int check_batch_cache(void *model, uint64_t bytes, uint64_t expert) {
+static int check_batch_cache(void *model, uint64_t bytes, uint64_t expert,
+                             uint32_t down_type, uint64_t down_expert) {
     enum { T = 257 };
     const uint64_t tensor = E * expert;
     const uint64_t row = D / block_values * block_bytes;
-    const uint64_t down_row = H / block_values * block_bytes;
+    const uint64_t down_row = H / block_values *
+        (down_block_bytes ? down_block_bytes : block_bytes);
     const size_t xb = T * D * sizeof(float), mb = T * N * H * sizeof(float);
     const size_t ob = T * D * sizeof(float), ib = T * N * sizeof(int32_t);
     float *x = malloc(xb), *weights = malloc(ib), *ref = malloc(ob), *got = malloc(ob);
@@ -136,7 +138,7 @@ static int check_batch_cache(void *model, uint64_t bytes, uint64_t expert) {
                      ds4_gpu_tensor_fill_f32(out, NAN, T * D) &&
                      ds4_gpu_begin_commands() && ds4_gpu_routed_moe_batch_tensor(
                         out, gate, up, mid, down, model, bytes, 0, tensor, 2 * tensor,
-                        quant_type, quant_type, expert, row, expert, down_row, D, H, D,
+                        quant_type, down_type, expert, row, down_expert, down_row, D, H, D,
                         it, wt, E, N, 7.0f, xt, 3 + c % 2, n, &half[streamed],
                         !streamed) && ds4_gpu_end_commands() &&
                      ds4_gpu_tensor_read(out, 0, streamed ? got : ref, n * D * sizeof(float)) &&
@@ -169,7 +171,8 @@ done:
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
-    fprintf(stderr, "Metal SSD type=%u batch cache exact outputs: %s\n", quant_type, ok ? "PASS" : "FAIL");
+    fprintf(stderr, "Metal SSD type=%u down=%u batch cache exact outputs: %s\n",
+            quant_type, down_type, ok ? "PASS" : "FAIL");
     return ok;
 }
 
@@ -392,8 +395,10 @@ int main(int argc, char **argv) {
     ds4_gpu_tensor_free(xt); ds4_gpu_tensor_free(it); ds4_gpu_tensor_free(wt);
     ds4_gpu_tensor_free(gate); ds4_gpu_tensor_free(up); ds4_gpu_tensor_free(mid);
     ds4_gpu_tensor_free(down); ds4_gpu_tensor_free(out);
-    /* The batch and seed checks assume one quant type for all three tensors. */
-    if (ok && !down_quant_type) ok = check_batch_cache(model, bytes, expert);
+    /* Mixed IQ2/Q2_K batches run for GLM's eight experts; the seed check
+     * assumes one quant type for all three tensors. */
+    if (ok && (!down_quant_type || N != 6))
+        ok = check_batch_cache(model, bytes, expert, down_type, down_expert);
     if (ok && D == 256 && !down_quant_type) ok = check_seed_release(model, bytes, expert);
     ds4_gpu_print_memory_report("SSD expert test");
     if (ok) ok = check_mapping_lifetime();
