@@ -59626,7 +59626,7 @@ static bool qwen4_expert_type_has_mm(uint32_t type) {
 
 /* GSQ-RCO and BF16 dense rows take the tiled dense GEMM once a batch has more
  * than 8 rows; the multi-row gemv reads their weights once per token.
- * Decode and MTP verify rows keep the gemv. */
+ * Single-session decode and MTP verify rows keep the gemv. */
 static bool qwen4_dense_mm_rows_ok(uint32_t type, uint32_t n_tok, uint64_t in_dim) {
 #ifdef DS4_HAS_QWEN4_METAL
     if (n_tok <= 8u || (in_dim % 8u) != 0 || in_dim > UINT32_MAX) return false;

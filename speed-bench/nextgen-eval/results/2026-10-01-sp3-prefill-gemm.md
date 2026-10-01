@@ -5,7 +5,7 @@ Its routed experts take the tiled MoE GEMM (`kernel_qwen4_moe_mm_mid/down`). Its
 BF16 tensors take the tiled dense GEMM (`kernel_qwen4_dense_mm`). Both stage weights through
 `qwen4_mm_stage8`, which now dequantizes the nine GSQ-RCO types.
 
-- Decode and MTP verify keep the per-token kernels SP3 verified.
+- Single-session decode and MTP verify keep the per-token kernels SP3 verified. A multi-session decode batch above 8 rows sends its GSQ-RCO and BF16 dense rows to the dense GEMM, the same batch policy F32/F16 rows already follow.
 - PROD's output is byte-identical, and its speed is unchanged.
 - PROD still prefills faster: about 537 t/s on the same bench. It runs the Metal 4 tensor-op tiles
   (`_nax`), which take only its four types.
@@ -36,13 +36,21 @@ so only its last position is compared:
 
 | model | chunk | path | worst max\|gpu-cpu\| | top1 agree |
 |---|---|---|---|---|
-| ISTA | 64 | per-token kernels (≤ 64 rows) | 2.410 | 3/3 |
+| ISTA | 64 | per-token experts (≤ 64 rows), dense rows on the new dense GEMM | 2.410 | 3/3 |
 | ISTA | 256 | tiled GEMMs | 3.021 | 1/1 |
 | Ivan IQ2 | 256 | PROD's tiled GEMMs (tensor-op tiles) | 4.249 | 0/1 |
 
 The plan's bar is max(Ivan chunk 256, ISTA chunk 64) × 1.25 = 5.31, and 3.021 meets it. The half
 staging moves ISTA further from the CPU than its per-token path does. It still stays inside the gap
 that PROD's own tiled path shows on the same prompt.
+
+This model-level check is thin evidence:
+- the chunk-256 rows compare one position each;
+- the bar comes partly from a different model;
+- the chunk-64 control already runs the new dense GEMM.
+
+The direct evidence is the kernel tests against the CPU rows, together with the unchanged coherence
+and MTP acceptance below.
 
 **Coherence:** `ds4 --metal -c 32768 --temp 0 -n 256 --mtp`, SP3's three prompts. All three answers are
 coherent and correct: `is_prime`, Rayleigh scattering in Vietnamese, and TCP/UDP.
