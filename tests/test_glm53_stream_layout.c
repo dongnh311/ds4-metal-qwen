@@ -182,6 +182,29 @@ static void check_glm_session_can_rewind(void) {
     CHECK(!ds4_session_glm_can_rewind(NULL, 45));
 }
 
+static ds4_glm_gpu_graph async_graph;
+
+/* Metal keeps the synchronous selected-expert load by default: the async
+ * worker measured 4.8% slower GLM decode on an M5 Pro. The opt-in switch
+ * enables it; the disable switches win. */
+static void check_glm_streaming_async_load_default(void) {
+    memset(&async_graph, 0, sizeof(async_graph));
+    CHECK(!glm_graph_use_streaming_selected_async_load(&async_graph));
+    async_graph.ssd_streaming = true;
+#if defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    CHECK(!glm_graph_use_streaming_selected_async_load(&async_graph));
+    setenv("DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD", "1", 1);
+#endif
+    CHECK(glm_graph_use_streaming_selected_async_load(&async_graph));
+    setenv("DS4_METAL_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD", "1", 1);
+    setenv("DS4_ROCM_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD", "1", 1);
+    CHECK(!glm_graph_use_streaming_selected_async_load(&async_graph));
+    unsetenv("DS4_METAL_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD");
+    unsetenv("DS4_ROCM_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD");
+    unsetenv("DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD");
+    CHECK(!glm_graph_use_streaming_selected_async_load(NULL));
+}
+
 int main(void) {
     /* Start from the default routed kernels whatever the caller exported. */
     static const char *const disables[] = {
@@ -193,12 +216,17 @@ int main(void) {
         "DS4_METAL_DISABLE_IQ2_STREAM_ADDR_TABLE", "DS4_ROCM_DISABLE_IQ2_STREAM_ADDR_TABLE",
         "DS4_METAL_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
         "DS4_ROCM_DISABLE_IQ2_SELECTED_EXPERT_VIEWS",
+        "DS4_METAL_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD",
+        "DS4_ROCM_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD",
+        "DS4_METAL_DISABLE_STREAMING_SELECTED_ASYNC_LOAD",
+        "DS4_ROCM_DISABLE_STREAMING_SELECTED_ASYNC_LOAD",
     };
     for (size_t i = 0; i < sizeof(disables) / sizeof(*disables); i++) unsetenv(disables[i]);
     check_glm_iq2_q2(&DS4_SHAPE_GLM53);
     check_glm_iq2_q2(&DS4_SHAPE_GLM52);
     check_glm53_prefill_full_layer();
     check_glm_session_can_rewind();
+    check_glm_streaming_async_load_default();
     if (failures) {
         fprintf(stderr, "test_glm53_stream_layout: %d failure(s)\n", failures);
         return 1;
