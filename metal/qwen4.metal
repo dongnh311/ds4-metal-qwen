@@ -4340,6 +4340,127 @@ kernel void kernel_qwen4_moe_build_lists(
     }
 }
 
+/* 8 consecutive values (quarter q of 32-wide block b) of a GSQ-RCO or BF16
+ * row into registers: ggml-quants.c dequantizers @931351ea (MIT), the same
+ * coordinates as the qwen4_lane_* helpers (super-block b / 8, 32-wide
+ * sub-block b % 8).  The tiled GEMMs stage through it and
+ * kernel_qwen4_gsq_mv dots it in registers. */
+static inline void qwen4_gsq_deq8(device const char *row, uint b, uint q, uint type, thread float *v) {
+    if (type == 30) {   /* BF16 */
+        device const ushort *w = (device const ushort *)row + b * 32 + q * 8;
+        for (uint i = 0; i < 8; i++) v[i] = as_type<float>((uint)w[i] << 16);
+        return;
+    }
+    if (type == 17) {   /* IQ2_XS */
+        const uint ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 74);
+        const uint sc = blk[66 + ib32];
+        const float db = (float)(*(device const half *)blk) * (0.5f + (float)(q < 2 ? (sc & 0xFu) : (sc >> 4))) * 0.25f;
+        const uint gi = ((device const ushort *)(blk + 2))[4 * ib32 + q];
+        constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xs_grid + (gi & 511u));
+        const uint signs = ds4_metal_ksigns_iq2xs[gi >> 9];
+        for (uint i = 0; i < 8; i++) v[i] = db * (float)grid[i] * ((signs >> i) & 1u ? -1.0f : 1.0f);
+        return;
+    }
+    if (type == 22) {   /* IQ2_S */
+        const uint ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 82);
+        const uint qh = blk[66 + ib32], sc = blk[74 + ib32];
+        const float db = (float)(*(device const half *)blk) * (0.5f + (float)(q < 2 ? (sc & 0xFu) : (sc >> 4))) * 0.25f;
+        constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2s_grid +
+            ((uint)blk[2 + 4 * ib32 + q] | ((qh << (8u - 2u * q)) & 0x300u)));
+        const uint s = blk[34 + 4 * ib32 + q];
+        for (uint i = 0; i < 8; i++) v[i] = db * (float)grid[i] * ((s >> i) & 1u ? -1.0f : 1.0f);
+        return;
+    }
+    if (type == 18) {   /* IQ3_XXS */
+        const uint ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 98);
+        device const ushort *ss = (device const ushort *)(blk + 66) + 2 * ib32;
+        const uint aux = (uint)ss[0] | ((uint)ss[1] << 16);
+        const float db = (float)(*(device const half *)blk) * (0.5f + (float)(aux >> 28)) * 0.5f;
+        const uint signs = ds4_metal_ksigns_iq2xs[(aux >> (7u * q)) & 127u];
+        device const uchar *qs = blk + 2 + 8 * ib32 + 2 * q;
+        constant const uchar *g1 = (constant const uchar *)(ds4_metal_iq3xxs_grid + qs[0]);
+        constant const uchar *g2 = (constant const uchar *)(ds4_metal_iq3xxs_grid + qs[1]);
+        for (uint i = 0; i < 4; i++) {
+            v[i] = db * (float)g1[i] * ((signs >> i) & 1u ? -1.0f : 1.0f);
+            v[4 + i] = db * (float)g2[i] * ((signs >> (i + 4u)) & 1u ? -1.0f : 1.0f);
+        }
+        return;
+    }
+    if (type == 21) {   /* IQ3_S */
+        const uint ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 110);
+        const uint qh = blk[66 + ib32], s = blk[74 + 4 * ib32 + q];
+        const float db = (float)(*(device const half *)blk) *
+                         (float)(1u + 2u * ((blk[106 + ib32 / 2] >> (4u * (ib32 & 1u))) & 0xFu));
+        device const uchar *qs = blk + 2 + 8 * ib32 + 2 * q;
+        constant const uchar *g1 = (constant const uchar *)(ds4_metal_iq3s_grid + ((uint)qs[0] | ((qh << (8u - 2u * q)) & 256u)));
+        constant const uchar *g2 = (constant const uchar *)(ds4_metal_iq3s_grid + ((uint)qs[1] | ((qh << (7u - 2u * q)) & 256u)));
+        for (uint i = 0; i < 4; i++) {
+            v[i] = db * (float)g1[i] * ((s >> i) & 1u ? -1.0f : 1.0f);
+            v[4 + i] = db * (float)g2[i] * ((s >> (i + 4u)) & 1u ? -1.0f : 1.0f);
+        }
+        return;
+    }
+    if (type == 20 || type == 23) {   /* IQ4_NL (18-byte blocks of 32), IQ4_XS (136-byte super-blocks) */
+        device const uchar *qs;
+        float dl;
+        if (type == 20) {
+            device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 18);
+            dl = (float)(*(device const half *)blk);
+            qs = blk + 2;
+        } else {
+            const uint ib32 = b % 8;
+            device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 136);
+            const uint scales_h = (uint)*(device const ushort *)(blk + 2);
+            const int ls = (int)(((blk[4 + ib32 / 2] >> (4u * (ib32 % 2u))) & 0xFu) | (((scales_h >> (2u * ib32)) & 3u) << 4));
+            dl = (float)(*(device const half *)blk) * (float)(ls - 32);
+            qs = blk + 8 + 16 * ib32;
+        }
+        qs += (q & 1u) * 8;
+        const bool hi = q >= 2;
+        for (uint i = 0; i < 8; i++) v[i] = dl * (float)ds4_metal_kvalues_iq4nl[hi ? (qs[i] >> 4) : (qs[i] & 0xFu)];
+        return;
+    }
+    if (type == 42) {   /* Q2_0: 18-byte blocks of 64, 2-bit codes minus one, four per byte */
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 2) * 18);
+        const float d = (float)(*(device const half *)blk);
+        device const uchar *qs = blk + 2 + ((b % 2) * 32 + q * 8) / 4;
+        for (uint i = 0; i < 8; i++) v[i] = d * (float)((int)((qs[i / 4] >> ((i % 4) * 2)) & 3u) - 1);
+        return;
+    }
+    if (type == 13) {   /* Q5_K */
+        const uint g = b % 8, l = q * 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 176);
+        const float d = (float)(*(device const half *)blk), dmin = (float)(*(device const half *)(blk + 2));
+        device const uchar *sc = blk + 4;
+        uint s, mn;
+        if (g < 4) { s = sc[g] & 63u; mn = sc[g + 4] & 63u; }
+        else { s = (sc[g + 4] & 0xFu) | ((sc[g - 4] >> 6) << 4); mn = (sc[g + 4] >> 4) | ((sc[g] >> 6) << 4); }
+        const float ds = d * (float)s, dm = dmin * (float)mn;
+        device const uchar *qh = blk + 16 + l, *ql = blk + 48 + 32 * (g / 2) + l;
+        for (uint i = 0; i < 8; i++) {
+            const uint lo = (g & 1u) ? (uint)(ql[i] >> 4) : (uint)(ql[i] & 0xFu);
+            v[i] = ds * (float)(lo + (((qh[i] >> g) & 1u) << 4)) - dm;
+        }
+        return;
+    }
+    if (type == 14) {   /* Q6_K */
+        const uint g = b % 8, h = g / 4, k = g % 4, l = q * 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 210);
+        device const uchar *ql = blk + 64 * h + ((k & 1u) ? 32 : 0) + l, *qh = blk + 128 + 32 * h + l;
+        const float ds = (float)(*(device const half *)(blk + 208)) *
+                         (float)((device const char *)(blk + 192 + 8 * h))[2 * k + (l >= 16 ? 1 : 0)];
+        for (uint i = 0; i < 8; i++) {
+            const uint lo = (k < 2) ? (uint)(ql[i] & 0xFu) : (uint)(ql[i] >> 4);
+            v[i] = ds * (float)((int)(lo | (((qh[i] >> (2u * k)) & 3u) << 4)) - 32);
+        }
+        return;
+    }
+}
+
 /* dequantize 8 consecutive values (quarter q of 32-wide block b of a row) */
 template <typename D>
 static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint type, threadgroup D *dst) {
@@ -4370,115 +4491,10 @@ static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint 
         for (uint i = 0; i < 8; i++) dst[i] = (D)(ds * (float)((qs[i] >> shift) & 0xFu) - dm);
         return;
     }
-    /* GSQ-RCO types (ggml-quants.c dequantizers @931351ea, MIT), the same
-     * coordinates as the qwen4_lane_* helpers: super-block b / 8, 32-wide
-     * sub-block b % 8, and the quarter's 8 values */
-    if (type == 17) {   /* IQ2_XS */
-        const uint ib32 = b % 8;
-        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 74);
-        const uint sc = blk[66 + ib32];
-        const float db = (float)(*(device const half *)blk) * (0.5f + (float)(q < 2 ? (sc & 0xFu) : (sc >> 4))) * 0.25f;
-        const uint v = ((device const ushort *)(blk + 2))[4 * ib32 + q];
-        constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xs_grid + (v & 511u));
-        const uint signs = ds4_metal_ksigns_iq2xs[v >> 9];
-        for (uint i = 0; i < 8; i++) dst[i] = (D)(db * (float)grid[i] * ((signs >> i) & 1u ? -1.0f : 1.0f));
-        return;
-    }
-    if (type == 22) {   /* IQ2_S */
-        const uint ib32 = b % 8;
-        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 82);
-        const uint qh = blk[66 + ib32], sc = blk[74 + ib32];
-        const float db = (float)(*(device const half *)blk) * (0.5f + (float)(q < 2 ? (sc & 0xFu) : (sc >> 4))) * 0.25f;
-        constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2s_grid +
-            ((uint)blk[2 + 4 * ib32 + q] | ((qh << (8u - 2u * q)) & 0x300u)));
-        const uint s = blk[34 + 4 * ib32 + q];
-        for (uint i = 0; i < 8; i++) dst[i] = (D)(db * (float)grid[i] * ((s >> i) & 1u ? -1.0f : 1.0f));
-        return;
-    }
-    if (type == 18) {   /* IQ3_XXS */
-        const uint ib32 = b % 8;
-        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 98);
-        device const ushort *ss = (device const ushort *)(blk + 66) + 2 * ib32;
-        const uint aux = (uint)ss[0] | ((uint)ss[1] << 16);
-        const float db = (float)(*(device const half *)blk) * (0.5f + (float)(aux >> 28)) * 0.5f;
-        const uint signs = ds4_metal_ksigns_iq2xs[(aux >> (7u * q)) & 127u];
-        device const uchar *qs = blk + 2 + 8 * ib32 + 2 * q;
-        constant const uchar *g1 = (constant const uchar *)(ds4_metal_iq3xxs_grid + qs[0]);
-        constant const uchar *g2 = (constant const uchar *)(ds4_metal_iq3xxs_grid + qs[1]);
-        for (uint i = 0; i < 4; i++) {
-            dst[i] = (D)(db * (float)g1[i] * ((signs >> i) & 1u ? -1.0f : 1.0f));
-            dst[4 + i] = (D)(db * (float)g2[i] * ((signs >> (i + 4u)) & 1u ? -1.0f : 1.0f));
-        }
-        return;
-    }
-    if (type == 21) {   /* IQ3_S */
-        const uint ib32 = b % 8;
-        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 110);
-        const uint qh = blk[66 + ib32], s = blk[74 + 4 * ib32 + q];
-        const float db = (float)(*(device const half *)blk) *
-                         (float)(1u + 2u * ((blk[106 + ib32 / 2] >> (4u * (ib32 & 1u))) & 0xFu));
-        device const uchar *qs = blk + 2 + 8 * ib32 + 2 * q;
-        constant const uchar *g1 = (constant const uchar *)(ds4_metal_iq3s_grid + ((uint)qs[0] | ((qh << (8u - 2u * q)) & 256u)));
-        constant const uchar *g2 = (constant const uchar *)(ds4_metal_iq3s_grid + ((uint)qs[1] | ((qh << (7u - 2u * q)) & 256u)));
-        for (uint i = 0; i < 4; i++) {
-            dst[i] = (D)(db * (float)g1[i] * ((s >> i) & 1u ? -1.0f : 1.0f));
-            dst[4 + i] = (D)(db * (float)g2[i] * ((s >> (i + 4u)) & 1u ? -1.0f : 1.0f));
-        }
-        return;
-    }
-    if (type == 20 || type == 23) {   /* IQ4_NL (18-byte blocks of 32), IQ4_XS (136-byte super-blocks) */
-        device const uchar *qs;
-        float dl;
-        if (type == 20) {
-            device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 18);
-            dl = (float)(*(device const half *)blk);
-            qs = blk + 2;
-        } else {
-            const uint ib32 = b % 8;
-            device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 136);
-            const uint scales_h = (uint)*(device const ushort *)(blk + 2);
-            const int ls = (int)(((blk[4 + ib32 / 2] >> (4u * (ib32 % 2u))) & 0xFu) | (((scales_h >> (2u * ib32)) & 3u) << 4));
-            dl = (float)(*(device const half *)blk) * (float)(ls - 32);
-            qs = blk + 8 + 16 * ib32;
-        }
-        qs += (q & 1u) * 8;
-        const bool hi = q >= 2;
-        for (uint i = 0; i < 8; i++) dst[i] = (D)(dl * (float)ds4_metal_kvalues_iq4nl[hi ? (qs[i] >> 4) : (qs[i] & 0xFu)]);
-        return;
-    }
-    if (type == 42) {   /* Q2_0: 18-byte blocks of 64, 2-bit codes minus one, four per byte */
-        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 2) * 18);
-        const float d = (float)(*(device const half *)blk);
-        device const uchar *qs = blk + 2 + ((b % 2) * 32 + q * 8) / 4;
-        for (uint i = 0; i < 8; i++) dst[i] = (D)(d * (float)((int)((qs[i / 4] >> ((i % 4) * 2)) & 3u) - 1));
-        return;
-    }
-    if (type == 13) {   /* Q5_K */
-        const uint g = b % 8, l = q * 8;
-        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 176);
-        const float d = (float)(*(device const half *)blk), dmin = (float)(*(device const half *)(blk + 2));
-        device const uchar *sc = blk + 4;
-        uint s, mn;
-        if (g < 4) { s = sc[g] & 63u; mn = sc[g + 4] & 63u; }
-        else { s = (sc[g + 4] & 0xFu) | ((sc[g - 4] >> 6) << 4); mn = (sc[g + 4] >> 4) | ((sc[g] >> 6) << 4); }
-        const float ds = d * (float)s, dm = dmin * (float)mn;
-        device const uchar *qh = blk + 16 + l, *ql = blk + 48 + 32 * (g / 2) + l;
-        for (uint i = 0; i < 8; i++) {
-            const uint lo = (g & 1u) ? (uint)(ql[i] >> 4) : (uint)(ql[i] & 0xFu);
-            dst[i] = (D)(ds * (float)(lo + (((qh[i] >> g) & 1u) << 4)) - dm);
-        }
-        return;
-    }
-    if (type == 14) {   /* Q6_K */
-        const uint g = b % 8, h = g / 4, k = g % 4, l = q * 8;
-        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 210);
-        device const uchar *ql = blk + 64 * h + ((k & 1u) ? 32 : 0) + l, *qh = blk + 128 + 32 * h + l;
-        const float ds = (float)(*(device const half *)(blk + 208)) *
-                         (float)((device const char *)(blk + 192 + 8 * h))[2 * k + (l >= 16 ? 1 : 0)];
-        for (uint i = 0; i < 8; i++) {
-            const uint lo = (k < 2) ? (uint)(ql[i] & 0xFu) : (uint)(ql[i] >> 4);
-            dst[i] = (D)(ds * (float)((int)(lo | (((qh[i] >> (2u * k)) & 3u) << 4)) - 32));
-        }
+    if (type == 13 || type == 14 || type == 17 || type == 18 || (type >= 20 && type <= 23) || type == 42) {
+        float v[8];
+        qwen4_gsq_deq8(row, b, q, type, v);
+        for (uint i = 0; i < 8; i++) dst[i] = (D)v[i];
         return;
     }
     if (type == 10) {
