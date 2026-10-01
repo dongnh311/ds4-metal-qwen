@@ -1993,9 +1993,12 @@ static void test_metal_qwen4_dense_mm_case(uint32_t type, const uint8_t *rows_by
 static void test_metal_qwen4_quant_dense_mm(void) {
     const uint32_t rows = 37u, nax_rows = 64u;
     static const uint32_t float_toks[2] = { 40u, 9u }, nax_toks[3] = { 64u, 128u, 96u };
-    /* Tensor-op tiles: prefill batches of whole 32-token tiles over 64-row multiples, GSQ-RCO and BF16 only */
-    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(13, 128u, 2560u, 64u) == 1);
-    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(30, 64u, 2560u, 128u) == 1);
+    /* Tensor-op tiles: prefill batches of whole 32-token tiles over 64-row multiples, GSQ-RCO and BF16 only,
+     * when the device has the tensor API and DS4_QWEN4_DENSE_NAX is not 0 */
+    const char *nax_env = getenv("DS4_QWEN4_DENSE_NAX");
+    const int nax = ds4_gpu_tensor_api_available() && !(nax_env && strcmp(nax_env, "0") == 0);
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(13, 128u, 2560u, 64u) == nax);
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(30, 64u, 2560u, 128u) == nax);
     TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(13, 40u, 2560u, 64u) == 0);   /* not whole 32-token tiles */
     TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(13, 8u, 2560u, 64u) == 0);    /* decode / verify rows */
     TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(13, 64u, 2560u, 37u) == 0);   /* rows not a 64 multiple */
@@ -2017,7 +2020,7 @@ static void test_metal_qwen4_quant_dense_mm(void) {
         TEST_ASSERT(nbuf != NULL);
         if (!nbuf) return;
         test_quant_fill_rows(nbuf, f, in_dim, nax_rows);
-        TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(f->type, 64u, in_dim, nax_rows) == 1);
+        TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(f->type, 64u, in_dim, nax_rows) == nax);
         test_metal_qwen4_dense_mm_case(f->type, nbuf, row_bytes, in_dim, nax_rows, nax_toks, 3, 1.5e-3);
         free(nbuf);
     }
