@@ -296,14 +296,16 @@ static int check_timeout(void) {
 
 int main(int argc, char **argv) {
     const char *mode = argc == 2 ? argv[1] : "";
-    if (strcmp(mode, "--qwen4") && strcmp(mode, "--glm") && strcmp(mode, "--glm-timeout")) {
-        fprintf(stderr, "usage: %s --qwen4 | --glm | --glm-timeout\n", argv[0]);
+    if (strcmp(mode, "--qwen4") && strcmp(mode, "--glm") && strcmp(mode, "--glm-timeout") &&
+        strcmp(mode, "--glm-split")) {
+        fprintf(stderr, "usage: %s --qwen4 | --glm | --glm-timeout | --glm-split\n", argv[0]);
         return 1;
     }
     int ok = setup();
     if (ok && !strcmp(mode, "--qwen4")) ok = qwen4_suite();
     if (ok && !strcmp(mode, "--glm")) ok = glm_suite(0);
     if (ok && !strcmp(mode, "--glm-timeout")) ok = check_timeout();
+    if (ok && !strcmp(mode, "--glm-split")) ok = glm_suite(1);
     ds4_gpu_stream_gate_test_set_mode(-1, -1);
     ds4_gpu_cleanup();
     if (model && model != MAP_FAILED) munmap(model, model_bytes);
