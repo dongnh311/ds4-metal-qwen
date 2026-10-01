@@ -48024,6 +48024,45 @@ static bool glm_graph_stream_prefill_full_layer_prepare_enabled(
                 "DS4_METAL_DISABLE_GLM_STREAMING_PREFILL_FULL_LAYER_PREPARE");
 }
 
+/* Apple indexed prefill: read whole routed layers through the pread prepare
+ * instead of paging them in through the mapped views. */
+static bool glm_graph_indexed_prefill_full_layer(
+        const ds4_glm_gpu_graph *g,
+        const ds4_weights       *weights,
+        uint32_t                 pos0,
+        uint32_t                 n_tokens,
+        bool                     use_batch_ffn) {
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    if (!g || !weights || !use_batch_ffn || g->quality || g->tp_world >= 2 ||
+        g->layer_start != 0 || g->layer_count != glm_graph_normal_layer_count()) {
+        return false;
+    }
+    const ds4_layer_weights *routed = &weights->layer[DS4_N_LEADING_DENSE];
+    /* Generic IQ2 layers without a selected-expert batch path for this chunk
+     * (IQ2/Q2_K down, large chunks) map every expert of each layer anyway, so
+     * read them sequentially for every chunk, continued and short ones too. */
+    if (glm_graph_layer_uses_generic_routed_moe(routed) &&
+        !glm_graph_stream_prefill_expert_addr_supported(g, weights, routed,
+                                                        DS4_N_LEADING_DENSE,
+                                                        n_tokens)) {
+        return g->ssd_streaming &&
+               !glm_graph_env_present(
+                       "DS4_ROCM_DISABLE_GLM_STREAMING_PREFILL_FULL_LAYER",
+                       "DS4_METAL_DISABLE_GLM_STREAMING_PREFILL_FULL_LAYER");
+    }
+    /* Keep the typed Flash path's selected-expert cache reuse. */
+    return pos0 == 0 && n_tokens >= 256u &&
+           glm_graph_stream_prefill_full_layer_enabled(g, n_tokens);
+#else
+    (void)g;
+    (void)weights;
+    (void)pos0;
+    (void)n_tokens;
+    (void)use_batch_ffn;
+    return false;
+#endif
+}
+
 #ifdef DS4_ROCM_BUILD
 static bool rocm_graph_glm_stream_prefill_full_layer_enabled(
         const ds4_glm_gpu_graph *g,
@@ -55320,19 +55359,8 @@ static bool glm_graph_forward_indexed_tokens(
     const uint32_t drain_interval =
         progress_flush_interval != 0 ? glm_graph_indexed_prefill_drain_interval() : 0u;
     const bool progress_requested = display_progress && work_total > 0;
-    /* Generic IQ2 GLM benefits from sequential layer reads on large continued
-     * chunks too. Keep the typed Flash path's selected-expert cache reuse. */
     const bool full_layer_prefill =
-#if defined(__APPLE__) && !defined(DS4_NO_GPU)
-        (pos0 == 0 || (!g->glm53 && glm_graph_layer_uses_generic_routed_moe(
-                                      &weights->layer[DS4_N_LEADING_DENSE]))) &&
-        n_tokens >= 256u && use_batch_ffn && !g->quality &&
-        g->tp_world < 2 &&
-        g->layer_start == 0 && g->layer_count == glm_graph_normal_layer_count() &&
-        glm_graph_stream_prefill_full_layer_enabled(g, n_tokens);
-#else
-        false;
-#endif
+        glm_graph_indexed_prefill_full_layer(g, weights, pos0, n_tokens, use_batch_ffn);
     const bool layer_prepare =
         glm_graph_stream_prefill_full_layer_prepare_enabled(g, full_layer_prefill);
     metal_graph_stream_prepare_slot layer_prepare_slot = {0};

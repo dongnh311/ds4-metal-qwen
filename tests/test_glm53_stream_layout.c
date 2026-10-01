@@ -57,6 +57,53 @@ static void check_glm_iq2_q2(const ds4_shape *shape) {
 #endif
 }
 
+static ds4_weights weights;
+static ds4_glm_gpu_graph graph;
+
+static bool full_layer(uint32_t pos0, uint32_t n_tokens) {
+    return glm_graph_indexed_prefill_full_layer(&graph, &weights, pos0, n_tokens, true);
+}
+
+/* Indexed prefill decides per chunk whether routed layers are read whole
+ * through the pread prepare or paged in through the mapped views. */
+static void check_glm53_prefill_full_layer(void) {
+    g_ds4_shape = DS4_SHAPE_GLM53;
+    memset(&graph, 0, sizeof(graph));
+    graph.glm53 = true;
+    graph.ssd_streaming = true;
+    graph.tp_world = 1;
+    graph.layer_count = glm_graph_normal_layer_count();
+    memset(&weights, 0, sizeof(weights));
+    set_layout(DS4_TENSOR_IQ2_XXS, DS4_TENSOR_Q2_K);
+    weights.layer[DS4_N_LEADING_DENSE] = layer;
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+    /* IQ2/Q2 has no selected-expert batch prefill, so every chunk would page
+     * in whole layers anyway: read them with the pread prepare instead. */
+    CHECK(full_layer(0, 2048));
+    CHECK(full_layer(2048, 2048));
+    CHECK(full_layer(0, 28));
+    CHECK(full_layer(4096, 40));
+    CHECK(!glm_graph_indexed_prefill_full_layer(&graph, &weights, 2048, 2048, false));
+    graph.quality = true;
+    CHECK(!full_layer(2048, 2048));
+    graph.quality = false;
+    graph.tp_world = 2;
+    CHECK(!full_layer(2048, 2048));
+    graph.tp_world = 1;
+    setenv("DS4_METAL_DISABLE_GLM_STREAMING_PREFILL_FULL_LAYER", "1", 1);
+    CHECK(!full_layer(2048, 2048));
+    CHECK(!full_layer(0, 28));
+    unsetenv("DS4_METAL_DISABLE_GLM_STREAMING_PREFILL_FULL_LAYER");
+    /* Typed uniform Q2_K layers keep selected-expert reuse after the first
+     * chunk and stay on that path for short chunks. */
+    set_layout(DS4_TENSOR_Q2_K, DS4_TENSOR_Q2_K);
+    weights.layer[DS4_N_LEADING_DENSE] = layer;
+    CHECK(full_layer(0, 2048));
+    CHECK(!full_layer(2048, 2048));
+    CHECK(!full_layer(0, 28));
+#endif
+}
+
 int main(void) {
     /* Start from the default routed kernels whatever the caller exported. */
     static const char *const disables[] = {
@@ -72,6 +119,7 @@ int main(void) {
     for (size_t i = 0; i < sizeof(disables) / sizeof(*disables); i++) unsetenv(disables[i]);
     check_glm_iq2_q2(&DS4_SHAPE_GLM53);
     check_glm_iq2_q2(&DS4_SHAPE_GLM52);
+    check_glm53_prefill_full_layer();
     if (failures) {
         fprintf(stderr, "test_glm53_stream_layout: %d failure(s)\n", failures);
         return 1;
