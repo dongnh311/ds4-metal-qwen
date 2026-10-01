@@ -54451,7 +54451,8 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
         const uint64_t *offsets, const uint32_t *types, const uint32_t *out_rows) {
-    struct { uint32_t n_tokens, in_dim, n_out, pad0, rows[4], types[4], row_bytes[4]; } args = {0};
+    /* `zero` must stay 0: kernel_qwen4_gsq_mv XORs every weight with it. */
+    struct { uint32_t n_tokens, in_dim, n_out, zero, rows[4], types[4], row_bytes[4]; } args = {0};
     qwen4_bind b[9];
     if (!x || n_tokens == 0 || in_dim == 0 || (in_dim % 32) != 0 || n_out == 0 || n_out > 4 ||
         !qwen4_bind_tensor(&b[0], x, (uint64_t)n_tokens * in_dim * sizeof(float), "multi gemv input")) {

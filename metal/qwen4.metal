@@ -3151,7 +3151,7 @@ struct ds4_metal_args_qwen4_gemv {
     uint32_t n_tokens;
     uint32_t in_dim;
     uint32_t n_out;
-    uint32_t pad0;
+    uint32_t zero;      /* must stay 0: kernel_qwen4_gsq_mv XORs every weight with it */
     uint32_t out_rows[4];
     uint32_t types[4];
     uint32_t row_bytes[4];
@@ -3250,16 +3250,16 @@ kernel void kernel_qwen4_gsq_mv(
     /* the type is constant inside each loop, so the dequantizer folds to one
      * type and its two halves of a chunk share their block header reads */
     switch (args.types[i]) {
-    case 13: qwen4_gsq_mv_loop<13, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
-    case 14: qwen4_gsq_mv_loop<14, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
-    case 17: qwen4_gsq_mv_loop<17, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
-    case 18: qwen4_gsq_mv_loop<18, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
-    case 20: qwen4_gsq_mv_loop<20, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
-    case 21: qwen4_gsq_mv_loop<21, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
-    case 22: qwen4_gsq_mv_loop<22, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
-    case 23: qwen4_gsq_mv_loop<23, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
-    case 42: qwen4_gsq_mv_loop<42, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
-    default: qwen4_gsq_mv_loop<30, R1>(row, x, args.in_dim, t0, nt, args.pad0, tiisg, acc); break;
+    case 13: qwen4_gsq_mv_loop<13, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 14: qwen4_gsq_mv_loop<14, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 17: qwen4_gsq_mv_loop<17, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 18: qwen4_gsq_mv_loop<18, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 20: qwen4_gsq_mv_loop<20, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 21: qwen4_gsq_mv_loop<21, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 22: qwen4_gsq_mv_loop<22, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 23: qwen4_gsq_mv_loop<23, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 42: qwen4_gsq_mv_loop<42, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    default: qwen4_gsq_mv_loop<30, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
     }
     for (uint t = 0; t < R1; t++) {
         const float v = simd_sum(acc[t]);
