@@ -46852,6 +46852,9 @@ typedef struct ds4_glm_gpu_graph {
     float directional_steering_attn_scale;
     float directional_steering_ffn_scale;
     bool streaming_static_decode_map_current;
+    /* SP1: this decode token may publish stream gates (set per token by
+     * glm_graph_forward_token, false outside it). */
+    bool stream_gate_token;
     /* Tensor parallelism (50/50 expert sharding): tp_world 2 means
      * this rank computes only its contiguous half of the routed experts
      * and exchanges the 24KB routed-FFN partial at one gate per sparse
@@ -50771,6 +50774,7 @@ static bool glm_graph_encode_sparse_ffn_one(
         async_profile ? glm_graph_streaming_async_profile_ms() : 0.0;
     double stream_t0 = stream_total_t0;
     bool async_path_profiled = false;
+    bool gate_published = false;
     if (ok && streaming_selected_cache) {
         const ds4_gpu_stream_expert_table table = {
             .model_map = model->map,
@@ -50783,7 +50787,17 @@ static bool glm_graph_encode_sparse_ffn_one(
             .gate_expert_bytes = gate_out * gate_row_bytes,
             .down_expert_bytes = down_out * down_row_bytes,
         };
+#if defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+        /* SP1 decode gates: publish the selection now and commit after the
+         * shared expert; the routed MoE below reads the gate's tables. */
+        gate_published = g->stream_gate_token &&
+                         generic_streaming_selected_cache &&
+                         ds4_gpu_glm_stream_gate_publish(&table,
+                                                         g->router_selected,
+                                                         DS4_N_EXPERT_USED) != 0;
+#endif
         const bool async_selected_load =
+            !gate_published &&
 #ifdef DS4_ROCM_BUILD
             streaming_selected_cache &&
 #else
@@ -50821,7 +50835,7 @@ static bool glm_graph_encode_sparse_ffn_one(
                 stream_t0 = glm_graph_streaming_async_profile_ms();
             }
         }
-        if (!async_load_started) {
+        if (!async_load_started && !gate_published) {
             if (async_selected_load && selected_event != 0) {
                 ok = ds4_gpu_wait_selected_readback_ready(
                         selected_event,
@@ -50871,6 +50885,14 @@ static bool glm_graph_encode_sparse_ffn_one(
                                              1,
                                              stage_t0);
     }
+#if defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    if (gate_published) {
+        /* Commit even after a failure so the gate never outlives its layer;
+         * the token then fails at its end_commands. */
+        const bool committed = ds4_gpu_glm_stream_gate_commit() != 0;
+        ok = ok && committed;
+    }
+#endif
     if (async_profile) {
         const double now_ms = glm_graph_streaming_async_profile_ms();
         if (async_path_profiled) {
@@ -57305,6 +57327,18 @@ static bool glm_graph_streaming_decode_sync_each_layer(void) {
 #endif
 }
 
+/* SP1 decode gates (Metal): a gated token is encoded without waiting, so all
+ * its weights must be mapped before encoding starts (the static decode map)
+ * and no diagnostic may read the routed selection on the host mid-token. */
+static bool glm_graph_stream_gate_token_allowed(bool     static_decode_map,
+                                                bool     imatrix,
+                                                bool     expert_profile,
+                                                uint32_t ablate_mask,
+                                                bool     async_profile) {
+    return static_decode_map && !imatrix && !expert_profile &&
+           ablate_mask == 0 && !async_profile;
+}
+
 static bool glm_graph_forward_token(
         ds4_glm_gpu_graph *g,
         const ds4_model   *model,
@@ -57411,6 +57445,13 @@ static bool glm_graph_forward_token(
         g->ssd_streaming &&
         !static_decode_map &&
         glm_graph_streaming_decode_sync_each_layer();
+    g->stream_gate_token =
+        g->ssd_streaming &&
+        glm_graph_stream_gate_token_allowed(static_decode_map,
+                                            g->imatrix != NULL,
+                                            g_expert_profile.active,
+                                            glm_decode_ablate_mask(),
+                                            glm_graph_streaming_async_profile_enabled());
     bool ok = true;
     if (!input_hc && g->glm53) {
         const int32_t token_id = (int32_t)token;
@@ -58347,6 +58388,7 @@ glm53_attention_done:
             else (void)ds4_gpu_synchronize();
         }
     }
+    g->stream_gate_token = false;
 #undef DS4_GLM_PROFILE_DECODE_STAGE
 #undef DS4_GLM_FT_STAGE
     if (ok && (merge_indexed_output ||

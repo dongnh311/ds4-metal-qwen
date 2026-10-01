@@ -205,6 +205,18 @@ static void check_glm_streaming_async_load_default(void) {
     CHECK(!glm_graph_use_streaming_selected_async_load(NULL));
 }
 
+/* SP1 decode gates encode a whole token without waiting: only tokens whose
+ * weights are mapped up front and that read no routed selection on the host
+ * mid-token may publish gates. */
+static void check_glm_stream_gate_token_allowed(void) {
+    CHECK(glm_graph_stream_gate_token_allowed(true, false, false, 0u, false));
+    CHECK(!glm_graph_stream_gate_token_allowed(false, false, false, 0u, false));
+    CHECK(!glm_graph_stream_gate_token_allowed(true, true, false, 0u, false));
+    CHECK(!glm_graph_stream_gate_token_allowed(true, false, true, 0u, false));
+    CHECK(!glm_graph_stream_gate_token_allowed(true, false, false, DS4_GLM_ABLATE_ROUTED, false));
+    CHECK(!glm_graph_stream_gate_token_allowed(true, false, false, 0u, true));
+}
+
 int main(void) {
     /* Start from the default routed kernels whatever the caller exported. */
     static const char *const disables[] = {
@@ -227,6 +239,7 @@ int main(void) {
     check_glm53_prefill_full_layer();
     check_glm_session_can_rewind();
     check_glm_streaming_async_load_default();
+    check_glm_stream_gate_token_allowed();
     if (failures) {
         fprintf(stderr, "test_glm53_stream_layout: %d failure(s)\n", failures);
         return 1;
