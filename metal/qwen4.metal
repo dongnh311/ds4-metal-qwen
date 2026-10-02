@@ -2807,8 +2807,8 @@ struct ds4_metal_args_qwen4_moe {
     uint32_t n_slots;      /* routed slots; slot n_slots is the shared expert when has_shared */
     uint32_t in_dim;       /* row length of the expert matrix */
     uint32_t out_rows;     /* rows per expert */
-    uint32_t weight_type;  /* 0 f32, 1 f16, 8 q8_0, 10 q2_K, 12 q4_K, 13 q5_K, 14 q6_K, 16 iq2_xxs, 17 iq2_xs,
-                            * 18 iq3_xxs, 20 iq4_nl, 21 iq3_s, 22 iq2_s, 23 iq4_xs, 39 mxfp4, 42 q2_0 */
+    uint32_t weight_type;  /* 0 f32, 1 f16, 6 q5_0, 8 q8_0, 10 q2_K, 11 q3_K, 12 q4_K, 13 q5_K, 14 q6_K, 16 iq2_xxs,
+                            * 17 iq2_xs, 18 iq3_xxs, 20 iq4_nl, 21 iq3_s, 22 iq2_s, 23 iq4_xs, 39 mxfp4, 42 q2_0 */
     uint32_t row_bytes;
     uint64_t expert_bytes;
     uint32_t has_shared;
@@ -2823,6 +2823,49 @@ struct ds4_metal_args_qwen4_moe {
  * rows in ds4_quants.h). One simdgroup per row: for 256-weight super-blocks
  * lane t takes sub-block t % 8 of blocks t / 8, t / 8 + 4, ...; the 32/64
  * weight blocks go round-robin. Each returns the lane's partial sum. */
+/* Q3_K scale s (0..15) minus 32 (ggml's aux[] unpacking per scale; ds4_quants.h dq_q3_k_scale) */
+static inline int qwen4_q3_k_scale(device const uchar *sc, uint s) {
+    const uint lo = s < 8u ? (uint)(sc[s] & 0xFu) : (uint)(sc[s - 8u] >> 4);
+    const uint hi = ((uint)sc[8u + s % 4u] >> (2u * (s / 4u))) & 3u;
+    return (int)(lo | (hi << 4)) - 32;
+}
+
+/* Q3_K, 110-byte super-blocks: lane t takes 32-value group g = t % 8 (half h = g / 4, bit pair j = g % 4) */
+static inline float qwen4_lane_q3_k(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    const uint nb = in_dim / 256u, g = tiisg % 8u, h = g / 4u, j = g % 4u;
+    float acc = 0.0f;
+    for (uint ib = tiisg / 8u; ib < nb; ib += 4u) {
+        device const uchar *blk = row + (uint64_t)ib * 110u;
+        device const float *y = x + ib * 256u + g * 32u;
+        float part0 = 0.0f, part1 = 0.0f;
+        for (uint l = 0; l < 16u; l++) {
+            part0 += (float)((int)((blk[32u + 32u * h + l] >> (2u * j)) & 3u) - (((blk[l] >> (4u * h + j)) & 1u) ? 0 : 4)) * y[l];
+            part1 += (float)((int)((blk[48u + 32u * h + l] >> (2u * j)) & 3u) - (((blk[16u + l] >> (4u * h + j)) & 1u) ? 0 : 4)) * y[16u + l];
+        }
+        const uint s0 = 8u * h + 2u * j;
+        acc += (float)(*(device const half *)(blk + 108u)) *
+               ((float)qwen4_q3_k_scale(blk + 96u, s0) * part0 + (float)qwen4_q3_k_scale(blk + 96u, s0 + 1u) * part1);
+    }
+    return acc;
+}
+
+/* Q5_0, 22-byte blocks of 32 round-robin over the lanes; byte reads (blocks are only 2-aligned) */
+static inline float qwen4_lane_q5_0(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
+    float acc = 0.0f;
+    for (uint ib = tiisg; ib < in_dim / 32u; ib += 32u) {
+        device const uchar *blk = row + (uint64_t)ib * 22u;
+        const uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);
+        device const float *y = x + ib * 32u;
+        float part = 0.0f;
+        for (uint j = 0; j < 16u; j++) {
+            part += (float)((int)((blk[6u + j] & 0xFu) | (((qh >> j) & 1u) << 4)) - 16) * y[j] +
+                    (float)((int)((blk[6u + j] >> 4) | (((qh >> (j + 16u)) & 1u) << 4)) - 16) * y[j + 16u];
+        }
+        acc += (float)(*(device const half *)blk) * part;
+    }
+    return acc;
+}
+
 static inline float qwen4_lane_iq2_xs(device const uchar *row, device const float *x, uint in_dim, ushort tiisg) {
     const uint nb = in_dim / 256u, ib32 = tiisg % 8u;
     float acc = 0.0f;
@@ -3121,6 +3164,10 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
         acc = qwen4_lane_iq4_xs((device const uchar *)row, x, in_dim, tiisg);
     } else if (weight_type == 42) {
         acc = qwen4_lane_q2_0((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 11) {
+        acc = qwen4_lane_q3_k((device const uchar *)row, x, in_dim, tiisg);
+    } else if (weight_type == 6) {
+        acc = qwen4_lane_q5_0((device const uchar *)row, x, in_dim, tiisg);
     } else if (weight_type == 13) {
         acc = qwen4_lane_q5_k((device const uchar *)row, x, in_dim, tiisg);
     } else if (weight_type == 14) {
@@ -3250,6 +3297,8 @@ kernel void kernel_qwen4_gsq_mv(
     /* the type is constant inside each loop, so the dequantizer folds to one
      * type and its two halves of a chunk share their block header reads */
     switch (args.types[i]) {
+    case 6: qwen4_gsq_mv_loop<6, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
+    case 11: qwen4_gsq_mv_loop<11, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
     case 13: qwen4_gsq_mv_loop<13, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
     case 14: qwen4_gsq_mv_loop<14, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
     case 17: qwen4_gsq_mv_loop<17, R1>(row, x, args.in_dim, t0, nt, args.zero, tiisg, acc); break;
@@ -4518,6 +4567,27 @@ static inline void qwen4_gsq_deq8(device const char *row, uint b, uint q, uint t
         for (uint i = 0; i < 8; i++) v[i] = d * (float)((int)((qs[i / 4] >> ((i % 4) * 2)) & 3u) - 1);
         return;
     }
+    if (type == 11) {   /* Q3_K: 110-byte super-blocks (hmask 32, qs 64, 12 scale bytes, f16 d) */
+        const uint g = b % 8, h = g / 4, j = g % 4, l = q * 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 110);
+        const float dl = (float)(*(device const half *)(blk + 108)) *
+                         (float)qwen4_q3_k_scale(blk + 96, 8 * h + 2 * j + (l >= 16 ? 1 : 0));
+        device const uchar *qs = blk + 32 + 32 * h + l, *hm = blk + l;
+        for (uint i = 0; i < 8; i++)
+            v[i] = dl * (float)((int)((qs[i] >> (2 * j)) & 3u) - (((hm[i] >> (4 * h + j)) & 1u) ? 0 : 4));
+        return;
+    }
+    if (type == 6) {    /* Q5_0: 22-byte blocks of 32 (f16 d, 32 high bits, 16 nibble bytes) */
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 22);
+        const float d = (float)(*(device const half *)blk);
+        const uint qh = (uint)blk[2] | ((uint)blk[3] << 8) | ((uint)blk[4] << 16) | ((uint)blk[5] << 24);
+        for (uint i = 0; i < 8; i++) {
+            const uint k = q * 8 + i;
+            const uint nib = k < 16 ? (uint)(blk[6 + k] & 0xFu) : (uint)(blk[6 + k - 16] >> 4);
+            v[i] = d * (float)((int)(nib | (((qh >> k) & 1u) << 4)) - 16);
+        }
+        return;
+    }
     if (type == 13) {   /* Q5_K */
         const uint g = b % 8, l = q * 8;
         device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8) * 176);
@@ -4580,7 +4650,7 @@ static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint 
         for (uint i = 0; i < 8; i++) dst[i] = (D)(ds * (float)((qs[i] >> shift) & 0xFu) - dm);
         return;
     }
-    if (type == 13 || type == 14 || type == 17 || type == 18 || (type >= 20 && type <= 23) || type == 42) {
+    if (type == 6 || type == 11 || type == 13 || type == 14 || type == 17 || type == 18 || (type >= 20 && type <= 23) || type == 42) {
         float v[8];
         qwen4_gsq_deq8(row, b, q, type, v);
         for (uint i = 0; i < 8; i++) dst[i] = (D)v[i];
@@ -5400,6 +5470,8 @@ QWEN4_DENSE_NAX("iq2_s", 22, 82, 16)
 QWEN4_DENSE_NAX("iq4_xs", 23, 136, 16)
 QWEN4_DENSE_NAX("q2_0", 42, 18, 4)
 QWEN4_DENSE_NAX("bf16", 30, 64, 2)
+QWEN4_DENSE_NAX("q3_K", 11, 110, 16)
+QWEN4_DENSE_NAX("q5_0", 6, 22, 2)
 #undef QWEN4_DENSE_NAX
 #undef QWEN4_DENSE_NAX_ONE
 #endif /* DS4_METAL_HAS_TENSOR */

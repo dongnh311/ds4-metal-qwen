@@ -137,6 +137,44 @@ static void dq_q2_0(const uint8_t *p, uint64_t n, float *y) {
     }
 }
 
+/* Q5_0: 22-byte blocks of 32 (f16 d, 32 high bits, 16 bytes of nibbles; low nibbles first). */
+static void dq_q5_0(const uint8_t *p, uint64_t n, float *y) {
+    for (uint64_t b = 0; b < n / 32u; b++, p += 22u, y += 32) {
+        const float d = dq_half(p);
+        const uint32_t qh = (uint32_t)p[2] | ((uint32_t)p[3] << 8) | ((uint32_t)p[4] << 16) | ((uint32_t)p[5] << 24);
+        for (uint32_t j = 0; j < 16u; j++) {
+            y[j] = d * (float)((int)((p[6u + j] & 0xfu) | (((qh >> j) & 1u) << 4)) - 16);
+            y[j + 16u] = d * (float)((int)((p[6u + j] >> 4) | (((qh >> (j + 16u)) & 1u) << 4)) - 16);
+        }
+    }
+}
+
+/* Q3_K scale s (0..15) minus 32: low nibble from byte s (s < 8) or the high nibble of byte s - 8, top two
+ * bits from byte 8 + s % 4 at bit 2 * (s / 4) -- ggml's aux[] unpacking written per scale. */
+static int dq_q3_k_scale(const uint8_t *sc, uint32_t s) {
+    const uint32_t lo = s < 8u ? (uint32_t)(sc[s] & 0xfu) : (uint32_t)(sc[s - 8u] >> 4);
+    const uint32_t hi = ((uint32_t)sc[8u + s % 4u] >> (2u * (s / 4u))) & 3u;
+    return (int)(lo | (hi << 4)) - 32;
+}
+
+/* Q3_K: 110-byte super-blocks of 256 (32-byte hmask, 64 bytes of 2-bit qs, 12 scale bytes, f16 d). Half h
+ * (128 values) uses qs[32h..32h+31]; its group j (32 values) takes bits 2j of qs and hmask bit 4h + j, a
+ * clear hmask bit subtracts 4; scales 8h + 2j and 8h + 2j + 1 cover the group's two 16-value halves. */
+static void dq_q3_k(const uint8_t *p, uint64_t n, float *y) {
+    for (uint64_t b = 0; b < n / 256u; b++, p += 110u) {
+        const float d = dq_half(p + 108u);
+        for (uint32_t h = 0; h < 2u; h++) {
+            for (uint32_t j = 0; j < 4u; j++) {
+                for (uint32_t l = 0; l < 32u; l++) {
+                    const float dl = d * (float)dq_q3_k_scale(p + 96u, 8u * h + 2u * j + l / 16u);
+                    const int q = (int)((p[32u + 32u * h + l] >> (2u * j)) & 3u) - (((p[l] >> (4u * h + j)) & 1u) ? 0 : 4);
+                    *y++ = dl * (float)q;
+                }
+            }
+        }
+    }
+}
+
 static void dq_q5_k(const uint8_t *p, uint64_t n, float *y) {
     for (uint64_t b = 0; b < n / 256u; b++, p += 176u) {
         const float d = dq_half(p), dmin = dq_half(p + 2);
