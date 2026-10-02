@@ -165,9 +165,15 @@ Plan: `docs/superpowers/plans/2026-10-01-glm53-decode-gates.md`.
 4. **Cold start.** The slab sizing already keys on qgate being requested, so the cache is one slab.
    Gates start after the first decode miss, not after ~65 tokens.
 5. **Cache ownership.** `end_commands` also waits for the service thread to go idle, so the
-   bookkeeping it does after a release is finished. qwen4 gets this too; it is a host wait only.
+   bookkeeping it does after a release is finished. GLM only (final review): qwen4 keeps its PROD
+   behaviour, where the service's post-release prune and lookahead overlap the next token.
 6. **Fallback.** GLM's fallback has 8 slots (~54 MiB); qwen4 keeps 64. Altogether, gates add about
    104 MiB for GLM.
 7. **Lookahead prefetch** stays qwen4-only; GLM prefetch is SP2.
 8. **Testing metric.** "Waited command buffers per token" is replaced by GPU busy % and gated layers
    per token (`DS4_GLM_STREAM_TIMING`).
+9. **Final review scope fixes.** Gates run only on tokens that produce logits (the only tokens whose
+   end waits for the GPU), never on a stage-profiled layer (its profile ends the batch between
+   publish and commit), and never with `--quality` or a switch that keeps the routed MoE off the
+   gate's tables. With gates requested the opt-in async selected-load worker stays off. Phase 0
+   measures with `DS4_GLM_STREAM_GATE=0`.
