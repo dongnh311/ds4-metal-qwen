@@ -550,6 +550,30 @@ static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, c
            qwen35_gemv(g, g->blk, m, l->attn_output, g->attn_o, T);
 }
 
+/* DS4_QWEN35_SPEC_OVERLAP=1: in each two-row MTP verify, count per layer the
+ * routed experts both rows chose; this bounds what a two-row MoE could save.
+ * Reading the ids ends the command buffer, so timings under it are not
+ * representative; the arithmetic is unchanged. */
+static bool qwen35_spec_overlap_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN35_SPEC_OVERLAP") != NULL;
+    return v != 0;
+}
+
+static uint64_t g_qwen35_overlap_sum, g_qwen35_overlap_n;
+
+static bool qwen35_spec_overlap_note(ds4_qwen4_gpu_graph *g) {
+    int32_t ids[2u * DS4_N_EXPERT_USED];
+    if (!ds4_gpu_end_commands() || !ds4_gpu_tensor_read(g->selected, 0, ids, sizeof(ids))) return false;
+    g_qwen35_overlap_sum += ds4_qwen35_topk_overlap(ids, ids + DS4_N_EXPERT_USED, DS4_N_EXPERT_USED);
+    if (++g_qwen35_overlap_n % 1024u == 0u) {
+        fprintf(stderr, "ds4: Ornith verify expert overlap: %.2f of %u per layer over %llu layer-verifies\n",
+                (double)g_qwen35_overlap_sum / (double)g_qwen35_overlap_n, (unsigned)DS4_N_EXPERT_USED,
+                (unsigned long long)g_qwen35_overlap_n);
+    }
+    return glm_graph_begin_commands_if_needed();
+}
+
 /* Router (softmax over 256, top 8, renormalized, sigmoid shared gate), the
  * routed experts and the shared expert, reduced into blk without a residual
  * (n_hc = 0); the caller adds blk to R.  Q4_K and Q5_K layers take the tiled
@@ -564,6 +588,7 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
         ds4_gpu_qwen4_router_topk_tensor(g->selected, g->weights, g->router, g->mixed, m->map, m->size,
                                          l->ffn_gate_inp_shexp->abs_offset, l->ffn_gate_inp_shexp->type,
                                          E, g->sh_gate_logit, T, NE, K) != 0;
+    if (ok && T == 2u && g->verify_rows_exact && qwen35_spec_overlap_enabled()) ok = qwen35_spec_overlap_note(g);
     const bool mm = T > 64u && xt == dt && (xt == DS4_TENSOR_Q4_K || xt == DS4_TENSOR_Q5_K);
     const bool shared_dense = mm || T > 8u;
     if (ok && shared_dense) {
