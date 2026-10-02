@@ -49770,6 +49770,7 @@ enum {
     QWEN4_K_HC_GATE_MIX_PAIR_Q8,
     QWEN4_K_MULTI_GEMV,
     QWEN4_K_GSQ_MV_R1, QWEN4_K_GSQ_MV_R2, QWEN4_K_GSQ_MV_R3, QWEN4_K_GSQ_MV_R4,
+    QWEN4_K_GSQ_MV2_R1, QWEN4_K_GSQ_MV2_R2, QWEN4_K_GSQ_MV2_R3, QWEN4_K_GSQ_MV2_R4,
     /* dense GSQ-RCO/BF16/F16 prefill on the tensor-op tiles: 13 types x tiles 32/64/128 (qwen4_dense_nax_kernel) */
     QWEN4_K_DENSE_NAX,
     QWEN4_K_DENSE_NAX_LAST = QWEN4_K_DENSE_NAX + 38,
@@ -49927,6 +49928,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_hc_gate_mix_pair_q8",
     "kernel_qwen4_multi_gemv",
     "kernel_qwen4_gsq_mv_r1", "kernel_qwen4_gsq_mv_r2", "kernel_qwen4_gsq_mv_r3", "kernel_qwen4_gsq_mv_r4",
+    "kernel_qwen4_gsq_mv2_r1", "kernel_qwen4_gsq_mv2_r2", "kernel_qwen4_gsq_mv2_r3", "kernel_qwen4_gsq_mv2_r4",
     "kernel_qwen4_dense_nax_q5_K", "kernel_qwen4_dense_nax_q5_K_n64", "kernel_qwen4_dense_nax_q5_K_n128",
     "kernel_qwen4_dense_nax_q6_K", "kernel_qwen4_dense_nax_q6_K_n64", "kernel_qwen4_dense_nax_q6_K_n128",
     "kernel_qwen4_dense_nax_iq2_xs", "kernel_qwen4_dense_nax_iq2_xs_n64", "kernel_qwen4_dense_nax_iq2_xs_n128",
@@ -55185,6 +55187,19 @@ int ds4_gpu_qwen4_gsq_mv_selected(uint32_t n_tokens, uint32_t in_dim, uint32_t n
     return qwen4_gsq_mv_ok(n_tokens, in_dim, n_out, types) ? 1 : 0;
 }
 
+/* Single-output IQ4_XS, IQ3_S and Q5_K rows take kernel_qwen4_gsq_mv2 (two rows per simdgroup, the
+ * chunk scale factored out of the dot product).  DS4_QWEN4_GSQ_MV_ONE_ROW=1 keeps kernel_qwen4_gsq_mv
+ * for A/B. */
+static bool qwen4_gsq_mv2_ok(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types) {
+    if (n_out != 1 || (in_dim % 256u) != 0 || !qwen4_gsq_mv_ok(n_tokens, in_dim, n_out, types) ||
+        getenv("DS4_QWEN4_GSQ_MV_ONE_ROW")) return false;
+    return types[0] == 13u || types[0] == 21u || types[0] == 23u;
+}
+
+int ds4_gpu_qwen4_gsq_mv2_selected(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types) {
+    return qwen4_gsq_mv2_ok(n_tokens, in_dim, n_out, types) ? 1 : 0;
+}
+
 int ds4_gpu_qwen4_multi_gemv_tensor(
         const ds4_gpu_tensor *x, uint32_t n_tokens, uint32_t in_dim, uint32_t n_out,
         ds4_gpu_tensor *const *outs, const void *model_map, uint64_t model_size,
@@ -55218,6 +55233,11 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
             b[1 + i] = b[1];
             b[5 + i] = b[5];
         }
+    }
+    if (qwen4_gsq_mv2_ok(n_tokens, in_dim, n_out, types)) {
+        const uint32_t r1 = n_tokens < 4u ? n_tokens : 4u;   /* 2 KiB: the IQ3_S grid */
+        return qwen4_dispatch(QWEN4_K_GSQ_MV2_R1 + (int)r1 - 1, &args, sizeof(args), b, 9,
+                              MTLSizeMake((total + 7) / 8, (n_tokens + r1 - 1) / r1, 1), MTLSizeMake(128, 1, 1), 2048);
     }
     if (qwen4_gsq_mv_ok(n_tokens, in_dim, n_out, types)) {
         const uint32_t r1 = n_tokens < 4u ? n_tokens : 4u;

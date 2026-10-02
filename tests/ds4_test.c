@@ -2170,6 +2170,18 @@ static void test_metal_qwen4_gsq_mv(void) {
     TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(3, 2560, 1, prod) == 0);     /* Q8_0 keeps its kernels */
     const uint32_t bf[1] = { 30u };
     TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(3, 2568, 1, bf) == 0);       /* not whole 16-value chunks */
+    /* IQ4_XS, IQ3_S and Q5_K single-output rows take the two-rows-per-simdgroup kernel */
+    const uint32_t two[3] = { 23u, 21u, 13u }, q6[1] = { 14u }, pair[2] = { 23u, 21u };
+    for (int i = 0; i < 3; i++) {
+        TEST_ASSERT(ds4_gpu_qwen4_gsq_mv2_selected(1, 2560, 1, &two[i]) == 1);
+        TEST_ASSERT(ds4_gpu_qwen4_gsq_mv2_selected(8, 6144, 1, &two[i]) == 1);
+        TEST_ASSERT(ds4_gpu_qwen4_gsq_mv2_selected(9, 2560, 1, &two[i]) == 0);
+    }
+    TEST_ASSERT(ds4_gpu_qwen4_gsq_mv2_selected(2, 2560, 1, q6) == 0);      /* Q6_K keeps the one-row kernel */
+    TEST_ASSERT(ds4_gpu_qwen4_gsq_mv2_selected(2, 2560, 2, pair) == 0);    /* so do multi-output calls */
+    setenv("DS4_QWEN4_GSQ_MV_ONE_ROW", "1", 1);
+    TEST_ASSERT(ds4_gpu_qwen4_gsq_mv2_selected(2, 2560, 1, two) == 0);
+    unsetenv("DS4_QWEN4_GSQ_MV_ONE_ROW");
     const uint32_t rows = 37u;
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
@@ -2181,6 +2193,17 @@ static void test_metal_qwen4_gsq_mv(void) {
         if (!buf) return;
         test_quant_fill_rows(buf, f, in_dim, rows);
         test_metal_qwen4_gsq_mv_case(f->type, buf, row_bytes, in_dim, rows);
+        free(buf);
+    }
+    for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
+        const ds4_quant_fixture *f = &quant_fixtures[i];   /* the GDN ssm_out width */
+        if (f->type != 13 && f->type != 21 && f->type != 23) continue;
+        const uint64_t row_bytes = test_quant_row_bytes(f->type, 6144u);
+        uint8_t *buf = malloc((size_t)(row_bytes * rows));
+        TEST_ASSERT(buf != NULL);
+        if (!buf) return;
+        test_quant_fill_rows(buf, f, 6144u, rows);
+        test_metal_qwen4_gsq_mv_case(f->type, buf, row_bytes, 6144u, rows);
         free(buf);
     }
     const uint32_t in_dim = 2560u;                     /* BF16 rows */
