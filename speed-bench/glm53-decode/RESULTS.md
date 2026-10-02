@@ -67,3 +67,32 @@ ds4: GLM stream gates 10500: avg service 1380.6 us, gpu arrival wait 935.3 us, s
   only at its router, and the routed MoE needs them right after the short shared expert. Hiding the
   ~57 ms per token of service time needs either a much cheaper service (prepare alone averaged
   0.87 ms per load call in Phase 0) or experts loaded before their router runs (SP2 prefetch).
+
+## Gate-service spike (2026-10-02 09:34-09:53)
+
+Question: can the ~1.4 ms per-gate service time be cut on the host? Throwaway code (worker-side
+readahead, service timers) was measured and deleted.
+
+| Variant (split gates, 256 tokens) | t/s | Output vs drain |
+|---|---|---|
+| default | 9.93 / 9.94 | IDENTICAL |
+| readahead off | 9.95 / 9.87 | IDENTICAL |
+| readahead moved into the pread workers | 9.78 / 9.77 | IDENTICAL |
+| pread threads 4 / 18 (default 9) | 9.81 / 9.83 | IDENTICAL |
+
+Service split per gate (instrumented build, split): pre 23 us, `load_batch` 1291 us of which
+**pread wall 1210 us**, tables 0.3 us, release 84 us, post-release prune ~0 us; 1.67 misses per gate.
+The gate path never calls readahead (`load_batch` preads directly), so readahead is not a lever here.
+
+SSD micro-benchmark (scratch file written with F_NOCACHE, 300 simulated gates of 5 random 2.25 MiB
+reads, persistent pool): 2.25 MiB x 9 threads 1.215 ms per gate (9.7 GB/s); best chunking
+(512 KiB x 16 threads) 1.157 ms (10.2 GB/s); smaller chunks or more threads are slower. The same
+reads from the page cache take 0.17 ms (65-72 GB/s).
+
+**Answer:** the gate service is SSD-bandwidth bound. Missed experts come from the SSD at its ~10 GB/s
+ceiling, ~11 MiB per gate, exactly the measured 1.2 ms. Host-side changes can win at most ~5%.
+Per token: ~41 x 1.2 ms of SSD reads (~49 ms) on the critical path plus ~52 ms of GPU work. Even
+perfect overlap of the two caps single-token decode near 19 t/s at this hit rate (0.77); 20 t/s
+needs fewer missed bytes. SP2 prefetch can only use the SSD's idle time during GPU work (~40%) and
+pays for wrong guesses with the same bandwidth (V4.1 spike: ~3 reads per saved miss), so a realistic
+SP2 result is ~11.5-12.5 t/s.
