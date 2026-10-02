@@ -776,6 +776,22 @@ static bool qwen35_fuse_norm_enabled(void) {
 }
 
 /* One trunk layer: pre-norm mixer and pre-norm MoE, each added to R. */
+/* DS4_QWEN35_PROFILE stage buckets, shared by qwen35_graph_forward_tokens
+ * and qwen35_graph_layer.  1 gdn, 2 attn, 4 head; at level 3, 1 and 2 hold
+ * the mixer half of each layer, 5 and 6 its MoE half (gdn, attn layers).
+ * g_qwen35_prof_split is set only for the forward that asked for level 3
+ * and cleared when it ends, so no other forward ever syncs on its account. */
+static double g_qwen35_prof_p[8], g_qwen35_prof_last;
+static bool g_qwen35_prof_split;
+
+static void qwen35_prof_mark(int idx) {
+    ds4_gpu_end_commands();
+    const double n = now_sec();
+    g_qwen35_prof_p[idx] += n - g_qwen35_prof_last;
+    g_qwen35_prof_last = n;
+    glm_graph_begin_commands_if_needed();
+}
+
 static bool qwen35_graph_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                uint32_t il, uint32_t pos0, uint32_t T) {
     const ds4_layer_weights *l = &w->layer[il];
@@ -794,6 +810,7 @@ static bool qwen35_graph_layer(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                                      DS4_N_EMBD, T, DS4_RMS_EPS) != 0;
         }
     }
+    if (ok && g_qwen35_prof_split) qwen35_prof_mark(ds4_qwen35_layer_is_attention(il) ? 2 : 1);
     if (ok) ok = qwen35_graph_moe(g, m, l, T);
     if (ok) ok = ds4_gpu_add_tensor(g->R, g->R, g->blk, n) != 0;
     return ok;
@@ -841,9 +858,12 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     static int prof_level = -1;
     if (prof_level < 0) { const char *e = getenv("DS4_QWEN35_PROFILE"); prof_level = e && e[0] ? atoi(e) : 0; }
     const bool prof = (prof_level >= 1 && T > 1u) || (prof_level >= 2 && T == 1u);
-    double p[5] = {0}, prof_last = prof ? now_sec() : 0.0;
+    memset(g_qwen35_prof_p, 0, sizeof(g_qwen35_prof_p));
+    g_qwen35_prof_last = prof ? now_sec() : 0.0;
+    g_qwen35_prof_split = prof && prof_level >= 3;
 #define QWEN35_PROF(idx_) do { if (prof) { ds4_gpu_end_commands(); const double n_ = now_sec(); \
-        p[idx_] += n_ - prof_last; prof_last = n_; glm_graph_begin_commands_if_needed(); } } while (0)
+        g_qwen35_prof_p[idx_] += n_ - g_qwen35_prof_last; g_qwen35_prof_last = n_; \
+        glm_graph_begin_commands_if_needed(); } } while (0)
     /* DS4_QWEN35_FLUSH_LAYER (Ornith decode lever L1, on by default at
      * layer 2): submit the command buffer after the given trunk layer so
      * the GPU can start executing while the host is still encoding the
@@ -865,7 +885,9 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     bool ok = qwen35_graph_carry_h(g, pos0);
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && ok; il++) {
         ok = qwen35_graph_layer(g, m, w, il, pos0, T);
-        QWEN35_PROF(ds4_qwen35_layer_is_attention(il) ? 2 : 1);   /* 1 gdn, 2 attn (moe folded into the layer's own bucket) */
+        /* 1 gdn, 2 attn (moe folded into the layer's own bucket); at level 3 the MoE half goes to 5 / 6 */
+        QWEN35_PROF(g_qwen35_prof_split ? (ds4_qwen35_layer_is_attention(il) ? 6 : 5)
+                                        : (ds4_qwen35_layer_is_attention(il) ? 2 : 1));
         if (ok && flush_layer >= 0 && (int)(il + 1u) == flush_layer && !prof) ok = ds4_gpu_flush_commands() != 0;
     }
     if (ok && g->mtp_h) {
@@ -888,27 +910,43 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     }
     QWEN35_PROF(4);
     if (prof) {
+        const double *p = g_qwen35_prof_p;
         if (T > 1u) {
             /* Also covers the T==2 MTP verify chunk, so the 128K verify's
              * attention/KV cost shows up here alongside ordinary prefill. */
-            fprintf(stderr, "ds4: Ornith stage ms/chunk (pos=%u T=%u): gdn %.1f attn %.1f head %.1f\n",
-                    pos0, T, 1000.0 * p[1], 1000.0 * p[2], 1000.0 * p[4]);
+            if (g_qwen35_prof_split) {
+                fprintf(stderr, "ds4: Ornith split ms/chunk (pos=%u T=%u): gdn-mix %.2f gdn-moe %.2f "
+                        "attn-mix %.2f attn-moe %.2f head %.2f\n", pos0, T, 1000.0 * p[1], 1000.0 * p[5],
+                        1000.0 * p[2], 1000.0 * p[6], 1000.0 * p[4]);
+            } else {
+                fprintf(stderr, "ds4: Ornith stage ms/chunk (pos=%u T=%u): gdn %.1f attn %.1f head %.1f\n",
+                        pos0, T, 1000.0 * p[1], 1000.0 * p[2], 1000.0 * p[4]);
+            }
         } else {
-            static double dprof[5] = {0};
+            static double dprof[8] = {0};
             static uint32_t dprof_n = 0, dprof_pos0 = 0;
             if (dprof_n == 0) dprof_pos0 = pos0;
-            for (int i = 0; i < 5; i++) dprof[i] += p[i];
+            for (int i = 0; i < 8; i++) dprof[i] += p[i];
             dprof_n++;
             if (dprof_n >= DS4_QWEN35_PROF_DECODE_N) {
-                fprintf(stderr, "ds4: Ornith decode stage ms/step (avg over %u steps, pos=%u..%u): "
-                        "gdn %.2f attn %.2f head %.2f\n",
-                        dprof_n, dprof_pos0, pos0, 1000.0 * dprof[1] / dprof_n,
-                        1000.0 * dprof[2] / dprof_n, 1000.0 * dprof[4] / dprof_n);
-                for (int i = 0; i < 5; i++) dprof[i] = 0;
+                if (g_qwen35_prof_split) {
+                    fprintf(stderr, "ds4: Ornith decode split ms/step (avg over %u steps, pos=%u..%u): "
+                            "gdn-mix %.2f gdn-moe %.2f attn-mix %.2f attn-moe %.2f head %.2f\n",
+                            dprof_n, dprof_pos0, pos0, 1000.0 * dprof[1] / dprof_n,
+                            1000.0 * dprof[5] / dprof_n, 1000.0 * dprof[2] / dprof_n,
+                            1000.0 * dprof[6] / dprof_n, 1000.0 * dprof[4] / dprof_n);
+                } else {
+                    fprintf(stderr, "ds4: Ornith decode stage ms/step (avg over %u steps, pos=%u..%u): "
+                            "gdn %.2f attn %.2f head %.2f\n",
+                            dprof_n, dprof_pos0, pos0, 1000.0 * dprof[1] / dprof_n,
+                            1000.0 * dprof[2] / dprof_n, 1000.0 * dprof[4] / dprof_n);
+                }
+                for (int i = 0; i < 8; i++) dprof[i] = 0;
                 dprof_n = 0;
             }
         }
     }
+    g_qwen35_prof_split = false;
 #undef QWEN35_PROF
 #undef DS4_QWEN35_PROF_DECODE_N
     if (!ds4_gpu_end_commands()) ok = false;
