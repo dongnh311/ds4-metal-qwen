@@ -662,15 +662,22 @@ static int test_qwen35_open_ctx(ds4_engine **out, int ctx) {
 }
 
 static void test_qwen35_yarn_engine(void) {
+    /* The family check reuses the cached engine, so another model is never
+     * opened at 524288 just to be skipped. */
+    ds4_engine *probe = test_get_engine(false);
+    if (!probe || !ds4_engine_is_qwen35moe(probe)) {
+        puts("qwen35-yarn-engine: Ornith model required, skipped");
+        return;
+    }
+    /* One open engine per process holds the instance lock: a second open
+     * while the cached engines live exits the whole run. */
+    test_close_engines();
+
     ds4_engine *e = NULL;
     char *saved = test_save_env("DS4_QWEN4_YARN_FACTOR");
     unsetenv("DS4_QWEN4_YARN_FACTOR");
     TEST_ASSERT(test_qwen35_open_ctx(&e, 524288) == 0 && e != NULL);
     if (!e) goto done;
-    if (!ds4_engine_is_qwen35moe(e)) {
-        puts("qwen35-yarn-engine: Ornith model required, skipped");
-        goto done;
-    }
     TEST_ASSERT(ds4_engine_rope_yarn_factor(e) == 2.0f);
     TEST_ASSERT(ds4_engine_native_context(e) == 262144u);
     TEST_ASSERT(ds4_gpu_qwen4_rope_table_set());
