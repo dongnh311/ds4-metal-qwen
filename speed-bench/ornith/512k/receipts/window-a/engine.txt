@@ -1,0 +1,8 @@
+qwen35-yarn-engine:
+ds4: Ornith YaRN factor 2 (from -c) over 262144 native tokens (pairs 14..22 blended, mscale 1.0693)
+ds4: Ornith YaRN factor 2 (DS4_QWEN4_YARN_FACTOR) over 262144 native tokens (pairs 14..22 blended, mscale 1.0693)
+ds4: Ornith YaRN factor 2 (DS4_QWEN4_YARN_FACTOR) over 262144 native tokens (pairs 14..22 blended, mscale 1.0693)
+ds4: Ornith -c 1048576 exceeds 262144 native tokens x YaRN factor 2; leave DS4_QWEN4_YARN_FACTOR unset so the factor follows -c
+ds4: Ornith -c 524288 exceeds 262144 native tokens x YaRN factor 1; leave DS4_QWEN4_YARN_FACTOR unset so the factor follows -c
+qwen35-yarn-engine: OK
+ds4 tests: ok

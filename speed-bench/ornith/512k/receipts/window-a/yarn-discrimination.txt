@@ -1,0 +1,14 @@
+code_c           shared 64 | ds4-yarn vs llama-yarn 0.0115, vs llama-plain 0.0844 | ds4-plain vs llama-plain 0.0168, vs llama-yarn 0.0859 | consistent
+code_c_pack      shared 16 | ds4-yarn vs llama-yarn 0.1402, vs llama-plain 0.1601 | ds4-plain vs llama-plain 0.1218, vs llama-yarn 0.2460 | consistent
+code_py          shared 42 | ds4-yarn vs llama-yarn 0.0870, vs llama-plain 0.1309 | ds4-plain vs llama-plain 0.1151, vs llama-yarn 0.1217 | consistent
+code_rust        shared 19 | ds4-yarn vs llama-yarn 0.0895, vs llama-plain 0.1281 | ds4-plain vs llama-plain 0.0807, vs llama-yarn 0.1134 | consistent
+en_capital       shared  3 | ds4-yarn vs llama-yarn 0.0008, vs llama-plain 0.0335 | ds4-plain vs llama-plain 0.0009, vs llama-yarn 0.0382 | consistent
+en_contributing  shared 14 | ds4-yarn vs llama-yarn 0.0638, vs llama-plain 0.1388 | ds4-plain vs llama-plain 0.0660, vs llama-yarn 0.1350 | consistent
+en_explain       shared  5 | ds4-yarn vs llama-yarn 0.0668, vs llama-plain 0.3125 | ds4-plain vs llama-plain 0.0005, vs llama-yarn 0.2850 | consistent
+en_story         shared 41 | ds4-yarn vs llama-yarn 0.0291, vs llama-plain 0.0957 | ds4-plain vs llama-plain 0.0595, vs llama-yarn 0.1115 | consistent
+json_obj         shared  5 | ds4-yarn vs llama-yarn 0.0296, vs llama-plain 0.2189 | ds4-plain vs llama-plain 0.0866, vs llama-yarn 0.2228 | consistent
+long_copy        shared 32 | ds4-yarn vs llama-yarn 0.2342, vs llama-plain 0.3310 | ds4-plain vs llama-plain 0.2637, vs llama-yarn 0.3840 | consistent
+math_mul         shared 32 | ds4-yarn vs llama-yarn 0.1151, vs llama-plain 0.2490 | ds4-plain vs llama-plain 0.1187, vs llama-yarn 0.1998 | consistent
+vi_greeting      shared 64 | ds4-yarn vs llama-yarn 0.0211, vs llama-plain 0.0785 | ds4-plain vs llama-plain 0.0064, vs llama-yarn 0.0794 | consistent
+vi_hanoi         shared 43 | ds4-yarn vs llama-yarn 0.0292, vs llama-plain 0.1904 | ds4-plain vs llama-plain 0.0311, vs llama-yarn 0.1962 | consistent
+mean over 13 prompts: ds4-yarn~llama-yarn 0.0706, ds4-yarn~llama-plain 0.1655, ds4-plain~llama-plain 0.0744, ds4-plain~llama-yarn 0.1707; consistent 13/13
