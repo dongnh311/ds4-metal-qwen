@@ -188,3 +188,26 @@ def calibrate(metal, cpu):
             gap = max(gap, _gap(m_steps[res["first_mismatch"]]))
     return {"tol": max(FLOOR, 3.0 * delta), "tie": max(FLOOR, 2.0 * gap),
             "observed_max_delta": delta, "observed_divergence_gap": gap}
+
+
+def llama_server_cmd(model, port, cpu, ubatch, extra=()):
+    """The reference llama-server command; extra args (e.g. YaRN flags) come last."""
+    cmd = ["llama-server", "-m", model, "--host", "127.0.0.1", "--port", str(port),
+           "-c", "16384", "-np", "1"]
+    cmd += ["-ngl", "0", "--device", "none"] if cpu else ["-ngl", "99"]
+    cmd += ["-ub", str(ubatch)] if ubatch is not None else []
+    return cmd + list(extra)
+
+
+def parse_gate1_args(argv, default_ref):
+    """gate1.py [--ds4-arg ARG]... [--ref-dir DIR] OUT_DIR -> (extra, ref_dir, out), or None."""
+    extra, ref_dir = [], default_ref
+    while len(argv) >= 2 and argv[0] in ("--ds4-arg", "--ref-dir"):
+        if argv[0] == "--ds4-arg":
+            extra.append(argv[1])
+        else:
+            ref_dir = argv[1]
+        argv = argv[2:]
+    if len(argv) != 1:
+        return None
+    return extra, ref_dir, argv[0]

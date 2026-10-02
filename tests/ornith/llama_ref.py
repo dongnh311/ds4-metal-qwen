@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Record llama.cpp references for the Ornith gate, or calibrate tolerances.
 
-  llama_ref.py record    MODEL OUT_DIR [--cpu]
+  llama_ref.py record    MODEL OUT_DIR [--cpu] [--llama-arg ARG]...
   llama_ref.py calibrate METAL_DIR CPU_DIR TOLERANCE_JSON
 
 `record` starts llama-server on port 18190 (never a gateway port), tokenizes
@@ -12,7 +12,8 @@ top-20 log-probabilities of the unsampled distribution.  A prompt with
 (-ub): long_copy uses 1, because llama.cpp's batched Metal prefill moves its
 contested step by more than the tolerance while its per-token path agrees
 with the CPU backend.  --cpu runs the same model on llama.cpp's CPU backend
-for calibration and skips the file-backed prompts.
+for calibration and skips the file-backed prompts.  --llama-arg passes one
+argument to llama-server (repeat it), for example the YaRN flags.
 """
 import json
 import os
@@ -49,18 +50,15 @@ def wait_ready(proc):
     sys.exit("llama-server did not become ready")
 
 
-def record(model, out_dir, cpu):
+def record(model, out_dir, cpu, extra=()):
     os.makedirs(out_dir, exist_ok=True)
     prompts = r.load_prompts(os.path.join(ROOT, "tests/ornith/prompts.json"))
     for ubatch, group in r.llama_server_groups(prompts, cpu):
-        record_group(model, out_dir, cpu, ubatch, group)
+        record_group(model, out_dir, cpu, ubatch, group, extra)
 
 
-def record_group(model, out_dir, cpu, ubatch, prompts):
-    cmd = ["llama-server", "-m", model, "--host", "127.0.0.1", "--port", str(PORT),
-           "-c", "16384", "-np", "1"]
-    cmd += ["-ngl", "0", "--device", "none"] if cpu else ["-ngl", "99"]
-    cmd += ["-ub", str(ubatch)] if ubatch is not None else []
+def record_group(model, out_dir, cpu, ubatch, prompts, extra=()):
+    cmd = r.llama_server_cmd(model, PORT, cpu, ubatch, extra)
     log_name = "llama-server.log" if ubatch is None else f"llama-server-ub{ubatch}.log"
     log = open(os.path.join(out_dir, log_name), "w")
     proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
@@ -100,7 +98,14 @@ def calibrate(metal_dir, cpu_dir, out_path):
 
 if __name__ == "__main__":
     if len(sys.argv) >= 4 and sys.argv[1] == "record":
-        record(sys.argv[2], sys.argv[3], "--cpu" in sys.argv[4:])
+        rest, extra = sys.argv[4:], []
+        while "--llama-arg" in rest:
+            i = rest.index("--llama-arg")
+            if i + 1 >= len(rest):
+                sys.exit(__doc__)
+            extra.append(rest[i + 1])
+            del rest[i:i + 2]
+        record(sys.argv[2], sys.argv[3], "--cpu" in rest, extra)
     elif len(sys.argv) == 5 and sys.argv[1] == "calibrate":
         calibrate(sys.argv[2], sys.argv[3], sys.argv[4])
     else:
