@@ -18,3 +18,4 @@ quality-testing/data/*
 !quality-testing/data/qwen38-flash-alibaba-100/**
 !quality-testing/data/qwen38-flash-alibaba-long/
 !quality-testing/data/qwen38-flash-alibaba-long/**
+deepseek41_engram_q4
