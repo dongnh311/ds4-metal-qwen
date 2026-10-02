@@ -1,0 +1,12 @@
+deploy: smoke model: Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx
+deploy: smoke vi: 297 tokens in 3.7 s (80.0 t/s incl. prefill), ok, same as ref
+deploy: smoke code: 290 tokens in 3.2 s (91.7 t/s incl. prefill), ok, same as ref
+deploy: smoke model: Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx-512K
+deploy: smoke vi: 300 tokens in 3.7 s (81.6 t/s incl. prefill), ok, same as ref
+deploy: smoke code: 300 tokens in 3.1 s (95.9 t/s incl. prefill), ok, same as ref
+deploy: smoke model: ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2
+deploy: smoke vi: 294 tokens in 15.0 s (19.6 t/s incl. prefill), ok, same as ref
+deploy: smoke code: 300 tokens in 8.7 s (34.4 t/s incl. prefill), ok, same as ref
+deploy: smoke model: ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2-512K
+deploy: smoke vi: 300 tokens in 9.2 s (32.6 t/s incl. prefill), ok, same as ref
+deploy: smoke code: 300 tokens in 8.7 s (34.7 t/s incl. prefill), ok, same as ref

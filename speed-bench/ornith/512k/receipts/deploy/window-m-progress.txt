@@ -1,0 +1,44 @@
+17:11:43 window steps-m.sh on 2146f8db
+paused
+no model processes
+17:11:44 start kernels
+17:12:29 end kernels rc=0
+17:12:29 start engine
+17:12:34 end engine rc=0
+17:12:34 start loader
+17:12:44 end loader rc=0
+17:12:44 start m1-base-64
+17:13:44 end m1-base-64 rc=0
+17:13:44 start m1-merge-64
+17:14:39 end m1-merge-64 rc=0
+17:14:39 identity chunk 64: 13 dumps, 0 differ
+17:14:39 start m1-base-512
+17:15:09 end m1-base-512 rc=0
+17:15:09 start m1-merge-512
+17:15:39 end m1-merge-512 rc=0
+17:15:39 identity chunk 512: 13 dumps, 0 differ
+17:15:39 start m1-base-2048
+17:16:10 end m1-base-2048 rc=0
+17:16:10 start m1-merge-2048
+17:16:40 end m1-merge-2048 rc=0
+17:16:40 identity chunk 2048: 13 dumps, 0 differ
+17:16:40 start m1-yarn2
+17:17:05 end m1-yarn2 rc=0
+17:17:05 start m1-mtp-yarn2
+17:21:00 end m1-mtp-yarn2 rc=0
+17:21:00 start ref-ornith
+17:21:10 end ref-ornith rc=0
+17:21:10 start ref-ornith-512K
+17:21:20 end ref-ornith-512K rc=0
+17:21:20 start ref-qwen
+17:21:45 end ref-qwen rc=0
+17:21:45 start ref-qwen-512K
+17:22:05 end ref-qwen-512K rc=0
+17:22:05 QWEN SLOT open on 2146f8db
+17:26:16 QWEN SLOT closed (done)
+17:26:16 window M ok=1
+17:26:16 steps rc=0; restore
+restored (backend_ok after 64x2s)
+17:28:27 restored
+status: backend_ok True last_byte_ago_s 1031.9
+17:28:27 window done rc=0

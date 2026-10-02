@@ -146,3 +146,51 @@ unreaped zombie, and the pause script counted it alive. The script now treats st
 - One run per arm cannot resolve a small YaRN cost, so the 262K entry stays the default, as the spec
   decided.
 - The abliteration probes are unchanged: 4/4 COMPLY on both arms, matching M4-M6.
+
+## Merge and deploy
+
+**Merge.** `feature/ornith-512k` was merged into develop with `--no-ff` as `2146f8db`, on top of
+`9695695c`, and pushed. The merge was re-gated in window M (17:11-17:28):
+- `test-qwen35-kernels`, the engine test (with the run-all lock pair) and the loader pass;
+- the 262K path is byte-identical to `9695695c` at chunks 64/512/2048 (39/39 dumps), and gate 1
+  passes on both builds;
+- gate 1 at factor 2 passes (compared 106, checked 150);
+- `test_mtp_cli` at factor 2 passes (369 accepted / 55 rejected drafts).
+
+The Qwen session gated Qwen on the merge in a slot of that window:
+- PROD 3/3 and ISTA 3/3 greedy output byte-identical to its develop baselines;
+- PROD at `-c 524288` identical between base and candidate;
+- paired decode within noise.
+
+Before the merge, the user-approved final-review minors went in (`baa7491d`):
+- the refusal names the fix that applies;
+- the rope setup is shared by Qwen3.8 and Ornith;
+- the payload comment moved back above its test.
+
+**Deploy** (window D, 2026-10-02 17:36-17:39).
+- `prod/ornith-512k-20261002` (= `2146f8db`) is installed in the PROD checkout. The previous branch
+  was `prod/qwen-512k-20261001@3a3bfa3`, recorded in `.deploy-history`.
+- The live config was hand-seeded at 17:36:29, each file backed up with suffix
+  `.bak-prod-ornith-512k-20261002`:
+  - `runtime-registry.json` gets the gateway catalog's 512K row (`f8f2e2ce`), plus `active_runtime
+    ds4` and `enabled: true`. The row runs `-c 524288` on :18089 with `--kv-disk-space-mb 16384`, in
+    its own `yarn-2` directory under the shared Ornith cache.
+  - `models.json` gets "Ornith-1.5-Abliterated-512K".
+  - The `-512K` model profile is byte-identical to gateway `b9dc323c`, which commits it so a
+    re-stage keeps it.
+- All four ds4 rows were smoke-tested from the PROD build:
+
+| row | vi | code |
+|---|---|---|
+| Ornith 262K (:18087) | 297 tok, 80.0 t/s, same as ref | 290 tok, 91.7 t/s, same as ref |
+| Ornith 512K (:18089) | 300 tok, 81.6 t/s, same as ref | 300 tok, 95.9 t/s, same as ref |
+| Qwen 262K (:18086) | 294 tok, 19.6 t/s (cold first request), same as ref | 300 tok, 34.4 t/s, same as ref |
+| Qwen 512K (:18088) | 300 tok, 32.6 t/s, same as ref | 300 tok, 34.7 t/s, same as ref |
+
+The references were recorded from the develop `2146f8db` build in window M. The t/s figures include
+prefill.
+
+**Rollback:**
+- `deploy-ai-gateway.sh install prod/qwen-512k-20261001`;
+- restore the two `.bak-prod-ornith-512k-20261002` files;
+- delete `model-profiles/<id>-512K.json`.

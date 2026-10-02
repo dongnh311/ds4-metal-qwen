@@ -1,0 +1,31 @@
+17:36:07 window steps-d.sh on 2146f8db
+paused
+no model processes
+17:36:09 start install
+17:36:24 end install rc=0
+17:36:24 PROD now 2146f8d Merge feature/ornith-512k: Ornith 512K context through static YaRN
+17:36:24 start seed
+17:36:29 end seed rc=0
+17:36:29 seeded the live 512K row at 17:36:29
+17:36:29 start smoke-ornith
+17:36:44 end smoke-ornith rc=0
+deploy: smoke vi: 297 tokens in 3.7 s (80.0 t/s incl. prefill), ok, same as ref
+deploy: smoke code: 290 tokens in 3.2 s (91.7 t/s incl. prefill), ok, same as ref
+17:36:44 start smoke-ornith-512K
+17:36:55 end smoke-ornith-512K rc=0
+deploy: smoke vi: 300 tokens in 3.7 s (81.6 t/s incl. prefill), ok, same as ref
+deploy: smoke code: 300 tokens in 3.1 s (95.9 t/s incl. prefill), ok, same as ref
+17:36:55 start smoke-qwen
+17:37:25 end smoke-qwen rc=0
+deploy: smoke vi: 294 tokens in 15.0 s (19.6 t/s incl. prefill), ok, same as ref
+deploy: smoke code: 300 tokens in 8.7 s (34.4 t/s incl. prefill), ok, same as ref
+17:37:25 start smoke-qwen-512K
+17:37:45 end smoke-qwen-512K rc=0
+deploy: smoke vi: 300 tokens in 9.2 s (32.6 t/s incl. prefill), ok, same as ref
+deploy: smoke code: 300 tokens in 8.7 s (34.7 t/s incl. prefill), ok, same as ref
+17:37:45 window D ok=1
+17:37:45 steps rc=0; restore
+restored (backend_ok after 62x2s)
+17:39:52 restored
+status: backend_ok True last_byte_ago_s 322.2
+17:39:52 window done rc=0
