@@ -95,7 +95,7 @@ static int run_fixture(int bad_layout) {
         assert(*(const float *)tensor_data(&m, model_find_tensor(&m, "test.weight")) == 0);
         model_warm_weights(&m);
         ds4_engram_table table;
-        assert(ds4_engram_table_open(&table, path, t->abs_offset, rows));
+        assert(ds4_engram_table_open(&table, path, t->abs_offset, rows, DS4_ENGRAM_ENC_E4M3_ROW264));
         const uint32_t id = rows - 1;
         float values[DS4_ENGRAM_DIM];
         assert(ds4_engram_read(&table, &id, 1, values));

@@ -41112,7 +41112,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     for (uint32_t i = 0; i < 2; i++) {
         const uint32_t il = i ? 14u : 1u;
         const ds4_tensor *table = required_tensorf(m, "blk.%u.engram_embd.weight", il);
-        if (!ds4_engram_table_open(&g->table[i], path, table->abs_offset, g->engram.rows[i])) goto fail;
+        if (!ds4_engram_table_open(&g->table[i], path, table->abs_offset, g->engram.rows[i],
+                                   DS4_ENGRAM_ENC_E4M3_ROW264)) goto fail;
         struct stat weights_stat, rows_stat;
         if (fstat(m->fd, &weights_stat) || fstat(g->table[i].fd, &rows_stat) ||
             weights_stat.st_dev != rows_stat.st_dev || weights_stat.st_ino != rows_stat.st_ino)

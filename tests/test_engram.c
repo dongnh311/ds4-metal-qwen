@@ -118,7 +118,7 @@ static void test_rows(void) {
     }
     assert(pwrite(fd, raw, sizeof(raw), offset) == sizeof(raw));
     ds4_engram_table t;
-    assert(ds4_engram_table_open(&t, path, offset, 3));
+    assert(ds4_engram_table_open(&t, path, offset, 3, DS4_ENGRAM_ENC_E4M3_ROW264));
     assert(fcntl(t.fd, F_GETFD) & FD_CLOEXEC);
     uint32_t rows[] = {2, 0, 2, 1};
     float out[4 * 256];
@@ -190,9 +190,9 @@ static void test_rows(void) {
     free(batch);
     ds4_engram_table_close(&t);
     ds4_engram_table_close(&t);
-    assert(!ds4_engram_table_open(&t, path, offset, 1));
-    assert(!ds4_engram_table_open(&t, path, UINT64_MAX - 1, 3));
-    assert(!ds4_engram_table_open(&t, path, offset, 0));
+    assert(!ds4_engram_table_open(&t, path, offset, 1, DS4_ENGRAM_ENC_E4M3_ROW264));
+    assert(!ds4_engram_table_open(&t, path, UINT64_MAX - 1, 3, DS4_ENGRAM_ENC_E4M3_ROW264));
+    assert(!ds4_engram_table_open(&t, path, offset, 0, DS4_ENGRAM_ENC_E4M3_ROW264));
     close(fd);
     assert(unlink(path) == 0);
 }
@@ -232,10 +232,92 @@ static void test_all_scaled_values(void) {
     close(fd);
 }
 
+/* Independent copy of the Lloyd 4-bit codebook (lloyd4_e5m3_32_r136). */
+static const float test_cb[8] = {0.0f, 0.095f, 0.1901f, 0.2944f, 0.4126f, 0.5586f, 0.7484f, 1.0f};
+
+static float bf16_round(float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;
+    memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+/* code = sign << 3 | idx; scale byte = E << 3 | M, scale (8 + M) / 16 * 2^(E - 16). */
+static float q4_expected(int code, int scale_byte) {
+    const double s = (8 + (scale_byte & 7)) / 16.0 * pow(2.0, (scale_byte >> 3) - 16);
+    float v = (float)((double)test_cb[code & 7] * s);
+    if (code & 8) v = -v;
+    return bf16_round(v);
+}
+
+static void q4_pack(uint8_t row[DS4_ENGRAM_Q4_ROW_BYTES], const int codes[DS4_ENGRAM_DIM],
+                    const int scales[DS4_ENGRAM_DIM / 32]) {
+    for (int k = 0; k < DS4_ENGRAM_DIM / 2; k++)
+        row[k] = (uint8_t)(codes[2 * k] | codes[2 * k + 1] << 4);
+    for (int g = 0; g < DS4_ENGRAM_DIM / 32; g++) row[DS4_ENGRAM_DIM / 2 + g] = (uint8_t)scales[g];
+}
+
+static void test_q4_rows(void) {
+    char path[] = "/tmp/ds4-engram-q4-XXXXXX";
+    int fd = mkstemp(path);
+    assert(fd >= 0);
+    const uint64_t offset = (1ull << 33) + 48;
+    int codes[3][DS4_ENGRAM_DIM], scales[3][DS4_ENGRAM_DIM / 32];
+    for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
+        codes[0][j] = ((j / 8) & 1) << 3 | (j % 8);   /* every level, both signs */
+        codes[1][j] = (j * 5) & 15;
+        codes[2][j] = 8;                               /* sign set, level 0: -0 */
+    }
+    for (int g = 0; g < DS4_ENGRAM_DIM / 32; g++) {
+        scales[0][g] = 16 << 3;                        /* 0.5 */
+        scales[1][g] = g & 1 ? 31 << 3 : 7;            /* both ends: 2^14, 15/16 * 2^-16 */
+        scales[2][g] = 16 << 3;
+    }
+    uint8_t raw[3][DS4_ENGRAM_Q4_ROW_BYTES];
+    for (int r = 0; r < 3; r++) q4_pack(raw[r], codes[r], scales[r]);
+    assert(pwrite(fd, raw, sizeof(raw), offset) == sizeof(raw));
+    ds4_engram_table t;
+    assert(!ds4_engram_table_open(&t, path, offset, 4, DS4_ENGRAM_ENC_LLOYD4_ROW136));
+    assert(!ds4_engram_table_open(&t, path, offset, 3, (ds4_engram_encoding)7) && errno == EINVAL);
+    assert(ds4_engram_table_open(&t, path, offset, 3, DS4_ENGRAM_ENC_LLOYD4_ROW136));
+    const uint32_t rows[] = {2, 0, 1};
+    float out[3 * DS4_ENGRAM_DIM];
+    assert(ds4_engram_read(&t, rows, 3, out));
+    for (int r = 0; r < 3; r++) {
+        for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
+            const float want = q4_expected(codes[rows[r]][j], scales[rows[r]][j / 32]);
+            assert(!memcmp(&out[r * DS4_ENGRAM_DIM + j], &want, sizeof(want)));
+        }
+    }
+    for (int j = 0; j < DS4_ENGRAM_DIM; j++) assert(out[j] == 0.0f && signbit(out[j]));
+    ds4_engram_table_close(&t);
+    close(fd);
+    assert(unlink(path) == 0);
+}
+
+static void test_encodings(void) {
+    ds4_engram_encoding e = (ds4_engram_encoding)5;
+    assert(ds4_engram_encoding_from_name("e4m3_e8m0_32_row264", 19, &e) &&
+           e == DS4_ENGRAM_ENC_E4M3_ROW264);
+    assert(ds4_engram_encoding_from_name("lloyd4_e5m3_32_r136", 19, &e) &&
+           e == DS4_ENGRAM_ENC_LLOYD4_ROW136);
+    assert(!ds4_engram_encoding_from_name("conversion_underway", 19, &e));
+    assert(!ds4_engram_encoding_from_name("", 0, &e));
+    assert(!ds4_engram_encoding_from_name("e4m3_e8m0_32_row264x", 20, &e));
+    assert(!ds4_engram_encoding_from_name("e4m3_e8m0_32_row264", 18, &e));
+    assert(!strcmp(ds4_engram_encoding_name(DS4_ENGRAM_ENC_E4M3_ROW264), "e4m3_e8m0_32_row264"));
+    assert(!strcmp(ds4_engram_encoding_name(DS4_ENGRAM_ENC_LLOYD4_ROW136), "lloyd4_e5m3_32_r136"));
+    assert(ds4_engram_row_bytes(DS4_ENGRAM_ENC_E4M3_ROW264) == 264);
+    assert(ds4_engram_row_bytes(DS4_ENGRAM_ENC_LLOYD4_ROW136) == 136);
+}
+
 int main(void) {
     test_hash();
     test_rows();
     test_all_scaled_values();
+    test_encodings();
+    test_q4_rows();
     puts("Engram hashes, history and bounded disk rows: PASS");
     return 0;
 }
