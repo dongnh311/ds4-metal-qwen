@@ -4,8 +4,9 @@ The AI-Gateway serves models through `ds4-server`, launched from the PROD
 checkout at `~/.local/share/ai-gateway/ds4-metal` with the command stored in
 the gateway registry (`~/.local/ai-gateway/runtime-registry.json`). Every model
 row with a `ds4` runtime is its own process on its own port: Qwen3.8-Flash-Next
-on 18086 (on demand) and Ornith-1.5 on 18087 (the default model). All rows run
-the same PROD binary, so one deploy ships both. The gateway stops the running
+on 18086 (on demand), Ornith-1.5 on 18087 (the default model), and their 512K
+YaRN entries on 18088 (Qwen) and 18089 (Ornith). All rows run the same PROD
+binary, so one deploy ships them all. The gateway stops the running
 ds4 row before it starts another one. This document is the only supported way
 to change what runs there.
 `deploy-ai-gateway.sh` at the repository root implements the mechanical steps
