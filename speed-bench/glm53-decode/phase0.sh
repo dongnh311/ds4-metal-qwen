@@ -12,13 +12,15 @@ mkdir -p "$R"
 Q="Write a Python function that parses an ISO-8601 duration string such as 'P3DT4H5M' into total seconds, with a short docstring and three doctest examples."
 log() { print -r -- "STEP $* $(date +%T)" | tee -a "$R/steps.log"; }
 # gen NAME N [K=V ...] [-- EXTRA_ARGS ...]
+# Phase 0 is the pre-SP1 baseline: every run keeps the per-layer drain
+# (DS4_GLM_STREAM_GATE=0), since the tree may already have decode gates on.
 gen() {
     local name=$1 n=$2; shift 2
     local -a envs args
     while (( $# )) && [[ $1 != -- ]]; do envs+=("$1"); shift; done
     (( $# )) && shift
     args=("$@")
-    env "${envs[@]}" /usr/bin/time -p ./ds4 -m "$M" --ssd-streaming --power 100 -c 262144 \
+    env DS4_GLM_STREAM_GATE=0 "${envs[@]}" /usr/bin/time -p ./ds4 -m "$M" --ssd-streaming --power 100 -c 262144 \
         --nothink --temp 0 -n "$n" "${args[@]}" -p "$Q" > "$R/$name.out" 2> "$R/$name.err"
     log "$name rc=$? $(grep -a -o 'generation: [0-9.]* t/s' "$R/$name.err" | tail -1)"
 }
