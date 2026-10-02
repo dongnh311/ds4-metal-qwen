@@ -2,7 +2,8 @@
 """Ornith 512K server check: the disk KV cache is keyed by the YaRN factor.
 
 Three server runs on one fresh --kv-disk-dir, the same ~30K-token prompt each:
-  1. 262k-store:   -c 262144 (no YaRN); the prompt is stored (cold store + shutdown store);
+  1. 262k-store:   -c 262144 (no YaRN); the prompt is stored (cold store + shutdown store) in the
+                   unkeyed root of the kv dir, else the cold phase below would prove nothing;
   2. 512k-cold:    -c 524288 (YaRN 2); the log names <kv-dir>/yarn-2 and the prompt is NOT
                    restored from the 262K cache (different rope);
   3. 512k-restore: -c 524288 again; the prompt IS restored (>= 90% of it cached).
@@ -29,6 +30,15 @@ def keyed_dir(log_text):
     return m.group(1) if m else None
 
 
+def stored_entries(path):
+    """Cache entries (<40 hex>.kv) directly in path; keyed subdirectories are not counted."""
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return 0
+    return sum(1 for n in names if re.fullmatch(r"[0-9a-f]{40}\.kv", n))
+
+
 def cached(resp):
     usage = resp.get("usage") or {}
     details = usage.get("prompt_tokens_details") or {}
@@ -38,9 +48,13 @@ def cached(resp):
 def verdict(phases):
     why = []
     by = {p["phase"]: p for p in phases}
-    cold, restore = by.get("512k-cold"), by.get("512k-restore")
-    if not cold or not restore:
+    store, cold, restore = by.get("262k-store"), by.get("512k-cold"), by.get("512k-restore")
+    if not store or not cold or not restore:
         return False, ["missing phase"]
+    if store["stored"] < 1:
+        why.append("262k-store stored nothing in the kv dir root")
+    if store["dir"] is not None:
+        why.append("262k-store keyed its cache (dir %r); factor 1 must use the root" % store["dir"])
     if cold["cached"] > 0:
         why.append("512k-cold restored %d tokens written at another rope" % cold["cached"])
     for p in (cold, restore):
@@ -83,7 +97,9 @@ def run_phase(a, name, ctx, prompt, extra):
             sys.exit("%s: ds4-server pid %d did not exit 300 s after SIGTERM; left running" % (name, srv.pid))
     c, n = cached(resp)
     with open(log_path) as f:
-        return {"phase": name, "ctx": ctx, "dir": keyed_dir(f.read()), "cached": c, "prompt": n}
+        d = keyed_dir(f.read())
+    return {"phase": name, "ctx": ctx, "dir": d, "cached": c, "prompt": n,
+            "stored": stored_entries(d or a.kv_dir)}
 
 
 def main():
@@ -112,7 +128,8 @@ def main():
     with open(os.path.join(a.out, "server_check.json"), "w") as f:
         json.dump({"phases": phases, "ok": ok, "why": why}, f, indent=1)
     for p in phases:
-        print("%-13s ctx %-7d dir %-40s cached %d/%d" % (p["phase"], p["ctx"], p["dir"], p["cached"], p["prompt"]))
+        print("%-13s ctx %-7d dir %-40s cached %d/%d stored %d"
+              % (p["phase"], p["ctx"], p["dir"], p["cached"], p["prompt"], p["stored"]))
     print("server_check:", "PASS" if ok else "FAIL " + "; ".join(why))
     return 0 if ok else 1
 

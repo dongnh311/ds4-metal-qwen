@@ -1,6 +1,7 @@
 """Unit tests for server_check.py (python3 -m unittest, no model)."""
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -25,11 +26,25 @@ class CachedTest(unittest.TestCase):
         self.assertEqual(sc.cached({"usage": {"prompt_tokens": 7}}), (0, 7))
 
 
+class StoredEntriesTest(unittest.TestCase):
+    def test_counts_only_cache_files_in_the_root(self):
+        with tempfile.TemporaryDirectory() as d:
+            open(os.path.join(d, "a" * 40 + ".kv"), "w").close()
+            open(os.path.join(d, "notes.txt"), "w").close()
+            os.makedirs(os.path.join(d, "yarn-2"))
+            open(os.path.join(d, "yarn-2", "b" * 40 + ".kv"), "w").close()
+            self.assertEqual(sc.stored_entries(d), 1)
+            self.assertEqual(sc.stored_entries(os.path.join(d, "yarn-2")), 1)
+
+    def test_missing_dir_is_zero(self):
+        self.assertEqual(sc.stored_entries("/nonexistent/kv"), 0)
+
+
 class VerdictTest(unittest.TestCase):
     GOOD = [
-        {"phase": "262k-store", "ctx": 262144, "dir": None, "cached": 0, "prompt": 30000},
-        {"phase": "512k-cold", "ctx": 524288, "dir": "/kv/yarn-2", "cached": 0, "prompt": 30000},
-        {"phase": "512k-restore", "ctx": 524288, "dir": "/kv/yarn-2", "cached": 29900, "prompt": 30000},
+        {"phase": "262k-store", "ctx": 262144, "dir": None, "cached": 0, "prompt": 30000, "stored": 1},
+        {"phase": "512k-cold", "ctx": 524288, "dir": "/kv/yarn-2", "cached": 0, "prompt": 30000, "stored": 1},
+        {"phase": "512k-restore", "ctx": 524288, "dir": "/kv/yarn-2", "cached": 29900, "prompt": 30000, "stored": 1},
     ]
 
     def test_good(self):
@@ -46,6 +61,21 @@ class VerdictTest(unittest.TestCase):
         bad = [dict(p) for p in self.GOOD]
         bad[2]["cached"] = 0
         self.assertFalse(sc.verdict(bad)[0])
+
+    def test_store_phase_that_stored_nothing_fails(self):
+        bad = [dict(p) for p in self.GOOD]
+        bad[0]["stored"] = 0          # a cold 512K phase then proves nothing about the keying
+        ok, why = sc.verdict(bad)
+        self.assertFalse(ok)
+        self.assertIn("262k-store stored nothing", why[0])
+
+    def test_keyed_store_phase_fails(self):
+        bad = [dict(p) for p in self.GOOD]
+        bad[0]["dir"] = "/kv/yarn-1"  # factor 1 must write the unkeyed root
+        self.assertFalse(sc.verdict(bad)[0])
+
+    def test_missing_store_phase_fails(self):
+        self.assertFalse(sc.verdict(self.GOOD[1:])[0])
 
     def test_unkeyed_dir_fails(self):
         bad = [dict(p) for p in self.GOOD]
