@@ -207,6 +207,29 @@ class RunTest(unittest.TestCase):
             row = self.run_one(tmp, body, running=running)
             self.assertFalse(row["contaminated"])
 
+    def test_mid_run_foreign_beside_own_process_marks_contaminated(self):
+        # pgrep returns every ds4 line; a foreign one next to our own must count.
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "sleep 0.2\n" + self.csv_body()
+            csv_path = os.path.join(tmp, self.TAG + ".csv")
+            t0 = time.monotonic()
+
+            def running():
+                dt = time.monotonic() - t0
+                if dt < 0.01 or dt >= 0.18:
+                    return ""
+                return f"9 ds4-bench --csv {csv_path}\n12 ds4-server --metal -m /x.gguf"
+
+            row = self.run_one(tmp, body, running=running)
+            self.assertTrue(row["contaminated"])
+
+    def test_row_records_bin_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._run_with(tmp)
+            self.assertEqual(row["bin_id"], phase0.bin_identity(tmp))
+            self.assertEqual(row["bin_id"]["dir"], os.path.abspath(tmp))
+            self.assertIsNotNone(row["bin_id"]["bench_size"])
+
     def test_env_does_not_leak_stray_router_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["DS4_V41_ROUTER_LOG"] = "/should/not/be/used"
@@ -243,6 +266,51 @@ class RunTest(unittest.TestCase):
             self.assertFalse(os.path.exists(router_log))
             self.assertTrue(os.path.exists(router_log + ".failed"))
 
+
+    def _run_with(self, tmp, **kw):
+        os.makedirs(os.path.join(tmp, "prompts"), exist_ok=True)
+        open(os.path.join(tmp, "prompts", "switch.txt"), "w").close()
+        return phase0.run_one(fake_bin(tmp, self.csv_body()), "/m.gguf",
+                              os.path.join(tmp, "prompts"), tmp, self.SPEC,
+                              running=lambda: "", swap=lambda: 0.0,
+                              sampler=lambda: _FakeSampler(),
+                              idle_read=lambda: FREE_VM_STAT, idle_timeout=0.05,
+                              idle_interval=0.01, **kw)
+
+    def test_default_applies_profile_env_and_records_bin_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._run_with(tmp)
+            for key in phase0.ENV:
+                self.assertIn(key, row["ds4_env"])
+            self.assertEqual(row["bin_dir"], os.path.abspath(tmp))
+
+    def test_runs_binary_from_its_own_dir(self):
+        # Upstream builds read metal/*.metal relative to the CWD, so each
+        # binary must run from its own tree, not from the caller's.
+        with tempfile.TemporaryDirectory() as tmp:
+            body = 'pwd -P > cwd.txt\n' + self.csv_body()
+            os.makedirs(os.path.join(tmp, "prompts"), exist_ok=True)
+            open(os.path.join(tmp, "prompts", "switch.txt"), "w").close()
+            phase0.run_one(fake_bin(tmp, body), "/m.gguf", os.path.join(tmp, "prompts"), tmp,
+                           self.SPEC, running=lambda: "", swap=lambda: 0.0,
+                           sampler=lambda: _FakeSampler(), idle_read=lambda: FREE_VM_STAT,
+                           idle_timeout=0.05, idle_interval=0.01)
+            with open(os.path.join(tmp, "cwd.txt")) as fp:
+                self.assertEqual(fp.read().strip(), os.path.realpath(tmp))
+
+    def test_plain_strips_inherited_profile_env(self):
+        old = os.environ.get("DS4_METAL_GPU_BUSY_PROFILE")
+        os.environ["DS4_METAL_GPU_BUSY_PROFILE"] = "1"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                row = self._run_with(tmp, base_env={})
+        finally:
+            if old is None:
+                os.environ.pop("DS4_METAL_GPU_BUSY_PROFILE", None)
+            else:
+                os.environ["DS4_METAL_GPU_BUSY_PROFILE"] = old
+        for key in phase0.ENV:
+            self.assertNotIn(key, row["ds4_env"])
 
     def test_extra_env_and_tag_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:

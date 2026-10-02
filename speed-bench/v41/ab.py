@@ -33,6 +33,13 @@ def parse_env(items):
     return env
 
 
+def profile_mismatch(row_env, plain):
+    """True when a reused run's diagnostics env differs from the mode asked for
+    now: plain runs carry none of phase0.ENV, default runs carry all of it."""
+    present = [k for k in phase0.ENV if k in row_env]
+    return bool(present) if plain else len(present) != len(phase0.ENV)
+
+
 def _mean(rows, key):
     vals = [r[key] for r in rows if r.get(key) is not None]
     return statistics.fmean(vals) if vals else None
@@ -78,6 +85,10 @@ def main():
     ap.add_argument("--prompts", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--bin", default=phase0.ROOT)
+    ap.add_argument("--a-bin", default=None, help="A side ds4-bench dir (default: --bin)")
+    ap.add_argument("--b-bin", default=None, help="B side ds4-bench dir (default: --bin)")
+    ap.add_argument("--plain", action="store_true",
+                    help="run without the phase0 diagnostics env (fair across binaries)")
     ap.add_argument("--workload", default="switch")
     ap.add_argument("--ctx", type=int, default=8192)
     ap.add_argument("--gen", type=int, default=512)
@@ -91,16 +102,26 @@ def main():
     caches = {"a": _cache(args.a_cache)}
     caches["b"] = caches["a"] if args.b_cache is None else _cache(args.b_cache)
     envs = {"a": parse_env(args.a_env), "b": parse_env(args.b_env)}
+    bins = {"a": os.path.abspath(args.a_bin or args.bin),
+            "b": os.path.abspath(args.b_bin or args.bin)}
+    base_env = {} if args.plain else None
 
     def run(side, suffix):
         spec = (args.workload, args.ctx, caches[side], args.gen, False)
-        row = phase0.run_one(args.bin, args.model, args.prompts, out, spec,
-                             extra_env=envs[side], tag_suffix=suffix)
-        if row is None:   # finished earlier: reuse it, if it ran with this side's switches
+        row = phase0.run_one(bins[side], args.model, args.prompts, out, spec,
+                             extra_env=envs[side], tag_suffix=suffix, base_env=base_env)
+        if row is None:   # finished earlier: reuse it only if it ran the same way
             tag = phase0.run_tag(spec, suffix)
             with open(os.path.join(out, tag + ".result.json")) as fp:
                 row = json.load(fp)
-            stale = env_mismatch(row.get("ds4_env", {}), envs, side)
+            row_env = row.get("ds4_env", {})
+            stale = env_mismatch(row_env, envs, side)
+            if "bin_id" not in row:
+                stale.append("bin (not recorded)")
+            elif row["bin_id"] != phase0.bin_identity(bins[side]):
+                stale.append("bin")
+            if profile_mismatch(row_env, args.plain):
+                stale.append("profile env")
             if stale:
                 raise SystemExit(f"ab: {tag} was run with different {', '.join(stale)}; "
                                  "use a new --label or --out")
@@ -108,7 +129,8 @@ def main():
 
     result = run_ab(run, args.label)
     result.update({"a_env": envs["a"], "b_env": envs["b"], "a_cache": caches["a"],
-                   "b_cache": caches["b"], "ctx": args.ctx, "workload": args.workload})
+                   "b_cache": caches["b"], "ctx": args.ctx, "workload": args.workload,
+                   "a_bin": bins["a"], "b_bin": bins["b"], "plain": args.plain})
     path = os.path.join(out, f"ab-{args.label}.json")
     with open(path + ".tmp", "w") as fp:
         json.dump(result, fp, indent=1)

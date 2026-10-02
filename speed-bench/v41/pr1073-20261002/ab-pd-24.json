@@ -1,0 +1,50 @@
+{
+ "label": "pd-24",
+ "a_tps": 10.82,
+ "b_tps": 9.705,
+ "ratio": 0.8969500924214417,
+ "runs": {
+  "a": [
+   10.84,
+   10.8
+  ],
+  "b": [
+   9.74,
+   9.67
+  ]
+ },
+ "terms": {
+  "a": {
+   "step_ms": null,
+   "gpu_busy_ms": null,
+   "pread_ms": null,
+   "readahead_ms": null,
+   "host_ms": null,
+   "decode_hit_rate": null,
+   "wired_steady_gib": 29.70904541015625,
+   "la_issued_per_tok": null,
+   "la_used_per_tok": null
+  },
+  "b": {
+   "step_ms": null,
+   "gpu_busy_ms": null,
+   "pread_ms": null,
+   "readahead_ms": null,
+   "host_ms": null,
+   "decode_hit_rate": null,
+   "wired_steady_gib": 29.672718048095703,
+   "la_issued_per_tok": null,
+   "la_used_per_tok": null
+  }
+ },
+ "contaminated": false,
+ "a_env": {},
+ "b_env": {},
+ "a_cache": 24,
+ "b_cache": 24,
+ "ctx": 8192,
+ "workload": "switch",
+ "a_bin": "/Users/dongnh/orca/workspaces/ds4-metal/v41-arm-d",
+ "b_bin": "/Users/dongnh/orca/workspaces/ds4-metal/v41-arm-p",
+ "plain": true
+}

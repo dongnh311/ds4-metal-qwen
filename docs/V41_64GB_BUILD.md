@@ -48,6 +48,7 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
 
 ## 0. Status
 
+- **PR #1073 measured 2026-10-02:** D vs P 0.866 (auto cache), M vs P 1.127, 24 GB 0.897; output byte-identical. Decision: no integration — under `--ssd-streaming` the PR loses DSpark and its concurrent FFN, and our streaming pipeline is faster. Side finding: our 8K prefill at the auto cache is 2.3× slower than upstream with the same cache plan (114 vs 260-265 t/s). Open: the PR's +12.7 % over plain upstream under streaming was not profiled. Results: `speed-bench/v41/pr1073-20261002/RESULTS.md`.
 - **FROZEN 2026-09-25 (user decision).** Effort moves back to Qwen3.8-Flash-Next
   (PROD: 51.6 GiB, about 35-44 t/s, 256K context, zero swap).
   - **Final state:** `develop` `2a910dc`. Shipped defaults decode at 12.1 t/s

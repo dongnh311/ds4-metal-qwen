@@ -1,5 +1,7 @@
+import json
 import os
 import sys
+import tempfile
 import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "v41"))
@@ -56,6 +58,106 @@ class AbReuseTest(unittest.TestCase):
                         "z")
         self.assertIsNone(res["ratio"])
         self.assertIn("ratio n/a", ab.summary_line(res))
+
+
+class AbMainTest(unittest.TestCase):
+    def _main(self, argv, fake):
+        old_argv, old_run = sys.argv, ab.phase0.run_one
+        sys.argv = ["ab.py", "--label", "x", "--model", "/m", "--prompts", "/p"] + argv
+        ab.phase0.run_one = fake
+        try:
+            return ab.main()
+        finally:
+            sys.argv, ab.phase0.run_one = old_argv, old_run
+
+    def test_per_side_bins_and_plain(self):
+        calls = []
+
+        def fake(bin_dir, model, prompts, out, spec, extra_env=None, tag_suffix="", base_env=None):
+            calls.append((bin_dir, base_env))
+            return row(10.0 if bin_dir == "/bins/a" else 12.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._main(["--out", tmp, "--a-bin", "/bins/a", "--b-bin", "/bins/b", "--plain"], fake)
+            with open(os.path.join(tmp, "ab-x.json")) as fp:
+                res = json.load(fp)
+        self.assertEqual([c[0] for c in calls], ["/bins/a", "/bins/b", "/bins/b", "/bins/a"])
+        self.assertTrue(all(c[1] == {} for c in calls))
+        self.assertAlmostEqual(res["ratio"], 1.2)
+        self.assertEqual((res["a_bin"], res["b_bin"], res["plain"]), ("/bins/a", "/bins/b", True))
+
+    def test_default_one_bin_with_profile_env(self):
+        calls = []
+
+        def fake(bin_dir, model, prompts, out, spec, extra_env=None, tag_suffix="", base_env=None):
+            calls.append((bin_dir, base_env))
+            return row(10.0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._main(["--out", tmp, "--bin", "/bins/one"], fake)
+        self.assertEqual({c[0] for c in calls}, {"/bins/one"})
+        self.assertTrue(all(c[1] is None for c in calls))
+
+    def _write_done(self, out, bin_dir, ds4_env, bin_id=None):
+        spec = ("switch", 8192, None, 512, False)   # ab defaults with --a-cache auto
+        path = os.path.join(out, ab.phase0.run_tag(spec, "-x-0a") + ".result.json")
+        extra = {} if bin_id is None else {"bin_id": bin_id}
+        with open(path, "w") as fp:
+            json.dump(dict(row(10.0), bin_dir=bin_dir, ds4_env=ds4_env, **extra), fp)
+
+    def _bin_dir(self, tmp, body="#!/bin/sh\n"):
+        d = os.path.join(tmp, "bin")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "ds4-bench"), "w") as fp:
+            fp.write(body)
+        return d
+
+    def test_reuse_refuses_rebuilt_bin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._bin_dir(tmp)
+            self._write_done(tmp, d, {}, bin_id=ab.phase0.bin_identity(d))
+            self._bin_dir(tmp, "#!/bin/sh\n# rebuilt, different size\n")
+            with self.assertRaises(SystemExit) as cm:
+                self._main(["--out", tmp, "--a-cache", "auto", "--bin", d, "--plain"],
+                           lambda *a, **k: None)
+        self.assertIn("bin", str(cm.exception))
+
+    def test_reuse_accepts_matching_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._bin_dir(tmp)
+            self._write_done(tmp, d, {}, bin_id=ab.phase0.bin_identity(d))
+
+            def fake(bin_dir, model, prompts, out, spec, extra_env=None, tag_suffix="", base_env=None):
+                return None if tag_suffix == "-x-0a" else row(12.0)
+
+            self._main(["--out", tmp, "--a-cache", "auto", "--bin", d, "--plain"], fake)
+            with open(os.path.join(tmp, "ab-x.json")) as fp:
+                res = json.load(fp)
+        self.assertEqual(res["runs"]["a"], [10.0, 12.0])
+
+    def test_reuse_refuses_other_bin(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_done(tmp, "/bins/old", {})
+            with self.assertRaises(SystemExit) as cm:
+                self._main(["--out", tmp, "--a-cache", "auto", "--a-bin", "/bins/a",
+                            "--b-bin", "/bins/b", "--plain"], lambda *a, **k: None)
+        self.assertIn("bin", str(cm.exception))
+
+    def test_reuse_refuses_profile_mode_change(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_done(tmp, "/bins/a", dict(ab.phase0.ENV),
+                             bin_id=ab.phase0.bin_identity("/bins/a"))
+            with self.assertRaises(SystemExit) as cm:
+                self._main(["--out", tmp, "--a-cache", "auto", "--a-bin", "/bins/a",
+                            "--b-bin", "/bins/b", "--plain"], lambda *a, **k: None)
+        self.assertIn("profile env", str(cm.exception))
+
+    def test_profile_mismatch(self):
+        full = dict(ab.phase0.ENV)
+        self.assertFalse(ab.profile_mismatch({}, True))
+        self.assertTrue(ab.profile_mismatch(full, True))
+        self.assertFalse(ab.profile_mismatch(full, False))
+        self.assertTrue(ab.profile_mismatch({}, False))
 
 
 if __name__ == "__main__":
