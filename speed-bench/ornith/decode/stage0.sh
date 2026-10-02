@@ -6,10 +6,10 @@ unset DS4_QWEN4_YARN_FACTOR DS4_QWEN35_PROFILE DS4_QWEN35_SPEC_STATS DS4_QWEN35_
 ok=1
 cli() {   # cli NAME PROMPTFILE ENV... -- ARGS...
     local name=$1 pf=$2; shift 2
-    local envs=()
+    local envs=()   # bash 3.2 + set -u: an empty array must expand as ${envs[@]+...}
     while [ $# -gt 0 ] && [ "$1" != "--" ]; do envs+=("$1"); shift; done
     shift
-    run_to "$name" 1800 env "${envs[@]}" ./ds4 -m "$ORNITH" --metal -c 262144 --prefill-chunk 2048 \
+    run_to "$name" 1800 env ${envs[@]+"${envs[@]}"} ./ds4 -m "$ORNITH" --metal -c 262144 --prefill-chunk 2048 \
         --prompt-file "$pf" -n 256 "$@" || ok=0
 }
 for c in 2k:7000 32k:112000 128k:450000; do
