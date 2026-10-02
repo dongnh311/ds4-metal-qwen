@@ -52882,6 +52882,7 @@ static int g_qgate_glm_ready;
 static struct {
     int published;                 /* publish encoded, commit pending */
     int committed;                 /* committed, routed MoE not encoded yet */
+    int queued;                    /* a gate reached the service since the last end_commands */
     uint64_t seq;
     int split;
     uint32_t n_selected;
@@ -52901,6 +52902,26 @@ void ds4_gpu_stream_gate_test_stall(uint64_t nth, uint32_t ms) {
     __atomic_store_n(&g_qgate_test_stall_seq, nth ? g_qgate_seq + nth : 0, __ATOMIC_RELEASE);
 }
 
+static uint64_t g_qgate_test_post_stall_seq;   /* gate whose service lingers after its release */
+static uint32_t g_qgate_test_post_stall_ms;
+
+static void qgate_test_post_stall_maybe(uint64_t seq) {
+    const uint64_t at = __atomic_load_n(&g_qgate_test_post_stall_seq, __ATOMIC_ACQUIRE);
+    if (at && seq == at) usleep((useconds_t)g_qgate_test_post_stall_ms * 1000u);
+}
+
+void ds4_gpu_stream_gate_test_stall_after_release(uint64_t nth, uint32_t ms) {
+    g_qgate_test_post_stall_ms = ms;
+    __atomic_store_n(&g_qgate_test_post_stall_seq, nth ? g_qgate_seq + nth : 0, __ATOMIC_RELEASE);
+}
+
+int ds4_gpu_stream_gate_test_service_busy(void) {
+    pthread_mutex_lock(&g_qgate_mutex);
+    const uint32_t pending = g_qgate_queue_count;
+    pthread_mutex_unlock(&g_qgate_mutex);
+    return pending != 0;
+}
+
 void ds4_gpu_stream_gate_test_clear_failure(void) {
     if (g_qgate_thread_running) qgate_wait_idle();
     g_qgate_failed = 0;
@@ -52915,6 +52936,10 @@ static int glm_gate_requested(void) {
         v = !(e && e[0] == '0');
     }
     return v;
+}
+
+int ds4_gpu_glm_stream_gate_requested(void) {
+    return glm_gate_requested();
 }
 
 /* Split gates (DS4_GLM_STREAM_SPLIT=0 keeps one pass): the GPU runs the
@@ -53482,6 +53507,7 @@ static void qgate_service(const qgate_req *r) {
         if (r->staged) qgate_release_lines(2u * QGATE_RING + ring, (uint32_t)r->seq, QGATE_RELEASE_HEAD, QGATE_POLL_LINES);
     }
     g_qgate_stat_release_ms += ds4_gpu_now_ms() - tl0;
+    qgate_test_post_stall_maybe(r->seq);
     if (r->split && ok && !g_qgate_failed) {
         /* The cache's bookkeeping for this gate, after both releases. A gate
          * without misses counts its hits here (load_batch finds every id). */
@@ -53633,6 +53659,7 @@ static void glm_gate_service(const qgate_req *r) {
     if (r->split) qgate_release_lines(QGATE_RING + ring, (uint32_t)r->seq, 0, QGATE_RELEASE_HEAD);
     qgate_release_lines(ring, (uint32_t)r->seq, QGATE_RELEASE_HEAD, QGATE_POLL_LINES);
     if (r->split) qgate_release_lines(QGATE_RING + ring, (uint32_t)r->seq, QGATE_RELEASE_HEAD, QGATE_POLL_LINES);
+    qgate_test_post_stall_maybe(r->seq);
     if (ok && !g_qgate_failed) {
         if (r->split && n_miss == 0) {
             /* Count the hits and refresh their recency, as load_batch does. */
@@ -53755,7 +53782,12 @@ static int qgate_check_after_wait(void) {
     g_qgate_glm.published = 0;
     g_qgate_glm.committed = 0;
     if (!g_qgate_thread_running) return 1;
-    qgate_wait_idle();
+    /* GLM: the service's bookkeeping after a release must end before the main
+     * thread uses the cache again. qwen4 keeps its PROD behaviour: no wait. */
+    if (g_qgate_glm.queued) {
+        qgate_wait_idle();
+        g_qgate_glm.queued = 0;
+    }
     if (g_qgate_last_seq != 0 && !g_qgate_failed) {
         const uint32_t last = (uint32_t)(g_qgate_last_seq % QGATE_RING);
         if (qgate_status_timed_out(last) ||
@@ -53963,10 +53995,22 @@ static int glm_gate_setup(uint64_t slot_bytes) {
     return 1;
 }
 
+/* The routed MoE reads a gate's tables only on its fused IQ2 address-table
+ * path (fuse_pair_swiglu and use_iq2_stream_addr_table in
+ * ds4_gpu_routed_moe_one_tensor); these switches turn that path off, and a
+ * gate nobody takes would read experts for nothing and hold off the next. */
+static int glm_gate_routed_tables_used(void) {
+    return !g_quality_mode &&
+           getenv("DS4_METAL_MOE_WRITE_CLAMPED_ACT") == NULL &&
+           getenv("DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION") == NULL &&
+           getenv("DS4_METAL_DISABLE_IQ2_STREAM_ADDR_TABLE") == NULL;
+}
+
 int ds4_gpu_glm_stream_gate_publish(const ds4_gpu_stream_expert_table *table,
                                     const ds4_gpu_tensor *selected, uint32_t n_selected) {
     if (!table || !selected || g_qgate_glm.published || g_qgate_glm.committed ||
         !g_ssd_streaming_mode || !glm_gate_requested() || g_qgate_failed || !g_batch_cb ||
+        !glm_gate_routed_tables_used() ||
         g_tp_split_world > 1 ||
         n_selected == 0 || n_selected > QGATE_GLM_FALLBACK_SLOTS ||
         table->layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER ||
@@ -54010,6 +54054,7 @@ int ds4_gpu_glm_stream_gate_commit(void) {
         .layer = t->layer, .n_sel = g_qgate_glm.n_selected, .n_total_expert = t->n_total_expert,
         .n_slabs = g_stream_expert_cache_slab_count, .split = split, .staged = 0,
     };
+    g_qgate_glm.queued = 1;
     if (!qgate_commit(g_qgate_glm.seq, &req)) return 0;
     g_qgate_glm.committed = 1;
     g_qgate_glm.split = split;

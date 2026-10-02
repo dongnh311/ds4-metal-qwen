@@ -50479,6 +50479,14 @@ static int glm_graph_routed_moe_batch_dispatch(
 
 static bool glm_graph_disable_add3_residual(void);
 
+/* SP1 decode gates: a stage-profiled layer ends its batch between publish
+ * and commit, which would drop the published gate. */
+static bool glm_graph_stream_gate_layer_allowed(bool token_gated,
+                                                bool generic_streaming_selected_cache,
+                                                bool stage_profile) {
+    return token_gated && generic_streaming_selected_cache && !stage_profile;
+}
+
 static bool glm_graph_use_streaming_selected_async_load(
         const ds4_glm_gpu_graph *g) {
     if (!g || !g->ssd_streaming) return false;
@@ -50494,6 +50502,11 @@ static bool glm_graph_use_streaming_selected_async_load(
      * 8.98 t/s with the worker vs 9.43 t/s synchronous (2026-10-01). */
 #ifdef DS4_ROCM_BUILD
     return true;
+#elif defined(__APPLE__)
+    /* SP1 decode gates supersede it: the gate service thread and the worker
+     * would both register as the cache's single service thread. */
+    return getenv("DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD") != NULL &&
+           !ds4_gpu_glm_stream_gate_requested();
 #else
     return getenv("DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD") != NULL;
 #endif
@@ -50790,8 +50803,9 @@ static bool glm_graph_encode_sparse_ffn_one(
 #if defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
         /* SP1 decode gates: publish the selection now and commit after the
          * shared expert; the routed MoE below reads the gate's tables. */
-        gate_published = g->stream_gate_token &&
-                         generic_streaming_selected_cache &&
+        gate_published = glm_graph_stream_gate_layer_allowed(g->stream_gate_token,
+                                                             generic_streaming_selected_cache,
+                                                             stage_profile) &&
                          ds4_gpu_glm_stream_gate_publish(&table,
                                                          g->router_selected,
                                                          DS4_N_EXPERT_USED) != 0;
@@ -57328,15 +57342,18 @@ static bool glm_graph_streaming_decode_sync_each_layer(void) {
 }
 
 /* SP1 decode gates (Metal): a gated token is encoded without waiting, so all
- * its weights must be mapped before encoding starts (the static decode map)
- * and no diagnostic may read the routed selection on the host mid-token. */
+ * its weights must be mapped before encoding starts (the static decode map),
+ * no diagnostic may read the routed selection on the host mid-token, and the
+ * token must end with a wait: only a logits token does, and without it the
+ * next token's id write would race this token's embedding. */
 static bool glm_graph_stream_gate_token_allowed(bool     static_decode_map,
                                                 bool     imatrix,
                                                 bool     expert_profile,
                                                 uint32_t ablate_mask,
-                                                bool     async_profile) {
+                                                bool     async_profile,
+                                                bool     has_logits) {
     return static_decode_map && !imatrix && !expert_profile &&
-           ablate_mask == 0 && !async_profile;
+           ablate_mask == 0 && !async_profile && has_logits;
 }
 
 static bool glm_graph_forward_token(
@@ -57451,7 +57468,8 @@ static bool glm_graph_forward_token(
                                             g->imatrix != NULL,
                                             g_expert_profile.active,
                                             glm_decode_ablate_mask(),
-                                            glm_graph_streaming_async_profile_enabled());
+                                            glm_graph_streaming_async_profile_enabled(),
+                                            logits_out != NULL);
     bool ok = true;
     if (!input_hc && g->glm53) {
         const int32_t token_id = (int32_t)token;

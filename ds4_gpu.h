@@ -447,12 +447,20 @@ int ds4_gpu_glm_stream_gate_publish(const ds4_gpu_stream_expert_table *table,
                                     const ds4_gpu_tensor *selected,
                                     uint32_t n_selected);
 int ds4_gpu_glm_stream_gate_commit(void);
+/* 1 unless DS4_GLM_STREAM_GATE=0: gates then supersede the async
+ * selected-load worker (both would be the cache's service thread). */
+int ds4_gpu_glm_stream_gate_requested(void);
 /* Tests: resolve every gated expert through the fallback buffer. */
 void ds4_gpu_stream_gate_test_force_fallback(int on);
 /* Tests: the service thread holds the nth gate published from now for ms
  * milliseconds before releasing it (0 clears); clear a latched failure. */
 void ds4_gpu_stream_gate_test_stall(uint64_t nth, uint32_t ms);
 void ds4_gpu_stream_gate_test_clear_failure(void);
+/* Tests: the service thread lingers ms milliseconds after releasing the nth
+ * gate published from now (0 clears); busy: a queued gate is still in
+ * service, read without waiting. */
+void ds4_gpu_stream_gate_test_stall_after_release(uint64_t nth, uint32_t ms);
+int ds4_gpu_stream_gate_test_service_busy(void);
 #endif
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(

@@ -169,6 +169,28 @@ static int compare_modes(const char *name, layer_fn fn, int split, uint64_t *gat
     return ok;
 }
 
+/* end_commands after a step whose last gate keeps the service thread busy
+ * past its release: qwen4 returns at once (PROD unchanged), GLM waits so the
+ * cache is the main thread's again. */
+static int check_end_wait(const char *name, layer_fn fn, int split, int want_wait) {
+    ds4_gpu_stream_gate_test_set_mode(1, split);
+    int ok = write_routes(0) && run_step(fn, 1, got);
+    ds4_gpu_stream_gate_test_stall_after_release(LAYERS, 300);
+    ok = ok && write_routes(1) && run_step(fn, 1, got);
+    const int busy = ds4_gpu_stream_gate_test_service_busy();
+    ds4_gpu_stream_gate_test_stall_after_release(0, 0);
+    int failed = 0;
+    ds4_gpu_stream_gate_stats(NULL, NULL, NULL, &failed);   /* waits for the service */
+    ds4_gpu_stream_gate_test_set_mode(0, split);
+    if (ok && (failed || busy == want_wait)) {
+        fprintf(stderr, "%s: end_commands %s the busy service thread (failed %d)\n", name,
+                want_wait ? "did not wait for" : "waited for", failed);
+        ok = 0;
+    }
+    fprintf(stderr, "%s: %s\n", name, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static int qwen4_layer(int layer, int gated) {
     (void)gated;   /* ds4_gpu_stream_gate_test_set_mode picks the path */
     return ds4_gpu_qwen4_moe_stream_layer(
@@ -186,6 +208,7 @@ static int qwen4_suite(void) {
         fprintf(stderr, "qwen4 split: no split gate ran\n");
         ok = 0;
     }
+    ok = ok && check_end_wait("qwen4 end without service wait", qwen4_layer, 1, 0);
     return ok;
 }
 
@@ -227,6 +250,41 @@ static int check_uncommitted_publish(int split) {
     return ok;
 }
 
+/* Switches that keep the routed MoE off the gate's tables (--quality, the
+ * fusion and address-table disables, clamped activations) must refuse the
+ * publish: a committed gate nobody takes reads experts for nothing and holds
+ * off the next layer's gate. */
+static int check_routed_switches(int split) {
+    static const char *const envs[] = {
+        "DS4_METAL_DISABLE_IQ2_STREAM_ADDR_TABLE", "DS4_METAL_DISABLE_ROUTED_PAIR_SWIGLU_FUSION",
+        "DS4_METAL_MOE_WRITE_CLAMPED_ACT", NULL /* --quality */,
+    };
+    int ok = 1;
+    for (int i = 0; ok && i < 4; i++) {
+        const char *what = envs[i] ? envs[i] : "quality";
+        uint64_t c0 = 0, c1 = 0;
+        int failed = 0;
+        if (envs[i]) setenv(envs[i], "1", 1);
+        else ds4_gpu_set_quality(true);
+        ds4_gpu_stream_gate_stats(&c0, NULL, NULL, &failed);
+        ok = write_routes(STEPS + 1);
+        ds4_gpu_stream_gate_test_set_mode(1, split);
+        ok = ok && run_step(glm_layer, 1, got);
+        ds4_gpu_stream_gate_test_set_mode(0, split);
+        ok = ok && run_step(glm_layer, 0, ref) && same_outputs(what, STEPS + 1);
+        ds4_gpu_stream_gate_stats(&c1, NULL, NULL, &failed);
+        if (envs[i]) unsetenv(envs[i]);
+        else ds4_gpu_set_quality(false);
+        if (ok && (c1 != c0 || failed)) {
+            fprintf(stderr, "glm %s: %llu gates committed (failed %d)\n", what,
+                    (unsigned long long)(c1 - c0), failed);
+            ok = 0;
+        }
+    }
+    fprintf(stderr, "glm routed switches: %s\n", ok ? "PASS" : "FAIL");
+    return ok;
+}
+
 static int glm_suite(int split) {
     const char *tag = split ? "glm split" : "glm one pass";
     char name[64];
@@ -254,6 +312,9 @@ static int glm_suite(int split) {
         ok = 0;
     }
     ok = ok && check_uncommitted_publish(split);
+    ok = ok && check_routed_switches(split);
+    ok = ok && check_end_wait(split ? "glm split end waits for the service" :
+                                      "glm end waits for the service", glm_layer, split, 1);
     /* A larger budget adds a slab: gates pause until it exists, then resume. */
     snprintf(name, sizeof(name), "%s budget growth", tag);
     ds4_gpu_set_streaming_expert_cache_budget(BUDGET + 16);
