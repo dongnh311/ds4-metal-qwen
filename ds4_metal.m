@@ -14434,10 +14434,10 @@ static uint64_t ds4_gpu_stream_expert_slab_target_bytes(void) {
 }
 
 /* qwen4 and GLM stream gates make every slab resident for each gated dispatch
- * and only start once all slabs exist: one slab for the whole budget lets them
- * start at the first decode miss instead of after the cache has filled its
- * first 4 GiB slab. Other models keep the target: one 28.5 GiB slab cut V4.1
- * prefill at the auto cache from 239 to 108 t/s (8K, M5 Pro 64 GB). */
+ * and only start once slabs for the whole budget exist: one slab lets them
+ * start at the first decode miss instead of after misses have allocated every
+ * 4 GiB slab. Other models keep the target: one 28.5 GiB slab cut V4.1 prefill
+ * at the auto cache from 255 to 112 t/s (8K, M5 Pro 64 GB). */
 static int ds4_gpu_stream_expert_one_slab(void) {
     if (getenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB") != NULL) return 0;
     if (g_glm_model_mode) return glm_gate_requested();
