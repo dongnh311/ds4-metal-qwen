@@ -244,6 +244,37 @@ class RunTest(unittest.TestCase):
             self.assertTrue(os.path.exists(router_log + ".failed"))
 
 
+    def _run_with(self, tmp, **kw):
+        os.makedirs(os.path.join(tmp, "prompts"), exist_ok=True)
+        open(os.path.join(tmp, "prompts", "switch.txt"), "w").close()
+        return phase0.run_one(fake_bin(tmp, self.csv_body()), "/m.gguf",
+                              os.path.join(tmp, "prompts"), tmp, self.SPEC,
+                              running=lambda: "", swap=lambda: 0.0,
+                              sampler=lambda: _FakeSampler(),
+                              idle_read=lambda: FREE_VM_STAT, idle_timeout=0.05,
+                              idle_interval=0.01, **kw)
+
+    def test_default_applies_profile_env_and_records_bin_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._run_with(tmp)
+            for key in phase0.ENV:
+                self.assertIn(key, row["ds4_env"])
+            self.assertEqual(row["bin_dir"], os.path.abspath(tmp))
+
+    def test_plain_strips_inherited_profile_env(self):
+        old = os.environ.get("DS4_METAL_GPU_BUSY_PROFILE")
+        os.environ["DS4_METAL_GPU_BUSY_PROFILE"] = "1"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                row = self._run_with(tmp, base_env={})
+        finally:
+            if old is None:
+                os.environ.pop("DS4_METAL_GPU_BUSY_PROFILE", None)
+            else:
+                os.environ["DS4_METAL_GPU_BUSY_PROFILE"] = old
+        for key in phase0.ENV:
+            self.assertNotIn(key, row["ds4_env"])
+
     def test_extra_env_and_tag_suffix(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "prompts"), exist_ok=True)

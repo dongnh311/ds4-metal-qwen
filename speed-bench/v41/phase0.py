@@ -166,7 +166,8 @@ def _fail_router_log(router_log):
 def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
             running=machine.ds4_running, swap=machine.swap_used_mib,
             sampler=wired.WiredSampler, idle_read=None,
-            idle_timeout=wired.IDLE_SETTLE_S, idle_interval=2.0, extra_env=None, tag_suffix=""):
+            idle_timeout=wired.IDLE_SETTLE_S, idle_interval=2.0, extra_env=None, tag_suffix="",
+            base_env=None):
     workload, ctx, gb, gen, log_router = spec
     tag = run_tag(spec, tag_suffix)
     result_path = os.path.join(out_dir, tag + ".result.json")
@@ -188,7 +189,12 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
         raise SystemExit(f"phase0: {idle:.1f} GiB wired before the run; the machine is not idle")
     env = dict(os.environ)
     env.pop("DS4_V41_ROUTER_LOG", None)
-    env.update(ENV)
+    if base_env is None:
+        env.update(ENV)
+    else:   # plain: no diagnostics, not even ones inherited from the caller's shell
+        for key in ENV:
+            env.pop(key, None)
+        env.update(base_env)
     env.update(extra_env or {})
     if router_log:
         env["DS4_V41_ROUTER_LOG"] = router_log
@@ -242,6 +248,7 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     row["router_log"] = router_log
     row["wired_idle_gib"] = idle
     row["ds4_env"] = {k: v for k, v in env.items() if k.startswith("DS4_")}
+    row["bin_dir"] = os.path.abspath(bin_dir)
     ra = parse_readahead(stderr)
     if ra is not None and row.get("host_gap_ms") is not None and gen > 0:
         row["readahead_ms"] = ra / gen
