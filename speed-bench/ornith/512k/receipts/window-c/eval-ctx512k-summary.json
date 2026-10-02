@@ -1,0 +1,483 @@
+{
+  "target": "http://127.0.0.1:18296",
+  "model": "qwen3.8-flash-coder-26gb-q4_k_m",
+  "ts": 1790917015.838815,
+  "benchmarks": {
+    "humaneval": {
+      "n": 17,
+      "passed": 17,
+      "pass_rate": 1.0,
+      "graded": 17,
+      "truncated": 0,
+      "errored": 0,
+      "ungradable_rate": 0.0,
+      "cases": [
+        {
+          "id": "HE/add",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.4,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 88
+        },
+        {
+          "id": "HE/strlen",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 77
+        },
+        {
+          "id": "HE/gcd",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.3,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 115
+        },
+        {
+          "id": "HE/is_prime",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.2,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 207
+        },
+        {
+          "id": "HE/truncate_number",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.3,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 104
+        },
+        {
+          "id": "HE/below_zero",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.7,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 158
+        },
+        {
+          "id": "HE/largest_divisor",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.4,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 203
+        },
+        {
+          "id": "HE/string_xor",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 3.3,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 319
+        },
+        {
+          "id": "HE/rolling_max",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.9,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 175
+        },
+        {
+          "id": "HE/all_prefixes",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 0.9,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 67
+        },
+        {
+          "id": "HE/filter_by_substring",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 1.5,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 134
+        },
+        {
+          "id": "HE/longest",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 0.9,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 73
+        },
+        {
+          "id": "HE/count_distinct_characters",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 0.7,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 41
+        },
+        {
+          "id": "HE/triples_sum_to_zero",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.3,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 210
+        },
+        {
+          "id": "HE/has_close_elements",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.3,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 204
+        },
+        {
+          "id": "HE/separate_paren_groups",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 4.5,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 446
+        },
+        {
+          "id": "HE/sort_even",
+          "passed": true,
+          "detail": "PASS",
+          "latency": 2.5,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 226
+        }
+      ]
+    },
+    "gsm8k": {
+      "n": 16,
+      "passed": 16,
+      "pass_rate": 1.0,
+      "graded": 16,
+      "truncated": 0,
+      "errored": 0,
+      "ungradable_rate": 0.0,
+      "cases": [
+        {
+          "id": "gsm/0",
+          "passed": true,
+          "detail": "got=72 gold=72",
+          "latency": 1.2,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 105
+        },
+        {
+          "id": "gsm/1",
+          "passed": true,
+          "detail": "got=10 gold=10",
+          "latency": 1.4,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 125
+        },
+        {
+          "id": "gsm/2",
+          "passed": true,
+          "detail": "got=5 gold=5",
+          "latency": 1.7,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 147
+        },
+        {
+          "id": "gsm/3",
+          "passed": true,
+          "detail": "got=3 gold=3",
+          "latency": 0.9,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 69
+        },
+        {
+          "id": "gsm/4",
+          "passed": true,
+          "detail": "got=624 gold=624",
+          "latency": 1.3,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 113
+        },
+        {
+          "id": "gsm/5",
+          "passed": true,
+          "detail": "got=42 gold=42",
+          "latency": 1.6,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 144
+        },
+        {
+          "id": "gsm/6",
+          "passed": true,
+          "detail": "got=18 gold=18",
+          "latency": 0.9,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 72
+        },
+        {
+          "id": "gsm/7",
+          "passed": true,
+          "detail": "got=105 gold=105",
+          "latency": 1.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 82
+        },
+        {
+          "id": "gsm/8",
+          "passed": true,
+          "detail": "got=5 gold=5",
+          "latency": 0.9,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 68
+        },
+        {
+          "id": "gsm/9",
+          "passed": true,
+          "detail": "got=150 gold=150",
+          "latency": 0.8,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 54
+        },
+        {
+          "id": "gsm/10",
+          "passed": true,
+          "detail": "got=336 gold=336",
+          "latency": 1.0,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 78
+        },
+        {
+          "id": "gsm/11",
+          "passed": true,
+          "detail": "got=26 gold=26",
+          "latency": 1.1,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 96
+        },
+        {
+          "id": "gsm/12",
+          "passed": true,
+          "detail": "got=3 gold=3",
+          "latency": 0.6,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 42
+        },
+        {
+          "id": "gsm/13",
+          "passed": true,
+          "detail": "got=9 gold=9",
+          "latency": 1.4,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 127
+        },
+        {
+          "id": "gsm/14",
+          "passed": true,
+          "detail": "got=20 gold=20",
+          "latency": 1.2,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 93
+        },
+        {
+          "id": "gsm/15",
+          "passed": true,
+          "detail": "got=40 gold=40",
+          "latency": 1.7,
+          "outcome": "pass",
+          "finish_reason": "stop",
+          "completion_tokens": 144
+        }
+      ]
+    }
+  },
+  "code_bench": {
+    "model": "",
+    "fix_bug": {
+      "factorial": {
+        "passed": true,
+        "detail": "PASS",
+        "answer": "def factorial(n):\n    r = 1\n    for i in range(1, n + 1):\n        r *= i\n    return r",
+        "completion_tokens": 38,
+        "finish_reason": "stop"
+      },
+      "dedupe": {
+        "passed": true,
+        "detail": "PASS",
+        "answer": "def dedupe(xs):\n    seen = set()\n    result = []\n    for x in xs:\n        if x not in seen:\n            seen.add(x)\n            result.append(x)\n    return result",
+        "completion_tokens": 52,
+        "finish_reason": "stop"
+      },
+      "clamp": {
+        "passed": true,
+        "detail": "PASS",
+        "answer": "def clamp(x, lo, hi):\n    if x < lo:\n        return lo\n    if x > hi:\n        return hi\n    return x",
+        "completion_tokens": 39,
+        "finish_reason": "stop"
+      }
+    },
+    "generate_testcase": {
+      "slugify": {
+        "passed": false,
+        "detail": "FAIL: over-constrained rc=1 6m/7tbx3cw94z1gc63lwcqv_0lm0000gn/T/tmphq2ywvb5/m.py\", line ",
+        "catches_bug": true,
+        "valid_on_fix": false,
+        "answer": "def test():\n    assert slugify(' Hi  There ') == 'hi-there'\n    assert slugify('Hello, World!') == 'hello-world'\n    assert slugify('  Leading and trailing  ') == 'leading-and-trailing'\n    assert slugify('Multiple   Spaces   Here') == 'multiple-spaces-here'\n    assert slugify('UPPERCASE') == 'uppercase'\n    assert slugify('MixedCase') == 'mixedcase'\n    assert slugify('') == ''\n    assert slugify('   ') == ''\n    assert slugify('Tab\\tAnd\\nNewline') == 'tab-and-newline'\n    assert slugify('a') == 'a'\n    assert slugify('with-dash') == 'with-dash'\n    assert slugify('Numbers 123 Test') == 'numbers-123-test'",
+        "completion_tokens": 196,
+        "finish_reason": "stop"
+      },
+      "chunk": {
+        "passed": false,
+        "detail": "FAIL: over-constrained rc=1 chunk([1, 2, 3, 4], 0) == []\n           ^^^^^^^^^^^^^^^^^^^^",
+        "catches_bug": true,
+        "valid_on_fix": false,
+        "answer": "def test():\n    assert chunk([1, 2, 3, 4, 5], 2) == [[1, 2], [3, 4], [5]]\n    assert chunk([1, 2, 3, 4, 5, 6], 2) == [[1, 2], [3, 4], [5, 6]]\n    assert chunk([1, 2, 3, 4, 5], 3) == [[1, 2, 3], [4, 5]]\n    assert chunk([], 2) == []\n    assert chunk([1], 2) == [[1]]\n    assert chunk([1, 2, 3, 4, 5], 5) == [[1, 2, 3, 4, 5]]\n    assert chunk([1, 2, 3, 4, 5], 6) == [[1, 2, 3, 4, 5]]\n    assert chunk([1, 2, 3, 4, 5], 1) == [[1], [2], [3], [4], [5]]\n    assert chunk([1, 2, 3, 4], 0) == []\n    assert chunk([1, 2, 3, 4, 5, 6, 7], 2) == [[1, 2], [3, 4], [5, 6], [7]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 4) == [[1, 2, 3, 4], [5, 6, 7, 8], [9, 10]]\n    assert chunk([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], 3) == [[1, 2, 3], [4, 5, 6], [7, 8, 9], [10]]",
+        "completion_tokens": 477,
+        "finish_reason": "stop"
+      },
+      "median": {
+        "passed": false,
+        "detail": "FAIL: over-constrained rc=1 ost recent call last):\n  File \"/var/folders/6m/7tbx3cw94z1gc",
+        "catches_bug": true,
+        "valid_on_fix": false,
+        "answer": "def test():\n    assert median([1, 3, 2]) == 2\n    assert median([1, 2, 3, 4]) == 2.5\n    assert median([5]) == 5\n    assert median([2, 1]) == 2\n    assert median([3, 1, 2, 5, 4]) == 3\n    assert median([1, 2, 3, 4, 5, 6]) == 3.5\n    assert median([10, -1, 5, 0, 3]) == 5",
+        "completion_tokens": 140,
+        "finish_reason": "stop"
+      }
+    },
+    "refactor": {
+      "letter_grade": {
+        "passed": true,
+        "behaves": true,
+        "improved": true,
+        "expected": "flatten the nested if/else chain (block nesting <= 3; the given code is 4)",
+        "detail": "PASS",
+        "answer": "def letter_grade(s):\n    if s >= 90:\n        return 'A'\n    if s >= 80:\n        return 'B'\n    if s >= 70:\n        return 'C'\n    return 'F'",
+        "completion_tokens": 61,
+        "finish_reason": "stop"
+      },
+      "count_true": {
+        "passed": true,
+        "behaves": true,
+        "improved": true,
+        "expected": "drop the dead `else` branch (no `n = n` self-assignment left)",
+        "detail": "PASS",
+        "answer": "def count_true(flags):\n    return sum(1 for f in flags if f)",
+        "completion_tokens": 23,
+        "finish_reason": "stop"
+      },
+      "is_leap": {
+        "passed": true,
+        "behaves": true,
+        "improved": true,
+        "expected": "flatten the nested if/else chain (block nesting <= 3; the given code is 4)",
+        "detail": "PASS",
+        "answer": "def is_leap(y):\n    return y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)",
+        "completion_tokens": 43,
+        "finish_reason": "stop"
+      }
+    },
+    "fix_bug_rate": 1.0,
+    "gen_test_rate": 0.0,
+    "refactor_rate": 1.0,
+    "fix_bug_counts": {
+      "truncated": 0,
+      "errored": 0,
+      "graded": 3,
+      "n": 3
+    },
+    "gen_test_counts": {
+      "truncated": 0,
+      "errored": 0,
+      "graded": 3,
+      "n": 3
+    },
+    "refactor_counts": {
+      "truncated": 0,
+      "errored": 0,
+      "graded": 3,
+      "n": 3
+    }
+  },
+  "review": {
+    "model": "",
+    "samples": {
+      "auth_db.py": {
+        "planted": 6,
+        "caught": 5,
+        "matched": 5,
+        "raised": 7,
+        "recall": 0.833,
+        "precision": 0.714,
+        "f1": 0.769,
+        "answer": "[\n  {\"line\": 11, \"category\": \"security\", \"issue\": \"SQL injection via string formatting of username into query\"},\n  {\"line\": 12, \"category\": \"security\", \"issue\": \"Use of parameterized query instead of string formatting\"},\n  {\"line\": 15, \"category\": \"reliability\", \"issue\": \"Database connection never closed\"},\n  {\"line\": 16, \"category\": \"correctness\", \"issue\": \"No NULL check before accessing row[0] and row[1]\"},\n  {\"line\": 21, \"category\": \"correctness\", \"issue\": \"Function returns None when password does not match\"},\n  {\"line\": 25, \"category\": \"correctness\", \"issue\": \"Off-by-one error in slice calculation\"},\n  {\"line\": 29, \"category\": \"correctness\", \"issue\": \"Always returns True due to 'or True'\"}\n]",
+        "completion_tokens": 209,
+        "finish_reason": "stop"
+      },
+      "stats.py": {
+        "planted": 5,
+        "caught": 5,
+        "matched": 5,
+        "raised": 10,
+        "recall": 1.0,
+        "precision": 0.5,
+        "f1": 0.667,
+        "answer": "[\n  {\"line\": 2, \"category\": \"correctness\", \"issue\": \"Mutable default argument cache={} persists across calls, causing stale cached results and unintended state sharing\"},\n  {\"line\": 3, \"category\": \"correctness\", \"issue\": \"Using id(xs) as cache key is unsafe: id can be reused after an object is garbage collected, returning stale cached values\"},\n  {\"line\": 8, \"category\": \"correctness\", \"issue\": \"Moving average divides by len(chunk) which is < window for trailing elements, producing a different (non-windowed) average instead of erroring or padding\"},\n  {\"line\": 16, \"category\": \"correctness\", \"issue\": \"idx can equal len(xs) when p=100, causing an IndexError out of range\"},\n  {\"line\": 16, \"category\": \"correctness\", \"issue\": \"int() truncates the index with no interpolation between nearest ranks, giving an inaccurate percentile\"},\n  {\"line\": 15, \"category\": \"reliability\", \"issue\": \"percentile fails on empty input with IndexError (no guard for len(xs)==0)\"},\n  {\"line\": 22, \"category\": \"correctness\", \"issue\": \"Bare except catches everything including KeyboardInterrupt/SystemExit and masks real errors\"},\n  {\"line\": 23, \"category\": \"correctness\", \"issue\": \"safe_div returns None on any exception (e.g. divide by zero) with no way to distinguish it from a legitimate None result\"},\n  {\"line\": 27, \"category\": \"correctness\", \"issue\": \"return None is indented inside the for loop, so only the first element is checked and the loop exits prematurely\"},\n  {\"line\": 25, \"category\": \"correctness\", \"issue\": \"first_even never returns None for an empty iterable or one with no even numbers\"}\n]",
+        "completion_tokens": 412,
+        "finish_reason": "stop"
+      }
+    },
+    "aggregate": {
+      "recall": 0.909,
+      "precision": 0.588,
+      "f1": 0.714,
+      "planted": 11,
+      "caught": 10,
+      "raised": 17
+    }
+  },
+  "axes": {
+    "humaneval": 1.0,
+    "gsm8k": 1.0,
+    "code_bench_mean": 0.667,
+    "code_bench_sub": {
+      "fix_bug": 1.0,
+      "gen_test": 0.0,
+      "refactor": 1.0
+    },
+    "review_f1": 0.714
+  },
+  "INDEX": 84.5
+}

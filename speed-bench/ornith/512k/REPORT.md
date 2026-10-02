@@ -64,4 +64,24 @@ ds4's YaRN therefore matches llama.cpp's. Per-prompt numbers are in `yarn-discri
 
 ## GPU window C: short-prompt quality, measured
 
-(Task 7)
+Run 2026-10-02 11:55-11:58 on `bf12877a`, with the gateway stack paused. The window uses the same M4/M5
+harness:
+- the eval is a scratch copy of AI-Gateway's `run_eval.py` with the think split: HumanEval/GSM8K
+  think-on, code_bench/review think-off;
+- four abliteration probes;
+- two staging `ds4-server` runs on 18296, with the MTP draft vocabulary and a fresh KV directory each.
+
+The first attempt at 11:52 stopped at the pause: the live Ornith server had exited but was an
+unreaped zombie, and the pause script counted it alive. The script now treats state Z as exited.
+
+| arm | HumanEval-mini | GSM8K-mini | code_bench (fix / gentest / refactor) | review F1 | INDEX | truncated / errored | probes |
+|---|---|---|---|---|---|---|---|
+| `-c 262144` (no YaRN; KV 5.50 GiB, 27.76 GiB planned) | 1.000 | 1.000 | 0.778 (0.667 / 0.667 / 1.000) | 0.571 | **83.7** | 0 / 0 | 4/4 COMPLY |
+| `-c 524288` (YaRN 2 from -c; KV 11.01 GiB, 33.26 GiB planned) | 1.000 | 1.000 | 0.667 (1.000 / 0.000 / 1.000) | 0.714 | **84.5** | 0 / 0 | 4/4 COMPLY |
+
+- No drop is detectable at this sample size: the 512K INDEX is +0.8.
+- The per-axis swaps (gentest down, fix and review up) are within the variance the earlier
+  milestones saw on these small suites; M5 recorded testgen AST-style variance of 3/8 vs 3/5.
+- One run per arm cannot resolve a small YaRN cost, so the 262K entry stays the default, as the spec
+  decided.
+- The abliteration probes are unchanged: 4/4 COMPLY on both arms, matching M4-M6.

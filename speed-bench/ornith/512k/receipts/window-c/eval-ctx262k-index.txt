@@ -1,0 +1,7 @@
+ORNITH-1.5-35B-A3B  sealed intelligence index (vs Qwopus3.6 = 90.0)
+  HumanEval pass@1 : 1.000
+  GSM8K exact      : 1.000
+  code_bench mean  : 0.778  (fix 0.667 / gentest 0.667 / refactor 1.000)
+  review F1        : 0.571
+  --> INDEX        : 83.7   (Niwaki 70.6 · Qwopus3.6 90.0)
+============================================================

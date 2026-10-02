@@ -1,0 +1,21 @@
+11:55:28 window steps-c.sh on bf12877a
+Unload failed: 5: Input/output error
+Try running `launchctl bootout` as root for richer errors.
+paused
+no model processes
+11:55:32 start eval-ctx262k
+11:56:47 end eval-ctx262k rc=0
+11:56:47 start probes-ctx262k
+11:56:52 end probes-ctx262k rc=0
+11:56:53 ctx262k: eval rc=0 probes rc=0
+11:56:55 start eval-ctx512k
+11:58:10 end eval-ctx512k rc=0
+11:58:10 start probes-ctx512k
+11:58:15 end probes-ctx512k rc=0
+11:58:16 ctx512k: eval rc=0 probes rc=0
+11:58:16 window C ok=1
+11:58:16 steps rc=0; restore
+restored (backend_ok after 62x2s)
+12:00:23 restored
+status: backend_ok True last_byte_ago_s 1549.6
+12:00:23 window done rc=0
