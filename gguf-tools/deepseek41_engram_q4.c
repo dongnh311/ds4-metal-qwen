@@ -77,7 +77,11 @@ static void pwrite_full(int fd, const void *p, size_t n, uint64_t off) {
     }
 }
 
+/* fsync on macOS does not order writes against a power loss; F_FULLFSYNC
+ * flushes the drive cache, so the journal and state files really precede the
+ * writes they protect. */
 static void sync_fd(int fd) {
+    if (fcntl(fd, F_FULLFSYNC) == 0) return;
     if (fsync(fd) != 0) die("fsync failed: %s", strerror(errno));
 }
 
@@ -85,7 +89,8 @@ static void sync_dir(const char *path) {
     char copy[4096];
     snprintf(copy, sizeof(copy), "%s", path);
     const int fd = open(dirname(copy), O_RDONLY | O_CLOEXEC);
-    if (fd < 0 || fsync(fd) != 0) die("fsync of the directory of %s failed", path);
+    if (fd < 0) die("cannot open the directory of %s", path);
+    sync_fd(fd);
     close(fd);
 }
 
@@ -313,29 +318,44 @@ static void hex(const uint8_t d[CC_SHA256_DIGEST_LENGTH], char out[2 * CC_SHA256
     for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) sprintf(out + 2 * i, "%02x", d[i]);
 }
 
-static void write_check(const char *path, const layout *l, const char *sha) {
-    char file[4200], text[512];
+/* Which file --check read, and that it has not been written since. */
+typedef struct { uint64_t dev, ino, size, mtime_sec, mtime_nsec; } identity;
+
+static identity file_identity(int fd) {
+    struct stat st;
+    if (fstat(fd, &st) != 0) die("stat failed: %s", strerror(errno));
+    return (identity){(uint64_t)st.st_dev, (uint64_t)st.st_ino, (uint64_t)st.st_size,
+                      (uint64_t)st.st_mtimespec.tv_sec, (uint64_t)st.st_mtimespec.tv_nsec};
+}
+
+static void write_check(const char *path, const layout *l, const identity *id, const char *sha) {
+    char file[4200], text[640];
     side(file, sizeof(file), path, ".eq4-check");
     const int n = snprintf(text, sizeof(text),
         TOOL " check 1\nfingerprint %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
-        " %" PRIu64 " %" PRIu64 "\nsha256 %s\n",
-        l->file_size, l->data_start, l->align, l->rel0, l->rows0, l->rel1, l->rows1, sha);
+        " %" PRIu64 " %" PRIu64 "\nidentity %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64 " %" PRIu64
+        "\nsha256 %s\n",
+        l->file_size, l->data_start, l->align, l->rel0, l->rows0, l->rel1, l->rows1,
+        id->dev, id->ino, id->size, id->mtime_sec, id->mtime_nsec, sha);
     write_atomic(file, text, (size_t)n);
 }
 
 /* 0 when there is no check file. */
-static int read_check(const char *path, layout *l, char sha[65]) {
+static int read_check(const char *path, layout *l, identity *id, char sha[65]) {
     char file[4200];
     side(file, sizeof(file), path, ".eq4-check");
     FILE *fp = fopen(file, "r");
     if (!fp) return 0;
     int version = 0;
+    identity unused;
+    if (!id) id = &unused;
     const int got = fscanf(fp, TOOL " check %d fingerprint %" SCNu64 " %" SCNu64 " %" SCNu64 " %" SCNu64
-                           " %" SCNu64 " %" SCNu64 " %" SCNu64 " sha256 %64s", &version,
+                           " %" SCNu64 " %" SCNu64 " %" SCNu64 " identity %" SCNu64 " %" SCNu64 " %" SCNu64
+                           " %" SCNu64 " %" SCNu64 " sha256 %64s", &version,
                            &l->file_size, &l->data_start, &l->align, &l->rel0, &l->rows0, &l->rel1,
-                           &l->rows1, sha);
+                           &l->rows1, &id->dev, &id->ino, &id->size, &id->mtime_sec, &id->mtime_nsec, sha);
     fclose(fp);
-    if (got != 9 || version != 1 || strlen(sha) != 64) die("%s is malformed", file);
+    if (got != 14 || version != 1 || strlen(sha) != 64) die("%s is malformed", file);
     return 1;
 }
 
@@ -464,6 +484,7 @@ static void cmd_check(const char *path, uint64_t chunk) {
     if (!g.have_enc || memcmp(g.enc, ENC_ORIG, ENC_LEN))
         die("%s is not an original e4m3_e8m0_32_row264 file", path);
     const layout l = original_layout(&g);
+    const identity id = file_identity(fd);
     remove_side(path, ".eq4-check");   /* a failed check leaves none behind */
     uint8_t *src = malloc((size_t)chunk * SRC_ROW), *dst = malloc((size_t)chunk * DST_ROW);
     if (!src || !dst) die("out of memory");
@@ -494,7 +515,7 @@ static void cmd_check(const char *path, uint64_t chunk) {
     char text[65];
     CC_SHA256_Final(digest, &sha);
     hex(digest, text);
-    write_check(path, &l, text);
+    write_check(path, &l, &id, text);
     printf("check ok: %" PRIu64 " + %" PRIu64 " rows; converted size %" PRIu64 " bytes; tail sha256 %s\n",
            l.rows0, l.rows1, new_end(&l), text);
     free(src);
@@ -516,10 +537,13 @@ static void cmd_convert(const char *path, uint64_t chunk) {
         if (!memcmp(g.enc, ENC_BUSY, ENC_LEN)) die("%s is mid-conversion but its state file is gone", path);
         if (memcmp(g.enc, ENC_ORIG, ENC_LEN)) die("unexpected Engram encoding in %s", path);
         const layout here = original_layout(&g);
-        if (!read_check(path, &l, sha)) die("run --check on %s first", path);
-        if (memcmp(&here, &l, sizeof(l))) die("%s changed since --check; rerun --check", path);
+        identity checked;
+        if (!read_check(path, &l, &checked, sha)) die("run --check on %s first", path);
+        const identity now = file_identity(fd);
+        if (memcmp(&here, &l, sizeof(l)) || memcmp(&now, &checked, sizeof(now)))
+            die("%s changed since --check; rerun --check", path);
     } else {
-        if (!read_check(path, &l, sha)) die("the check file of %s is gone", path);
+        if (!read_check(path, &l, NULL, sha)) die("the check file of %s is gone", path);
         if (memcmp(&s.l, &l, sizeof(l))) die("state and check files of %s disagree", path);
         const int busy = !memcmp(g.enc, ENC_BUSY, ENC_LEN), orig = !memcmp(g.enc, ENC_ORIG, ENC_LEN),
                   done = !memcmp(g.enc, ENC_Q4, ENC_LEN);
@@ -529,6 +553,7 @@ static void cmd_convert(const char *path, uint64_t chunk) {
     }
     refuse_if_open(path);
     if (!resume) {
+        remove_side(path, ".eq4-journal");   /* never feed a fresh start from an abandoned run */
         write_state(path, 1, 0, 0, &l);
         s.phase = 1;
         s.table = 0;
@@ -595,6 +620,9 @@ static void cmd_convert(const char *path, uint64_t chunk) {
     pwrite_full(fd, &width, 8, g.t[1].dim_pos);
     pwrite_full(fd, &l.rel0, 8, g.t[0].off_pos);
     pwrite_full(fd, &rel1, 8, g.t[1].off_pos);
+    sync_fd(fd);
+    test_stop("geometry");
+    /* Only now the encoding: ds4 must never see the new name over old geometry. */
     pwrite_full(fd, ENC_Q4, ENC_LEN, g.enc_pos);
     sync_fd(fd);
     test_stop("header");
@@ -611,7 +639,7 @@ static void cmd_convert(const char *path, uint64_t chunk) {
 static layout converted_layout(const char *path, const gguf *g) {
     layout l;
     char sha[65];
-    if (!read_check(path, &l, sha)) die("no check file for %s", path);
+    if (!read_check(path, &l, NULL, sha)) die("no check file for %s", path);
     if (!g->have_enc || memcmp(g->enc, ENC_Q4, ENC_LEN)) die("%s is not converted", path);
     if (!g->t[0].found || !g->t[1].found || g->t[0].width != DST_ROW || g->t[1].width != DST_ROW ||
         g->t[0].rows != l.rows0 || g->t[1].rows != l.rows1 || g->t[0].rel != l.rel0 ||
@@ -630,7 +658,7 @@ static void cmd_verify(const char *path, uint64_t chunk) {
     const layout l = converted_layout(path, &g);
     layout dummy;
     char want[65];
-    (void)read_check(path, &dummy, want);
+    (void)read_check(path, &dummy, NULL, want);
     const size_t bytes = (size_t)chunk * DST_ROW;
     uint8_t *p = malloc(bytes);
     if (!p) die("out of memory");

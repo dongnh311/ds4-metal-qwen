@@ -202,7 +202,8 @@ static void test_resume(const fixture *f, const char *path) {
     /* write:1 and write:2 stop after a chunk overwrote part of its own source:
      * only the journal can restore it. */
     static const char *stops[] = {"block:1", "journal:1", "journal:2", "write:1", "write:2",
-                                  "write:3", "chunk:1", "chunk:5", "chunk:60", "header:1"};
+                                  "write:3", "chunk:1", "chunk:5", "chunk:60", "geometry:1",
+                                  "header:1"};
     for (size_t i = 0; i < sizeof(stops) / sizeof(stops[0]); i++) {
         clean(path);
         write_file(path, &f->src);
@@ -216,6 +217,23 @@ static void test_resume(const fixture *f, const char *path) {
         }
         assert(run(NULL, "--verify", path, NULL, NULL, NULL) == 0);
     }
+    /* A journal left by an abandoned run must not feed a fresh start. */
+    fixture other;
+    build(&other, 0, "deepseek41");
+    char check[512], state[512], journal[512];
+    side_paths(path, check, state, journal);
+    clean(path);
+    write_file(path, &f->src);
+    assert(run(NULL, "--check", path, NULL, NULL, NULL) == 0);
+    assert(run("chunk:1", "--convert", path, "--chunk-rows", "64", NULL) == 3);
+    assert(access(journal, F_OK) == 0);
+    write_file(path, &other.src);
+    unlink(state);
+    assert(run(NULL, "--check", path, NULL, NULL, NULL) == 0);
+    assert(run(NULL, "--convert", path, "--chunk-rows", "64", NULL) == 0);
+    assert(same_file(path, &other.want));
+    free(other.src.bytes);
+    free(other.want.bytes);
     puts("engram q4 convert: resume after every phase: PASS");
 }
 
@@ -237,6 +255,25 @@ static void test_refusals(const fixture *f, const char *path) {
     assert(same_file(path, &other.src));
     free(other.src.bytes);
     free(other.want.bytes);
+    /* The file changed after --check: --convert refuses before writing. */
+    clean(path);
+    write_file(path, &f->src);
+    assert(run(NULL, "--check", path, NULL, NULL, NULL) == 0);
+    {
+        const int fd = open(path, O_WRONLY);
+        assert(fd >= 0);
+        const uint64_t rel2 = align_up(ALIGN + (uint64_t)ROWS1 * 264);
+        const uint8_t bad = 255;
+        assert(pwrite(fd, &bad, 1, (off_t)(ALIGN + rel2 + 1234 * 264 + 260)) == 1);
+        close(fd);
+        buf changed = {malloc(f->src.size), f->src.size, f->src.size};
+        assert(changed.bytes);
+        memcpy(changed.bytes, f->src.bytes, f->src.size);
+        changed.bytes[ALIGN + rel2 + 1234 * 264 + 260] = 255;
+        assert(run(NULL, "--convert", path, NULL, NULL, NULL) == 1);
+        assert(same_file(path, &changed));
+        free(changed.bytes);
+    }
     /* Another process holds the file open. */
     clean(path);
     write_file(path, &f->src);
