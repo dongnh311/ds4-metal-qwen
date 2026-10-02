@@ -1,0 +1,92 @@
+{
+ "runs": {
+  "base": [
+   {
+    "arm": "base",
+    "rows": {
+     "2048": {
+      "prompt_tokens": 2159,
+      "completion_tokens": 256,
+      "ttft_s": 1.173030138015747,
+      "decode_s": 2.740325927734375,
+      "finish_reason": "length",
+      "prefill_tps": 1840.5324211465545,
+      "decode_tps": 93.05462442229523,
+      "cached_tokens": 0
+     }
+    },
+    "chars_per_token": 3.3675530124537194,
+    "swap_before_mib": 1435.12,
+    "swap_after_mib": 1435.12,
+    "swap_delta_mib": 0.0
+   },
+   {
+    "arm": "base",
+    "rows": {
+     "2048": {
+      "prompt_tokens": 2159,
+      "completion_tokens": 256,
+      "ttft_s": 1.1718599796295166,
+      "decode_s": 2.803463935852051,
+      "finish_reason": "length",
+      "prefill_tps": 1842.370281031841,
+      "decode_tps": 90.95890150001105,
+      "cached_tokens": 0
+     }
+    },
+    "chars_per_token": 3.3675530124537194,
+    "swap_before_mib": 1435.12,
+    "swap_after_mib": 1435.12,
+    "swap_delta_mib": 0.0
+   }
+  ],
+  "lever": [
+   {
+    "arm": "lever",
+    "rows": {
+     "2048": {
+      "prompt_tokens": 2160,
+      "completion_tokens": 256,
+      "ttft_s": 1.1776628494262695,
+      "decode_s": 2.8899190425872803,
+      "finish_reason": "length",
+      "prefill_tps": 1834.1412408927586,
+      "decode_tps": 88.23776591738161,
+      "cached_tokens": 0
+     }
+    },
+    "chars_per_token": 3.3675530124537194,
+    "swap_before_mib": 1435.12,
+    "swap_after_mib": 1435.12,
+    "swap_delta_mib": 0.0
+   },
+   {
+    "arm": "lever",
+    "rows": {
+     "2048": {
+      "prompt_tokens": 2160,
+      "completion_tokens": 256,
+      "ttft_s": 1.1682360172271729,
+      "decode_s": 2.628877878189087,
+      "finish_reason": "length",
+      "prefill_tps": 1848.9414537370583,
+      "decode_tps": 96.99956095931614,
+      "cached_tokens": 0
+     }
+    },
+    "chars_per_token": 3.3675530124537194,
+    "swap_before_mib": 1435.12,
+    "swap_after_mib": 1435.12,
+    "swap_delta_mib": 0.0
+   }
+  ]
+ },
+ "2048": {
+  "base_decode": 92.00676296115314,
+  "base_prefill": 1841.4513510891977,
+  "base_ttft_s": 1.1724450588226318,
+  "lever_decode": 92.61866343834888,
+  "lever_prefill": 1841.5413473149083,
+  "lever_ttft_s": 1.1729494333267212
+ }
+}

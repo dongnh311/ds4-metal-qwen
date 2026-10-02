@@ -34,3 +34,17 @@ dominate, not bandwidth, so prefetching the next tile can only move it a little.
 decode-only lever moved prefill by 5%. Single-knob results near +4% are at the noise edge. The final
 window measures both knobs together against all-off at 2K, 32K and 128K before either becomes the
 default.
+
+**Final, window F** (2026-10-03 00:44-01:15, `afd68849`). Both knobs on (prefetch plus flush every 8)
+against every lever off, A-B-B-A:
+
+| context | off | on | change |
+|---|---|---|---|
+| 2K | 92.9 | 93.1 | +0.2% |
+| 32K | 69.8 | 67.5 | -3.3% |
+| 128K | 45.1 | 44.7 | -0.9% |
+
+Flush every 4 against every 8, at 2K with prefetch on: 92.0 against 92.6 (+0.7%).
+
+**Decision:** both knobs stay default off. The window-C single-knob gains were within the run-to-run
+noise, and together they gain nothing at 2K and lose a little at 32K.
