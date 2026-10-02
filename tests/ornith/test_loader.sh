@@ -139,12 +139,12 @@ if ./ds4 --cpu -m "$model" -p hi -n 1 > "$tmp/cpu.txt" 2>&1; then
 fi
 grep -q 'not supported' "$tmp/cpu.txt" || { cat "$tmp/cpu.txt"; exit 1; }
 
-# Metal-only open gate: a context above the native 262144 (no YaRN) is
-# refused before any model load.
-if ./ds4 -m "$model" --raw -c 262145 -p hi -n 1 > "$tmp/ctx.txt" 2>&1; then
-    echo "context 262145 accepted for Ornith"; exit 1
+# Open gate: a context above the native 262144 runs only with a YaRN factor
+# that covers it; with YaRN forced off it is refused at open.
+if DS4_QWEN4_YARN_FACTOR=1 ./ds4 -m "$model" --raw -c 262145 -p hi -n 1 > "$tmp/ctx.txt" 2>&1; then
+    echo "context 262145 without YaRN accepted for Ornith"; exit 1
 fi
-grep -q 'Ornith supports up to 262144 tokens of context (no YaRN)' "$tmp/ctx.txt" || { cat "$tmp/ctx.txt"; exit 1; }
+grep -q 'exceeds 262144 native tokens x YaRN factor 1' "$tmp/ctx.txt" || { cat "$tmp/ctx.txt"; exit 1; }
 
 # Metal-only open gate: --batched-session > 1 is refused too (port 18191,
 # never a gateway port).

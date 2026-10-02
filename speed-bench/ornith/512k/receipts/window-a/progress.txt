@@ -1,0 +1,40 @@
+11:36:25 window steps-a.sh on 909aede0
+paused
+no model processes
+11:36:26 start kernels
+11:37:11 end kernels rc=0
+11:37:11 start engine
+11:37:16 end engine rc=0
+11:37:16 start loader
+11:37:26 end loader rc=0
+11:37:26 start g1-base-64
+11:38:32 end g1-base-64 rc=0
+11:38:32 start g1-br-64
+11:39:32 end g1-br-64 rc=0
+11:39:32 identity chunk 64: 13 dumps, 0 differ
+11:39:32 start g1-base-512
+11:40:07 end g1-base-512 rc=0
+11:40:07 start g1-br-512
+11:40:42 end g1-br-512 rc=0
+11:40:42 identity chunk 512: 13 dumps, 0 differ
+11:40:42 start g1-base-2048
+11:41:17 end g1-base-2048 rc=0
+11:41:17 start g1-br-2048
+11:41:52 end g1-br-2048 rc=0
+11:41:52 identity chunk 2048: 13 dumps, 0 differ
+11:41:52 start qwen-fast
+11:42:52 end qwen-fast rc=0
+11:42:52 start ref-yarn2
+11:45:38 end ref-yarn2 rc=0
+11:45:38 llama.cpp: version: 0.5.0 (build 11146, commit 7fe450e19)
+yarn refs: 13 prompts, 13 differ from the unscaled refs: ['code_c.json', 'code_c_pack.json', 'code_py.json', 'code_rust.json', 'en_capital.json', 'en_contributing.json']
+11:45:38 start g1-yarn2
+11:46:03 end g1-yarn2 rc=0
+11:46:03 start mtp-yarn2
+11:49:58 end mtp-yarn2 rc=0
+11:49:58 window A ok=1
+11:49:58 steps rc=0; restore
+restored (backend_ok after 63x2s)
+11:52:07 restored
+status: backend_ok True last_byte_ago_s 1053.4
+11:52:07 window done rc=0

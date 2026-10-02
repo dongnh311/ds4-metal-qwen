@@ -50915,6 +50915,10 @@ void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n_pairs, float mscale) {
     g_qwen4_rope_set = freq != NULL;
 }
 
+bool ds4_gpu_qwen4_rope_table_set(void) {
+    return g_qwen4_rope_set;
+}
+
 static void qwen4_rope_fill(float *freq, float *mscale, uint32_t n_rot, float base) {
     for (uint32_t i = 0; i < 32u; i++) {
         freq[i] = g_qwen4_rope_set ? g_qwen4_rope_freq[i] :

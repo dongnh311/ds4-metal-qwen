@@ -644,6 +644,72 @@ cleanup:
     test_restore_env("DS4_QWEN35_KV", saved_kv);
 }
 
+#if defined(__APPLE__) && !defined(DS4_NO_GPU)
+/* Ornith YaRN through the engine (DS4_TEST_MODEL = the Ornith GGUF, Metal):
+ * -c 524288 opens at factor 2 with the table on Metal; -c 262144 opens
+ * unscaled with the table cleared (no stale table from the engine before);
+ * YaRN forced on a short context sets it; a factor that does not cover -c,
+ * or one forced off past native, is refused at open. */
+static int test_qwen35_open_ctx(ds4_engine **out, int ctx) {
+    ds4_engine_options opt = {
+        .model_path = test_model_path(),
+        .backend = test_model_backend(),
+        .context_size = ctx,
+    };
+    *out = NULL;
+    return ds4_engine_open(out, &opt);
+}
+
+static void test_qwen35_yarn_engine(void) {
+    /* The family check reuses the cached engine, so another model is never
+     * opened at 524288 just to be skipped. */
+    ds4_engine *probe = test_get_engine(false);
+    if (!probe || !ds4_engine_is_qwen35moe(probe)) {
+        puts("qwen35-yarn-engine: Ornith model required, skipped");
+        return;
+    }
+    /* One open engine per process holds the instance lock: a second open
+     * while the cached engines live exits the whole run. */
+    test_close_engines();
+
+    ds4_engine *e = NULL;
+    char *saved = test_save_env("DS4_QWEN4_YARN_FACTOR");
+    unsetenv("DS4_QWEN4_YARN_FACTOR");
+    TEST_ASSERT(test_qwen35_open_ctx(&e, 524288) == 0 && e != NULL);
+    if (!e) goto done;
+    TEST_ASSERT(ds4_engine_rope_yarn_factor(e) == 2.0f);
+    TEST_ASSERT(ds4_engine_native_context(e) == 262144u);
+    TEST_ASSERT(ds4_gpu_qwen4_rope_table_set());
+    ds4_engine_close(e);
+    e = NULL;
+
+    TEST_ASSERT(test_qwen35_open_ctx(&e, 262144) == 0 && e != NULL);
+    if (e) {
+        TEST_ASSERT(ds4_engine_rope_yarn_factor(e) == 1.0f);
+        TEST_ASSERT(ds4_engine_native_context(e) == 262144u);
+        TEST_ASSERT(!ds4_gpu_qwen4_rope_table_set());   /* the 524288 engine's table is gone */
+        ds4_engine_close(e);
+        e = NULL;
+    }
+
+    setenv("DS4_QWEN4_YARN_FACTOR", "2", 1);            /* forced on a short context */
+    TEST_ASSERT(test_qwen35_open_ctx(&e, 16384) == 0 && e != NULL);
+    if (e) {
+        TEST_ASSERT(ds4_engine_rope_yarn_factor(e) == 2.0f);
+        TEST_ASSERT(ds4_gpu_qwen4_rope_table_set());
+        ds4_engine_close(e);
+        e = NULL;
+    }
+    TEST_ASSERT(test_qwen35_open_ctx(&e, 1048576) != 0 && e == NULL);   /* 2 does not cover 1M */
+
+    setenv("DS4_QWEN4_YARN_FACTOR", "1", 1);            /* forced off past native */
+    TEST_ASSERT(test_qwen35_open_ctx(&e, 524288) != 0 && e == NULL);
+done:
+    if (e) ds4_engine_close(e);
+    test_restore_env("DS4_QWEN4_YARN_FACTOR", saved);
+}
+#endif
+
 /* The payload round trip and refusals in every Ornith KV mode (M4): each
  * mode writes its own tag, and a checkpoint never loads into another mode. */
 static void test_qwen35_payloads(void) {
@@ -8369,6 +8435,38 @@ static void test_qwen_yarn_policy(void) {
     TEST_ASSERT(ds4_qwen4_yarn_factor(262144, ds4_engine_rope_context(262273, 262144), NULL) == 1.0);
 }
 
+static void test_qwen35_context_policy(void) {
+    /* Ornith: within the native context always; past it only with a factor that covers -c. */
+    TEST_ASSERT(ds4_qwen35_context_ok(262144, 262144, 1.0));
+    TEST_ASSERT(ds4_qwen35_context_ok(262144, 8192, 1.0));
+    TEST_ASSERT(!ds4_qwen35_context_ok(262144, 262145, 1.0));   /* past native, unscaled */
+    TEST_ASSERT(ds4_qwen35_context_ok(262144, 300000, 2.0));
+    TEST_ASSERT(ds4_qwen35_context_ok(262144, 524288, 2.0));
+    TEST_ASSERT(!ds4_qwen35_context_ok(262144, 524289, 2.0));   /* factor 2 does not cover it */
+    TEST_ASSERT(ds4_qwen35_context_ok(262144, 1048576, 4.0));
+    TEST_ASSERT(ds4_qwen35_context_ok(262144, 8192, 2.0));      /* YaRN forced on a short context */
+    /* the factor the engine derives from -c always covers -c */
+    const uint32_t ctxs[] = {262145, 300000, 524288, 524289, 1048576};
+    for (size_t i = 0; i < sizeof(ctxs) / sizeof(ctxs[0]); i++) {
+        TEST_ASSERT(ds4_qwen35_context_ok(262144, ctxs[i], ds4_qwen4_yarn_factor(262144, ctxs[i], NULL)));
+    }
+    /* DS4_QWEN4_YARN_FACTOR=1 past native: refused */
+    TEST_ASSERT(!ds4_qwen35_context_ok(262144, 524288, ds4_qwen4_yarn_factor(262144, 524288, "1")));
+
+    /* The refusal names the fix that applies: the variable only when it is set. */
+    char msg[256];
+    ds4_qwen35_context_refusal(msg, sizeof(msg), 262144, 524417, 2.0, 524288, false);  /* ds4-bench --ctx-max 524288 */
+    TEST_ASSERT(strstr(msg, "exceeds 262144 native tokens x YaRN factor 2") != NULL);
+    TEST_ASSERT(strstr(msg, "DS4_QWEN4_YARN_FACTOR") == NULL);
+    TEST_ASSERT(strstr(msg, "at most 524288 tokens") != NULL);
+    ds4_qwen35_context_refusal(msg, sizeof(msg), 262144, 524288, 1.0, 32768, false);   /* REPL /ctx past a 32K open */
+    TEST_ASSERT(strstr(msg, "DS4_QWEN4_YARN_FACTOR") == NULL);
+    TEST_ASSERT(strstr(msg, "open with a context of at least 524288") != NULL);
+    ds4_qwen35_context_refusal(msg, sizeof(msg), 262144, 524288, 1.0, 524288, true);   /* the variable forces 1 */
+    TEST_ASSERT(strstr(msg, "exceeds 262144 native tokens x YaRN factor 1") != NULL);
+    TEST_ASSERT(strstr(msg, "leave DS4_QWEN4_YARN_FACTOR unset") != NULL);
+}
+
 /* Grow-on-demand KV, model-backed.  Needs a Qwen3.8 model and its PLE:
  *   DS4_TEST_MODEL=...gguf DS4_TEST_PLE=...PLE-Q4_1.gguf DS4_TEST_GLM_MTP=1 \
  *   DS4_TEST_SSD_STREAMING=1 DS4_TEST_SSD_STREAMING_CACHE_GB=6 \
@@ -8720,6 +8818,7 @@ typedef struct {
 static const ds4_test_entry test_entries[] = {
     {"--qwen-kv-grow-policy", "qwen-kv-grow-policy", "Qwen3.8 grow-on-demand KV capacity policy (no model)", test_qwen_kv_grow_policy},
     {"--qwen-yarn-policy", "qwen-yarn-policy", "Qwen3.8 YaRN factor from -c and the rope table (no model)", test_qwen_yarn_policy},
+    {"--qwen35-context-policy", "qwen35-context-policy", "Ornith context rule: past 262144 only with a covering YaRN factor (no model)", test_qwen35_context_policy},
     {"--dir-steering-rows", "dir-steering-rows", "directional steering rows must be unit length or zero (no model)", test_dir_steering_rows},
     {"--quant-types", "quant-types", "GGUF quant block sizes match ggml (no model)", test_quant_types},
     {"--quant-dequant", "quant-dequant", "GSQ-RCO row dequantizers match ggml (no model)", test_quant_dequant},
@@ -8727,6 +8826,9 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen4-prefill-checkpoints", "qwen4-prefill-checkpoints", "Qwen chunk checkpoints restore matching logits and state", test_qwen_prefill_checkpoints},
     {"--qwen4-restore-reuse", "qwen4-restore-reuse", "Qwen restore discards old verifier state and rejects truncated payloads", test_qwen_restore_reused_session},
     {"--qwen-kv-grow", "qwen-kv-grow", "Qwen3.8 grow-on-demand KV decodes byte-identically to full capacity", test_qwen_kv_grow},
+#if defined(__APPLE__)
+    {"--qwen35-yarn-engine", "qwen35-yarn-engine", "Ornith YaRN factor, table state and context gate through the engine", test_qwen35_yarn_engine},
+#endif
     {"--qwen35-payloads", "qwen35-payloads", "Ornith disk-KV payloads restore; foreign, MTP-mismatched and truncated ones are refused", test_qwen35_payloads},
     {"--qwen35-rewind", "qwen35-rewind", "Ornith rewind by verify snapshot, otherwise invalidate and replay", test_qwen35_rewind},
     {"--session-snapshot", "session-snapshot", "session snapshot and recurrent-state round trip", test_session_snapshot_roundtrip},

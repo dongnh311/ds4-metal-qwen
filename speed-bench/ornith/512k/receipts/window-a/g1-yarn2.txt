@@ -1,0 +1,14 @@
+en_capital: ok compared=1 checked=3 tie_at=1 max_delta=0.0009
+en_story: ok compared=13 checked=22 tie_at=13 max_delta=0.0244
+en_explain: ok compared=5 checked=9 tie_at=5 max_delta=0.0071
+vi_greeting: ok compared=1 checked=2 tie_at=1 max_delta=0.0016
+vi_hanoi: ok compared=0 checked=3 tie_at=0 max_delta=0.0061
+code_py: ok compared=3 checked=6 tie_at=3 max_delta=0.0260
+code_c: ok compared=3 checked=6 tie_at=3 max_delta=0.0012
+code_rust: ok compared=1 checked=3 tie_at=1 max_delta=0.0451
+json_obj: ok compared=4 checked=8 tie_at=4 max_delta=0.0221
+math_mul: ok compared=16 checked=23 tie_at=16 max_delta=0.1809
+long_copy: ok compared=32 checked=33 tie_at=None max_delta=0.2893
+en_contributing: ok compared=11 checked=14 tie_at=11 max_delta=0.0593
+code_c_pack: ok compared=16 checked=18 tie_at=16 max_delta=0.0548
+gate1: PASS compared=106 checked=150 tol=1.4802 tie=0.4478

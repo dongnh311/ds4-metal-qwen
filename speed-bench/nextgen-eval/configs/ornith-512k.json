@@ -1,0 +1,4 @@
+{"name": "ornith-512k", "base": "registry",
+ "registry_model": "Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx",
+ "model": null, "args_add": ["-c", "524288", "--kv-cache-continued-interval-tokens", "0"],
+ "args_remove": [], "env": {}}

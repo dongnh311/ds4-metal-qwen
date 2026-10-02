@@ -1,0 +1,9 @@
+ds4: Ornith YaRN factor 2 (from -c) over 262144 native tokens (pairs 14..22 blended, mscale 1.0693)
+ds4: memory: KV 11.01 GiB (raw 11.01 + compressed 0.00) + buffers 1.00 GiB + resident model 21.26 GiB = 33.26 GiB planned
+1002 15:36:58 ds4-server: keyed kv cache directory <run>/kv-f1bo4q3_/yarn-2
+1002 15:39:14 ds4-server: chat ctx=0..125012:125012 gen=6 finish=stop 135.540s
+1002 15:46:23 ds4-server: chat ctx=0..239868:239868 gen=6 finish=stop 425.249s
+1002 15:46:32 ds4-server: chat ctx=239616..239876:260 gen=2 finish=stop 1.124s
+1002 15:46:42 ds4-server: chat ctx=239616..239878:262 gen=5 finish=stop 1.235s
+1002 15:46:52 ds4-server: chat ctx=239616..239879:263 gen=2 finish=stop 1.191s
+1002 16:12:29 ds4-server: chat ctx=0..480575:480575 gen=6 finish=stop 1528.317s

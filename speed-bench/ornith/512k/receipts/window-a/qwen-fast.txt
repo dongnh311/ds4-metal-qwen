@@ -1,0 +1,4 @@
+test_qwen4_prefill_pipe: PASS
+qwen_gate: registry row ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2
+qwen_gate: registry row ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2
+qwen_gate: PASS

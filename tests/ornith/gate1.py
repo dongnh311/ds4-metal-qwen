@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """M1 gate 1: ds4 against the llama.cpp references for every prompt.
 
-  gate1.py [--ds4-arg ARG ...] OUT_DIR
+  gate1.py [--ds4-arg ARG ...] [--ref-dir DIR] OUT_DIR
 
 For each prompt in tests/ornith/prompts.json: write the raw text, check that
 ds4's prompt tokens equal llama.cpp's, run `ds4 --dump-logprobs` greedily for
 the reference's step count, and compare with tests/ornith/tolerance.json.
 A prompt whose comparison checked no probable-token pair fails as vacuous.
 Extra ds4 arguments (for example --prefill-chunk 64) are passed through.
+--ref-dir reads the references from DIR instead of tests/ornith/ref (e.g. YaRN references).
 """
 import json
 import os
@@ -21,19 +22,16 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
 
 def main(argv):
-    extra = []
-    while len(argv) >= 2 and argv[0] == "--ds4-arg":
-        extra.append(argv[1])
-        argv = argv[2:]
-    if len(argv) != 1:
+    parsed = r.parse_gate1_args(argv, os.path.join(ROOT, "tests/ornith/ref"))
+    if parsed is None:
         sys.exit(__doc__)
-    out = argv[0]
+    extra, ref_dir, out = parsed
     model = os.environ["DS4_ORNITH_MODEL"]
     os.makedirs(os.path.join(out, "ds4"), exist_ok=True)
     tol = json.load(open(os.path.join(ROOT, "tests/ornith/tolerance.json")))
     failed = compared = checked = 0
     for p in r.load_prompts(os.path.join(ROOT, "tests/ornith/prompts.json")):
-        ref = json.load(open(os.path.join(ROOT, "tests/ornith/ref", p["name"] + ".json")))
+        ref = json.load(open(os.path.join(ref_dir, p["name"] + ".json")))
         txt = os.path.join(out, "ds4", p["name"] + ".txt")
         with open(txt, "w", encoding="utf-8") as f:
             f.write(r.prompt_text(p, ROOT))

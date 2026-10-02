@@ -1,0 +1,2 @@
+ds4: Ornith YaRN factor 2 (from -c) over 262144 native tokens (pairs 14..22 blended, mscale 1.0693)
+ds4: memory: KV 11.01 GiB (raw 11.01 + compressed 0.00) + buffers 1.00 GiB + resident model 21.26 GiB = 33.26 GiB planned

@@ -183,5 +183,34 @@ class NormaliseTest(unittest.TestCase):
         self.assertEqual(r.ds4_steps(dump), [step(5, (5, -0.1), (7, -3.0))])
 
 
+class LlamaServerCmdTest(unittest.TestCase):
+    def test_metal_default(self):
+        cmd = r.llama_server_cmd("m.gguf", 18190, cpu=False, ubatch=None)
+        self.assertEqual(cmd, ["llama-server", "-m", "m.gguf", "--host", "127.0.0.1", "--port", "18190",
+                               "-c", "16384", "-np", "1", "-ngl", "99"])
+
+    def test_extra_args_come_last(self):
+        cmd = r.llama_server_cmd("m.gguf", 18190, cpu=False, ubatch=1,
+                                 extra=["--rope-scaling", "yarn", "--rope-scale", "2"])
+        self.assertEqual(cmd[-6:], ["-ub", "1", "--rope-scaling", "yarn", "--rope-scale", "2"])
+
+    def test_cpu(self):
+        cmd = r.llama_server_cmd("m.gguf", 18190, cpu=True, ubatch=None)
+        self.assertEqual(cmd[-4:], ["-ngl", "0", "--device", "none"])
+
+
+class Gate1ArgsTest(unittest.TestCase):
+    def test_defaults(self):
+        self.assertEqual(r.parse_gate1_args(["out"], "/ref"), ([], "/ref", "out"))
+
+    def test_ds4_args_and_ref_dir(self):
+        got = r.parse_gate1_args(["--ds4-arg", "--prefill-chunk", "--ds4-arg", "64",
+                                  "--ref-dir", "/yarn", "out"], "/ref")
+        self.assertEqual(got, (["--prefill-chunk", "64"], "/yarn", "out"))
+
+    def test_missing_out_is_none(self):
+        self.assertIsNone(r.parse_gate1_args(["--ref-dir", "/yarn"], "/ref"))
+
+
 if __name__ == "__main__":
     unittest.main()
