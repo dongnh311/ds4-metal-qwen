@@ -356,6 +356,8 @@ kernel void kernel_dsv4_qkv_rms_norm_kv_rope_fp8_store_f32(
         if (tid < 64u && off + (int)tid < n_nope) {
             v = kv[off + tid];
             scratch[tid] = abs(v);
+        } else if (tid < 64u) {
+            scratch[tid] = 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
