@@ -96,3 +96,14 @@ perfect overlap of the two caps single-token decode near 19 t/s at this hit rate
 needs fewer missed bytes. SP2 prefetch can only use the SSD's idle time during GPU work (~40%) and
 pays for wrong guesses with the same bandwidth (V4.1 spike: ~3 reads per saved miss), so a realistic
 SP2 result is ~11.5-12.5 t/s.
+
+## Decision (2026-10-02): GLM-5.3 shelved
+
+GLM-5.3-Flash scores higher on the Intelligence Index than DeepSeek V4.1 Flash, but on this M5 Pro
+64 GB its decode speed is capped by hardware: the Q2 file (89.9 GiB) must stream, and the missed
+experts (~470 MiB per token at a ~0.77 hit rate) come from the SSD at its ~10 GB/s ceiling.
+Byte-identical work reached 10.05 t/s (SP1 decode gates, kept, `DS4_GLM_STREAM_GATE=0` restores the
+drain); the realistic next step (SP2 prefetch) would reach ~12 t/s and perfect overlap ~19 t/s.
+No further GLM speed work on 64 GB. GLM is not deployed. What would change the answer: a machine with
+enough RAM to keep the experts resident (upstream ds4#1057: 22-25 t/s streamed on 128 GB), or a
+much smaller expert set (e.g. REAP-style pruning to ~50 GiB, output not byte-identical, quality unknown).
