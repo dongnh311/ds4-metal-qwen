@@ -234,6 +234,17 @@ test-metal-stream-gate: tests/test_metal_stream_gate
 	./tests/test_metal_stream_gate --glm-split
 	./tests/test_metal_stream_gate --slabs
 
+# In-place V4.1 Engram 4-bit conversion (CPU and disk only; CommonCrypto SHA-256).
+gguf-tools/deepseek41_engram_q4: gguf-tools/deepseek41_engram_q4.c ds4_engram.c ds4_engram.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ gguf-tools/deepseek41_engram_q4.c ds4_engram.c $(LDLIBS)
+
+tests/test_engram_convert: tests/test_engram_convert.c ds4_engram.c ds4_engram.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -o $@ tests/test_engram_convert.c ds4_engram.c $(LDLIBS)
+
+.PHONY: test-engram-convert
+test-engram-convert: tests/test_engram_convert gguf-tools/deepseek41_engram_q4
+	./tests/test_engram_convert ./gguf-tools/deepseek41_engram_q4
+
 tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
 
@@ -1213,7 +1224,7 @@ clean:
 	rm -f tests/test_quality_api
 	rm -f tests/test_linux_memory tests/test_rocm_memory
 	rm -f tests/test_glm_attention tests/test_glm_attention_rocm
-	rm -f tests/test_ssd_cache tests/test_engram
+	rm -f tests/test_ssd_cache tests/test_engram tests/test_engram_convert gguf-tools/deepseek41_engram_q4
 	rm -f tests/test_session_state tests/test_session_state_gpu tests/test_tp_commands
 	rm -f tests/test_tp_rdma tests/test_tp_link tests/test_tp_tcp
 	rm -f tests/test_metal_tp_spec
