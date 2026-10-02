@@ -132,8 +132,11 @@ from that deploy's commits.
   - the variable overrides;
   - a forced-off variable above native is refused;
   - the table is set only when the factor is above 1.
-- **Cache directory naming** already has tests. One more case asserts that Ornith's engine queries
-  yield `yarn-2`.
+- **Cache directory naming** already has tests.
+- **Ornith's engine queries** (factor 2, native 262144) and the Metal table state are checked by a
+  model-backed test, `ds4_test --qwen35-yarn-engine`. It runs in the first GPU window because it
+  loads the model. It also asserts that a table set by a 524288 engine is cleared when a 262144
+  engine opens next in the same process.
 - `make` builds every binary, `make test` passes, and so do the existing Ornith model-free tests.
 
 ### GPU (each window needs the user's go-ahead and a paused gateway stack)
@@ -160,9 +163,18 @@ from that deploy's commits.
      abliteration probes run on the 512K build and on the 262K build, the same day.
    - The 512K entry is separate, so a drop is recorded in the results and in the registry status
      text. It does not block.
-5. **Server.**
-   - `server.log` names the `yarn-2` directory.
-   - A second request on a cached prompt above 262K restores from disk instead of a cold prefill.
+5. **Server.** `speed-bench/ornith/512k/server_check.py` uses one fresh disk-KV directory and the same
+   prompt of about 30K tokens:
+   - **Run 1:** `-c 262144` stores the prompt.
+   - **Run 2:** `-c 524288` must log the `yarn-2` directory and must *not* restore that 262K cache.
+     The two entries share `--kv-disk-dir`.
+   - **Run 3:** `-c 524288` again must restore at least 90% of the prompt.
+
+   Amended while planning: with `--kv-cache-cold-max-tokens 262144` and continued checkpoints off, a
+   prompt above 262K is stored only at shutdown. So the restore is checked across a restart on a
+   shorter prompt, and the needle runs cover the positions past 262K.
+6. **MTP under YaRN.** `tests/ornith/test_mtp_cli.py` with `DS4_QWEN4_YARN_FACTOR=2`: `--mtp` greedy
+   output equals plain output, because the MTP block rotates through the same table.
 
 ## Exit check
 
