@@ -1672,6 +1672,13 @@ static double test_quant_row_ref(uint32_t type, const uint8_t *row, uint32_t in_
             memcpy(&w[i], &u, sizeof(u));
         }
         for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
+    } else if (w && type == 1u) {                             /* F16 rows */
+        for (uint32_t i = 0; i < in_dim; i++) {
+            uint16_t h;
+            memcpy(&h, row + (uint64_t)i * 2u, sizeof(h));
+            w[i] = test_f16_to_f32(h);
+        }
+        for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
     } else if (w && ds4_dequant_row(type, row, in_dim, w) == 0) {
         for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
     }
@@ -2064,6 +2071,36 @@ static void test_metal_qwen4_quant_dense_mm(void) {
     }
     free(nbf);
     free(nv);
+    /* F16 (hc up: 320 wide, 10240 rows) takes the tensor-op tiles only with DS4_QWEN4_DENSE_NAX_F16=1,
+     * so PROD's F16 hc up keeps the float tiles unless a run opts in */
+    const char *f16_env = getenv("DS4_QWEN4_DENSE_NAX_F16");
+    char *f16_saved = f16_env ? strdup(f16_env) : NULL;
+    const int f16_on = f16_env && strcmp(f16_env, "1") == 0;
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(1, 128u, 320u, 10240u) == (nax && f16_on));
+    setenv("DS4_QWEN4_DENSE_NAX_F16", "1", 1);
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(1, 128u, 320u, 10240u) == nax);
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(1, 8u, 320u, 10240u) == 0);     /* decode / verify rows */
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(0, 128u, 320u, 10240u) == 0);   /* F32 keeps its kernels */
+    static const uint32_t f16_dims[2] = { 320u, 2560u };
+    for (int di = 0; di < 2; di++) {
+        const uint32_t fd = f16_dims[di];
+        uint16_t *fh = malloc((size_t)fd * nax_rows * sizeof(uint16_t));
+        float *fv = malloc((size_t)fd * sizeof(float));
+        TEST_ASSERT(fh && fv);
+        if (fh && fv) {
+            for (uint32_t r = 0; r < nax_rows; r++) {
+                test_quant_x(fv, fd, r + 307u);
+                for (uint32_t k = 0; k < fd; k++) fh[(uint64_t)r * fd + k] = test_float_to_f16(fv[k]);
+            }
+            test_metal_qwen4_dense_mm_case(1u, (const uint8_t *)fh, (uint64_t)fd * 2u, fd, nax_rows,
+                                           nax_toks, 3, 1.5e-3);
+        }
+        free(fh);
+        free(fv);
+    }
+    if (f16_saved) setenv("DS4_QWEN4_DENSE_NAX_F16", f16_saved, 1);
+    else unsetenv("DS4_QWEN4_DENSE_NAX_F16");
+    free(f16_saved);
 }
 
 /* kernel_qwen4_gsq_mv: dense GSQ-RCO and BF16 rows at 1-8 tokens dequantize each chunk once.
