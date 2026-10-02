@@ -8049,7 +8049,8 @@ static void test_quant_dequant(void) {
 static void test_quant_types(void) {
     /* ggml-common.h @931351ea block sizes of every quant type ds4 sizes tensors with */
     static const struct { uint32_t type, elems, bytes; } want[] = {
-        {2, 32, 18}, {3, 32, 20}, {8, 32, 34}, {10, 256, 84}, {12, 256, 144}, {13, 256, 176},
+        {2, 32, 18}, {3, 32, 20}, {6, 32, 22}, {8, 32, 34}, {10, 256, 84}, {11, 256, 110}, {12, 256, 144},
+        {13, 256, 176},
         {14, 256, 210}, {16, 256, 66}, {17, 256, 74}, {18, 256, 98}, {19, 256, 50}, {20, 32, 18},
         {21, 256, 110}, {22, 256, 82}, {23, 256, 136}, {29, 256, 56}, {39, 32, 17}, {42, 64, 18},
     };
@@ -8070,6 +8071,8 @@ static void test_quant_types(void) {
         TEST_ASSERT(ds4_test_routed_expert_type_ok(gsq[i], 1));
         TEST_ASSERT(!ds4_test_routed_expert_type_ok(gsq[i], 0));
     }
+    /* Q3_K and Q5_0 come only as dense tensors (the ISTA Q2_0 tier): a routed one is refused at load */
+    TEST_ASSERT(!ds4_test_routed_expert_type_ok(6, 1) && !ds4_test_routed_expert_type_ok(11, 1));
     TEST_ASSERT(ds4_test_routed_expert_type_ok(16, 0) && ds4_test_routed_expert_type_ok(16, 1));   /* IQ2_XXS */
 #if defined(__APPLE__)
     /* prefill routing: GSQ-RCO experts take the tiled MoE GEMM, GSQ-RCO and BF16 dense rows the
@@ -8078,6 +8081,10 @@ static void test_quant_types(void) {
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(18) == 1);
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(42) == 1);
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(30) == 0);
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(6) == 0 && ds4_test_qwen4_expert_has_mm(11) == 0);
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(11, 40, 2560) == 1);   /* Q3_K attention / shared gate-up */
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(6, 40, 640) == 1);     /* Q5_0 shared down */
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(11) == 1);        /* converts through ds4_dequant_row */
     /* MTP draft heads: Q8_0 rows gather as they are, the row-dequantizer types convert to Q8_0 */
     TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(8) == 1);
     TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(13) == 1);  /* ISTA's Q5_K output head */
