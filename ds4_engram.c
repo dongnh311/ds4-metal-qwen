@@ -180,6 +180,91 @@ static float e4m3(uint8_t byte) {
     return byte & 128 ? -value : value;
 }
 
+static float engram_f8_up(float x) {
+    int e;
+    const float m = frexpf(x, &e);
+    return ldexpf(ceilf(m * 16.0f) / 16.0f, e);
+}
+
+static float engram_f8_down(float s) {
+    int e;
+    const float m = frexpf(s, &e);
+    const float n = roundf(m * 16.0f) - 1.0f;
+    return n < 8.0f ? ldexpf(15.0f / 16.0f, e - 1) : ldexpf(n / 16.0f, e);
+}
+
+/* Nearest level of |v| / s, ties to the lower index; float squared error in order. */
+static float engram_q4_group(const float *v, uint8_t *idx, float s) {
+    float err = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        const float x = fabsf(v[j]) / s;
+        int best = 0;
+        for (int k = 1; k < 8; k++)
+            if (fabsf(ds4_engram_lloyd4[k] - x) < fabsf(ds4_engram_lloyd4[best] - x)) best = k;
+        idx[j] = (uint8_t)best;
+        const float d = copysignf(ds4_engram_lloyd4[best] * s, v[j]) - v[j];
+        err += d * d;
+    }
+    return err;
+}
+
+static bool engram_scale_byte(float s, uint8_t *byte) {
+    int e;
+    const float m = frexpf(s, &e);
+    const float steps = m * 16.0f - 8.0f;
+    if (!(steps >= 0.0f && steps <= 7.0f) || steps != floorf(steps) ||
+        e + 16 < 0 || e + 16 > 31) return false;
+    *byte = (uint8_t)((e + 16) << 3 | (int)steps);
+    return true;
+}
+
+bool ds4_engram_encode_row136(const uint8_t src[DS4_ENGRAM_ROW_BYTES],
+                              uint8_t dst[DS4_ENGRAM_Q4_ROW_BYTES]) {
+    float v[DS4_ENGRAM_DIM];
+    for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
+        const uint8_t code = src[j], scale = src[DS4_ENGRAM_DIM + j / 32];
+        if ((code & 127) == 127 || scale == 255) {
+            errno = EDOM;
+            return false;
+        }
+        v[j] = ldexpf(e4m3(code), (int)scale - 127);
+        if (!isfinite(v[j])) {
+            errno = EDOM;
+            return false;
+        }
+    }
+    memset(dst, 0, DS4_ENGRAM_Q4_ROW_BYTES);
+    for (int g = 0; g < DS4_ENGRAM_DIM / 32; g++) {
+        const float *gv = v + 32 * g;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(gv[j]));
+        uint8_t idx[32] = {0}, byte = 0;
+        if (amax != 0.0f) {   /* an all-zero group keeps level 0 and its signs */
+            const float up = engram_f8_up(amax / ds4_engram_lloyd4[7]);
+            const float down = engram_f8_down(up);
+            uint8_t up_byte, down_byte, idx_down[32];
+            if (!engram_scale_byte(up, &up_byte) || !engram_scale_byte(down, &down_byte)) {
+                errno = EDOM;
+                return false;
+            }
+            const float err_up = engram_q4_group(gv, idx, up);
+            const float err_down = engram_q4_group(gv, idx_down, down);
+            byte = up_byte;
+            if (err_down < err_up) {
+                memcpy(idx, idx_down, sizeof(idx));
+                byte = down_byte;
+            }
+        }
+        for (int j = 0; j < 32; j++) {
+            const int k = 32 * g + j;
+            const uint8_t nibble = (uint8_t)((signbit(gv[j]) ? 8 : 0) | idx[j]);
+            dst[k / 2] |= (uint8_t)(nibble << (4 * (k & 1)));
+        }
+        dst[DS4_ENGRAM_DIM / 2 + g] = byte;
+    }
+    return true;
+}
+
 bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
                      size_t count, float *out) {
     if (!t || t->fd < 0 || (count && (!rows || !out)) ||

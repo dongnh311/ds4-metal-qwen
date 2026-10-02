@@ -312,12 +312,159 @@ static void test_encodings(void) {
     assert(ds4_engram_row_bytes(DS4_ENGRAM_ENC_LLOYD4_ROW136) == 136);
 }
 
+/* The spike's v7 arithmetic, retyped independently of ds4_engram.c. */
+static float ref_f8_up(float x) {
+    int e;
+    const float m = frexpf(x, &e);
+    return ldexpf(ceilf(m * 16.0f) / 16.0f, e);
+}
+
+static float ref_f8_down(float s) {
+    int e;
+    const float m = frexpf(s, &e);
+    const float n = roundf(m * 16.0f) - 1.0f;
+    return n < 8.0f ? ldexpf(15.0f / 16.0f, e - 1) : ldexpf(n / 16.0f, e);
+}
+
+static float ref_group(const float *v, float *q, int *idx, float s) {
+    float err = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        const float x = fabsf(v[j]) / s;
+        int best = 0;
+        for (int k = 1; k < 8; k++)
+            if (fabsf(test_cb[k] - x) < fabsf(test_cb[best] - x)) best = k;
+        q[j] = copysignf(test_cb[best] * s, v[j]);
+        idx[j] = best;
+        const float d = q[j] - v[j];
+        err += d * d;
+    }
+    return err;
+}
+
+static float ref_e4m3_value(uint8_t code, uint8_t scale) {
+    const int exponent = (code >> 3) & 15;
+    double value = exponent ? (1.0 + (code & 7u) / 8.0) * pow(2.0, exponent - 7) : (code & 7u) / 512.0;
+    if (code & 128u) value = -value;
+    return (float)(value * pow(2.0, (int)scale - 127));
+}
+
+/* Reference v7 of one source row: BF16 output values and the expected 136 bytes. */
+static void ref_encode(const uint8_t src[DS4_ENGRAM_ROW_BYTES], float out[DS4_ENGRAM_DIM],
+                       uint8_t row[DS4_ENGRAM_Q4_ROW_BYTES]) {
+    float v[DS4_ENGRAM_DIM];
+    int codes[DS4_ENGRAM_DIM], scales[DS4_ENGRAM_DIM / 32];
+    for (int j = 0; j < DS4_ENGRAM_DIM; j++) v[j] = ref_e4m3_value(src[j], src[DS4_ENGRAM_DIM + j / 32]);
+    for (int g = 0; g < DS4_ENGRAM_DIM / 32; g++) {
+        const float *gv = v + 32 * g;
+        float amax = 0.0f, q[32];
+        int idx[32] = {0};
+        for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(gv[j]));
+        float s = 0.0f;
+        if (amax == 0.0f) {
+            memcpy(q, gv, sizeof(q));
+            scales[g] = 0;
+        } else {
+            const float up = ref_f8_up(amax / test_cb[7]), down = ref_f8_down(up);
+            float qa[32], qb[32];
+            int ia[32], ib[32];
+            const float ea = ref_group(gv, qa, ia, up), eb = ref_group(gv, qb, ib, down);
+            s = eb < ea ? down : up;
+            memcpy(q, eb < ea ? qb : qa, sizeof(q));
+            memcpy(idx, eb < ea ? ib : ia, sizeof(idx));
+            int e;
+            const float m = frexpf(s, &e);
+            scales[g] = (e + 16) << 3 | (int)(m * 16.0f - 8.0f);
+        }
+        for (int j = 0; j < 32; j++) {
+            out[32 * g + j] = bf16_round(q[j]);
+            codes[32 * g + j] = (signbit(gv[j]) ? 8 : 0) | idx[j];
+        }
+    }
+    q4_pack(row, codes, scales);
+}
+
+static uint32_t enc_rng = 2463534242u;
+static uint32_t enc_next(void) {
+    enc_rng ^= enc_rng << 13;
+    enc_rng ^= enc_rng >> 17;
+    enc_rng ^= enc_rng << 5;
+    return enc_rng;
+}
+
+static void random_source_row(uint8_t src[DS4_ENGRAM_ROW_BYTES]) {
+    for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
+        uint8_t c;
+        do c = (uint8_t)enc_next(); while ((c & 127) == 127);
+        src[j] = c;
+    }
+    for (int g = 0; g < DS4_ENGRAM_DIM / 32; g++)
+        src[DS4_ENGRAM_DIM + g] = (uint8_t)(enc_next() % 4 ? 117 + enc_next() % 6 : 112 + enc_next() % 16);
+}
+
+/* Encode a row, decode it through the 136-byte table path, compare with the reference. */
+static void check_encoded(int fd, const uint8_t src[DS4_ENGRAM_ROW_BYTES]) {
+    uint8_t row[DS4_ENGRAM_Q4_ROW_BYTES], want_row[DS4_ENGRAM_Q4_ROW_BYTES];
+    float want[DS4_ENGRAM_DIM], got[DS4_ENGRAM_DIM];
+    memset(row, 0xa5, sizeof(row));
+    assert(ds4_engram_encode_row136(src, row));
+    ref_encode(src, want, want_row);
+    assert(!memcmp(row, want_row, sizeof(row)));
+    assert(pwrite(fd, row, sizeof(row), 0) == sizeof(row));
+    ds4_engram_table t = {.fd = fd, .rows = 1, .encoding = DS4_ENGRAM_ENC_LLOYD4_ROW136};
+    const uint32_t id = 0;
+    assert(ds4_engram_read(&t, &id, 1, got));
+    assert(!memcmp(got, want, sizeof(got)));
+}
+
+static void test_encoder(void) {
+    char path[] = "/tmp/ds4-engram-enc-XXXXXX";
+    const int fd = mkstemp(path);
+    assert(fd >= 0);
+    assert(unlink(path) == 0);
+    uint8_t src[DS4_ENGRAM_ROW_BYTES];
+    for (int r = 0; r < 20000; r++) {
+        random_source_row(src);
+        check_encoded(fd, src);
+    }
+    /* An all-zero group keeps the sign of each source zero. */
+    random_source_row(src);
+    for (int j = 32; j < 64; j++) src[j] = j & 1 ? 0x80 : 0x00;
+    check_encoded(fd, src);
+    /* amax exactly a power of two: the down step takes the 15/16 * 2^(e-1) branch. */
+    random_source_row(src);
+    for (int j = 64; j < 96; j++) src[j] = (uint8_t)(enc_next() % 48);
+    src[70] = 56;                         /* 1.0: the group's largest magnitude */
+    check_encoded(fd, src);
+    /* Refused sources leave errno EDOM. */
+    uint8_t row[DS4_ENGRAM_Q4_ROW_BYTES];
+    random_source_row(src);
+    src[5] = 0xff;
+    errno = 0;
+    assert(!ds4_engram_encode_row136(src, row) && errno == EDOM);
+    random_source_row(src);
+    src[DS4_ENGRAM_DIM + 3] = 255;
+    errno = 0;
+    assert(!ds4_engram_encode_row136(src, row) && errno == EDOM);
+    random_source_row(src);                /* 448 * 2^13: up needs E > 31 */
+    src[0] = 0x7e;
+    src[DS4_ENGRAM_DIM] = 140;
+    errno = 0;
+    assert(!ds4_engram_encode_row136(src, row) && errno == EDOM);
+    random_source_row(src);                /* every |v| = 2^-21: both scales need E < 0 */
+    for (int j = 0; j < 32; j++) src[j] = j & 1 ? 0x08 : 0x88;
+    src[DS4_ENGRAM_DIM] = 112;
+    errno = 0;
+    assert(!ds4_engram_encode_row136(src, row) && errno == EDOM);
+    close(fd);
+}
+
 int main(void) {
     test_hash();
     test_rows();
     test_all_scaled_values();
     test_encodings();
     test_q4_rows();
+    test_encoder();
     puts("Engram hashes, history and bounded disk rows: PASS");
     return 0;
 }

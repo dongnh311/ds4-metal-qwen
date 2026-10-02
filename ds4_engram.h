@@ -65,6 +65,15 @@ typedef struct {
     ds4_engram_encoding encoding;
 } ds4_engram_table;
 
+/* Encode one e4m3_e8m0_32_row264 row as lloyd4_e5m3_32_r136. Per 32 values,
+ * the scale is the better (by float squared error, ties to the larger) of
+ * amax rounded up to 4 significant bits and one step below it; each value
+ * takes the nearest codebook level (ties to the lower) and its source sign.
+ * False with errno EDOM on a NaN code, scale byte 255, a non-finite value, or
+ * a scale candidate outside E = 0..31. */
+bool ds4_engram_encode_row136(const uint8_t src[DS4_ENGRAM_ROW_BYTES],
+                              uint8_t dst[DS4_ENGRAM_Q4_ROW_BYTES]);
+
 /* A separate uncached file descriptor, never an mmap or Metal model view. */
 bool ds4_engram_table_open(ds4_engram_table *table, const char *path,
                            uint64_t offset, uint32_t rows,
