@@ -171,9 +171,11 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     workload, ctx, gb, gen, log_router = spec
     tag = run_tag(spec, tag_suffix)
     result_path = os.path.join(out_dir, tag + ".result.json")
-    csv_path = os.path.join(out_dir, tag + ".csv")
-    router_log = os.path.join(out_dir, tag + ".router.log") if log_router else None
-    cmd = bench_cmd(bin_dir, model, os.path.join(prompts_dir, workload + ".txt"),
+    # Absolute paths: the binary runs from its own tree (cwd=bin_dir below).
+    csv_path = os.path.abspath(os.path.join(out_dir, tag + ".csv"))
+    router_log = os.path.abspath(os.path.join(out_dir, tag + ".router.log")) if log_router else None
+    cmd = bench_cmd(os.path.abspath(bin_dir), os.path.abspath(model),
+                    os.path.abspath(os.path.join(prompts_dir, workload + ".txt")),
                     ctx, gen, gb, csv_path)
     if dry_run:
         print("phase0:", " ".join(cmd))
@@ -219,7 +221,10 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
         interval = getattr(ws, "interval", 0.5)
         poll_thread = threading.Thread(target=poll, args=(interval,), daemon=True)
         poll_thread.start()
-        rc = subprocess.run(cmd, env=env, stdout=err, stderr=err).returncode
+        # Upstream builds load metal/*.metal relative to the CWD: run each
+        # binary from its own tree so its shaders match it.
+        rc = subprocess.run(cmd, env=env, stdout=err, stderr=err,
+                            cwd=os.path.abspath(bin_dir)).returncode
         t_exit = time.monotonic()
         stop_poll.set()
         poll_thread.join()

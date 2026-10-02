@@ -261,6 +261,20 @@ class RunTest(unittest.TestCase):
                 self.assertIn(key, row["ds4_env"])
             self.assertEqual(row["bin_dir"], os.path.abspath(tmp))
 
+    def test_runs_binary_from_its_own_dir(self):
+        # Upstream builds read metal/*.metal relative to the CWD, so each
+        # binary must run from its own tree, not from the caller's.
+        with tempfile.TemporaryDirectory() as tmp:
+            body = 'pwd -P > cwd.txt\n' + self.csv_body()
+            os.makedirs(os.path.join(tmp, "prompts"), exist_ok=True)
+            open(os.path.join(tmp, "prompts", "switch.txt"), "w").close()
+            phase0.run_one(fake_bin(tmp, body), "/m.gguf", os.path.join(tmp, "prompts"), tmp,
+                           self.SPEC, running=lambda: "", swap=lambda: 0.0,
+                           sampler=lambda: _FakeSampler(), idle_read=lambda: FREE_VM_STAT,
+                           idle_timeout=0.05, idle_interval=0.01)
+            with open(os.path.join(tmp, "cwd.txt")) as fp:
+                self.assertEqual(fp.read().strip(), os.path.realpath(tmp))
+
     def test_plain_strips_inherited_profile_env(self):
         old = os.environ.get("DS4_METAL_GPU_BUSY_PROFILE")
         os.environ["DS4_METAL_GPU_BUSY_PROFILE"] = "1"
