@@ -461,6 +461,13 @@ void ds4_gpu_stream_gate_test_clear_failure(void);
  * service, read without waiting. */
 void ds4_gpu_stream_gate_test_stall_after_release(uint64_t nth, uint32_t ms);
 int ds4_gpu_stream_gate_test_service_busy(void);
+/* The loaded model runs the qwen4 graph. With ds4_gpu_set_glm_model it names
+ * the models whose stream gates want the whole expert cache in one slab. */
+void ds4_gpu_set_qwen4_model(bool enabled);
+/* Tests: the expert cache slab target in bytes (0 restores the default) and
+ * the number of slabs the cache holds. */
+void ds4_gpu_stream_expert_slab_test_set_target(uint64_t bytes);
+uint32_t ds4_gpu_stream_expert_slab_test_count(void);
 #endif
 #if defined(DS4_ROCM_BUILD) || (!defined(DS4_NO_GPU) && !defined(__APPLE__))
 int ds4_gpu_stream_expert_cache_prepare_selected_batch(
