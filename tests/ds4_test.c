@@ -1945,6 +1945,7 @@ static void test_metal_qwen4_quant_moe_mm(void) {
     test_metal_qwen4_quant_moe_mm_case(18, 42);   /* IQ3_XXS, Q2_0 */
     test_metal_qwen4_quant_moe_mm_case(21, 20);   /* IQ3_S, IQ4_NL */
     test_metal_qwen4_quant_moe_mm_case(16, 20);   /* IQ2_XXS (existing tiles), IQ4_NL down */
+    test_metal_qwen4_quant_moe_mm_case(42, 42);   /* Q2_0 tier: Q2_0 gate/up/down */
 }
 
 /* The tiled dense GEMM on 37 rows: 40 tokens (one full and one partial token tile) and 9 tokens
