@@ -3569,6 +3569,7 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
         const uint64_t *offsets, const uint32_t *types, const uint32_t *out_rows);
 /* 1 when the call above runs kernel_qwen4_gsq_mv (dense GSQ-RCO/BF16 rows, 1-8 tokens) */
 int ds4_gpu_qwen4_gsq_mv_selected(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types);
+int ds4_gpu_qwen4_gsq_mv2_selected(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types);
 /* softmax top-k router; with in_dim != 0 also the shared expert gate logit
  * (one row of gate_type at gate_offset dotted with x) into shared_gate [T] */
 int ds4_gpu_qwen4_router_topk_tensor(

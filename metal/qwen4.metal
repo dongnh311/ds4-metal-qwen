@@ -3323,6 +3323,170 @@ template [[host_name("kernel_qwen4_gsq_mv_r1")]] kernel void kernel_qwen4_gsq_mv
 template [[host_name("kernel_qwen4_gsq_mv_r2")]] kernel void kernel_qwen4_gsq_mv<2>(QWEN4_GSQ_MV_SIG);
 template [[host_name("kernel_qwen4_gsq_mv_r3")]] kernel void kernel_qwen4_gsq_mv<3>(QWEN4_GSQ_MV_SIG);
 template [[host_name("kernel_qwen4_gsq_mv_r4")]] kernel void kernel_qwen4_gsq_mv<4>(QWEN4_GSQ_MV_SIG);
+
+/* The 16 codes of chunk c (half h of 32-value block b) as floats, and the chunk's scale: the chunk's
+ * dot product is scale * sum(code * x), minus mn * sum(x) for Q5_K.  IQ4_XS reads its values and
+ * IQ3_S its grid from threadgroup memory. */
+template <uint TYPE>
+static inline float qwen4_mv2_codes(device const char *row, uint c, threadgroup const float *kv,
+                                    threadgroup const uint *grid, thread float *cv, thread float &mn) {
+    const uint b = c / 2u, h = c % 2u, ib32 = b % 8u;
+    mn = 0.0f;
+    if (TYPE == 23) {   /* IQ4_XS: half 0 is the low nibbles of the block's 16 bytes, half 1 the high */
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8u) * 136u);
+        const uint scales_h = (uint)*(device const ushort *)(blk + 2);
+        const int ls = (int)(((blk[4 + ib32 / 2] >> (4u * (ib32 % 2u))) & 0xFu) | (((scales_h >> (2u * ib32)) & 3u) << 4));
+        device const uchar *qs = blk + 8 + 16 * ib32;
+        for (uint i = 0; i < 16u; i++) cv[i] = kv[h ? (qs[i] >> 4) : (qs[i] & 0xFu)];
+        return (float)(*(device const half *)blk) * (float)(ls - 32);
+    }
+    if (TYPE == 21) {   /* IQ3_S: two runs of eight, each two grid entries and a sign byte */
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8u) * 110u);
+        const uint qh = blk[66 + ib32];
+        for (uint k = 0; k < 2u; k++) {
+            const uint q = 2u * h + k, s = blk[74 + 4 * ib32 + q];
+            device const uchar *qs = blk + 2 + 8 * ib32 + 2 * q;
+            const uchar4 g1 = as_type<uchar4>(grid[(uint)qs[0] | ((qh << (8u - 2u * q)) & 256u)]);
+            const uchar4 g2 = as_type<uchar4>(grid[(uint)qs[1] | ((qh << (7u - 2u * q)) & 256u)]);
+            for (uint i = 0; i < 4u; i++) {
+                cv[8u * k + i] = (float)g1[i] * ((s >> i) & 1u ? -1.0f : 1.0f);
+                cv[8u * k + 4u + i] = (float)g2[i] * ((s >> (i + 4u)) & 1u ? -1.0f : 1.0f);
+            }
+        }
+        return (float)(*(device const half *)blk) *
+               (float)(1u + 2u * ((blk[106 + ib32 / 2] >> (4u * (ib32 & 1u))) & 0xFu));
+    }
+    /* Q5_K: 5-bit codes, block scale and min */
+    device const uchar *blk = (device const uchar *)(row + (uint64_t)(b / 8u) * 176u);
+    const float d = (float)(*(device const half *)blk), dmin = (float)(*(device const half *)(blk + 2));
+    device const uchar *sc = blk + 4;
+    const uint g = ib32;
+    uint s, m;
+    if (g < 4) { s = sc[g] & 63u; m = sc[g + 4] & 63u; }
+    else { s = (sc[g + 4] & 0xFu) | ((sc[g - 4] >> 6) << 4); m = (sc[g + 4] >> 4) | ((sc[g] >> 6) << 4); }
+    for (uint k = 0; k < 2u; k++) {
+        const uint l = 16u * h + 8u * k;   /* 176-byte blocks in 32-aligned tensors: 8-byte aligned */
+        const uint2 hq = *(device const uint2 *)(blk + 16 + l), lq = *(device const uint2 *)(blk + 48 + 32 * (g / 2) + l);
+        for (uint i = 0; i < 8u; i++) {
+            const uint hb = (hq[i >> 2] >> (8u * (i & 3u))) & 0xFFu, lb = (lq[i >> 2] >> (8u * (i & 3u))) & 0xFFu;
+            const uint lo = (g & 1u) ? (lb >> 4) : (lb & 0xFu);
+            cv[8u * k + i] = (float)(lo + (((hb >> g) & 1u) << 4));
+        }
+    }
+    mn = dmin * (float)m;
+    return d * (float)s;
+}
+
+/* a value through the runtime zero: rounded on its own, opaque to reassociation */
+static inline float qwen4_mv2_pin(float v, uint opaque) {
+    return as_type<float>(as_type<uint>(v) ^ opaque);
+}
+
+/* two rows of kernel_qwen4_gsq_mv2 for a constant type; row1 is computed only when `two` */
+template <uint TYPE, uint R1>
+static inline void qwen4_gsq_mv2_loop(device const char *row0, device const char *row1, bool two,
+                                      device const float *x, uint in_dim, uint t0, uint nt, uint opaque,
+                                      ushort tiisg, threadgroup const float *kv, threadgroup const uint *grid,
+                                      thread float *acc0, thread float *acc1) {
+    for (uint t = 0; t < R1; t++) { acc0[t] = 0.0f; acc1[t] = 0.0f; }
+    for (uint c = tiisg; c < in_dim / 16u; c += 32u) {
+        float c0[16], c1[16], m0, m1 = 0.0f, s1 = 0.0f;
+        float s0 = qwen4_mv2_codes<TYPE>(row0, c, kv, grid, c0, m0);
+        if (two) s1 = qwen4_mv2_codes<TYPE>(row1, c, kv, grid, c1, m1);
+        else for (uint i = 0; i < 16u; i++) c1[i] = 0.0f;
+        for (uint i = 0; i < 16u; i++) {
+            c0[i] = as_type<float>(as_type<uint>(c0[i]) ^ opaque);
+            c1[i] = as_type<float>(as_type<uint>(c1[i]) ^ opaque);
+        }
+        s0 = as_type<float>(as_type<uint>(s0) ^ opaque);
+        s1 = as_type<float>(as_type<uint>(s1) ^ opaque);
+        for (uint t = 0; t < R1; t++) {
+            if (t < nt) {
+                device const float4 *xv = (device const float4 *)(x + (uint64_t)(t0 + t) * in_dim + c * 16u);
+                float d0 = 0.0f, d1 = 0.0f, sx = 0.0f;
+                for (uint j = 0; j < 4u; j++) {
+                    const float4 y = xv[j];
+                    d0 += c0[4u * j] * y.x + c0[4u * j + 1u] * y.y + c0[4u * j + 2u] * y.z + c0[4u * j + 3u] * y.w;
+                    d1 += c1[4u * j] * y.x + c1[4u * j + 1u] * y.y + c1[4u * j + 2u] * y.z + c1[4u * j + 3u] * y.w;
+                    if (TYPE == 13) sx += y.x + y.y + y.z + y.w;
+                }
+                if (TYPE == 13) {
+                    /* acc + s*d - m*sx has several fast-math orders and each R1 may pick another:
+                     * pin both products and their difference, so only acc + term remains */
+                    acc0[t] += qwen4_mv2_pin(qwen4_mv2_pin(s0 * d0, opaque) - qwen4_mv2_pin(m0 * sx, opaque), opaque);
+                    acc1[t] += qwen4_mv2_pin(qwen4_mv2_pin(s1 * d1, opaque) - qwen4_mv2_pin(m1 * sx, opaque), opaque);
+                } else {
+                    acc0[t] += s0 * d0;
+                    acc1[t] += s1 * d1;
+                }
+            }
+        }
+    }
+}
+
+/* IQ4_XS, IQ3_S and Q5_K rows of one output over R1 tokens, two rows per simdgroup: a lane loads an
+ * activation chunk once for both rows, sums the chunk's codes against it and applies the chunk's
+ * scale once (Q5_K also its min times the chunk's activation sum).  The codes and scales pass through
+ * `opaque` as in kernel_qwen4_gsq_mv, so a column's sum does not depend on R1. */
+template <uint R1>
+kernel void kernel_qwen4_gsq_mv2(
+        constant ds4_metal_args_qwen4_gemv & args,
+        device const float *x,          /* [T][in_dim] */
+        device const char  *w0,
+        device const char  *w1,
+        device const char  *w2,
+        device const char  *w3,
+        device float       *o0,         /* [T][out_rows[0]] */
+        device float       *o1,
+        device float       *o2,
+        device float       *o3,
+        threadgroup char   *shmem [[threadgroup(0)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiitg [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    threadgroup uint *grid = (threadgroup uint *)shmem;     /* IQ3_S: the 512-entry grid */
+    threadgroup float *kv = (threadgroup float *)shmem;     /* IQ4_XS: the 16 values */
+    const uint type = args.types[0];
+    if (type == 21) {
+        for (uint i = tiitg; i < 512u; i += 128u) grid[i] = ds4_metal_iq3s_grid[i];
+    } else if (type == 23 && tiitg < 16u) {
+        kv[tiitg] = (float)ds4_metal_kvalues_iq4nl[tiitg];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint rows = args.out_rows[0], r = (tgpig.x * 4u + (uint)sgitg) * 2u;
+    if (r >= rows) return;
+    const bool two = r + 1u < rows;
+    device const char *row0 = w0 + (uint64_t)r * args.row_bytes[0];
+    device const char *row1 = two ? row0 + args.row_bytes[0] : row0;
+    const uint t0 = tgpig.y * R1;
+    const uint nt = min(R1, args.n_tokens - t0);
+    float acc0[R1], acc1[R1];
+    switch (type) {
+    case 13: qwen4_gsq_mv2_loop<13, R1>(row0, row1, two, x, args.in_dim, t0, nt, args.zero, tiisg, kv, grid, acc0, acc1); break;
+    case 21: qwen4_gsq_mv2_loop<21, R1>(row0, row1, two, x, args.in_dim, t0, nt, args.zero, tiisg, kv, grid, acc0, acc1); break;
+    case 23: qwen4_gsq_mv2_loop<23, R1>(row0, row1, two, x, args.in_dim, t0, nt, args.zero, tiisg, kv, grid, acc0, acc1); break;
+    default:   /* the host routes only the three types here: anything else fails parity loudly */
+        for (uint t = 0; t < R1; t++) { acc0[t] = NAN; acc1[t] = NAN; }
+        break;
+    }
+    for (uint t = 0; t < R1; t++) {
+        const float v0 = simd_sum(acc0[t]), v1 = simd_sum(acc1[t]);
+        if (tiisg == 0 && t < nt) {
+            o0[(uint64_t)(t0 + t) * rows + r] = v0;
+            if (two) o0[(uint64_t)(t0 + t) * rows + r + 1u] = v1;
+        }
+    }
+}
+
+#define QWEN4_GSQ_MV2_SIG constant ds4_metal_args_qwen4_gemv &, device const float *, device const char *, \
+    device const char *, device const char *, device const char *, device float *, device float *, \
+    device float *, device float *, threadgroup char *, uint3, ushort, ushort, ushort
+template [[host_name("kernel_qwen4_gsq_mv2_r1")]] kernel void kernel_qwen4_gsq_mv2<1>(QWEN4_GSQ_MV2_SIG);
+template [[host_name("kernel_qwen4_gsq_mv2_r2")]] kernel void kernel_qwen4_gsq_mv2<2>(QWEN4_GSQ_MV2_SIG);
+template [[host_name("kernel_qwen4_gsq_mv2_r3")]] kernel void kernel_qwen4_gsq_mv2<3>(QWEN4_GSQ_MV2_SIG);
+template [[host_name("kernel_qwen4_gsq_mv2_r4")]] kernel void kernel_qwen4_gsq_mv2<4>(QWEN4_GSQ_MV2_SIG);
+#undef QWEN4_GSQ_MV2_SIG
 #undef QWEN4_GSQ_MV_SIG
 
 /* Decode specialization keeps the original per-lane accumulation order. */
