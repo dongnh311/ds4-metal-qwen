@@ -286,6 +286,11 @@ uint32_t ds4_engine_native_context(const ds4_engine *e);
 /* Ornith's context rule: a context within the native one always runs; past
  * it only when the YaRN factor covers it (context_size <= native_ctx * factor). */
 bool ds4_qwen35_context_ok(uint32_t native_ctx, uint32_t context_size, double factor);
+/* The refusal when that rule fails, with the fix that applies: a factor forced
+ * by DS4_QWEN4_YARN_FACTOR is to be unset; one chosen for rope_ctx needs a
+ * context of at most native_ctx * factor, or an engine opened past context_size. */
+void ds4_qwen35_context_refusal(char *buf, size_t n, uint32_t native_ctx, uint32_t context_size,
+                                double factor, uint32_t rope_ctx, bool forced);
 /* The context the rope is chosen for: rope_context_size when set (> 0), else
  * context_size. Callers that allocate slack past the context they run (ds4-bench)
  * set rope_context_size so the slack does not turn YaRN on. */

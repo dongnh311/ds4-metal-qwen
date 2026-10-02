@@ -7285,6 +7285,19 @@ bool ds4_qwen35_context_ok(uint32_t native_ctx, uint32_t context_size, double fa
     return factor > 1.0 && (double)context_size <= (double)native_ctx * factor;
 }
 
+void ds4_qwen35_context_refusal(char *buf, size_t n, uint32_t native_ctx, uint32_t context_size,
+                                double factor, uint32_t rope_ctx, bool forced) {
+    if (forced) {
+        snprintf(buf, n, "Ornith context %u exceeds %u native tokens x YaRN factor %g; leave "
+                 "DS4_QWEN4_YARN_FACTOR unset so the factor follows the context",
+                 context_size, native_ctx, factor);
+    } else {
+        snprintf(buf, n, "Ornith context %u exceeds %u native tokens x YaRN factor %g (chosen for a "
+                 "%u-token rope context); use at most %.0f tokens, or open with a context of at least %u",
+                 context_size, native_ctx, factor, rope_ctx, (double)native_ctx * factor, context_size);
+    }
+}
+
 void ds4_qwen4_rope_table(uint32_t n_rot, double base, uint32_t native_ctx, double factor,
                           float freq[32], float *mscale, double *low_out, double *high_out) {
     const uint32_t half = n_rot / 2u;
@@ -7312,8 +7325,10 @@ void ds4_qwen4_rope_table(uint32_t n_rot, double base, uint32_t native_ctx, doub
  * beyond 262k tokens. It is on when -c exceeds the native context (factor
  * from ds4_qwen4_yarn_factor) or when DS4_QWEN4_YARN_FACTOR asks for it; it
  * costs some quality on short text, so a context within the native one stays
- * unscaled. */
-static void qwen4_rope_configure(uint32_t native_ctx) {
+ * unscaled.  qwen4_rope_setup is shared by Qwen3.8 and Ornith: it sets the
+ * factor, table and mscale, logs them under label and returns whether YaRN is
+ * on; each family pushes the table itself. */
+static bool qwen4_rope_setup(uint32_t native_ctx, const char *label) {
     const char *env = getenv("DS4_QWEN4_YARN_FACTOR");
     if (env && env[0] && ds4_qwen4_yarn_env_factor(env) == 0.0) {
         fprintf(stderr, "ds4: ignoring DS4_QWEN4_YARN_FACTOR=\"%s\": not a finite positive number\n", env);
@@ -7328,10 +7343,15 @@ static void qwen4_rope_configure(uint32_t native_ctx) {
     g_qwen4_rope_factor = yarn ? (float)factor : 1.0f;
     if (yarn) {
         const bool from_env = ds4_qwen4_yarn_env_factor(env) > 1.0;
-        fprintf(stderr, "ds4: Qwen3.8 YaRN factor %g (%s) over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
-                factor, from_env ? "DS4_QWEN4_YARN_FACTOR" : "from -c", native_ctx, low, high,
+        fprintf(stderr, "ds4: %s YaRN factor %g (%s) over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
+                label, factor, from_env ? "DS4_QWEN4_YARN_FACTOR" : "from -c", native_ctx, low, high,
                 g_qwen4_rope_mscale);
     }
+    return yarn;
+}
+
+static void qwen4_rope_configure(uint32_t native_ctx) {
+    (void)qwen4_rope_setup(native_ctx, "Qwen3.8");
 #ifdef DS4_HAS_QWEN4_GPU
     ds4_gpu_qwen4_set_rope(g_qwen4_rope_freq, DS4_N_ROT / 2u, g_qwen4_rope_mscale);
 #endif
@@ -7344,27 +7364,12 @@ static void qwen4_rope_configure(uint32_t native_ctx) {
  * computed in double and could differ in the last bit), so -c <= 262144
  * stays byte-identical, and an earlier engine's table is cleared. */
 static void qwen35_rope_configure(uint32_t native_ctx) {
-    const char *env = getenv("DS4_QWEN4_YARN_FACTOR");
-    if (env && env[0] && ds4_qwen4_yarn_env_factor(env) == 0.0) {
-        fprintf(stderr, "ds4: ignoring DS4_QWEN4_YARN_FACTOR=\"%s\": not a finite positive number\n", env);
-    }
-    const double factor = ds4_qwen4_yarn_factor(native_ctx, g_qwen4_rope_ctx_hint, env);
-    const bool yarn = factor > 1.0;
-    double low = 0.0, high = 0.0;
-    ds4_qwen4_rope_table(DS4_N_ROT, DS4_ROPE_FREQ_BASE, native_ctx, factor,
-                         g_qwen4_rope_freq, &g_qwen4_rope_mscale, &low, &high);
-    g_qwen4_native_ctx = native_ctx;
-    g_qwen4_rope_yarn = yarn;
-    g_qwen4_rope_factor = yarn ? (float)factor : 1.0f;
-    if (yarn) {
-        const bool from_env = ds4_qwen4_yarn_env_factor(env) > 1.0;
-        fprintf(stderr, "ds4: Ornith YaRN factor %g (%s) over %u native tokens (pairs %g..%g blended, mscale %.4f)\n",
-                factor, from_env ? "DS4_QWEN4_YARN_FACTOR" : "from -c", native_ctx, low, high,
-                g_qwen4_rope_mscale);
-    }
+    const bool yarn = qwen4_rope_setup(native_ctx, "Ornith");
 #ifdef DS4_HAS_QWEN4_METAL
     if (yarn) ds4_gpu_qwen4_set_rope(g_qwen4_rope_freq, DS4_N_ROT / 2u, g_qwen4_rope_mscale);
     else ds4_gpu_qwen4_set_rope(NULL, 0, 1.0f);
+#else
+    (void)yarn;
 #endif
 }
 
@@ -73992,9 +73997,12 @@ static int ds4_engine_open_internal(ds4_engine **out,
         if (opt->context_size > 0 &&
             !ds4_qwen35_context_ok((uint32_t)DS4_ROPE_ORIG_CTX, (uint32_t)opt->context_size,
                                    (double)g_qwen4_rope_factor)) {
-            fprintf(stderr, "ds4: Ornith -c %d exceeds %llu native tokens x YaRN factor %g; leave "
-                            "DS4_QWEN4_YARN_FACTOR unset so the factor follows -c\n",
-                    opt->context_size, (unsigned long long)DS4_ROPE_ORIG_CTX, (double)g_qwen4_rope_factor);
+            char why[256];
+            ds4_qwen35_context_refusal(why, sizeof(why), (uint32_t)DS4_ROPE_ORIG_CTX,
+                                       (uint32_t)opt->context_size, (double)g_qwen4_rope_factor,
+                                       g_qwen4_rope_ctx_hint,
+                                       ds4_qwen4_yarn_env_factor(getenv("DS4_QWEN4_YARN_FACTOR")) > 0.0);
+            fprintf(stderr, "ds4: %s\n", why);
             ds4_engine_close(e);
             *out = NULL;
             return 1;

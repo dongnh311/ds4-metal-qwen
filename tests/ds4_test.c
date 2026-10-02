@@ -643,8 +643,6 @@ cleanup:
     test_restore_env("DS4_QWEN35_KV", saved_kv);
 }
 
-/* The payload round trip and refusals in every Ornith KV mode (M4): each
- * mode writes its own tag, and a checkpoint never loads into another mode. */
 #if defined(__APPLE__) && !defined(DS4_NO_GPU)
 /* Ornith YaRN through the engine (DS4_TEST_MODEL = the Ornith GGUF, Metal):
  * -c 524288 opens at factor 2 with the table on Metal; -c 262144 opens
@@ -711,6 +709,8 @@ done:
 }
 #endif
 
+/* The payload round trip and refusals in every Ornith KV mode (M4): each
+ * mode writes its own tag, and a checkpoint never loads into another mode. */
 static void test_qwen35_payloads(void) {
     ds4_engine *engine = test_get_engine(false);
     if (!engine || !ds4_engine_is_qwen35moe(engine)) {
@@ -8247,6 +8247,19 @@ static void test_qwen35_context_policy(void) {
     }
     /* DS4_QWEN4_YARN_FACTOR=1 past native: refused */
     TEST_ASSERT(!ds4_qwen35_context_ok(262144, 524288, ds4_qwen4_yarn_factor(262144, 524288, "1")));
+
+    /* The refusal names the fix that applies: the variable only when it is set. */
+    char msg[256];
+    ds4_qwen35_context_refusal(msg, sizeof(msg), 262144, 524417, 2.0, 524288, false);  /* ds4-bench --ctx-max 524288 */
+    TEST_ASSERT(strstr(msg, "exceeds 262144 native tokens x YaRN factor 2") != NULL);
+    TEST_ASSERT(strstr(msg, "DS4_QWEN4_YARN_FACTOR") == NULL);
+    TEST_ASSERT(strstr(msg, "at most 524288 tokens") != NULL);
+    ds4_qwen35_context_refusal(msg, sizeof(msg), 262144, 524288, 1.0, 32768, false);   /* REPL /ctx past a 32K open */
+    TEST_ASSERT(strstr(msg, "DS4_QWEN4_YARN_FACTOR") == NULL);
+    TEST_ASSERT(strstr(msg, "open with a context of at least 524288") != NULL);
+    ds4_qwen35_context_refusal(msg, sizeof(msg), 262144, 524288, 1.0, 524288, true);   /* the variable forces 1 */
+    TEST_ASSERT(strstr(msg, "exceeds 262144 native tokens x YaRN factor 1") != NULL);
+    TEST_ASSERT(strstr(msg, "leave DS4_QWEN4_YARN_FACTOR unset") != NULL);
 }
 
 /* Grow-on-demand KV, model-backed.  Needs a Qwen3.8 model and its PLE:
