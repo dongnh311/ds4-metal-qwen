@@ -170,9 +170,11 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
 
     for (int64_t off = 0; off < n_nope; off += 64) {
         float v = 0.0f;
-        if (tid < 64) {
+        if (tid < 64 && off + tid < n_nope) {
             v = *((device const float *) (src_base + (off + tid)*args.nb00));
             scratch[tid] = abs(v);
+        } else if (tid < 64) {
+            scratch[tid] = 0.0f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -185,7 +187,7 @@ kernel void kernel_dsv4_fp8_kv_quantize_f32(
 
         const float amax = max(scratch[0], 1.0e-4f);
         const float scale = exp2(ceil(log2(amax / 448.0f)));
-        if (tid < 64) {
+        if (tid < 64 && off + tid < n_nope) {
             const float q = dsv4_e4m3fn_dequant(clamp(v / scale, -448.0f, 448.0f)) * scale;
             *((device float *) (dst_base + (off + tid)*args.nb0)) = q;
         }

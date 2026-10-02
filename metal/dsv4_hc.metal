@@ -1580,12 +1580,14 @@ kernel void kernel_dsv4_hc_rms_norm_mix_f16_cluster2_pre_norm(
  * threadgroups and writes the expanded residual x; a device-scope barrier
  * across the co-resident threadgroups then orders every read of post/comb
  * and every write of x before the producer overwrites split and reads x.
- * The barrier counter is monotonic; the host passes 6 * dispatch count. */
+ * The barrier counter is monotonic.  Each threadgroup derives its target
+ * from its own arrival index, so a dispatch that never ran cannot leave
+ * later dispatches waiting on a count that will not arrive. */
 kernel void kernel_dsv4_hc_expand4_rms_norm_mix_f16_cluster2_pre_norm(
         constant ds4_metal_args_hc_norm_mix & args,
         constant ds4_metal_args_dsv4_hc_split_weighted_sum_norm & split_args,
         constant ds4_metal_args_dsv4_hc_expand & ex,
-        constant uint & barrier_target,
+        constant uint & barrier_group,
         device       char  * x,
         device const char  * weight,
         device       char  * dst,
@@ -1633,7 +1635,9 @@ kernel void kernel_dsv4_hc_expand4_rms_norm_mix_f16_cluster2_pre_norm(
     if (tiitg == 0) {
         atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst,
                             thread_scope_device);
-        atomic_fetch_add_explicit(barrier, 1u, memory_order_relaxed);
+        const uint arrived =
+            atomic_fetch_add_explicit(barrier, 1u, memory_order_relaxed);
+        const uint barrier_target = arrived - arrived % barrier_group + barrier_group;
         uint spins = 0u;
         while (atomic_load_explicit(barrier, memory_order_relaxed) < barrier_target) {
             if (++spins > 100000000u) break; /* never expected; avoids a GPU hang */

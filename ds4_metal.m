@@ -14489,6 +14489,49 @@ static void ds4_gpu_stream_expert_slab_push_free_slot(uint32_t slot) {
         slot;
 }
 
+/* Returns load buffers that never reached an installed entry: a slab slot
+ * goes back on the free list (still locked, like an evicted slot), anything
+ * else is munlocked and dropped.  Nils the pointers so a second call is a
+ * no-op.  Callers must not use this on buffers a blit may still write. */
+static void ds4_gpu_stream_expert_give_back_buffers(
+        __strong id<MTLBuffer> *gate,
+        __strong id<MTLBuffer> *up,
+        __strong id<MTLBuffer> *down,
+        NSUInteger              gate_inner) {
+    uint32_t slot = 0;
+    if (*gate && *gate == *up && *gate == *down &&
+        ds4_gpu_stream_expert_slab_slot_for_buffer(*gate, gate_inner, &slot)) {
+        ds4_gpu_stream_expert_slab_push_free_slot(slot);
+    } else {
+        ds4_gpu_stream_expert_unlock_explicit_buffer(*gate);
+        if (*up != *gate) ds4_gpu_stream_expert_unlock_explicit_buffer(*up);
+        if (*down != *gate && *down != *up) {
+            ds4_gpu_stream_expert_unlock_explicit_buffer(*down);
+        }
+    }
+    *gate = nil;
+    *up = nil;
+    *down = nil;
+}
+
+static void ds4_gpu_stream_expert_give_back_loads(
+        __strong id<MTLBuffer> *gate_bufs,
+        __strong id<MTLBuffer> *up_bufs,
+        __strong id<MTLBuffer> *down_bufs,
+        const NSUInteger       *gate_inners,
+        ds4_gpu_stream_expert_reusable_buffers *batch_reuse) {
+    for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
+        ds4_gpu_stream_expert_give_back_buffers(&gate_bufs[i], &up_bufs[i],
+                                                &down_bufs[i], gate_inners[i]);
+        if (batch_reuse) {
+            ds4_gpu_stream_expert_give_back_buffers(&batch_reuse[i].gate_buffer,
+                                                    &batch_reuse[i].up_buffer,
+                                                    &batch_reuse[i].down_buffer,
+                                                    batch_reuse[i].gate_inner);
+        }
+    }
+}
+
 static int ds4_gpu_stream_expert_slab_lock_slot(uint32_t slot) {
     if (slot >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_ENTRIES ||
         g_stream_expert_cache_slab_slot_locked[slot]) {
@@ -14604,6 +14647,33 @@ static int ds4_gpu_stream_expert_slab_slot_buffers(
     return 1;
 }
 
+/* The slot has already left the free list (or bumped slots_used), so a
+ * failed lock must hand it back or it is lost for the process lifetime. */
+static int ds4_gpu_stream_expert_slab_claim_slot(
+        uint32_t slot,
+        uint64_t gate_expert_bytes,
+        uint64_t down_expert_bytes,
+        __strong id<MTLBuffer> *gate_buf,
+        __strong id<MTLBuffer> *up_buf,
+        __strong id<MTLBuffer> *down_buf,
+        NSUInteger *gate_inner,
+        NSUInteger *up_inner,
+        NSUInteger *down_inner) {
+    if (ds4_gpu_stream_expert_slab_slot_buffers(slot,
+                                                gate_expert_bytes,
+                                                down_expert_bytes,
+                                                gate_buf,
+                                                up_buf,
+                                                down_buf,
+                                                gate_inner,
+                                                up_inner,
+                                                down_inner)) {
+        return 1;
+    }
+    ds4_gpu_stream_expert_slab_push_free_slot(slot);
+    return 0;
+}
+
 static int ds4_gpu_stream_expert_alloc_slab_slot(
         uint64_t gate_expert_bytes,
         uint64_t down_expert_bytes,
@@ -14637,15 +14707,15 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
     if (g_stream_expert_cache_free_slot_count != 0) {
         const uint32_t slot =
             g_stream_expert_cache_free_slots[--g_stream_expert_cache_free_slot_count];
-        return ds4_gpu_stream_expert_slab_slot_buffers(slot,
-                                                       gate_expert_bytes,
-                                                       down_expert_bytes,
-                                                       gate_buf,
-                                                       up_buf,
-                                                       down_buf,
-                                                       gate_inner,
-                                                       up_inner,
-                                                       down_inner);
+        return ds4_gpu_stream_expert_slab_claim_slot(slot,
+                                                     gate_expert_bytes,
+                                                     down_expert_bytes,
+                                                     gate_buf,
+                                                     up_buf,
+                                                     down_buf,
+                                                     gate_inner,
+                                                     up_inner,
+                                                     down_inner);
     }
 
     uint32_t slab = g_stream_expert_cache_slab_count;
@@ -14706,15 +14776,15 @@ static int ds4_gpu_stream_expert_alloc_slab_slot(
     const uint32_t local_slot = g_stream_expert_cache_slab_slots_used[slab]++;
     const uint32_t slot =
         g_stream_expert_cache_slab_start_slot[slab] + local_slot;
-    return ds4_gpu_stream_expert_slab_slot_buffers(slot,
-                                                   gate_expert_bytes,
-                                                   down_expert_bytes,
-                                                   gate_buf,
-                                                   up_buf,
-                                                   down_buf,
-                                                   gate_inner,
-                                                   up_inner,
-                                                   down_inner);
+    return ds4_gpu_stream_expert_slab_claim_slot(slot,
+                                                 gate_expert_bytes,
+                                                 down_expert_bytes,
+                                                 gate_buf,
+                                                 up_buf,
+                                                 down_buf,
+                                                 gate_inner,
+                                                 up_inner,
+                                                 down_inner);
 }
 
 static uint64_t ds4_gpu_stream_expert_buffer_object_count(
@@ -16258,6 +16328,7 @@ static uint32_t ds4_gpu_stream_expert_cache_release_mlock_margin(
         for (uint32_t layer = 0;
              layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER;
              layer++) {
+            if (g_stream_expert_cache_layer_count[layer] == 0) continue;
             for (uint32_t expert = 0;
                  expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT;
                  expert++) {
@@ -16552,7 +16623,10 @@ static void ds4_gpu_stream_expert_cache_prune_global(
                  expert++) {
                 ds4_gpu_stream_expert_cache_entry *e =
                     &g_stream_expert_cache[layer][expert];
+                /* clear_entry skips in-flight entries, so picking one would
+                 * leave entry_count unchanged and spin this loop forever. */
                 if (!e->valid ||
+                    ds4_gpu_stream_expert_cache_entry_inflight(e) ||
                     ds4_gpu_stream_expert_cache_entry_protected(layer,
                                                                 expert,
                                                                 protect_layer,
@@ -16820,12 +16894,13 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
                                                           &down_inner)) {
         return NULL;
     }
-    if (!gate_buf || !up_buf || !down_buf) return NULL;
-
-    uint8_t *gate_dst = (uint8_t *)[gate_buf contents] + gate_inner;
-    uint8_t *up_dst = (uint8_t *)[up_buf contents] + up_inner;
-    uint8_t *down_dst = (uint8_t *)[down_buf contents] + down_inner;
-    if (!gate_dst || !up_dst || !down_dst) return NULL;
+    uint8_t *gate_dst = gate_buf ? (uint8_t *)[gate_buf contents] + gate_inner : NULL;
+    uint8_t *up_dst = up_buf ? (uint8_t *)[up_buf contents] + up_inner : NULL;
+    uint8_t *down_dst = down_buf ? (uint8_t *)[down_buf contents] + down_inner : NULL;
+    if (!gate_dst || !up_dst || !down_dst) {
+        ds4_gpu_stream_expert_give_back_buffers(&gate_buf, &up_buf, &down_buf, gate_inner);
+        return NULL;
+    }
 
     ds4_gpu_stream_expert_pread_task tasks[3] = {
         {
@@ -16847,6 +16922,7 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
     uint64_t read_bytes = 0;
     double read_ms = 0.0;
     if (!ds4_gpu_stream_expert_pread_tasks(tasks, 3, &read_bytes, &read_ms)) {
+        ds4_gpu_stream_expert_give_back_buffers(&gate_buf, &up_buf, &down_buf, gate_inner);
         return NULL;
     }
     ds4_gpu_stream_expert_cache_note_pread(layer, read_bytes, read_ms);
@@ -16860,21 +16936,26 @@ static ds4_gpu_stream_expert_cache_entry *ds4_gpu_stream_expert_cache_get_protec
                 ds4_gpu_gib(read_bytes),
                 read_ms);
     }
-    return ds4_gpu_stream_expert_cache_install_loaded(model_map,
-                                                      model_size,
-                                                      layer,
-                                                      expert,
-                                                      gate_abs_offset,
-                                                      up_abs_offset,
-                                                      down_abs_offset,
-                                                      gate_expert_bytes,
-                                                      down_expert_bytes,
-                                                      gate_buf,
-                                                      up_buf,
-                                                      down_buf,
-                                                      gate_inner,
-                                                      up_inner,
-                                                      down_inner);
+    ds4_gpu_stream_expert_cache_entry *entry =
+        ds4_gpu_stream_expert_cache_install_loaded(model_map,
+                                                   model_size,
+                                                   layer,
+                                                   expert,
+                                                   gate_abs_offset,
+                                                   up_abs_offset,
+                                                   down_abs_offset,
+                                                   gate_expert_bytes,
+                                                   down_expert_bytes,
+                                                   gate_buf,
+                                                   up_buf,
+                                                   down_buf,
+                                                   gate_inner,
+                                                   up_inner,
+                                                   down_inner);
+    if (!entry) {
+        ds4_gpu_stream_expert_give_back_buffers(&gate_buf, &up_buf, &down_buf, gate_inner);
+    }
+    return entry;
 }
 
 /*
@@ -17079,10 +17160,11 @@ static int ds4_gpu_stream_expert_pending_load_profile_enabled(void) {
 static void ds4_gpu_stream_expert_pending_load_release_buffers(
         ds4_gpu_stream_expert_pending_load *p) {
     if (!p) return;
+    /* Installed loads were nilled by pending_load_install; the rest never
+     * reached an entry and go back to the free pool. */
+    ds4_gpu_stream_expert_give_back_loads(p->gate_bufs, p->up_bufs, p->down_bufs,
+                                          p->gate_inners, NULL);
     for (uint32_t i = 0; i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED; i++) {
-        p->gate_bufs[i] = nil;
-        p->up_bufs[i] = nil;
-        p->down_bufs[i] = nil;
         p->gate_inners[i] = 0;
         p->up_inners[i] = 0;
         p->down_inners[i] = 0;
@@ -17137,6 +17219,9 @@ static int ds4_gpu_stream_expert_pending_load_install(
                                                        p->up_inners[load_i],
                                                        p->down_inners[load_i]);
         if (!entry) return 0;
+        p->gate_bufs[load_i] = nil;
+        p->up_bufs[load_i] = nil;
+        p->down_bufs[load_i] = nil;
         loaded_entries[slot] = entry;
         if (entries) entries[slot] = entry;
     }
@@ -17419,6 +17504,7 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
             p->gate_inners[load_i] = batch_reuse[load_i].gate_inner;
             p->up_inners[load_i] = batch_reuse[load_i].up_inner;
             p->down_inners[load_i] = batch_reuse[load_i].down_inner;
+            batch_reuse[load_i] = (ds4_gpu_stream_expert_reusable_buffers){ nil, nil, nil, 0, 0, 0 };
         } else {
             const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
             const int prepared =
@@ -17442,6 +17528,8 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
             }
             if (!prepared) {
                 ds4_gpu_stream_expert_pending_load_release_buffers(p);
+                ds4_gpu_stream_expert_give_back_loads(p->gate_bufs, p->up_bufs, p->down_bufs,
+                                                      p->gate_inners, batch_reuse);
                 return 0;
             }
         }
@@ -17456,6 +17544,8 @@ int ds4_gpu_stream_expert_cache_begin_selected_load(
                              p->down_inners[load_i];
         if (!gate_dst || !up_dst || !down_dst) {
             ds4_gpu_stream_expert_pending_load_release_buffers(p);
+            ds4_gpu_stream_expert_give_back_loads(p->gate_bufs, p->up_bufs, p->down_bufs,
+                                                  p->gate_inners, batch_reuse);
             return 0;
         }
         const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
@@ -17711,6 +17801,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
             gate_inners[load_i] = batch_reuse[load_i].gate_inner;
             up_inners[load_i] = batch_reuse[load_i].up_inner;
             down_inners[load_i] = batch_reuse[load_i].down_inner;
+            batch_reuse[load_i] = (ds4_gpu_stream_expert_reusable_buffers){ nil, nil, nil, 0, 0, 0 };
         } else {
             const double buffer_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
             const int prepared =
@@ -17733,6 +17824,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                         ds4_gpu_now_ms() - buffer_t0);
             }
             if (!prepared) {
+                ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
                 return 0;
             }
         }
@@ -17740,6 +17832,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
             reserved_entries++;
         }
         if (!gate_bufs[load_i] || !up_bufs[load_i] || !down_bufs[load_i]) {
+            ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
             return 0;
         }
 
@@ -17749,7 +17842,10 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                            up_inners[load_i];
         uint8_t *down_dst = (uint8_t *)[down_bufs[load_i] contents] +
                              down_inners[load_i];
-        if (!gate_dst || !up_dst || !down_dst) return 0;
+        if (!gate_dst || !up_dst || !down_dst) {
+            ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
+            return 0;
+        }
         if (gpu_copy_source &&
             (gate_abs_offsets[slot] > model_size ||
              gate_expert_bytes > model_size - gate_abs_offsets[slot] ||
@@ -17759,6 +17855,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
              down_expert_bytes > model_size - down_abs_offsets[slot])) {
             fprintf(stderr,
                     "ds4: Metal streaming mapped expert source is outside the model mapping\n");
+            ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
             return 0;
         }
         const double task_t0 = load_timing ? ds4_gpu_now_ms() : 0.0;
@@ -17797,6 +17894,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
         if (!g_batch_cb ||
             gate_expert_bytes > (uint64_t)NSUIntegerMax ||
             down_expert_bytes > (uint64_t)NSUIntegerMax) {
+            ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
             return 0;
         }
         __strong id<MTLBuffer> gate_srcs[DS4_METAL_STREAM_EXPERT_CACHE_MAX_SELECTED];
@@ -17829,6 +17927,7 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                 gate_inner > (uint64_t)NSUIntegerMax ||
                 up_inner > (uint64_t)NSUIntegerMax ||
                 down_inner > (uint64_t)NSUIntegerMax) {
+                ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
                 return 0;
             }
             gate_src_inners[load_i] = (NSUInteger)gate_inner;
@@ -17838,7 +17937,10 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
 
         ds4_gpu_close_batch_encoder();
         id<MTLBlitCommandEncoder> blit = ds4_gpu_blit_encoder(g_batch_cb, "expert_cache_fill", n_loads * 3u);
-        if (!blit) return 0;
+        if (!blit) {
+            ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
+            return 0;
+        }
         for (uint32_t load_i = 0; load_i < n_loads; load_i++) {
             [blit copyFromBuffer:gate_srcs[load_i]
                     sourceOffset:gate_src_inners[load_i]
@@ -17869,7 +17971,11 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                                                &read_bytes,
                                                &read_ms);
     }
-    if (!ok) return 0;
+    if (!ok) {
+        /* only the pread path can fail here, so no blit targets these */
+        ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
+        return 0;
+    }
     if (load_timing) {
         load_t0 = ds4_gpu_now_ms();
     }
@@ -17917,7 +18023,20 @@ static int ds4_gpu_stream_expert_cache_load_selected_missing_with_source(
                                                        gate_inners[load_i],
                                                        up_inners[load_i],
                                                        down_inners[load_i]);
-        if (!entry) return 0;
+        if (!entry) {
+            /* Queued blits still target GPU-copy buffers, so leaking them
+             * beats handing their slots to the next CPU pread. */
+            if (!gpu_copy_source) ds4_gpu_stream_expert_give_back_loads(gate_bufs, up_bufs, down_bufs, gate_inners, batch_reuse);
+            return 0;
+        }
+        gate_bufs[load_i] = nil;
+        up_bufs[load_i] = nil;
+        down_bufs[load_i] = nil;
+        /* A GPU-copy entry's bytes land only when g_batch_cb runs the blit;
+         * until then pruning must not recycle its slot for a CPU pread. */
+        if (gpu_copy_source && !ds4_gpu_stream_expert_cache_mark_inflight(entry)) {
+            return 0;
+        }
         entries[slot] = entry;
     }
 
@@ -18098,7 +18217,8 @@ static void ds4_gpu_stream_expert_cache_clear_layer(uint32_t layer) {
          expert++) {
         ds4_gpu_stream_expert_cache_clear_entry(layer, expert, 0);
     }
-    g_stream_expert_cache_layer_count[layer] = 0;
+    /* clear_entry decrements layer_count itself and skips in-flight
+     * entries, so forcing 0 here would desync it from the live entries. */
 }
 
 static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
@@ -18423,6 +18543,9 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
                     ok = 0;
                     break;
                 }
+                gate_bufs[load_i] = nil;
+                up_bufs[load_i] = nil;
+                down_bufs[load_i] = nil;
                 unique_entries[u] = entry;
             }
         }
@@ -18434,6 +18557,12 @@ static int ds4_gpu_stream_expert_cache_prepare_selected_batch(
         }
     }
     if (tasks) free(tasks);
+    /* Installed loads were nilled above; the failed one (index n_loads) may
+     * also hold buffers. */
+    for (uint32_t i = 0; i <= n_loads && i < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; i++) {
+        ds4_gpu_stream_expert_give_back_buffers(&gate_bufs[i], &up_bufs[i],
+                                                &down_bufs[i], gate_inners[i]);
+    }
     if (ok) {
         for (uint32_t u = 0; u < unique_count; u++) {
             ds4_gpu_stream_expert_cache_entry *entry = unique_entries[u];
@@ -30977,17 +31106,23 @@ static int ds4_gpu_encode_flash_attention_decode_mixed_batch_heads(
                                                ratio);
     }
     if (use_comp_mask) {
-        if (!ds4_gpu_encode_cpy_f32_f16_2d(cb,
-                                             maskbuf,
-                                             ds4_gpu_tensor_offset(comp_mask),
-                                             mask_buffer,
-                                             (NSUInteger)n_raw * sizeof(uint16_t),
-                                             n_comp,
-                                             n_tokens,
-                                             (uint64_t)n_comp * sizeof(float),
-                                             (uint64_t)n_keys * sizeof(uint16_t))) {
-            return 0;
-        }
+        /* Top-k may contain -inf-scored future rows when fewer than top_k
+         * causal keys exist. Selection must never replace causal visibility.
+         * Keep raw image bidirectionality; intersect only compressed keys. */
+        id<MTLComputePipelineState> pipeline =
+            ds4_gpu_get_pipeline("kernel_dsv4_causal_comp_mask");
+        if (!pipeline) return 0;
+        const struct {
+            uint32_t n_comp, n_tokens, pos0, ratio, n_keys;
+        } args = { n_comp, n_tokens, pos0, ratio, n_keys };
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:maskbuf offset:ds4_gpu_tensor_offset(comp_mask) atIndex:1];
+        [enc setBuffer:mask_buffer offset:(NSUInteger)n_raw * sizeof(uint16_t) atIndex:2];
+        [enc dispatchThreads:MTLSizeMake(n_comp, n_tokens, 1)
+             threadsPerThreadgroup:MTLSizeMake(MIN(256u, pipeline.maxTotalThreadsPerThreadgroup), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
     }
 
     id<MTLComputePipelineState> pad_pipeline = nil;
@@ -44565,7 +44700,7 @@ int ds4_gpu_routed_moe_batch_tensor(
             use_mm_id &&
             !(gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
               (ds4_gpu_routed_mm_mpp_mask() & 3) == 3) &&
-            g_tp_split_world != 2 &&    /* pair-swiglu mm kernel lacks expert ownership */
+            g_tp_split_world <= 1 &&    /* pair-swiglu mm kernel lacks expert ownership */
             request_mid_f16 &&
             n_expert == 6 &&
             ((gate_type == DS4_METAL_TENSOR_IQ2_XXS &&
@@ -46514,26 +46649,31 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
             g_dsv4_hc_producer_last_completion = completion;
         }
         [g_transient_buffers addObject:completion];
-        /* Monotonic cross-threadgroup barrier counter for this mix tensor,
-         * plus the host-side dispatch count that sets the target. */
+        /* Monotonic cross-threadgroup barrier counter for this mix tensor.
+         * The kernel derives each dispatch's target from the arrival index;
+         * the host only counts dispatches to swap in a zeroed counter long
+         * before 6 * count could wrap a uint32. */
         NSString *barrier_key = [NSString stringWithFormat:@"%p:%llu",
             (void *)mixbuf, (unsigned long long)mix_offset];
         if (!g_dsv4_hc_barrier_cache) {
             g_dsv4_hc_barrier_cache = [NSMutableDictionary dictionary];
             g_dsv4_hc_barrier_gen = [NSMutableDictionary dictionary];
         }
+        const uint32_t barrier_group = 6u;
+        uint32_t gen =
+            (uint32_t)[[g_dsv4_hc_barrier_gen objectForKey:barrier_key] unsignedIntValue] + 1u;
         id<MTLBuffer> barrier = [g_dsv4_hc_barrier_cache objectForKey:barrier_key];
-        if (!barrier) {
+        if (!barrier || gen > (1u << 28)) {
+            /* In-flight command buffers keep the old counter alive through
+             * g_transient_buffers. */
             barrier = [g_device newBufferWithLength:sizeof(uint32_t)
                                             options:MTLResourceStorageModeShared];
             if (!barrier) return 0;
             *((uint32_t *)[barrier contents]) = 0u;
             [g_dsv4_hc_barrier_cache setObject:barrier forKey:barrier_key];
+            gen = 1u;
         }
-        const uint32_t gen =
-            (uint32_t)[[g_dsv4_hc_barrier_gen objectForKey:barrier_key] unsignedIntValue] + 1u;
         [g_dsv4_hc_barrier_gen setObject:@(gen) forKey:barrier_key];
-        const uint32_t barrier_target = 6u * gen;
         [g_transient_buffers addObject:barrier];
         ds4_gpu_hc_expand_args ex = {
             .n_embd = n_embd,
@@ -46593,7 +46733,7 @@ int ds4_gpu_hc_expand_add_rms_norm_mix_split_norm_f16_tensor(
         [enc setBytes:&mix_args length:sizeof(mix_args) atIndex:0];
         [enc setBytes:&split_args length:sizeof(split_args) atIndex:1];
         [enc setBytes:&ex length:sizeof(ex) atIndex:2];
-        [enc setBytes:&barrier_target length:sizeof(barrier_target) atIndex:3];
+        [enc setBytes:&barrier_group length:sizeof(barrier_group) atIndex:3];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(residual_hc) atIndex:4];
         [enc setBuffer:mix_weight offset:(NSUInteger)mix_weight_inner atIndex:5];
         [enc setBuffer:mixbuf offset:ds4_gpu_tensor_offset(mix) atIndex:6];
