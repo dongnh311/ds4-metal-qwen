@@ -355,11 +355,51 @@ static int check_timeout(void) {
     return ok;
 }
 
+/* Only the models whose gates need every slab (qwen4, GLM) put the whole cache
+ * budget in one slab, and only while their gates are requested (mode 1); any
+ * other model keeps the slab target (here 4 slots). One step of 4 layers x 8
+ * routes fills the budget. */
+static int check_slabs(const char *name, bool glm, bool qwen4, int mode, uint32_t want) {
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint64_t slot = (2 * expert_bytes + down_expert_bytes + page - 1) / page * page;
+    ds4_gpu_set_glm_model(glm);
+    ds4_gpu_set_qwen4_model(qwen4);
+    ds4_gpu_stream_expert_slab_test_set_target(4 * slot);
+    ds4_gpu_set_streaming_expert_cache_budget(BUDGET);   /* empties the cache and its slabs */
+    ds4_gpu_stream_gate_test_set_mode(mode, 0);
+    int ok = write_routes(0) && run_step(glm_layer, 0, ref);
+    ds4_gpu_stream_gate_test_set_mode(0, 0);
+    const uint32_t slabs = ds4_gpu_stream_expert_slab_test_count();
+    ds4_gpu_stream_expert_slab_test_set_target(0);
+    if (ok && slabs != want) {
+        fprintf(stderr, "%s: %u slabs, want %u\n", name, slabs, want);
+        ok = 0;
+    }
+    fprintf(stderr, "%s: %s\n", name, ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static int slab_suite(void) {
+    /* Either would change the layout under test. */
+    unsetenv("DS4_METAL_STREAMING_EXPERT_SLAB_MB");
+    unsetenv("DS4_METAL_DISABLE_STREAMING_EXPERT_SLABS");
+    out_elems = D;
+    int ok = check_slabs("deepseek keeps the slab target", false, false, 1, BUDGET / 4);
+    ok = ok && check_slabs("qwen4 one slab", false, true, 1, 1);
+    ok = ok && check_slabs("qwen4 gates off keep the slab target", false, true, 0, BUDGET / 4);
+    ok = ok && check_slabs("glm one slab", true, false, 1, 1);
+    ok = ok && check_slabs("glm gates off keep the slab target", true, false, 0, BUDGET / 4);
+    ds4_gpu_set_qwen4_model(false);
+    ds4_gpu_set_glm_model(false);
+    return ok;
+}
+
 int main(int argc, char **argv) {
     const char *mode = argc == 2 ? argv[1] : "";
     if (strcmp(mode, "--qwen4") && strcmp(mode, "--glm") && strcmp(mode, "--glm-timeout") &&
-        strcmp(mode, "--glm-split")) {
-        fprintf(stderr, "usage: %s --qwen4 | --glm | --glm-timeout | --glm-split\n", argv[0]);
+        strcmp(mode, "--glm-split") && strcmp(mode, "--slabs")) {
+        fprintf(stderr, "usage: %s --qwen4 | --glm | --glm-timeout | --glm-split | --slabs\n",
+                argv[0]);
         return 1;
     }
     int ok = setup();
@@ -367,6 +407,7 @@ int main(int argc, char **argv) {
     if (ok && !strcmp(mode, "--glm")) ok = glm_suite(0);
     if (ok && !strcmp(mode, "--glm-timeout")) ok = check_timeout();
     if (ok && !strcmp(mode, "--glm-split")) ok = glm_suite(1);
+    if (ok && !strcmp(mode, "--slabs")) ok = slab_suite();
     ds4_gpu_stream_gate_test_set_mode(-1, -1);
     ds4_gpu_cleanup();
     if (model && model != MAP_FAILED) munmap(model, model_bytes);

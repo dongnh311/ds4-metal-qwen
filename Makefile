@@ -232,6 +232,7 @@ test-metal-stream-gate: tests/test_metal_stream_gate
 	./tests/test_metal_stream_gate --glm
 	./tests/test_metal_stream_gate --glm-timeout
 	./tests/test_metal_stream_gate --glm-split
+	./tests/test_metal_stream_gate --slabs
 
 tests/test_metal_command_memory: tests/test_metal_command_memory.c ds4_gpu.h $(CORE_OBJS)
 	$(CC) $(CFLAGS) -I. -o $@ $< $(CORE_OBJS) $(METAL_LDLIBS)
