@@ -207,6 +207,29 @@ class RunTest(unittest.TestCase):
             row = self.run_one(tmp, body, running=running)
             self.assertFalse(row["contaminated"])
 
+    def test_mid_run_foreign_beside_own_process_marks_contaminated(self):
+        # pgrep returns every ds4 line; a foreign one next to our own must count.
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "sleep 0.2\n" + self.csv_body()
+            csv_path = os.path.join(tmp, self.TAG + ".csv")
+            t0 = time.monotonic()
+
+            def running():
+                dt = time.monotonic() - t0
+                if dt < 0.01 or dt >= 0.18:
+                    return ""
+                return f"9 ds4-bench --csv {csv_path}\n12 ds4-server --metal -m /x.gguf"
+
+            row = self.run_one(tmp, body, running=running)
+            self.assertTrue(row["contaminated"])
+
+    def test_row_records_bin_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = self._run_with(tmp)
+            self.assertEqual(row["bin_id"], phase0.bin_identity(tmp))
+            self.assertEqual(row["bin_id"]["dir"], os.path.abspath(tmp))
+            self.assertIsNotNone(row["bin_id"]["bench_size"])
+
     def test_env_does_not_leak_stray_router_log(self):
         with tempfile.TemporaryDirectory() as tmp:
             os.environ["DS4_V41_ROUTER_LOG"] = "/should/not/be/used"

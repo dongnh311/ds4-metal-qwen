@@ -163,6 +163,29 @@ def _fail_router_log(router_log):
         os.replace(router_log, router_log + ".failed")
 
 
+def bin_identity(bin_dir):
+    """What a reused run must match: the tree's commit and dirty state (upstream
+    builds compile metal/*.metal from the tree at run time) and the ds4-bench file."""
+    d = os.path.abspath(bin_dir)
+
+    def git(*args):
+        try:
+            proc = subprocess.run(["git", "-C", d, *args], capture_output=True, text=True)
+        except OSError:
+            return None
+        return proc.stdout.strip() if proc.returncode == 0 else None
+
+    head = git("rev-parse", "HEAD")
+    status = git("status", "--porcelain", "--untracked-files=no") if head else None
+    try:
+        st = os.stat(os.path.join(d, "ds4-bench"))
+        size, mtime = st.st_size, st.st_mtime_ns
+    except OSError:
+        size = mtime = None
+    return {"dir": d, "git_head": head, "git_dirty": None if status is None else bool(status),
+            "bench_size": size, "bench_mtime": mtime}
+
+
 def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
             running=machine.ds4_running, swap=machine.swap_used_mib,
             sampler=wired.WiredSampler, idle_read=None,
@@ -201,6 +224,7 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     if router_log:
         env["DS4_V41_ROUTER_LOG"] = router_log
     stderr_path = os.path.join(out_dir, tag + ".stderr")
+    bin_id = bin_identity(bin_dir)   # what is about to run
     swap0 = swap()
     contam = {"hit": False}
     stop_poll = threading.Event()
@@ -214,7 +238,8 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
                 # this background poll; stop watching rather than crash the
                 # thread. Real callers (machine.ds4_running) never raise this.
                 return
-            if line and csv_path not in line:
+            # pgrep lists every ds4 process: any line that is not our run counts.
+            if line and any(csv_path not in l for l in line.splitlines() if l.strip()):
                 contam["hit"] = True
 
     with open(stderr_path, "w") as err, sampler() as ws:
@@ -254,6 +279,7 @@ def run_one(bin_dir, model, prompts_dir, out_dir, spec, dry_run=False,
     row["wired_idle_gib"] = idle
     row["ds4_env"] = {k: v for k, v in env.items() if k.startswith("DS4_")}
     row["bin_dir"] = os.path.abspath(bin_dir)
+    row["bin_id"] = bin_id
     ra = parse_readahead(stderr)
     if ra is not None and row.get("host_gap_ms") is not None and gen > 0:
         row["readahead_ms"] = ra / gen

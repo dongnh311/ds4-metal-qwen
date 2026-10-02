@@ -116,7 +116,9 @@ def main():
                 row = json.load(fp)
             row_env = row.get("ds4_env", {})
             stale = env_mismatch(row_env, envs, side)
-            if row.get("bin_dir") != bins[side]:
+            if "bin_id" not in row:
+                stale.append("bin (not recorded)")
+            elif row["bin_id"] != phase0.bin_identity(bins[side]):
                 stale.append("bin")
             if profile_mismatch(row_env, args.plain):
                 stale.append("profile env")
