@@ -1,0 +1,86 @@
+{
+ "suites": {},
+ "case_ids": {},
+ "errors": [],
+ "vi_cjk_leaks": null,
+ "uncensor": {},
+ "longctx": {
+  "needle": {
+   "120k": true,
+   "240k": true,
+   "480k": true,
+   "960k": null
+  },
+  "docqa": {
+   "docqa-0": true,
+   "docqa-1": true,
+   "docqa-2": true
+  },
+  "peak_wired_gib": 36.8,
+  "swapouts": 0,
+  "short_tiers": []
+ },
+ "speed": {
+  "total_seconds": {},
+  "think_tokens_median": null,
+  "decode_tps_median": 24.35,
+  "prefill_tps_median": 283.38
+ },
+ "arm": "ornith-512k",
+ "config": {
+  "name": "ornith-512k",
+  "base": "registry",
+  "registry_model": "Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx",
+  "model": null,
+  "args_add": [
+   "-c",
+   "524288",
+   "--kv-cache-continued-interval-tokens",
+   "0"
+  ],
+  "args_remove": [],
+  "env": {}
+ },
+ "suites_run": [
+  "longctx"
+ ],
+ "provenance": {
+  "git_head": "8ef62eb17fe63bd2613264760d92d0adc78bd390",
+  "git_dirty": false,
+  "gateway_head": "a753e37eb98b4dba86fa425ac3a7a17807206511",
+  "ds4_server_sha256": "5f74955cb003cc5f8fa3e87412173f27c945d0d8ba650cb0aee087f5fffce2b7",
+  "ds4_eval_sha256": "9a50894673d39821884bf0b727214b3b666e0468f04f464b54264f8d92cc82df",
+  "env": {
+   "DS4_QWEN35_MTP_DRAFT_VOCAB": "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt"
+  },
+  "argv": [
+   "/Users/dongnh/orca/workspaces/ds4-metal/foxface/ds4-server",
+   "--metal",
+   "-m",
+   "/Users/dongnh/.local/share/ai-gateway/ds4-models/Ornith-1.5-35B-A3B-Abliterated-CyberTiel_Calibrated-MTPv2-23G-ICE.gguf",
+   "-c",
+   "524288",
+   "--mtp",
+   "--kv-disk-dir",
+   "/Users/dongnh/orca/workspaces/ds4-metal-data/evals/nextgen/runs/ornith-512k-20261002-153658/kv-f1bo4q3_",
+   "--kv-disk-space-mb",
+   "32768",
+   "--kv-cache-cold-max-tokens",
+   "262144",
+   "--host",
+   "127.0.0.1",
+   "--port",
+   "18299",
+   "--kv-cache-continued-interval-tokens",
+   "0"
+  ],
+  "data": {
+   "mbpp.jsonl": "831bc72948221d99982f69d095a2c03f299da7605e6b964df334f3b90562af94",
+   "ifeval.jsonl": "1eb9e16cf993fc30f552cb1f8b641e89fe5e882de9fc1abdbce00cfa00f3e7e6",
+   "harmful.jsonl": "73143c124365c6412af3c080336479308cf9beb13890a7113c17e5d6d06baa8c",
+   "harmless.jsonl": "055c3667efb019ab5378ab97e4cda7d18f5cc9fb8be2c92937b6f59b2ea28670",
+   "haystack.c": "714124ef847a814d91f56d5c368a5eec08a3206647ae702b2bc0e52297241644",
+   "mcp_tools.json": "07a050f22df4926d92319b604d6474ae0865a1180a5787b73a5d9b3e522a4d21"
+  }
+ }
+}

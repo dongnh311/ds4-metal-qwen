@@ -60,7 +60,68 @@ ds4's YaRN therefore matches llama.cpp's. Per-prompt numbers are in `yarn-discri
 
 ## GPU window B: long context and server
 
-(Task 6)
+Run 2026-10-02 15:36-16:17 on `8ef62eb1`, with the gateway stack paused. Receipts are in
+`receipts/window-b/`.
+
+**Long context.** The nextgen-eval `longctx` suite ran on the `configs/ornith-512k.json` arm: the
+registry's Ornith command at `-c 524288` with `--kv-cache-continued-interval-tokens 0`. The server
+logged "Ornith YaRN factor 2 (from -c)", KV 11.01 GiB and 33.26 GiB planned.
+
+| tier | real prompt tokens | hit | prefill | decode (answer tokens) |
+|---|---|---|---|---|
+| needle 120K | 125,012 | yes | 924 t/s (135 s) | 28.7 t/s (6) |
+| needle 240K | 239,868 | yes | 564 t/s (425 s) | 28.9 t/s (6) |
+| needle 480K | 480,575 | yes | 315 t/s (1,528 s) | 19.5 t/s (6) |
+| docqa 0 / 1 / 2 (240K document) | 239,876-239,879 | 3 / 3 | ~1.1 s each: the document is reused, 260-263 new tokens | 21.5 / 27.2 / 21.5 t/s (2 / 5 / 2) |
+
+- Peak wired memory was 36.8 GiB, with 0 swap-outs. The 960K tier was skipped because it is above the
+  524288 limit.
+- Past 400K the prefill chunk rate falls to about 190 t/s, because attention covers the whole context
+  before each new chunk.
+- The answers are 2-6 tokens, so the decode figures are short samples. The MTP acceptance rate cannot
+  be measured here, and the server logs no acceptance line for these requests. The Qwen 512K report
+  left 480K decode blank for the same reason. Steady decode at depth is the first measurement of the
+  tok/s sub-project.
+- Against the spec's estimates: the 480K cold prefill took 25.5 min (estimate about 30 min for 512K),
+  and decode at 480K was 19.5 t/s on 6 tokens (estimate about 20 t/s).
+
+**Server check.** `server_check.py` ran three ds4-server runs on one fresh disk-KV directory, with
+the same 44,161-token prompt each time:
+
+| phase | `-c` | cache directory | cached / prompt | entries after |
+|---|---|---|---|---|
+| 262k-store | 262144 | root (unkeyed) | 0 / 44,161 | 6 (continued, cold, shutdown) |
+| 512k-cold | 524288 | `yarn-2` | 0 / 44,161 | 2 (cold, shutdown) |
+| 512k-restore | 524288 | `yarn-2` | 43,008 / 44,161 | 2 |
+
+- The 512K cold run ignores the six entries the 262K run wrote at the other rope.
+- The restore reuses 97% of the prompt: 1.3 s instead of 28.7 s. PASS.
+
+**Final-review fix and `make test`.**
+- The final review found that `ds4_test --qwen35-yarn-engine` opened its engine while run-all's
+  cached engine still held the instance lock, which made the whole `ds4_test` run exit with status 2.
+  Fixed in `87b1f062`.
+  - The pre-fix binary on `--qwen4-prefill-checkpoints --qwen35-yarn-engine` exited 2 with "another
+    ds4 process is already running".
+  - The fixed binary passed all five engine cases.
+- `make test` ran with `DS4_TEST_MODEL` set to the Ornith GGUF, because the default `ds4flash.gguf`
+  is absent.
+  - Every step before `ds4_test` passed.
+  - `ds4_test` gave 23 OK and 6 ERR: long-context, logprob-vectors,
+    metal-ssd-streaming-cache-pressure, local-golden-vectors, metal-short-prefill and server.
+  - Develop `5b36552a`'s `ds4_test` on the same model gave the same 6 ERR with the same 16
+    assertions. Those entries assume the default DeepSeek model.
+  - The branch adds two entries, `qwen35-context-policy` and `qwen35-yarn-engine`, and both pass.
+  - The CPU-only steps after `ds4_test` were run by hand after the window's steps, and all pass.
+
+**Exit check.** Every condition in the spec holds:
+- 262K byte-identical: window A, 39/39 gate-1 dumps match develop at chunks 64/512/2048, and the
+  Qwen fast gate passes.
+- YaRN agrees with llama.cpp: window A, gate 1 at factor 2 passes against the llama.cpp YaRN
+  references, and the discrimination check is 13/13.
+- 480K needle hit with 480,575 real tokens, within 0.12% of 480,000.
+- No startup memory failure and no crash: the 512K server ran the long-context suite and the server
+  check, with peak wired 36.8 GiB and 0 swap-outs.
 
 ## GPU window C: short-prompt quality, measured
 

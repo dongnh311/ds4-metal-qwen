@@ -1,0 +1,40 @@
+{
+ "config": {
+  "name": "ornith-512k",
+  "base": "registry",
+  "registry_model": "Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx",
+  "model": null,
+  "args_add": [
+   "-c",
+   "524288",
+   "--kv-cache-continued-interval-tokens",
+   "0"
+  ],
+  "args_remove": [],
+  "env": {}
+ },
+ "env": {
+  "DS4_QWEN35_MTP_DRAFT_VOCAB": "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt"
+ },
+ "argv": [
+  "/Users/dongnh/orca/workspaces/ds4-metal/foxface/ds4-server",
+  "--metal",
+  "-m",
+  "/Users/dongnh/.local/share/ai-gateway/ds4-models/Ornith-1.5-35B-A3B-Abliterated-CyberTiel_Calibrated-MTPv2-23G-ICE.gguf",
+  "-c",
+  "524288",
+  "--mtp",
+  "--kv-disk-dir",
+  "/Users/dongnh/orca/workspaces/ds4-metal-data/evals/nextgen/runs/ornith-512k-20261002-153658/kv-f1bo4q3_",
+  "--kv-disk-space-mb",
+  "32768",
+  "--kv-cache-cold-max-tokens",
+  "262144",
+  "--host",
+  "127.0.0.1",
+  "--port",
+  "18299",
+  "--kv-cache-continued-interval-tokens",
+  "0"
+ ]
+}

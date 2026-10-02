@@ -1,0 +1,16 @@
+1002 16:13:23 ds4-server: kv cache stored tokens=10240 trimmed=0 reason=continued key=token-text size=283.99 MiB save=35.8 ms
+1002 16:13:29 ds4-server: kv cache stored tokens=20480 trimmed=0 reason=continued key=token-text size=504.21 MiB save=62.1 ms
+1002 16:13:36 ds4-server: kv cache stored tokens=30720 trimmed=0 reason=continued key=token-text size=724.43 MiB save=83.0 ms
+1002 16:13:44 ds4-server: kv cache stored tokens=40960 trimmed=0 reason=continued key=token-text size=944.65 MiB save=110.2 ms
+1002 16:13:46 ds4-server: kv cache stored tokens=43008 trimmed=1153 reason=cold key=token-text size=988.70 MiB save=169.7 ms
+1002 16:13:47 ds4-server: chat ctx=0..44161:44161 prefill chunk 44161/44161 (100.0%) chunk=853.35 t/s avg=1508.26 t/s 29.279s
+1002 16:13:47 ds4-server: chat ctx=0..44161:44161 gen=1 finish=stop 29.372s
+1002 16:13:47 ds4-server: kv cache stored tokens=44162 trimmed=0 reason=shutdown key=token-text size=1013.52 MiB save=128.5 ms
+1002 16:14:18 ds4-server: keyed kv cache directory <scratch>/kv-check/yarn-2
+1002 16:14:20 ds4-server: chat ctx=43008..44161:1153 prefill chunk 1153/1153 (100.0%) chunk=0.00 t/s avg=885.43 t/s 1.302s
+1002 16:14:20 ds4-server: chat ctx=43008..44161:1153 gen=1 finish=stop 1.366s
+1002 16:13:48 ds4-server: keyed kv cache directory <scratch>/kv-check/yarn-2
+1002 16:14:16 ds4-server: kv cache stored tokens=43008 trimmed=1153 reason=cold key=token-text size=988.70 MiB save=102.3 ms
+1002 16:14:17 ds4-server: chat ctx=0..44161:44161 prefill chunk 44161/44161 (100.0%) chunk=885.57 t/s avg=1538.59 t/s 28.702s
+1002 16:14:17 ds4-server: chat ctx=0..44161:44161 gen=1 finish=stop 28.766s
+1002 16:14:18 ds4-server: kv cache stored tokens=44162 trimmed=0 reason=shutdown key=token-text size=1013.52 MiB save=106.9 ms

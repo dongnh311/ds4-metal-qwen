@@ -1,0 +1,30 @@
+{
+ "phases": [
+  {
+   "phase": "262k-store",
+   "ctx": 262144,
+   "dir": null,
+   "cached": 0,
+   "prompt": 44161,
+   "stored": 6
+  },
+  {
+   "phase": "512k-cold",
+   "ctx": 524288,
+   "dir": "<kv-dir>/yarn-2",
+   "cached": 0,
+   "prompt": 44161,
+   "stored": 2
+  },
+  {
+   "phase": "512k-restore",
+   "ctx": 524288,
+   "dir": "<kv-dir>/yarn-2",
+   "cached": 43008,
+   "prompt": 44161,
+   "stored": 2
+  }
+ ],
+ "ok": true,
+ "why": []
+}
