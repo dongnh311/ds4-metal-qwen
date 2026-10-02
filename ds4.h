@@ -279,10 +279,13 @@ int ds4_test_qwen4_draft_head_type_ok(uint32_t type);
  * factor > 1 and native_ctx > 0. mscale, low and high may be NULL. */
 void ds4_qwen4_rope_table(uint32_t n_rot, double base, uint32_t native_ctx, double factor,
                           float freq[32], float *mscale, double *low, double *high);
-/* The loaded model's active YaRN factor (1 when off or not Qwen3.8) and its
+/* The loaded model's active YaRN factor (1 when off or not Qwen3.8/Ornith) and its
  * native context (0 when the family has none). */
 float ds4_engine_rope_yarn_factor(const ds4_engine *e);
 uint32_t ds4_engine_native_context(const ds4_engine *e);
+/* Ornith's context rule: a context within the native one always runs; past
+ * it only when the YaRN factor covers it (context_size <= native_ctx * factor). */
+bool ds4_qwen35_context_ok(uint32_t native_ctx, uint32_t context_size, double factor);
 /* The context the rope is chosen for: rope_context_size when set (> 0), else
  * context_size. Callers that allocate slack past the context they run (ds4-bench)
  * set rope_context_size so the slack does not turn YaRN on. */

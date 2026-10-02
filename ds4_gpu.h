@@ -3579,6 +3579,8 @@ int ds4_gpu_qwen4_router_topk_tensor(
 /* Rotary table for the Qwen3.8 kernels: n_pairs inverse frequencies and the
  * cos/sin magnitude scale (YaRN); NULL restores plain rope from the base. */
 void ds4_gpu_qwen4_set_rope(const float *freq, uint32_t n_pairs, float mscale);
+/* Whether a YaRN table is set (tests; Metal only). */
+bool ds4_gpu_qwen4_rope_table_set(void);
 int ds4_gpu_qwen4_attn_prep_tensor(
         ds4_gpu_tensor *q_out, ds4_gpu_tensor *gate_out, ds4_gpu_tensor *k_cache, ds4_gpu_tensor *v_cache,
         ds4_gpu_tensor *iq_out, ds4_gpu_tensor *ik_cache,

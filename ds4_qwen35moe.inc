@@ -28,9 +28,9 @@
 
 static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens, bool mtp) {
     memset(g, 0, sizeof(*g));
-    if ((uint64_t)ctx_cap > DS4_ROPE_ORIG_CTX) {
-        fprintf(stderr, "ds4: Ornith supports up to %llu tokens of context (no YaRN)\n",
-                (unsigned long long)DS4_ROPE_ORIG_CTX);
+    if (!ds4_qwen35_context_ok((uint32_t)DS4_ROPE_ORIG_CTX, ctx_cap, (double)g_qwen4_rope_factor)) {
+        fprintf(stderr, "ds4: Ornith context %u exceeds %llu native tokens x YaRN factor %g\n",
+                ctx_cap, (unsigned long long)DS4_ROPE_ORIG_CTX, (double)g_qwen4_rope_factor);
         return false;
     }
     const uint64_t E = DS4_N_EMBD, T = cap_tokens;

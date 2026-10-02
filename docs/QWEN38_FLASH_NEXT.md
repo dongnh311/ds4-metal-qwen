@@ -71,6 +71,12 @@ factor that covers it (2 for 524288, 4 for 1048576); `DS4_QWEN4_YARN_FACTOR=f`
 overrides the factor and `=1` turns YaRN off. YaRN may cost some quality on
 shorter prompts, so `-c 262144` stays unscaled.
 
+Ornith-1.5 (qwen35moe) has the same rope parameters and native context and
+follows the same rule with the same variable, with two differences: below the
+native context it keeps the kernels' own frequencies (no table), and a `-c`
+past 262144 that the factor does not cover (for example
+`DS4_QWEN4_YARN_FACTOR=1`) is refused instead of running unscaled.
+
 ## DGX Spark performance
 
 Measured on a single Spark with resident weights and disk-only n-grams:
