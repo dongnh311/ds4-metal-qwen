@@ -8467,6 +8467,30 @@ static void test_qwen35_context_policy(void) {
     TEST_ASSERT(strstr(msg, "leave DS4_QWEN4_YARN_FACTOR unset") != NULL);
 }
 
+static void test_qwen35_decode_stats(void) {
+    /* routed-expert overlap of two verify rows */
+    const int32_t a[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+    const int32_t b[8] = {8, 7, 6, 5, 40, 41, 42, 43};
+    const int32_t c[8] = {50, 51, 52, 53, 54, 55, 56, 57};
+    TEST_ASSERT(ds4_qwen35_topk_overlap(a, b, 8) == 4);
+    TEST_ASSERT(ds4_qwen35_topk_overlap(a, a, 8) == 8);
+    TEST_ASSERT(ds4_qwen35_topk_overlap(a, c, 8) == 0);
+
+    /* MTP cycle stats: an accepted verify, a rejected one, a plain step */
+    ds4_qwen35_spec_stats st = {0};
+    ds4_qwen35_spec_stats_add(&st, true, 2, 0.010, 0.002, 0.001, 0.0);
+    ds4_qwen35_spec_stats_add(&st, true, 1, 0.010, 0.002, 0.001, 0.0);
+    ds4_qwen35_spec_stats_add(&st, false, 1, 0.008, 0.002, 0.001, 2.0);   /* a gap > 1 s: a new request */
+    TEST_ASSERT(st.cycles == 3 && st.plain_cycles == 1 && st.accepted == 1 && st.committed == 4);
+    TEST_ASSERT(st.outside_s == 0.0);
+    char line[320];
+    TEST_ASSERT(ds4_qwen35_spec_stats_format(&st, line, sizeof(line)) > 0);
+    TEST_ASSERT(strstr(line, "3 cycles (1 plain)") != NULL);
+    TEST_ASSERT(strstr(line, "accept 0.500") != NULL);
+    TEST_ASSERT(strstr(line, "1.333 tokens/cycle") != NULL);
+    TEST_ASSERT(strstr(line, "ms/token 9.25") != NULL);   /* (0.028 + 0.006 + 0.003) / 4 s */
+}
+
 /* Grow-on-demand KV, model-backed.  Needs a Qwen3.8 model and its PLE:
  *   DS4_TEST_MODEL=...gguf DS4_TEST_PLE=...PLE-Q4_1.gguf DS4_TEST_GLM_MTP=1 \
  *   DS4_TEST_SSD_STREAMING=1 DS4_TEST_SSD_STREAMING_CACHE_GB=6 \
@@ -8819,6 +8843,7 @@ static const ds4_test_entry test_entries[] = {
     {"--qwen-kv-grow-policy", "qwen-kv-grow-policy", "Qwen3.8 grow-on-demand KV capacity policy (no model)", test_qwen_kv_grow_policy},
     {"--qwen-yarn-policy", "qwen-yarn-policy", "Qwen3.8 YaRN factor from -c and the rope table (no model)", test_qwen_yarn_policy},
     {"--qwen35-context-policy", "qwen35-context-policy", "Ornith context rule: past 262144 only with a covering YaRN factor (no model)", test_qwen35_context_policy},
+    {"--qwen35-decode-stats", "qwen35-decode-stats", "Ornith decode instrumentation: top-k overlap and MTP cycle stats (no model)", test_qwen35_decode_stats},
     {"--dir-steering-rows", "dir-steering-rows", "directional steering rows must be unit length or zero (no model)", test_dir_steering_rows},
     {"--quant-types", "quant-types", "GGUF quant block sizes match ggml (no model)", test_quant_types},
     {"--quant-dequant", "quant-dequant", "GSQ-RCO row dequantizers match ggml (no model)", test_quant_dequant},

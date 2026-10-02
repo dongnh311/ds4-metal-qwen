@@ -7305,6 +7305,44 @@ void ds4_qwen35_context_refusal(char *buf, size_t n, uint32_t native_ctx, uint32
     }
 }
 
+uint32_t ds4_qwen35_topk_overlap(const int32_t *a, const int32_t *b, uint32_t k) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < k; i++) {
+        for (uint32_t j = 0; j < k; j++) {
+            if (a[i] == b[j]) {
+                n++;
+                break;
+            }
+        }
+    }
+    return n;
+}
+
+void ds4_qwen35_spec_stats_add(ds4_qwen35_spec_stats *st, bool verified, int committed,
+                               double target_s, double draft_s, double host_s, double outside_s) {
+    st->cycles++;
+    if (!verified) st->plain_cycles++;
+    else if (committed > 1) st->accepted++;
+    if (committed > 0) st->committed += (uint64_t)committed;
+    st->target_s += target_s;
+    st->draft_s += draft_s;
+    st->host_s += host_s;
+    if (outside_s > 0.0 && outside_s <= 1.0) st->outside_s += outside_s;
+}
+
+int ds4_qwen35_spec_stats_format(const ds4_qwen35_spec_stats *st, char *buf, size_t n) {
+    const uint64_t verified = st->cycles - st->plain_cycles;
+    const double c = st->cycles ? (double)st->cycles : 1.0;
+    const double tok = st->committed ? (double)st->committed : 1.0;
+    return snprintf(buf, n, "Ornith spec stats: %llu cycles (%llu plain), accept %.3f, %.3f tokens/cycle, "
+                    "ms/cycle target %.2f draft %.2f host %.2f outside %.2f, ms/token %.2f",
+                    (unsigned long long)st->cycles, (unsigned long long)st->plain_cycles,
+                    verified ? (double)st->accepted / (double)verified : 0.0, (double)st->committed / c,
+                    1000.0 * st->target_s / c, 1000.0 * st->draft_s / c, 1000.0 * st->host_s / c,
+                    1000.0 * st->outside_s / c,
+                    1000.0 * (st->target_s + st->draft_s + st->host_s + st->outside_s) / tok);
+}
+
 void ds4_qwen4_rope_table(uint32_t n_rot, double base, uint32_t native_ctx, double factor,
                           float freq[32], float *mscale, double *low_out, double *high_out) {
     const uint32_t half = n_rot / 2u;

@@ -291,6 +291,19 @@ bool ds4_qwen35_context_ok(uint32_t native_ctx, uint32_t context_size, double fa
  * context of at most native_ctx * factor, or an engine opened past context_size. */
 void ds4_qwen35_context_refusal(char *buf, size_t n, uint32_t native_ctx, uint32_t context_size,
                                 double factor, uint32_t rope_ctx, bool forced);
+/* Ornith decode instrumentation (DS4_QWEN35_SPEC_STATS, DS4_QWEN35_SPEC_OVERLAP):
+ * the routed experts two top-k lists share, and running MTP cycle totals.
+ * A cycle is one target forward (a verify, or a plain step with no draft)
+ * plus its draft; outside_s is the caller's time since the previous cycle,
+ * dropped above 1 s (that is a new request, not decoding). */
+uint32_t ds4_qwen35_topk_overlap(const int32_t *a, const int32_t *b, uint32_t k);
+typedef struct {
+    uint64_t cycles, plain_cycles, accepted, committed;
+    double target_s, draft_s, host_s, outside_s;
+} ds4_qwen35_spec_stats;
+void ds4_qwen35_spec_stats_add(ds4_qwen35_spec_stats *st, bool verified, int committed,
+                               double target_s, double draft_s, double host_s, double outside_s);
+int ds4_qwen35_spec_stats_format(const ds4_qwen35_spec_stats *st, char *buf, size_t n);
 /* The context the rope is chosen for: rope_context_size when set (> 0), else
  * context_size. Callers that allocate slack past the context they run (ds4-bench)
  * set rope_context_size so the slack does not turn YaRN on. */
