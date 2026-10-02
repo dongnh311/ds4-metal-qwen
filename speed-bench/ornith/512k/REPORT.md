@@ -190,6 +190,18 @@ Before the merge, the user-approved final-review minors went in (`baa7491d`):
 The references were recorded from the develop `2146f8db` build in window M. The t/s figures include
 prefill.
 
+**Gateway re-stage and live check.**
+- The deploy owner re-staged gateway `a753e37e`, `f8f2e2ce` and `b9dc323c` on the user's go. It was
+  staged at 20:47, and Tier L finished at 20:52.
+  - `_llm_ports()` now includes 18089.
+  - The `-512K` profile survived the installer.
+  - Tier L was 16/17; the only red is the pre-existing `L.vision_capability`.
+- The live check then passed, through the gateway on :8090:
+  - `/v1/models` lists the `-512K` id.
+  - A request to it answered in 2.5 s, including the switch. One `ds4-server` was running, on :18089,
+    and `/status` named the `-512K` model.
+  - Switching back to the 262K Ornith answered in 1.8 s, with one `ds4-server`, on :18087.
+
 **Rollback:**
 - `deploy-ai-gateway.sh install prod/qwen-512k-20261001`;
 - restore the two `.bak-prod-ornith-512k-20261002` files;

@@ -1,0 +1,5 @@
+models list has 512K: True
+before: {'model': 'Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx', 'backend_ok': True} ds4 ports ['18087']
+n-mtplx-512K -> 2.5 s, 7 tokens, '2+2 equals 4.' | ds4 ports ['18089'] | status {'model': 'Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx-512K', 'backend_ok': True} | ok
+vision-mtplx -> 1.8 s, 7 tokens, '2+2 equals 4.' | ds4 ports ['18087'] | status {'model': 'Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx', 'backend_ok': True} | ok
+live_check: PASS
