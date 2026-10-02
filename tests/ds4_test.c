@@ -1673,6 +1673,13 @@ static double test_quant_row_ref(uint32_t type, const uint8_t *row, uint32_t in_
             memcpy(&w[i], &u, sizeof(u));
         }
         for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
+    } else if (w && type == 1u) {                             /* F16 rows */
+        for (uint32_t i = 0; i < in_dim; i++) {
+            uint16_t h;
+            memcpy(&h, row + (uint64_t)i * 2u, sizeof(h));
+            w[i] = test_f16_to_f32(h);
+        }
+        for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
     } else if (w && ds4_dequant_row(type, row, in_dim, w) == 0) {
         for (uint32_t i = 0; i < in_dim; i++) { acc += (double)w[i] * x[i]; m += fabs((double)w[i] * x[i]); }
     }
@@ -1693,7 +1700,7 @@ static void test_metal_qwen4_quant_gemv(void) {
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
         if (f->type == 16) continue;                        /* IQ2_XXS already has its own kernels */
-        const uint32_t dims[2] = { 2560u, (f->type == 20 || f->type == 42) ? 640u : 6144u };
+        const uint32_t dims[2] = { 2560u, (f->type == 20 || f->type == 42 || f->type == 6) ? 640u : 6144u };
         for (int di = 0; di < 2; di++) {
             const uint32_t in_dim = dims[di], rows = 37u, n_tok = 3u;
             uint32_t elems = 0, bytes = 0;
@@ -1849,6 +1856,7 @@ static void test_metal_qwen4_quant_moe(void) {
     test_metal_qwen4_quant_moe_case(18, 42, 21, 20);                   /* IQ3_XXS, Q2_0; shared IQ3_S / IQ4_NL */
     test_metal_qwen4_quant_moe_case(21, 20, 23, 42);                   /* IQ3_S, IQ4_NL; shared IQ4_XS / Q2_0 */
     test_metal_qwen4_quant_moe_case(16, 20, 23, 20);                   /* IQ2_XXS (M5 NR kernels), GSQ shared slot */
+    test_metal_qwen4_quant_moe_case(42, 42, 11, 6);                    /* Q2_0 tier: Q2_0 gate/up/down; shared Q3_K / Q5_0 */
 }
 
 /* The tiled prefill GEMMs (kernel_qwen4_moe_mm_mid/down) on 3 experts and 40 tokens x 2 slots:
@@ -1945,6 +1953,7 @@ static void test_metal_qwen4_quant_moe_mm(void) {
     test_metal_qwen4_quant_moe_mm_case(18, 42);   /* IQ3_XXS, Q2_0 */
     test_metal_qwen4_quant_moe_mm_case(21, 20);   /* IQ3_S, IQ4_NL */
     test_metal_qwen4_quant_moe_mm_case(16, 20);   /* IQ2_XXS (existing tiles), IQ4_NL down */
+    test_metal_qwen4_quant_moe_mm_case(42, 42);   /* Q2_0 tier: Q2_0 gate/up/down */
 }
 
 /* The tiled dense GEMM on 37 rows: 40 tokens (one full and one partial token tile) and 9 tokens
@@ -2008,7 +2017,7 @@ static void test_metal_qwen4_quant_dense_mm(void) {
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
         if (f->type == 16) continue;                        /* IQ2_XXS dense rows keep their kernels */
-        const uint32_t in_dim = (f->type == 20 || f->type == 42) ? 640u : 2560u;
+        const uint32_t in_dim = (f->type == 20 || f->type == 42 || f->type == 6) ? 640u : 2560u;
         const uint64_t row_bytes = test_quant_row_bytes(f->type, in_dim);
         uint8_t *buf = malloc((size_t)(row_bytes * rows));
         TEST_ASSERT(buf != NULL);
@@ -2063,6 +2072,36 @@ static void test_metal_qwen4_quant_dense_mm(void) {
     }
     free(nbf);
     free(nv);
+    /* F16 (hc up: 320 wide, 10240 rows) takes the tensor-op tiles only with DS4_QWEN4_DENSE_NAX_F16=1,
+     * so PROD's F16 hc up keeps the float tiles unless a run opts in */
+    const char *f16_env = getenv("DS4_QWEN4_DENSE_NAX_F16");
+    char *f16_saved = f16_env ? strdup(f16_env) : NULL;
+    const int f16_on = f16_env && strcmp(f16_env, "1") == 0;
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(1, 128u, 320u, 10240u) == (nax && f16_on));
+    setenv("DS4_QWEN4_DENSE_NAX_F16", "1", 1);
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(1, 128u, 320u, 10240u) == nax);
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(1, 8u, 320u, 10240u) == 0);     /* decode / verify rows */
+    TEST_ASSERT(ds4_gpu_qwen4_dense_nax_selected(0, 128u, 320u, 10240u) == 0);   /* F32 keeps its kernels */
+    static const uint32_t f16_dims[2] = { 320u, 2560u };
+    for (int di = 0; di < 2; di++) {
+        const uint32_t fd = f16_dims[di];
+        uint16_t *fh = malloc((size_t)fd * nax_rows * sizeof(uint16_t));
+        float *fv = malloc((size_t)fd * sizeof(float));
+        TEST_ASSERT(fh && fv);
+        if (fh && fv) {
+            for (uint32_t r = 0; r < nax_rows; r++) {
+                test_quant_x(fv, fd, r + 307u);
+                for (uint32_t k = 0; k < fd; k++) fh[(uint64_t)r * fd + k] = test_float_to_f16(fv[k]);
+            }
+            test_metal_qwen4_dense_mm_case(1u, (const uint8_t *)fh, (uint64_t)fd * 2u, fd, nax_rows,
+                                           nax_toks, 3, 1.5e-3);
+        }
+        free(fh);
+        free(fv);
+    }
+    if (f16_saved) setenv("DS4_QWEN4_DENSE_NAX_F16", f16_saved, 1);
+    else unsetenv("DS4_QWEN4_DENSE_NAX_F16");
+    free(f16_saved);
 }
 
 /* kernel_qwen4_gsq_mv: dense GSQ-RCO and BF16 rows at 1-8 tokens dequantize each chunk once.
@@ -2135,7 +2174,7 @@ static void test_metal_qwen4_gsq_mv(void) {
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
         if (f->type == 16) continue;
-        const uint32_t in_dim = (f->type == 20 || f->type == 42) ? 640u : 2560u;
+        const uint32_t in_dim = (f->type == 20 || f->type == 42 || f->type == 6) ? 640u : 2560u;
         const uint64_t row_bytes = test_quant_row_bytes(f->type, in_dim);
         uint8_t *buf = malloc((size_t)(row_bytes * rows));
         TEST_ASSERT(buf != NULL);
@@ -8165,7 +8204,8 @@ static void test_quant_dequant(void) {
 static void test_quant_types(void) {
     /* ggml-common.h @931351ea block sizes of every quant type ds4 sizes tensors with */
     static const struct { uint32_t type, elems, bytes; } want[] = {
-        {2, 32, 18}, {3, 32, 20}, {8, 32, 34}, {10, 256, 84}, {12, 256, 144}, {13, 256, 176},
+        {2, 32, 18}, {3, 32, 20}, {6, 32, 22}, {8, 32, 34}, {10, 256, 84}, {11, 256, 110}, {12, 256, 144},
+        {13, 256, 176},
         {14, 256, 210}, {16, 256, 66}, {17, 256, 74}, {18, 256, 98}, {19, 256, 50}, {20, 32, 18},
         {21, 256, 110}, {22, 256, 82}, {23, 256, 136}, {29, 256, 56}, {39, 32, 17}, {42, 64, 18},
     };
@@ -8186,6 +8226,8 @@ static void test_quant_types(void) {
         TEST_ASSERT(ds4_test_routed_expert_type_ok(gsq[i], 1));
         TEST_ASSERT(!ds4_test_routed_expert_type_ok(gsq[i], 0));
     }
+    /* Q3_K and Q5_0 come only as dense tensors (the ISTA Q2_0 tier): a routed one is refused at load */
+    TEST_ASSERT(!ds4_test_routed_expert_type_ok(6, 1) && !ds4_test_routed_expert_type_ok(11, 1));
     TEST_ASSERT(ds4_test_routed_expert_type_ok(16, 0) && ds4_test_routed_expert_type_ok(16, 1));   /* IQ2_XXS */
 #if defined(__APPLE__)
     /* prefill routing: GSQ-RCO experts take the tiled MoE GEMM, GSQ-RCO and BF16 dense rows the
@@ -8194,6 +8236,10 @@ static void test_quant_types(void) {
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(18) == 1);
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(42) == 1);
     TEST_ASSERT(ds4_test_qwen4_expert_has_mm(30) == 0);
+    TEST_ASSERT(ds4_test_qwen4_expert_has_mm(6) == 0 && ds4_test_qwen4_expert_has_mm(11) == 0);
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(11, 40, 2560) == 1);   /* Q3_K attention / shared gate-up */
+    TEST_ASSERT(ds4_test_qwen4_dense_mm_rows(6, 40, 640) == 1);     /* Q5_0 shared down */
+    TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(11) == 1);        /* converts through ds4_dequant_row */
     /* MTP draft heads: Q8_0 rows gather as they are, the row-dequantizer types convert to Q8_0 */
     TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(8) == 1);
     TEST_ASSERT(ds4_test_qwen4_draft_head_type_ok(13) == 1);  /* ISTA's Q5_K output head */

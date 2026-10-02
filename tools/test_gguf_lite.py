@@ -45,6 +45,8 @@ class GgufLiteTest(unittest.TestCase):
         self.assertEqual(g.nbytes(21, [2560, 640, 512]), 2560 // 256 * 110 * 640 * 512)
         self.assertEqual(g.nbytes(20, [640, 2560]), 640 // 32 * 18 * 2560)
         self.assertEqual(g.nbytes(42, [640, 2560]), 640 // 64 * 18 * 2560)
+        self.assertEqual(g.nbytes(6, [640, 2560]), 640 // 32 * 22 * 2560)      # Q5_0 (ffn_down_shexp)
+        self.assertEqual(g.nbytes(11, [6144, 2560]), 6144 // 256 * 110 * 2560)  # Q3_K (ssm_out)
         with self.assertRaises(ValueError):
             g.nbytes(99, [32])
 

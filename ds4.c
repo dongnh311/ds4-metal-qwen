@@ -2457,8 +2457,10 @@ enum {
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q4_0     = 2,
     DS4_TENSOR_Q4_1     = 3,
+    DS4_TENSOR_Q5_0     = 6,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_Q5_K     = 13,
     DS4_TENSOR_Q6_K     = 14,
@@ -2586,9 +2588,14 @@ static const gguf_type_info *tensor_type(uint32_t type) {
 
 /* The GSQ-RCO types: CPU rows (ds4_quants.h) and the Metal qwen4_row_dot. */
 static bool qwen4_type_is_gsq(uint32_t type) {
-    return type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_Q6_K || type == DS4_TENSOR_IQ2_XS ||
+    return type == DS4_TENSOR_Q3_K || type == DS4_TENSOR_Q5_0 || type == DS4_TENSOR_Q5_K || type == DS4_TENSOR_Q6_K || type == DS4_TENSOR_IQ2_XS ||
            type == DS4_TENSOR_IQ2_S || type == DS4_TENSOR_IQ3_XXS || type == DS4_TENSOR_IQ3_S ||
            type == DS4_TENSOR_IQ4_NL || type == DS4_TENSOR_IQ4_XS || type == DS4_TENSOR_Q2_0;
+}
+
+/* Q3_K and Q5_0 come only as dense tensors (the ISTA Q2_0 tier); no routed-expert kernel reads them. */
+static bool qwen4_type_is_gsq_expert(uint32_t type) {
+    return qwen4_type_is_gsq(type) && type != DS4_TENSOR_Q3_K && type != DS4_TENSOR_Q5_0;
 }
 
 int ds4_gguf_type_block(uint32_t type, uint32_t *block_elems, uint32_t *block_bytes) {
@@ -5653,7 +5660,7 @@ static void tensor_expect_qwen4_dense_layout(
 }
 
 static bool qwen4_expert_type_ok(uint32_t type) {
-    return tensor_is_routed_expert_type(type) || qwen4_type_is_gsq(type) ||
+    return tensor_is_routed_expert_type(type) || qwen4_type_is_gsq_expert(type) ||
            type == DS4_TENSOR_F16 || type == DS4_TENSOR_F32 || type == DS4_TENSOR_Q4_0;
 }
 
@@ -59793,7 +59800,8 @@ static bool qwen4_graph_dense_ok(const ds4_tensor *t) {
 /* expert types the tiled prefill GEMM stages (kernel_qwen4_moe_mm_*) */
 static bool qwen4_expert_type_has_mm(uint32_t type) {
     return type == DS4_TENSOR_Q8_0 || type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q4_K ||
-           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS || qwen4_graph_gsq_ok(type);
+           type == DS4_TENSOR_Q2_K || type == DS4_TENSOR_IQ2_XXS ||
+           (qwen4_graph_gsq_ok(type) && qwen4_type_is_gsq_expert(type));
 }
 
 /* GSQ-RCO and BF16 dense rows take the tiled dense GEMM once a batch has more
@@ -59820,7 +59828,7 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
                   (t->dim[0] % 256u) == 0) ||
-                 (qwen4_graph_gsq_ok(t->type) && tensor_type(t->type) &&
+                 (qwen4_graph_gsq_ok(t->type) && qwen4_type_is_gsq_expert(t->type) && tensor_type(t->type) &&
                   (t->dim[0] % tensor_type(t->type)->block_elems) == 0));
 }
 
@@ -60611,7 +60619,7 @@ static bool qwen4_gemv_rows(ds4_gpu_tensor *out, const ds4_model *m, const ds4_t
     case DS4_TENSOR_Q4_K: rc = ds4_gpu_matmul_quant_tensor(out, m->map, m->size, w->abs_offset, w->type, in_dim, out_dim, x, n_tok); break;
     case DS4_TENSOR_Q5_K: case DS4_TENSOR_Q6_K: case DS4_TENSOR_IQ2_XS: case DS4_TENSOR_IQ2_S:
     case DS4_TENSOR_IQ3_XXS: case DS4_TENSOR_IQ3_S: case DS4_TENSOR_IQ4_NL: case DS4_TENSOR_IQ4_XS:
-    case DS4_TENSOR_Q2_0:
+    case DS4_TENSOR_Q2_0: case DS4_TENSOR_Q3_K: case DS4_TENSOR_Q5_0:
     case DS4_TENSOR_BF16: {
         ds4_gpu_tensor *outs[1] = { out };
         const uint64_t offs[1] = { w->abs_offset };
@@ -70309,6 +70317,8 @@ int ds4_dequant_row(uint32_t type, const void *src, uint64_t n, float *out) {
     case DS4_TENSOR_IQ4_NL:  dq_iq4_nl(p, n, out); return 0;
     case DS4_TENSOR_IQ4_XS:  dq_iq4_xs(p, n, out); return 0;
     case DS4_TENSOR_Q2_0:    dq_q2_0(p, n, out); return 0;
+    case DS4_TENSOR_Q3_K:    dq_q3_k(p, n, out); return 0;
+    case DS4_TENSOR_Q5_0:    dq_q5_0(p, n, out); return 0;
     default:                 return -1;
     }
 }
@@ -70451,7 +70461,8 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
     }
     case DS4_TENSOR_IQ2_XXS: case DS4_TENSOR_Q5_K: case DS4_TENSOR_Q6_K:
     case DS4_TENSOR_IQ2_XS: case DS4_TENSOR_IQ2_S: case DS4_TENSOR_IQ3_XXS: case DS4_TENSOR_IQ3_S:
-    case DS4_TENSOR_IQ4_NL: case DS4_TENSOR_IQ4_XS: case DS4_TENSOR_Q2_0: {
+    case DS4_TENSOR_IQ4_NL: case DS4_TENSOR_IQ4_XS: case DS4_TENSOR_Q2_0:
+    case DS4_TENSOR_Q3_K: case DS4_TENSOR_Q5_0: {
         const gguf_type_info *info = tensor_type(t->type);
         const uint64_t row_bytes = n / info->block_elems * info->block_bytes;
         if (ds4_dequant_row(t->type, (const uint8_t *)tensor_data(m, t) + row * row_bytes, n, out) != 0) {
