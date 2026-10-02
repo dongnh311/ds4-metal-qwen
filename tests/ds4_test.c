@@ -1692,7 +1692,7 @@ static void test_metal_qwen4_quant_gemv(void) {
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
         if (f->type == 16) continue;                        /* IQ2_XXS already has its own kernels */
-        const uint32_t dims[2] = { 2560u, (f->type == 20 || f->type == 42) ? 640u : 6144u };
+        const uint32_t dims[2] = { 2560u, (f->type == 20 || f->type == 42 || f->type == 6) ? 640u : 6144u };
         for (int di = 0; di < 2; di++) {
             const uint32_t in_dim = dims[di], rows = 37u, n_tok = 3u;
             uint32_t elems = 0, bytes = 0;
@@ -1848,6 +1848,7 @@ static void test_metal_qwen4_quant_moe(void) {
     test_metal_qwen4_quant_moe_case(18, 42, 21, 20);                   /* IQ3_XXS, Q2_0; shared IQ3_S / IQ4_NL */
     test_metal_qwen4_quant_moe_case(21, 20, 23, 42);                   /* IQ3_S, IQ4_NL; shared IQ4_XS / Q2_0 */
     test_metal_qwen4_quant_moe_case(16, 20, 23, 20);                   /* IQ2_XXS (M5 NR kernels), GSQ shared slot */
+    test_metal_qwen4_quant_moe_case(42, 42, 11, 6);                    /* Q2_0 tier: Q2_0 gate/up/down; shared Q3_K / Q5_0 */
 }
 
 /* The tiled prefill GEMMs (kernel_qwen4_moe_mm_mid/down) on 3 experts and 40 tokens x 2 slots:
@@ -2007,7 +2008,7 @@ static void test_metal_qwen4_quant_dense_mm(void) {
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
         if (f->type == 16) continue;                        /* IQ2_XXS dense rows keep their kernels */
-        const uint32_t in_dim = (f->type == 20 || f->type == 42) ? 640u : 2560u;
+        const uint32_t in_dim = (f->type == 20 || f->type == 42 || f->type == 6) ? 640u : 2560u;
         const uint64_t row_bytes = test_quant_row_bytes(f->type, in_dim);
         uint8_t *buf = malloc((size_t)(row_bytes * rows));
         TEST_ASSERT(buf != NULL);
@@ -2134,7 +2135,7 @@ static void test_metal_qwen4_gsq_mv(void) {
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
         if (f->type == 16) continue;
-        const uint32_t in_dim = (f->type == 20 || f->type == 42) ? 640u : 2560u;
+        const uint32_t in_dim = (f->type == 20 || f->type == 42 || f->type == 6) ? 640u : 2560u;
         const uint64_t row_bytes = test_quant_row_bytes(f->type, in_dim);
         uint8_t *buf = malloc((size_t)(row_bytes * rows));
         TEST_ASSERT(buf != NULL);
