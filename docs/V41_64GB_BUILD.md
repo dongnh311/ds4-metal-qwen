@@ -53,7 +53,9 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
   - **Tool and encoding.** `gguf-tools/deepseek41_engram_q4`, encoding `lloyd4_e5m3_32_r136`.
   - **Quality.** No measurable loss. General NLL is −0.05 % against the FP8 original, and the converted file scores byte-identically to
     the simulation. The long set's +0.94 % sits at the 6-bit control's floor of +1.04 %.
-  - **Speed.** Steady decode is unchanged (9.18 vs 9.33 t/s). The prefill was cold-cache in the first runs; its recheck is pending.
+  - **Speed.** Steady decode is within 2.6 % in 5 of 6 runs. Prefill was 15 % below the earlier runs on the original file (mean 212
+    vs 251 t/s), not under identical conditions. A profile puts Engram at 0.25 s of 36.5 s, so the gap is not the format; it is
+    still unexplained.
   - **Download.** `./download_model.sh ds41f-q2-eq4`. Only this fork reads it.
   - **Details.** `speed-bench/v41/engram-q4-20261002/RESULTS.md`.
 - **PR #1073 measured 2026-10-02:** D vs P 0.866 (auto cache), M vs P 1.127, 24 GB 0.897; output byte-identical. Decision: no integration — under `--ssd-streaming` the PR loses DSpark and its concurrent FFN, and our streaming pipeline is faster. Side finding: our 8K prefill at the auto cache is 2.3× slower than upstream with the same cache plan (114 vs 260-265 t/s). Open: the PR's +12.7 % over plain upstream under streaming was not profiled. Results: `speed-bench/v41/pr1073-20261002/RESULTS.md`.

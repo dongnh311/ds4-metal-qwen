@@ -52,28 +52,45 @@ The TSV is byte-identical to `score-v7-general.tsv`.
 The long-set floor still applies: v7 +0.94 %, 6-bit control +1.04 %, 5-bit +1.33 %. Any perturbation moves the 9-case long set
 by about +1 %, so 4-bit is no worse than 5/6-bit there.
 
-## Speed (window 8, cold page cache)
+## Speed (windows 8-10)
 
-`ds4-bench` switch, ctx 8192, auto cache (28.5 GiB, 8 slabs), gen 64:
+`ds4-bench` switch, ctx 8192, auto cache (28.5 GiB, 8 slabs), gen 64, run as phase0 runs. No foreign ds4 process was present
+in any run.
 
-| Run | Prefill t/s | Steady decode t/s | Expert miss pread |
-| --- | ---: | ---: | --- |
-| Slab-fix A/B 2026-10-02, original file (fix1 / fix2) | 252.9 / 256.9 | 9.32 / 9.35 | 35.08 GiB, 1.38–1.41 s |
-| Converted, run 1 | 188.2 | 9.09 | 35.21 GiB, 1.42 s |
-| Converted, run 2 | 214.1 | 9.18 | 35.21 GiB, 1.43 s |
+| Run | Prefill t/s | Steady decode t/s | Idle wired GiB |
+| --- | ---: | ---: | ---: |
+| Original file, earlier the same day: slab-fix A/B fix1 / fix2 | 252.9 / 256.9 | 9.32 / 9.35 | 3.00 / 2.91 |
+| Original file, earlier: slab4096 / qgate0 / upstream (gen 16) | 239.2 / 257.4 / 246.7 | — | — |
+| Converted, window 8 (23:3x): runs 1, 2 | 188.2, 214.1 | 9.09, 9.18 | 3.92, 3.94 |
+| Converted, window 9 (01:1x), back to back: runs 3-6 | 217.6, 230.0, 229.5, 195.7 | 8.35, 9.04, 9.19, 8.79 | 3.73-4.25 |
+| Converted, window 10, prefill profile (gen 16) | 218.7 | — | — |
 
-**Steady decode** is within 2.6 %, which passes the 5 % gate.
+**Steady decode** is within 2.6 % in 5 of the 6 runs; run 3 is 10 % low. **Prefill** is 15 % below the earlier runs on average
+(212.5 vs 250.6) and never reaches the plan's 242 gate.
 
-**Prefill** misses the gate (≥ 242). What was ruled out:
-- the cache plan (identical);
-- the expert miss bytes and pread time (identical);
-- the decode arithmetic (the 136 B path does fewer `ldexpf` calls per value and touches fewer pages).
+### What the prefill gap is not
 
-Run 2 was faster than run 1.
+- **Not the Engram format.** `DS4_METAL_GRAPH_PREFILL_PROFILE` on the converted file attributes 36.5 s of prefill:
+  - map 1.25 s;
+  - Engram 0.25 s, a single 247 ms wait at layer 1 for the second chunk;
+  - encode 0.39 s;
+  - drain 31.34 s;
+  - seed 3.29 s.
 
-Hypothesis: the page cache was cold.
-- 136/264 B Engram rows are not page-aligned, so `F_NOCACHE` does not keep them out of the cache. Before the conversion, the rows
-  this prompt touches were warm from the evening's many runs.
-- The conversion's 97 GiB rewrite, plus another session's 52 GB write, evicted those pages and the resident weights.
+  So Engram is at most 0.7 % of prefill time. A CPU microbenchmark (4M-row temp files, 16-reader `ds4_engram_read_batch`, one
+  4096-token chunk of 98,304 rows) reads 136 B rows as fast as 264 B rows: 538-546 ms vs 541-568 ms.
 
-**Pending:** a warm-cache recheck (several back-to-back runs) after the other sessions' GPU windows.
+  Every row read costs one SSD latency, about 45-63 us, even from a just-written file. `F_NOCACHE` keeps Engram rows out of the
+  page cache in both encodings, so the early "cold Engram cache" hypothesis was wrong.
+- **Not the SSD.** Random 9.49 MiB `F_NOCACHE` reads over the main-weight region run at 14.1 GB/s, steady over three reps
+  (01:30).
+- **Not the cache plan.** The cache plan, slab layout (8), expert-cache hits and misses (11562 / 6768 vs 11576 / 6754) and decode
+  miss pread time are the same as before.
+
+### What remains
+
+The gap sits in drain (GPU and expert streaming), which the conversion does not change. The runs were not A/B'd under identical
+conditions: the original file is gone, and re-downloading it (341 GiB) does not fit next to the converted file (205 GiB free).
+
+The environment differed. Idle wired memory is about 1 GiB higher tonight, and the other sessions loaded and unloaded their
+models between runs. **Status: unexplained, not attributable to the format; the gate is not met as measured.**
