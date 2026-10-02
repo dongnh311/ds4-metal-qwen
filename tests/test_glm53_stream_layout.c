@@ -194,6 +194,11 @@ static void check_glm_streaming_async_load_default(void) {
 #if defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
     CHECK(!glm_graph_use_streaming_selected_async_load(&async_graph));
     setenv("DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD", "1", 1);
+    /* SP1 decode gates supersede the worker: both would register as the
+     * cache's single service thread. */
+    ds4_gpu_stream_gate_test_set_mode(1, -1);
+    CHECK(!glm_graph_use_streaming_selected_async_load(&async_graph));
+    ds4_gpu_stream_gate_test_set_mode(0, -1);
 #endif
     CHECK(glm_graph_use_streaming_selected_async_load(&async_graph));
     setenv("DS4_METAL_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD", "1", 1);
@@ -203,6 +208,29 @@ static void check_glm_streaming_async_load_default(void) {
     unsetenv("DS4_ROCM_DISABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD");
     unsetenv("DS4_METAL_ENABLE_GLM_STREAMING_SELECTED_ASYNC_LOAD");
     CHECK(!glm_graph_use_streaming_selected_async_load(NULL));
+#if defined(__APPLE__) && !defined(DS4_ROCM_BUILD)
+    ds4_gpu_stream_gate_test_set_mode(-1, -1);
+#endif
+}
+
+/* SP1 decode gates encode a whole token without waiting: only tokens whose
+ * weights are mapped up front, that read no routed selection on the host
+ * mid-token and that end with a wait (logits) may publish gates. */
+static void check_glm_stream_gate_token_allowed(void) {
+    CHECK(glm_graph_stream_gate_token_allowed(true, false, false, 0u, false, true));
+    CHECK(!glm_graph_stream_gate_token_allowed(false, false, false, 0u, false, true));
+    CHECK(!glm_graph_stream_gate_token_allowed(true, true, false, 0u, false, true));
+    CHECK(!glm_graph_stream_gate_token_allowed(true, false, true, 0u, false, true));
+    CHECK(!glm_graph_stream_gate_token_allowed(true, false, false, DS4_GLM_ABLATE_ROUTED, false, true));
+    CHECK(!glm_graph_stream_gate_token_allowed(true, false, false, 0u, true, true));
+    /* Without logits nothing waits for the token, and the next token's id
+     * write would race its embedding. */
+    CHECK(!glm_graph_stream_gate_token_allowed(true, false, false, 0u, false, false));
+    /* A stage-profiled layer ends the batch between publish and commit. */
+    CHECK(glm_graph_stream_gate_layer_allowed(true, true, false));
+    CHECK(!glm_graph_stream_gate_layer_allowed(false, true, false));
+    CHECK(!glm_graph_stream_gate_layer_allowed(true, false, false));
+    CHECK(!glm_graph_stream_gate_layer_allowed(true, true, true));
 }
 
 int main(void) {
@@ -227,6 +255,7 @@ int main(void) {
     check_glm53_prefill_full_layer();
     check_glm_session_can_rewind();
     check_glm_streaming_async_load_default();
+    check_glm_stream_gate_token_allowed();
     if (failures) {
         fprintf(stderr, "test_glm53_stream_layout: %d failure(s)\n", failures);
         return 1;
