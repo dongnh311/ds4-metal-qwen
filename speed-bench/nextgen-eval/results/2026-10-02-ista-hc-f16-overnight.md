@@ -129,3 +129,32 @@ What the harness does differently, any of which may cap decode near 34 t/s for b
 
 Next step: the same A/B with the arm's exact argv (disk KV on) and an ifeval item. One variable at a
 time.
+
+### Follow-up A/B, 08:27-08:37: disk KV is not the cause
+
+Each case used the arm's exact argv with and without the disk KV flags. The request was the arm's first
+ifeval item (key 13), `max_tokens` 16384, after a short warm-up request.
+
+| ifeval key 13 | disk KV on | disk KV off | completion tokens |
+|---|---|---|---|
+| new file (F16 hc) | 39.04 t/s | 39.18 t/s | 5122 |
+| old file (F32 hc) | 37.44 t/s | 37.75 t/s | 5527 |
+
+- **The disk KV flags change decode by under 1%.**
+- **On this item the new file is +4.3% faster.** The harness measured the same item at +4.7%
+  (35.19 → 36.83 t/s), so the harness does see the gain where it exists.
+- **Across all 200 ifeval items the harness ratio is ×0.994.**
+  - The geometric mean is ×0.994. Half the items lie between ×0.975 and ×1.010, and 80% between ×0.959
+    and ×1.030.
+  - Item 13 is a high one.
+- Only 2 of the 200 items have the same output length in both arms. Near-ties change the output, and
+  with it the MTP acceptance, so each item's speed carries content noise of a few percent.
+
+**Conclusion.**
+- The hc-F16 decode gain depends on the content:
+  - about 0% on average on thinking-heavy ifeval answers;
+  - +8 to +16% on the story prompt;
+  - +12% in ds4-bench and the CLI MTP runs.
+- The harness and the server agree with each other; nothing in the harness hides the gain.
+- Why the gain is small on ifeval content is not explained. The next check is a per-stage GPU profile
+  (`DS4_QWEN4_STAGE_TS_PROFILE`) of old vs new on item 13.
