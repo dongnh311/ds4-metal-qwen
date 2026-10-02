@@ -1649,14 +1649,16 @@ static void test_metal_q8_0_decode_pair_exact(void) {
 }
 
 #if defined(__APPLE__)
-/* Rows of a GSQ-RCO type built from the fixture's two real blocks, varied per row. */
+/* Rows of a GSQ-RCO type built from the fixture's two real blocks.  Block k's choice carries bit k % 6
+ * of the row index, so any two of 64 consecutive rows differ: a kernel that reads the wrong row cannot
+ * match the reference by sharing a pattern with it. */
 static void test_quant_fill_rows(uint8_t *dst, const ds4_quant_fixture *f, uint32_t in_dim, uint32_t rows) {
     uint32_t elems = 0, bytes = 0;
     (void)ds4_gguf_type_block(f->type, &elems, &bytes);
     const uint32_t per_row = in_dim / elems;
     for (uint32_t r = 0; r < rows; r++) {
         for (uint32_t k = 0; k < per_row; k++) {
-            const uint32_t pick = (r * 7u + k * 3u) % 2u;
+            const uint32_t pick = ((r >> (k % 6u)) ^ k) & 1u;
             memcpy(dst + ((uint64_t)r * per_row + k) * bytes, f->bytes + (uint64_t)pick * bytes, bytes);
         }
     }
@@ -2170,7 +2172,12 @@ static void test_metal_qwen4_gsq_mv(void) {
     TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(3, 2560, 1, prod) == 0);     /* Q8_0 keeps its kernels */
     const uint32_t bf[1] = { 30u };
     TEST_ASSERT(ds4_gpu_qwen4_gsq_mv_selected(3, 2568, 1, bf) == 0);       /* not whole 16-value chunks */
-    /* IQ4_XS, IQ3_S and Q5_K single-output rows take the two-rows-per-simdgroup kernel */
+    /* IQ4_XS, IQ3_S and Q5_K single-output rows take the two-rows-per-simdgroup kernel unless
+     * DS4_QWEN4_GSQ_MV_ONE_ROW is set; the caller's value of that switch is restored afterwards, so
+     * the parity loops below run whichever kernel the suite was started with */
+    const char *one_row_env = getenv("DS4_QWEN4_GSQ_MV_ONE_ROW");
+    char *one_row_saved = one_row_env ? strdup(one_row_env) : NULL;
+    unsetenv("DS4_QWEN4_GSQ_MV_ONE_ROW");
     const uint32_t two[3] = { 23u, 21u, 13u }, q6[1] = { 14u }, pair[2] = { 23u, 21u };
     for (int i = 0; i < 3; i++) {
         TEST_ASSERT(ds4_gpu_qwen4_gsq_mv2_selected(1, 2560, 1, &two[i]) == 1);
@@ -2181,8 +2188,21 @@ static void test_metal_qwen4_gsq_mv(void) {
     TEST_ASSERT(ds4_gpu_qwen4_gsq_mv2_selected(2, 2560, 2, pair) == 0);    /* so do multi-output calls */
     setenv("DS4_QWEN4_GSQ_MV_ONE_ROW", "1", 1);
     TEST_ASSERT(ds4_gpu_qwen4_gsq_mv2_selected(2, 2560, 1, two) == 0);
-    unsetenv("DS4_QWEN4_GSQ_MV_ONE_ROW");
     const uint32_t rows = 37u;
+    for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
+        const ds4_quant_fixture *f = &quant_fixtures[i];   /* the one-row kernel the switch keeps */
+        if (f->type != 13 && f->type != 21 && f->type != 23) continue;
+        const uint64_t row_bytes = test_quant_row_bytes(f->type, 2560u);
+        uint8_t *buf = malloc((size_t)(row_bytes * rows));
+        TEST_ASSERT(buf != NULL);
+        if (!buf) break;
+        test_quant_fill_rows(buf, f, 2560u, rows);
+        test_metal_qwen4_gsq_mv_case(f->type, buf, row_bytes, 2560u, rows);
+        free(buf);
+    }
+    if (one_row_saved) setenv("DS4_QWEN4_GSQ_MV_ONE_ROW", one_row_saved, 1);
+    else unsetenv("DS4_QWEN4_GSQ_MV_ONE_ROW");
+    free(one_row_saved);
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
         if (f->type == 16) continue;

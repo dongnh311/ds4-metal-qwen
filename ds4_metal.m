@@ -55191,9 +55191,9 @@ int ds4_gpu_qwen4_gsq_mv_selected(uint32_t n_tokens, uint32_t in_dim, uint32_t n
  * chunk scale factored out of the dot product).  DS4_QWEN4_GSQ_MV_ONE_ROW=1 keeps kernel_qwen4_gsq_mv
  * for A/B. */
 static bool qwen4_gsq_mv2_ok(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types) {
-    if (n_out != 1 || (in_dim % 256u) != 0 || !qwen4_gsq_mv_ok(n_tokens, in_dim, n_out, types) ||
-        getenv("DS4_QWEN4_GSQ_MV_ONE_ROW")) return false;
-    return types[0] == 13u || types[0] == 21u || types[0] == 23u;
+    /* cheap checks first: most calls are other types and should not pay the getenv */
+    if (n_out != 1 || (types[0] != 13u && types[0] != 21u && types[0] != 23u) || (in_dim % 256u) != 0) return false;
+    return qwen4_gsq_mv_ok(n_tokens, in_dim, n_out, types) && !getenv("DS4_QWEN4_GSQ_MV_ONE_ROW");
 }
 
 int ds4_gpu_qwen4_gsq_mv2_selected(uint32_t n_tokens, uint32_t in_dim, uint32_t n_out, const uint32_t *types) {
