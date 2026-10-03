@@ -76592,6 +76592,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         qwen35_graph_reset(&s->qwen4_graph);
+        (void)ds4_gpu_qwen35_attn_merge_fold_selfcheck();
         if (e->glm_mtp) qwen35_verify_batch_selfcheck(&e->model, &e->weights);
         s->qwen35_graph_ready = true;
         s->prefill_cap = (uint32_t)ctx_size;
