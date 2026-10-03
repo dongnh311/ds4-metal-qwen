@@ -884,6 +884,69 @@ static void test_attn_decode3_rows(arena_t *a, uint32_t pos0, uint32_t split_key
 /* attn_flash (M5): causal prefill attention for T tokens at pos0 against a
  * host double reference and against today's kernel (qwen4 attn_mm via the
  * qwen4 wrapper). */
+/* Plan B (round 2): kernel_qwen35_attn_merge3_fold folds merge3's fixed
+ * binary tree with one register slot per level; the decode3 output with
+ * DS4_QWEN35_ATTN_MERGE_FOLD=1 must memcmp-equal the merge3 output, rows
+ * 1 and 2, and the fold must actually have run (dispatch counter). */
+static void test_attn_merge_fold(arena_t *a, uint32_t pos0, uint32_t split_keys) {
+    (void)a;
+    const uint32_t H = 16u, Hkv = 2u, D = 256u, cap = pos0 + 2u;
+    const float scale = 0.0625f;
+    char sk[16];
+    snprintf(sk, sizeof(sk), "%u", split_keys);
+    setenv("DS4_QWEN35_ATTN_SPLIT_KEYS", sk, 1);
+    ds4_gpu_tensor *kc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *vc = ds4_gpu_tensor_alloc((uint64_t)cap * Hkv * D * 2u);
+    ds4_gpu_tensor *q = ds4_gpu_tensor_alloc(2ull * H * D * sizeof(float));
+    ds4_gpu_tensor *g = ds4_gpu_tensor_alloc(2ull * H * D * sizeof(float));
+    ds4_gpu_tensor *part = ds4_gpu_tensor_alloc(ds4_gpu_qwen35_attn_part3_floats(2u, H, D) * sizeof(float));
+    ds4_gpu_tensor *o_ref = ds4_gpu_tensor_alloc(2ull * H * D * sizeof(float));
+    ds4_gpu_tensor *o_new = ds4_gpu_tensor_alloc(2ull * H * D * sizeof(float));
+    require_ok(kc && vc && q && g && part && o_ref && o_new, "merge fold buffers");
+    uint16_t *kv = malloc((uint64_t)cap * Hkv * D * 2u);
+    float *f = malloc(2ull * H * D * sizeof(float));
+    uint32_t r = 0x51ed270bu ^ pos0;
+    for (uint64_t i = 0; i < (uint64_t)cap * Hkv * D; i++) {
+        r = r * 1664525u + 1013904223u;
+        kv[i] = (uint16_t)(0x3800u + ((r >> 9) & 0x3ffu) - 0x200u);   /* halves around +/-0.5 */
+    }
+    require_ok(ds4_gpu_tensor_write(kc, 0, kv, (uint64_t)cap * Hkv * D * 2u), "merge fold k");
+    for (uint64_t i = 0; i < (uint64_t)cap * Hkv * D; i++) kv[i] ^= 0x8000u;
+    require_ok(ds4_gpu_tensor_write(vc, 0, kv, (uint64_t)cap * Hkv * D * 2u), "merge fold v");
+    for (uint64_t i = 0; i < 2ull * H * D; i++) {
+        r = r * 1664525u + 1013904223u;
+        f[i] = (float)((int32_t)(r >> 8) - (1 << 23)) / (float)(1 << 22);
+    }
+    require_ok(ds4_gpu_tensor_write(q, 0, f, 2ull * H * D * sizeof(float)) &&
+               ds4_gpu_tensor_write(g, 0, f, 2ull * H * D * sizeof(float)), "merge fold q/gate");
+    for (uint32_t rows = 1u; rows <= 2u; rows++) {
+        unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
+        require_ok(ds4_gpu_tensor_fill_f32(o_ref, -1234.5f, 2ull * H * D) &&
+                   ds4_gpu_qwen35_attn_decode3_tensor(o_ref, q, g, kc, vc, part, H, Hkv, D, pos0, rows, scale),
+                   "decode3 merge3");
+        const uint64_t before = ds4_gpu_qwen35_attn_merge_fold_dispatches();
+        setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "1", 1);
+        require_ok(ds4_gpu_tensor_fill_f32(o_new, -1234.5f, 2ull * H * D) &&
+                   ds4_gpu_qwen35_attn_decode3_tensor(o_new, q, g, kc, vc, part, H, Hkv, D, pos0, rows, scale),
+                   "decode3 merge3_fold");
+        unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
+        const bool ran = ds4_gpu_qwen35_attn_merge_fold_dispatches() > before;
+        float *x = malloc(2ull * H * D * sizeof(float)), *y = malloc(2ull * H * D * sizeof(float));
+        require_ok(ds4_gpu_tensor_read(o_ref, 0, x, (uint64_t)rows * H * D * sizeof(float)) &&
+                   ds4_gpu_tensor_read(o_new, 0, y, (uint64_t)rows * H * D * sizeof(float)), "merge fold read");
+        const bool same = memcmp(x, y, (uint64_t)rows * H * D * sizeof(float)) == 0;
+        printf("  attn merge fold pos0=%u split_keys=%u rows=%u: %s%s\n", pos0, split_keys, rows,
+               same ? "bit-identical" : "DIFFERS", ran ? "" : " (fold did not run)");
+        require_ok(same, "merge3_fold output equals merge3");
+        require_ok(ran, "merge3_fold dispatched under DS4_QWEN35_ATTN_MERGE_FOLD=1");
+        free(x); free(y);
+    }
+    unsetenv("DS4_QWEN35_ATTN_SPLIT_KEYS");
+    free(kv); free(f);
+    ds4_gpu_tensor_free(kc); ds4_gpu_tensor_free(vc); ds4_gpu_tensor_free(q); ds4_gpu_tensor_free(g);
+    ds4_gpu_tensor_free(part); ds4_gpu_tensor_free(o_ref); ds4_gpu_tensor_free(o_new);
+}
+
 static void test_attn_flash(arena_t *a, uint32_t pos0, uint32_t T, int use_part) {
     const uint32_t H = 16, Hkv = 2, D = 256, n_rot = 64, fill = pos0 + T, cap = fill + 8u;
     const float scale = 1.0f / sqrtf((float)D);
@@ -1183,6 +1246,17 @@ int main(void) {
     test_attn_decode3_rows(&arena, 62u, 64u);     /* n0 = 63 (1 split), n1 = 64 (1 split, full) */
     test_attn_decode3_rows(&arena, 63u, 64u);     /* n0 = 64 (1 split), n1 = 65 (2 splits): ns0 != ns1 */
     test_attn_decode3_rows(&arena, 200u, 16u);    /* shared dispatch, kps 16/16 */
+    printf("qwen35 attention merge fold (round 2 Plan B)\n");
+    require_ok(ds4_gpu_qwen35_attn_merge_fold_selfcheck(), "merge fold self-check (knob off: trivially 1)");
+    test_attn_merge_fold(&arena, 40u, 16u);       /* n = 41/42: ns 3 (pad to 4) */
+    test_attn_merge_fold(&arena, 2046u, 64u);     /* n = 2047/2048: ns 32 (a power of two) */
+    test_attn_merge_fold(&arena, 2100u, 64u);     /* ns 33 (pad to 64) */
+    test_attn_merge_fold(&arena, 8250u, 64u);     /* ns 129 (pad to 256) */
+    test_attn_merge_fold(&arena, 32766u, 64u);    /* ns 256 (the cap) */
+    test_attn_merge_fold(&arena, 63u, 64u);       /* n0 = 64 (1 split), n1 = 65 (2): the solo path */
+    setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "1", 1);
+    require_ok(ds4_gpu_qwen35_attn_merge_fold_selfcheck(), "merge fold self-check on this compiler");
+    unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
     test_attn_decode3_rows(&arena, 194u, 16u);    /* same ns 13, kps0 = 15 != kps1 = 16 */
     test_attn_decode3_rows(&arena, 4200u, 16u);   /* at the 256-split cap: n / 16 > 256 */
     test_attn_decode3_rows(&arena, 64u, 64u);     /* shared dispatch (ns 2, kps 33): row 1 needs a third tile */
