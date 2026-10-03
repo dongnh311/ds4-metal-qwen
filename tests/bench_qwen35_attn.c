@@ -252,6 +252,9 @@ int main(int argc, char **argv) {
                 c.pos0 = pos[i]; c.T = rows; c.rows = rows;
                 report("decode2", "decode", c.pos0, c.T, rows, time_ms(run_decode2, &c, 3, 9));
                 report("decode3", "decode", c.pos0, c.T, rows, time_ms(run_decode3, &c, 3, 9));
+                setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "1", 1);
+                report("decode3-fold", "decode", c.pos0, c.T, rows, time_ms(run_decode3, &c, 3, 9));
+                unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
             }
     }
     ds4_gpu_tensor_free(c.kc); ds4_gpu_tensor_free(c.vc); ds4_gpu_tensor_free(c.q);
