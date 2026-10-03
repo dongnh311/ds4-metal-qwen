@@ -13,6 +13,7 @@ Q4 = "DeepSeek-V4.1-Flash-Q4.gguf"
 PART1, PART2 = Q4 + ".part1", Q4 + ".part2"
 VISION = "DeepSeek-V4.1-Flash-Vision.gguf"
 EQ4 = "DeepSeek-V4.1-Flash-Q2-EngramQ4.gguf"
+EQ4_PARTS = [EQ4 + ".part" + str(i) for i in range(1, 7)]
 QWEN_Q2 = "Qwen3.8-Flash-Next-Q2.gguf"
 QWEN_Q4 = "Qwen3.8-Flash-Next-Q4.gguf"
 ARTIFACTS = {
@@ -24,12 +25,20 @@ ARTIFACTS = {
     PART2: (38596067328, "7c3e10646c918eeaffbc39305a75ec96117450262c61454ff194cef00d7617f0"),
     VISION: (970555552, "cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15"),
     EQ4: (267406761552, "311f35981bf14ef8e49968ef942e13263bf9011ffdc28c7b6d00a1de45d2f719"),
+    EQ4_PARTS[0]: (45097156608, "e3a25ed2c0498eea95f4a7b5605f41eeeac9855486414f647b7ddc002e8fa635"),
+    EQ4_PARTS[1]: (45097156608, "19673581014fb8ee8f0f9f466107a0168fd97859346474c00b05f7e45e5d8dcc"),
+    EQ4_PARTS[2]: (45097156608, "1512b3d02258b979c8a5a5fec8fca473ae37c134c832daf71ef4546a1b6c5929"),
+    EQ4_PARTS[3]: (45097156608, "3125d0fae3a2a79ee79c0bdda59e1fb9bdcb0067f49d201549a1a9affbe7d227"),
+    EQ4_PARTS[4]: (45097156608, "936b8b67e7be53cb09e60d6ca969ef53c494d83b03cb7d84cd4325a4886aeec8"),
+    EQ4_PARTS[5]: (41920978512, "d485a71b28ea3e9795f1849c06fb8101f60da26de50b58f222678e4b045d3c73"),
 }
 
 
 def payload(name):
     if name == Q4:
         return payload(PART1) + payload(PART2)
+    if name == EQ4:
+        return b"".join(payload(part) for part in EQ4_PARTS)
     return (name + "\n").encode()
 
 
@@ -46,10 +55,11 @@ class DownloadTests(unittest.TestCase):
         text = (ROOT / "download_model.sh").read_text()
         for name, (size, sha) in ARTIFACTS.items():
             data = payload(name)
-            self.assertIn("expected_bytes=" + str(size), text)
-            self.assertIn("expected_sha=" + sha, text)
-            text = text.replace("expected_bytes=" + str(size), "expected_bytes=" + str(len(data)))
-            text = text.replace("expected_sha=" + sha, "expected_sha=" + hashlib.sha256(data).hexdigest())
+            # Several parts share a size, so swap each size and SHA pair as one unit.
+            pinned = "expected_bytes=%d\n            expected_sha=%s\n" % (size, sha)
+            self.assertEqual(text.count(pinned), 1, name)
+            text = text.replace(pinned, "expected_bytes=%d\n            expected_sha=%s\n"
+                                % (len(data), hashlib.sha256(data).hexdigest()))
         self.script.write_text(text)
         hf = self.bin / "hf"
         hf.write_text("""#!/usr/bin/env python3
@@ -61,6 +71,9 @@ assert args[0] == 'download'
 assert args[1] == ('antirez/qwen3.8-flash-next-gguf' if args[2].startswith('Qwen')
                    else 'dongnhdev/DeepSeek-V4.1-Flash-Q2-EngramQ4-GGUF' if 'EngramQ4' in args[2]
                    else 'antirez/deepseek-v4.1-flash-gguf')
+if os.environ.get('HF_LOG'):
+    with open(os.environ['HF_LOG'], 'a') as log:
+        log.write(args[2] + '\\n')
 if os.environ.get('FAIL_DOWNLOAD'):
     sys.exit(7)
 out = Path(args[args.index('--local-dir') + 1])
@@ -94,8 +107,8 @@ out.mkdir(parents=True, exist_ok=True)
 
     def test_truncated_and_corrupt_artifacts(self):
         self.out.mkdir()
-        for target, name in (("ds41f-q2", Q2), ("ds41f-q4", Q4), ("ds41f-vision", VISION),
-                             ("qwen38-q2", QWEN_Q2), ("qwen38-q4k", QWEN_Q4)):
+        for target, name in (("ds41f-q2", Q2), ("ds41f-q4", Q4), ("ds41f-q2-eq4", EQ4),
+                             ("ds41f-vision", VISION), ("qwen38-q2", QWEN_Q2), ("qwen38-q4k", QWEN_Q4)):
             with self.subTest(target=target):
                 path = self.out / name
                 path.write_bytes(b"short")
@@ -115,11 +128,47 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / QWEN_Q2)
         self.assertNotIn("--ple", self.run_download("--help"))
 
-    def test_engram_q4_is_one_verified_file(self):
+    def downloaded(self):
+        log = self.root / "hf.log"
+        names = log.read_text().split() if log.exists() else []
+        log.unlink(missing_ok=True)
+        return names
+
+    def test_engram_q4_joins_six_verified_parts(self):
+        self.env["HF_LOG"] = str(self.root / "hf.log")
         self.assertIn("Verifying SHA-256", self.run_download("ds41f-q2-eq4"))
+        self.assertEqual(self.downloaded(), EQ4_PARTS)
         self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / EQ4)
         self.assertEqual((self.out / EQ4).read_bytes(), payload(EQ4))
+        self.assertEqual({p.name for p in self.out.iterdir()}, {EQ4, EQ4 + ".assembling.lock"})
+        self.assertIn("Already downloaded", self.run_download("ds41f-q2-eq4"))
+        self.assertEqual(self.downloaded(), [])
         self.assertIn("ds41f-q2-eq4", self.run_download("--help"))
+
+    def test_engram_q4_resumes_without_fetching_joined_parts(self):
+        self.env["HF_LOG"] = str(self.root / "hf.log")
+        self.out.mkdir()
+        pending = self.out / (EQ4 + ".assembling")
+        for joined in range(1, 6):
+            for tail in (b"", payload(EQ4_PARTS[joined])[:7]):
+                with self.subTest(joined=joined, tail=len(tail)):
+                    # Joined parts are gone; the next one may be half appended or not yet downloaded.
+                    pending.write_bytes(b"".join(payload(p) for p in EQ4_PARTS[:joined]) + tail)
+                    if tail:
+                        (self.out / EQ4_PARTS[joined]).write_bytes(payload(EQ4_PARTS[joined]))
+                    self.run_download("ds41f-q2-eq4")
+                    self.assertEqual(self.downloaded(), EQ4_PARTS[joined + 1 if tail else joined:])
+                    self.assertEqual((self.out / EQ4).read_bytes(), payload(EQ4))
+                    self.assertEqual({p.name for p in self.out.iterdir()}, {EQ4, pending.name + ".lock"})
+                    (self.out / EQ4).unlink()
+
+    def test_engram_q4_rejects_a_corrupt_part(self):
+        self.run_download("ds41f-q2")
+        self.out.joinpath(EQ4_PARTS[3]).write_bytes(b"x" * len(payload(EQ4_PARTS[3])))
+        self.assertIn("Checksum mismatch", self.run_download("ds41f-q2-eq4", ok=False))
+        self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / Q2)
+        self.assertFalse((self.out / EQ4).exists())
+        self.assertFalse((self.out / (EQ4 + ".assembling")).exists())
 
     def test_failure_does_not_replace_link(self):
         self.run_download("ds41f-q2")
