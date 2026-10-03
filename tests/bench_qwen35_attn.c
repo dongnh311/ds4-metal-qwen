@@ -148,6 +148,8 @@ int main(int argc, char **argv) {
     const int do_prefill = !strcmp(what, "all") || !strcmp(what, "prefill");
     const int do_decode = !strcmp(what, "all") || !strcmp(what, "decode");
     need(ds4_gpu_init(), "GPU initialization");
+    unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
+    need(ds4_gpu_qwen35_attn_merge_fold_selfcheck(), "merge fold self-check");   /* the fold waits for it */
     const char *min_tg_env = getenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
     const int have_min_tg = min_tg_env != NULL;
     char min_tg_saved[32] = {0};
@@ -253,9 +255,11 @@ int main(int argc, char **argv) {
                 report("decode2", "decode", c.pos0, c.T, rows, time_ms(run_decode2, &c, 3, 9));
                 setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "0", 1);
                 report("decode3", "decode", c.pos0, c.T, rows, time_ms(run_decode3, &c, 3, 9));
+                const uint64_t fold0 = ds4_gpu_qwen35_attn_merge_fold_dispatches();
                 setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "1", 1);
                 report("decode3-fold", "decode", c.pos0, c.T, rows, time_ms(run_decode3, &c, 3, 9));
                 unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
+                need(ds4_gpu_qwen35_attn_merge_fold_dispatches() > fold0, "decode3-fold row ran the fold");
             }
     }
     ds4_gpu_tensor_free(c.kc); ds4_gpu_tensor_free(c.vc); ds4_gpu_tensor_free(c.q);
