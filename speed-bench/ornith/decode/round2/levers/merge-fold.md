@@ -61,7 +61,11 @@ decode3 with the fold against decode3 with merge3, `memcmp` on the output, rows 
 | 128K | 1 × 1 | 1 | +5.2% | - | +5.2% | +5.2% | 0 |
 
 - Mean decode rates, base → fold: 2K 89.2 → 90.0 t/s; 32K 68.3 → 74.2 t/s; 128K 45.5 → 47.8 t/s.
-- Prefill is unchanged within noise (the fold only runs in decode3).
+- Prefill moves within noise: 32K 1620 → 1633 t/s, 128K 860 → 871.
+  - The fold also merges the flash prefill key splits (`qwen35_attn_flash_merge3`, simdgroup and accelerator
+    paths), which run in long prefill chunks. r2w3 had no bit-level test of that caller.
+  - Since then, `test_attn_flash_merge_fold` has covered it (memcmp at 2-8 splits, both paths). A mutant that
+    pins merge3 there fails that test.
 - Every repeated request decoded the same text in all four runs of its block (SHA-256 of reasoning and
   content), so this is also an identity check on the server path.
 
