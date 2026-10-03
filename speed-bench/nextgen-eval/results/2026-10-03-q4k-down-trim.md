@@ -122,14 +122,42 @@ number.
 - The gate had not yet run. It has now passed.
 - The six minors are deferred (see the branch ledger).
 
-## Deploying (waits for the user)
+## Deployed (2026-10-03, user go)
 
-1. Upload the trimmed GGUF and its `.json` manifest to the dongnhdev HF repo (model-sync rule).
-2. Merge `feature/q4k-down-trim` into develop.
-3. Cut `prod/q4k-down-trim-YYYYMMDD` from develop and deploy with `deploy-ai-gateway.sh`.
-4. In the registry, change the Qwen rows' `-m` (262K and 512K) to the trimmed file. The rest of the command is
-   unchanged.
-5. Rollback: the registry's previous `-m`. The old binary cannot load the trimmed file; the new binary loads both.
+- **HF:** the trimmed GGUF and its manifest are in `dongnhdev/Qwen3.8-Flash-Next-OrcaUncensored-IQ2-Light`.
+  - GGUF commit 074e39e0: 51,421,324,928 B, sha256 `3a7c8430…`, matching the local file.
+  - Manifest commit 9befdcd4.
+- **Merge:** develop 331cf3b2.
+- **PROD:** `prod/q4k-down-trim-20261003` @331cf3b, installed at 12:35:41. The previous branch was
+  `prod/ornith-512k-20261002` @2146f8d. The gateway was paused from 12:34 to 12:39 and returned backend_ok.
+- **Registry:** the two Qwen rows (262K on :18086, 512K on :18088) changed three fields: `model_path`, the
+  `-m` in `process_command`, and `quantization`. Each went from `Q4KDownPad768` to `Q4KDownTrim`. The Ornith rows
+  were not touched. Backup: `runtime-registry.json.bak-prod-q4k-down-trim-20261003`. The Qwen KV directory was
+  empty, so nothing was moved aside.
+- **Smoke:** every ds4 row ran with its exact registry command against references recorded from the develop
+  331cf3b2 build. All 8 replies (vi + code × 4 rows) were "same as ref". The table shows t/s including prefill,
+  for replies of 290-300 tokens:
+
+  | Row | Ref vi | PROD vi | Ref code | PROD code |
+  |---|---|---|---|---|
+  | Qwen 262K | 21.0 | 23.4 | 31.7 | 33.7 |
+  | Qwen 512K | 30.2 | 30.3 | 30.1 | 31.7 |
+  | Ornith 262K | 75.4 | 76.6 | 90.3 | 80.4 |
+  | Ornith 512K | 80.3 | 78.6 | 93.1 | 83.8 |
+
+  The Ornith code runs last 3.2-3.6 s, so their t/s carries the noise of a short window with prefill. The
+  Ornith model and command did not change.
+- **Live check** through the gateway on :8090:
+  - The Qwen row answered in 15.2 s, including the switch. One `ds4-server` was running, on :18086, with the
+    trimmed GGUF.
+  - Switching back to the default Ornith row answered in 5.8 s, with one `ds4-server` on :18087.
+- **Cleanup:** both local hard links of the padded unc48L GGUF were deleted after its HF copy was checked
+  (55,447,856,768 B, sha256 `20b4c617…`).
+- **Rollback:**
+  1. Download `...-Q4KDownPad768-DenseQ4Kselimat-MTP.gguf` from the HF repo into `ds4-models`.
+  2. Restore the registry backup. The deployed binary loads both files.
+  3. For a full rollback, run `deploy-ai-gateway.sh install prod/ornith-512k-20261002`. That binary refuses
+     the trimmed file.
 
 The freed memory (2.5 GiB resident, smaller expert reserve) could later buy one more resident layer or a bigger
 cache. That is a separate tuning decision.
