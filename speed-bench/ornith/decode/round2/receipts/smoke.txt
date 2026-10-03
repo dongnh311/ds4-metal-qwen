@@ -1,0 +1,23 @@
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /Users/dongnh/orca/workspaces/ds4-metal/foxface (CWD)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.215 ms, residency requested in 53.771 ms, warmup 2.457 ms (mapped 3953.62 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+smoke: q8 2048x248320 (lm_head, peak ref)   T1 ok (max |y| = 35.9075)
+smoke: q8 2048x248320 (lm_head, peak ref)   T2 ok (max |y| = 40.5075)
+smoke: q8 2048x8192 (attn_qkv, attn_q)      T1 ok (max |y| = 28.2825)
+smoke: q8 2048x8192 (attn_qkv, attn_q)      T2 ok (max |y| = 29.9426)
+smoke: q8 2048x4096 (attn_gate)             T1 ok (max |y| = 32.9823)
+smoke: q8 2048x4096 (attn_gate)             T2 ok (max |y| = 32.9823)
+smoke: q8 4096x2048 (ssm_out, attn_output)  T1 ok (max |y| = 37.9827)
+smoke: q8 4096x2048 (ssm_out, attn_output)  T2 ok (max |y| = 46.5267)
+smoke: moe mid Q5_K + shared                T1 ok (max |y| = 49273.1)
+smoke: moe mid Q5_K + shared                T2 ok (max |y| = 49273.1)
+smoke: moe down Q5_K + shared               T1 ok (max |y| = 306.789)
+smoke: moe down Q5_K + shared               T2 ok (max |y| = 306.789)
+smoke: moe mid Q4_K + shared                T1 ok (max |y| = 11485.2)
+smoke: moe mid Q4_K + shared                T2 ok (max |y| = 11485.2)
+smoke: moe down Q4_K + shared               T1 ok (max |y| = 153.531)
+smoke: moe down Q4_K + shared               T2 ok (max |y| = 153.531)
+smoke: ok
