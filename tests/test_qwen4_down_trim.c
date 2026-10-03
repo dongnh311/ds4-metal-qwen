@@ -68,6 +68,32 @@ static void check_trimmed_layouts(void) {
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 1);
 }
 
+/* the bound nextn (MTP) layers after the executable range count toward the down layout, so a
+ * padded Q4_K MTP down beside trimmed main layers is refused instead of read at the wrong stride */
+static void check_collect_includes_nextn(void) {
+    static ds4_weights w;
+    const uint32_t saved_layers = g_ds4_shape.n_layer;
+    g_ds4_shape.n_layer = 4;
+    g_ds4_shape.n_ff_exp = 640;
+    static ds4_tensor main_down = { .ndim = 3, .dim = {640, 2560, 512}, .type = DS4_TENSOR_Q4_K };
+    static ds4_tensor mtp_pad = { .ndim = 3, .dim = {768, 2560, 512}, .type = DS4_TENSOR_Q4_K };
+    static ds4_tensor mtp_q8 = { .ndim = 3, .dim = {640, 2560, 512}, .type = DS4_TENSOR_Q8_0 };
+    for (uint32_t il = 0; il < 3; il++) w.layer[il].ffn_down_exps = &main_down;
+    bool tr[DS4_MAX_LAYER];
+    uint32_t ty[DS4_MAX_LAYER];
+    /* layers 0..2 executable, layer 3 the nextn block */
+    w.layer[3].ffn_down_exps = &mtp_pad;
+    CHECK(qwen4_collect_down_layouts(&w, 0, tr, ty) == 4);
+    CHECK(tr[0] && tr[2] && !tr[3] && ty[3] == DS4_TENSOR_Q4_K);
+    w.layer[3].ffn_down_exps = &mtp_q8;
+    CHECK(qwen4_collect_down_layouts(&w, 0, tr, ty) == 4);
+    CHECK(!tr[3] && ty[3] == DS4_TENSOR_Q8_0);
+    /* a slice that did not bind the nextn block: only the bound layers count */
+    w.layer[3].ffn_down_exps = NULL;
+    CHECK(qwen4_collect_down_layouts(&w, 0, tr, ty) == 3);
+    g_ds4_shape.n_layer = saved_layers;
+}
+
 /* the CPU reference reads a trimmed row exactly like the first n values of its padded twin */
 static void check_ref_row(void) {
     enum { ROWS = 3 };
@@ -95,6 +121,7 @@ static void check_ref_row(void) {
 int main(void) {
     check_row_bytes();
     check_trimmed_layouts();
+    check_collect_includes_nextn();
     check_ref_row();
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("test_qwen4_down_trim: ok\n");

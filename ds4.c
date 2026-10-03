@@ -5740,6 +5740,32 @@ static void qwen4_check_down_layouts(const bool *trimmed, const uint32_t *types,
     }
 }
 
+/* Routed down tensors the qwen4 graph runs from layer start on: the executable
+ * layers and, for a full model, the nextn (MTP) layers weights_bind bound after
+ * them.  Returns the count written to trimmed/types. */
+static uint32_t qwen4_collect_down_layouts(const ds4_weights *w, uint32_t start,
+                                           bool *trimmed, uint32_t *types) {
+    uint32_t n = 0;
+    for (uint32_t il = start; il < DS4_N_LAYER && il < DS4_MAX_LAYER; il++) {
+        const ds4_tensor *t = w->layer[il].ffn_down_exps;
+        if (!t) continue;
+        trimmed[n] = qwen4_down_is_trimmed(t);
+        types[n++] = t->type;
+    }
+    return n;
+}
+
+/* Q2_K and Q4_K down rows store 640 logical inputs in three 256-value blocks
+ * (Q4_K super-blocks) unless the Q4_K rows are trimmed to 640 (the last block
+ * cut after its real values). Activations remain 640 wide; only the weight
+ * row stride differs. */
+static void qwen4_expect_down_layout(const ds4_tensor *down) {
+    const bool trimmed = qwen4_down_is_trimmed(down);
+    const uint32_t down_width = !trimmed && (down->type == DS4_TENSOR_Q2_K || down->type == DS4_TENSOR_Q4_K) ?
+        (DS4_N_FF_EXP + 255u) / 256u * 256u : DS4_N_FF_EXP;
+    tensor_expect_qwen4_expert_layout(down, down_width, DS4_N_EMBD, DS4_N_EXPERT);
+}
+
 static void weights_validate_qwen4_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -5792,9 +5818,6 @@ static void weights_validate_qwen4_layout(
         tensor_expect_qwen4_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
-    bool down_trimmed[DS4_MAX_LAYER] = {0};
-    uint32_t down_types[DS4_MAX_LAYER] = {0};
-    uint32_t n_down = 0;
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (!weights_qwen4_layer_has_required(l, il)) {
@@ -5844,17 +5867,7 @@ static void weights_validate_qwen4_layout(
         tensor_expect_layout(l->ffn_gate_inp, DS4_TENSOR_F32, 2, DS4_N_EMBD, DS4_N_EXPERT, 0);
         tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
-        /* Q2_K and Q4_K down rows store 640 logical inputs in three 256-value
-         * blocks (Q4_K super-blocks) unless the Q4_K rows are trimmed to 640
-         * (the last block cut after its real values). Activations remain 640
-         * wide; only the weight row stride differs. */
-        const bool trimmed = qwen4_down_is_trimmed(l->ffn_down_exps);
-        const uint32_t down_width = !trimmed && (l->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
-                                                 l->ffn_down_exps->type == DS4_TENSOR_Q4_K) ?
-            (DS4_N_FF_EXP + 255u) / 256u * 256u : DS4_N_FF_EXP;
-        tensor_expect_qwen4_expert_layout(l->ffn_down_exps, down_width, DS4_N_EMBD, DS4_N_EXPERT);
-        down_trimmed[n_down] = trimmed;
-        down_types[n_down++] = l->ffn_down_exps->type;
+        qwen4_expect_down_layout(l->ffn_down_exps);
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -5877,6 +5890,14 @@ static void weights_validate_qwen4_layout(
             tensor_expect_qwen4_dense_layout(l->nextn_hc_head_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
         }
     }
+    /* the bound nextn (MTP) layers run the same down kernels and stride */
+    for (uint32_t il = layer_end + 1u; il < DS4_N_LAYER; il++) {
+        const ds4_layer_weights *l = &w->layer[il];
+        if (l->ffn_down_exps) qwen4_expect_down_layout(l->ffn_down_exps);
+    }
+    bool down_trimmed[DS4_MAX_LAYER] = {0};
+    uint32_t down_types[DS4_MAX_LAYER] = {0};
+    const uint32_t n_down = qwen4_collect_down_layouts(w, layer_start, down_trimmed, down_types);
     qwen4_check_down_layouts(down_trimmed, down_types, n_down);
     bool any_trimmed = false;
     for (uint32_t i = 0; i < n_down; i++) any_trimmed |= down_trimmed[i];
