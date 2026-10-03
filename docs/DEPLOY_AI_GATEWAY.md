@@ -98,13 +98,23 @@ appends `previous -> new` to `.deploy-history` in the PROD checkout.
 
 Run it once per ds4 row. It starts that row's exact registry command from the
 PROD checkout on a scratch port (18297) with a scratch KV directory, sends a
-Vietnamese and a code prompt at temperature 0, and compares both replies with
-the `develop` reference. The deploy passes only if both replies are non-empty
-and identical to the reference, and the tokens per second match the `develop`
-run. It never touches the live ports or KV caches. If the server does not exit
-within 60 s of SIGTERM, the smoke fails and leaves it running (a Metal process
-is never SIGKILLed); stop it before going on. The script itself is tested
-without a GPU by `python3 tests/test_deploy_smoke.py`.
+Vietnamese and a code prompt at temperature 0, then runs a greedy two-leg tool
+round trip (a `get_weather` call, then a reply to its result on top of the
+first leg's KV checkpoint). It compares all three outputs (`vi.txt`, `code.txt`,
+`tool.txt`) with the `develop` reference. The deploy passes only if the replies
+are non-empty, the first tool leg calls `get_weather`, the second leg's reply
+contains the tool's 31°C, every output is identical to the reference, and the
+tokens per second match the `develop` run. The tool reply's wording is judged
+only against the reference: Ornith's reply starts with a garbled word ("Thú
+Huế"), and llama.cpp on the same GGUF gives the same text, so that is the model,
+not ds4. For a deploy that should not change the output (no model, quant or
+non-exact kernel change), also run the smoke with `--ref` pointing at the
+previous deploy's reference (or smoke outputs kept with `--out`); a `tool.txt`
+that differs there means the tool-result turn changed. The smoke never touches
+the live ports or KV caches. If the server does not exit within 60 s of
+SIGTERM, the smoke fails and leaves it running (a Metal process is never
+SIGKILLed); stop it before going on. The script itself is tested without a GPU
+by `python3 tests/test_deploy_smoke.py`.
 
 ### 6. Hand over
 
