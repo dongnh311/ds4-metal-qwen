@@ -16,4 +16,4 @@ esac
 cd "$root"
 make ds4-server test-qwen4-kernels test-qwen4-q2 test-qwen4-prefill-pipe
 python3 "$here/qwen_gate.py" check --bin "$root" --baseline "$baseline" \
-    --out "$here/last-$tier" $full_flag
+    --out "$here/last-$tier" $full_flag ${BRANCH_MODEL:+--branch-model "$BRANCH_MODEL"}

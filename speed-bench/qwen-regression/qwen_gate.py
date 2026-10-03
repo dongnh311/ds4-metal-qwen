@@ -29,6 +29,9 @@ import wired  # noqa: E402
 
 REGISTRY = os.path.expanduser(os.environ.get(
     "DS4_GATEWAY_REGISTRY", "~/.local/ai-gateway/runtime-registry.json"))
+# check/longab --branch-model: the branch servers load this GGUF instead of the registry model
+# (a lossless repack such as trimmed Q4_K down rows); the PROD side keeps the registry model.
+BRANCH_MODEL = None
 # Same prompts and request body as deploy-ai-gateway.sh smoke.
 PROMPTS = {
     "vi": "Giải thích ngắn gọn cách bộ nhớ đệm KV giúp mô hình ngôn ngữ sinh văn bản nhanh hơn.",
@@ -84,7 +87,20 @@ def registry_command(registry, bin_dir, port, kv_dir):
         elif bin_dir and os.path.basename(arg) == "ds4-server":
             cmd[i] = os.path.join(os.path.abspath(bin_dir), "ds4-server")
     cwd = os.path.abspath(bin_dir) if bin_dir else entry.get("process_cwd")
+    if bin_dir is not None:
+        cmd = retarget_model(cmd, BRANCH_MODEL)
     return cmd, cwd
+
+
+def retarget_model(cmd, path):
+    """cmd with the value after -m replaced by path (cmd unchanged when path is None)."""
+    if path is None:
+        return cmd
+    if "-m" not in cmd[:-1]:
+        raise SystemExit("qwen_gate: registry command has no -m to retarget")
+    out = list(cmd)
+    out[out.index("-m") + 1] = path
+    return out
 
 
 def compare_replies(ref_dir, replies):
@@ -453,7 +469,12 @@ def main():
     lng.add_argument("--bin", required=True, help="directory holding the ds4-server to test")
     lng.add_argument("--out", required=True)
     lng.add_argument("--prefill-mode", required=True, choices=("safe", "max"))
+    for p in (chk, lng):
+        p.add_argument("--branch-model", default=None,
+                       help="GGUF for the branch servers (default: the registry model)")
     args = ap.parse_args()
+    global BRANCH_MODEL
+    BRANCH_MODEL = getattr(args, "branch_model", None)
     if args.mode == "longab":
         result = run_long(args.bin, args.out, args.prefill_mode)
         for name, row in result["summary"].items():

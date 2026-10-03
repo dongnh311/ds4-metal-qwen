@@ -14,6 +14,8 @@ other ds4 process must be stopped, and the user must agree to the run.
 ```sh
 speed-bench/qwen-regression/run.sh fast
 speed-bench/qwen-regression/run.sh full
+# a lossless repack of the PROD model (e.g. trimmed Q4_K down rows): branch servers load it, PROD keeps the registry model
+BRANCH_MODEL=/path/to/repacked.gguf speed-bench/qwen-regression/run.sh full
 # re-record the reference from the PROD binary (only after the PROD deploy changes):
 python3 speed-bench/qwen-regression/qwen_gate.py record --out speed-bench/qwen-regression/baseline --full
 ```
