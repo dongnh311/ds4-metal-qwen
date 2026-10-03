@@ -3,6 +3,7 @@
 import hashlib
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -76,6 +77,8 @@ if os.environ.get('HF_LOG'):
         log.write(args[2] + '\\n')
 if os.environ.get('FAIL_DOWNLOAD'):
     sys.exit(7)
+if os.environ.get('HF_RACE_SRC'):
+    Path(os.environ['HF_RACE_DST']).write_bytes(Path(os.environ['HF_RACE_SRC']).read_bytes())
 out = Path(args[args.index('--local-dir') + 1])
 out.mkdir(parents=True, exist_ok=True)
 (out / args[2]).write_bytes((args[2] + '\\n').encode())
@@ -134,6 +137,12 @@ out.mkdir(parents=True, exist_ok=True)
         log.unlink(missing_ok=True)
         return names
 
+    def fresh_out(self):
+        """Empties the download directory and the fetch log, so a failed subtest cannot leak into the next."""
+        shutil.rmtree(self.out, ignore_errors=True)
+        self.out.mkdir()
+        self.downloaded()
+
     def test_engram_q4_joins_six_verified_parts(self):
         self.env["HF_LOG"] = str(self.root / "hf.log")
         self.assertIn("Verifying SHA-256", self.run_download("ds41f-q2-eq4"))
@@ -147,11 +156,11 @@ out.mkdir(parents=True, exist_ok=True)
 
     def test_engram_q4_resumes_without_fetching_joined_parts(self):
         self.env["HF_LOG"] = str(self.root / "hf.log")
-        self.out.mkdir()
         pending = self.out / (EQ4 + ".assembling")
         for joined in range(1, 6):
             for tail in (b"", payload(EQ4_PARTS[joined])[:7]):
                 with self.subTest(joined=joined, tail=len(tail)):
+                    self.fresh_out()
                     # Joined parts are gone; the next one may be half appended or not yet downloaded.
                     pending.write_bytes(b"".join(payload(p) for p in EQ4_PARTS[:joined]) + tail)
                     if tail:
@@ -160,7 +169,37 @@ out.mkdir(parents=True, exist_ok=True)
                     self.assertEqual(self.downloaded(), EQ4_PARTS[joined + 1 if tail else joined:])
                     self.assertEqual((self.out / EQ4).read_bytes(), payload(EQ4))
                     self.assertEqual({p.name for p in self.out.iterdir()}, {EQ4, pending.name + ".lock"})
-                    (self.out / EQ4).unlink()
+
+    def test_engram_q4_keeps_joined_data_when_a_part_copy_is_left_over(self):
+        self.env["HF_LOG"] = str(self.root / "hf.log")
+        pending = self.out / (EQ4 + ".assembling")
+        # joined = parts in the assembly; strays = copies still on disk (another run, or a crash before unlink).
+        for joined, strays in ((4, (2, 3)), (3, (3,)), (5, (1, 5))):
+            with self.subTest(joined=joined, strays=strays):
+                self.fresh_out()
+                pending.write_bytes(b"".join(payload(p) for p in EQ4_PARTS[:joined]))
+                for k in strays:
+                    (self.out / EQ4_PARTS[k - 1]).write_bytes(payload(EQ4_PARTS[k - 1]))
+                self.run_download("ds41f-q2-eq4")
+                self.assertEqual(self.downloaded(), EQ4_PARTS[joined:])
+                self.assertEqual((self.out / EQ4).read_bytes(), payload(EQ4))
+                self.assertEqual({p.name for p in self.out.iterdir()}, {EQ4, pending.name + ".lock"})
+
+    def test_engram_q4_removes_parts_left_by_an_overlapping_run(self):
+        self.out.mkdir()
+        done = self.root / "joined-by-other-run"
+        done.write_bytes(payload(EQ4))
+        # Another run finishes the file while this one downloads its parts.
+        self.env.update(HF_RACE_SRC=str(done), HF_RACE_DST=str(self.out / EQ4))
+        self.run_download("ds41f-q2-eq4")
+        self.assertEqual((self.out / EQ4).read_bytes(), payload(EQ4))
+        self.assertEqual({p.name for p in self.out.iterdir()}, {EQ4, EQ4 + ".assembling.lock"})
+        # A finished file with parts still beside it is checked and the parts are removed.
+        del self.env["HF_RACE_SRC"], self.env["HF_RACE_DST"]
+        for name in (EQ4_PARTS[1], EQ4_PARTS[4]):
+            (self.out / name).write_bytes(payload(name))
+        self.assertIn("Already downloaded", self.run_download("ds41f-q2-eq4"))
+        self.assertEqual({p.name for p in self.out.iterdir()}, {EQ4, EQ4 + ".assembling.lock"})
 
     def test_engram_q4_rejects_a_corrupt_part(self):
         self.run_download("ds41f-q2")

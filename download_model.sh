@@ -141,7 +141,7 @@ Targets:
        lloyd4_e5m3_32_r136), about 249 GiB on disk; no measurable quality loss.
        Made with gguf-tools/deepseek41_engram_q4 from ds41f-q2. Only this fork
        reads it. Downloads six parts and joins them automatically; allow
-       another 42 GiB of free disk space.
+       another 43 GiB of free disk space.
 
   ds41f-vision
        Matching V4.1 Flash vision encoder, about 0.9 GiB. Add --vision FILE
@@ -637,13 +637,19 @@ download_one() {
 
 # Downloads FILE as COUNT parts, FILE.part1 .. FILE.partCOUNT, and joins them.
 # Each part is SHA-checked when it is downloaded and removed once it has been
-# appended, so joining needs free space for one more part.
+# appended, so joining needs free space for one more part plus 1 GiB.
 download_joined_hf() {
     joined=$1
     count=$2
     joined_out="$OUT_DIR/$joined"
     if [ -e "$joined_out" ]; then
         verify_download "$joined" "$joined_out"
+        # Parts an overlapping run downloaded again are no longer needed.
+        i=1
+        while [ "$i" -le "$count" ]; do
+            rm -f "$joined_out.part$i"
+            i=$((i + 1))
+        done
         echo "Already downloaded: $joined_out"
         return
     fi
@@ -704,12 +710,20 @@ def invalid():
     sys.exit("Invalid partial assembly: " + str(pending) +
              ". Move it aside before retrying.")
 
+def drop_leftover_parts():
+    for part in parts:
+        try:
+            part.unlink()
+        except FileNotFoundError:
+            pass
+
 # Keep this lock file: unlinking it could allow two different locks for the
 # same download. The first part becomes the output without a second full copy.
 with Path(str(pending) + ".lock").open("a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     if out.exists():
         verify(out)
+        drop_leftover_parts()
         sys.exit(0)
     if not pending.exists():
         if parts[0].stat().st_size != sizes[0]:
@@ -718,14 +732,19 @@ with Path(str(pending) + ".lock").open("a") as lock:
     size = pending.stat().st_size
     if not sizes[0] <= size <= total:
         invalid()
-    # A part is removed only after its append reached the disk. A part that is
-    # still present is appended again from its start; a removed one must
+    # A part is removed only after its append was fsynced, and the next part
+    # is appended only after that. So a part that is still present is appended
+    # again from its start, unless the assembly already runs past it (a copy
+    # left by an overlapping run): then it is dropped. A removed part must
     # already be in the assembly.
     with pending.open("r+b") as dst:
         for part, start, length in zip(parts[1:], starts[1:], sizes[1:]):
             if not part.exists():
                 if size < start + length:
                     invalid()
+                continue
+            if size > start + length:
+                part.unlink()
                 continue
             if part.stat().st_size != length:
                 sys.exit("Incorrect file size: " + str(part))
@@ -745,6 +764,7 @@ with Path(str(pending) + ".lock").open("a") as lock:
             size = start + length
     verify(pending)
     pending.rename(out)
+    drop_leftover_parts()
 PY
 }
 
