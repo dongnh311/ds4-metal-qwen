@@ -7319,6 +7319,44 @@ void ds4_qwen35_context_refusal(char *buf, size_t n, uint32_t native_ctx, uint32
     }
 }
 
+uint32_t ds4_qwen35_topk_overlap(const int32_t *a, const int32_t *b, uint32_t k) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < k; i++) {
+        for (uint32_t j = 0; j < k; j++) {
+            if (a[i] == b[j]) {
+                n++;
+                break;
+            }
+        }
+    }
+    return n;
+}
+
+void ds4_qwen35_spec_stats_add(ds4_qwen35_spec_stats *st, bool verified, int committed,
+                               double target_s, double draft_s, double host_s, double outside_s) {
+    st->cycles++;
+    if (!verified) st->plain_cycles++;
+    else if (committed > 1) st->accepted++;
+    if (committed > 0) st->committed += (uint64_t)committed;
+    st->target_s += target_s;
+    st->draft_s += draft_s;
+    st->host_s += host_s;
+    if (outside_s > 0.0 && outside_s <= 1.0) st->outside_s += outside_s;
+}
+
+int ds4_qwen35_spec_stats_format(const ds4_qwen35_spec_stats *st, char *buf, size_t n) {
+    const uint64_t verified = st->cycles - st->plain_cycles;
+    const double c = st->cycles ? (double)st->cycles : 1.0;
+    const double tok = st->committed ? (double)st->committed : 1.0;
+    return snprintf(buf, n, "Ornith spec stats: %llu cycles (%llu plain), accept %.3f, %.3f tokens/cycle, "
+                    "ms/cycle target %.2f draft %.2f host %.2f outside %.2f, ms/token %.2f",
+                    (unsigned long long)st->cycles, (unsigned long long)st->plain_cycles,
+                    verified ? (double)st->accepted / (double)verified : 0.0, (double)st->committed / c,
+                    1000.0 * st->target_s / c, 1000.0 * st->draft_s / c, 1000.0 * st->host_s / c,
+                    1000.0 * st->outside_s / c,
+                    1000.0 * (st->target_s + st->draft_s + st->host_s + st->outside_s) / tok);
+}
+
 void ds4_qwen4_rope_table(uint32_t n_rot, double base, uint32_t native_ctx, double factor,
                           float freq[32], float *mscale, double *low_out, double *high_out) {
     const uint32_t half = n_rot / 2u;
@@ -78136,6 +78174,33 @@ static bool qwen35_spec_force_accept(void) {
     return getenv("DS4_QWEN35_SPEC_FORCE_ACCEPT") != NULL;
 }
 
+/* DS4_QWEN35_SPEC_STATS=1: time each Ornith MTP cycle (the target forward,
+ * the draft, the host work around them, and the caller's time since the
+ * previous cycle) and print running totals every 64 cycles.  Timing only:
+ * the cycle's work is unchanged. */
+static bool qwen35_spec_stats_enabled(void) {
+    static int v = -1;
+    if (v < 0) v = getenv("DS4_QWEN35_SPEC_STATS") != NULL;
+    return v != 0;
+}
+
+static ds4_qwen35_spec_stats g_qwen35_spec_stats;
+static double g_qwen35_spec_last_end;
+
+static void qwen35_spec_stats_note(bool verified, int committed, double t0, double target_s, double draft_s) {
+    const double t1 = now_sec();
+    const double outside = g_qwen35_spec_last_end > 0.0 ? t0 - g_qwen35_spec_last_end : 0.0;
+    const double host = t1 - t0 - target_s - draft_s;
+    ds4_qwen35_spec_stats_add(&g_qwen35_spec_stats, verified, committed, target_s, draft_s,
+                              host > 0.0 ? host : 0.0, outside);
+    g_qwen35_spec_last_end = t1;
+    if (g_qwen35_spec_stats.cycles % 64u == 0u) {
+        char line[320];
+        ds4_qwen35_spec_stats_format(&g_qwen35_spec_stats, line, sizeof(line));
+        fprintf(stderr, "ds4: %s\n", line);
+    }
+}
+
 /* Run the MTP block over tokens at pos0.. and keep the draft that follows
  * the last of them; without a draft the next cycle takes the plain path.
  * Returns false only when the precheck passed but the GPU call itself
@@ -78181,18 +78246,26 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
     const ds4_model *m = &e->model;
     const ds4_weights *w = &e->weights;
     const uint32_t pos = g->pos, V = DS4_N_VOCAB;
+    const bool stats = qwen35_spec_stats_enabled();
+    const double t0 = stats ? now_sec() : 0.0;
+    double tt = 0.0, td = 0.0, tm = 0.0;
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
     if (!s->glm_mtp_have || accepted_cap < 2 || pos + 2u > g->ctx_cap || g->cap_tokens < 2u ||
         !qwen4_graph_fused(g, 2u)) {
         s->glm_spec_inside = 1;
+        tm = stats ? now_sec() : 0.0;
         const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
+        if (stats) tt = now_sec() - tm;
         s->glm_spec_inside = 0;
         if (rc != 0) return -1;
         /* rewrite MTP row pos for first_token, then draft after the parent */
         const int toks[2] = { first_token, sample_argmax(s->logits, V) };
+        tm = stats ? now_sec() : 0.0;
         if (!qwen35_session_draft(s, toks, 2u, pos, err, errlen)) return -1;
+        if (stats) td = now_sec() - tm;
         if (qwen35_spec_trace()) fprintf(stderr, "ds4: Ornith spec pos %u token %d plain\n", pos, first_token);
         accepted[0] = first_token;
+        if (stats) qwen35_spec_stats_note(false, 1, t0, tt, td);
         return 1;
     }
     s->glm_mtp_have = 0;
@@ -78203,7 +78276,9 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
     float *rows = s->qwen4_verify_logits;
     g->snap_after_first = true;
     g->verify_rows_exact = true;
+    tm = stats ? now_sec() : 0.0;
     const bool ok = qwen35_graph_forward_tokens(g, m, w, toks, 2u, rows, true);
+    if (stats) tt = now_sec() - tm;
     g->verify_rows_exact = false;
     if (!ok) {
         if (errlen) snprintf(err, errlen, "Ornith mtp: verify failed");
@@ -78224,10 +78299,13 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
         memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
         /* rows pos+1 (d with h_pos) and pos+2 (the parent with h_{pos+1}) */
         const int next[2] = { d, sample_argmax(s->logits, V) };
+        tm = stats ? now_sec() : 0.0;
         if (!qwen35_session_draft(s, next, 2u, pos + 1u, err, errlen)) return -1;
+        if (stats) td = now_sec() - tm;
         s->qwen4_spec_accepted++;
         accepted[0] = first_token;
         accepted[1] = d;
+        if (stats) qwen35_spec_stats_note(true, 2, t0, tt, td);
         return 2;
     }
     if (!qwen35_graph_state_swap(g)) {
@@ -78237,8 +78315,11 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
     }
     memcpy(s->logits, rows, (size_t)V * sizeof(float));
     const int parent = sample_argmax(s->logits, V);
+    tm = stats ? now_sec() : 0.0;
     if (!qwen35_session_draft(s, &parent, 1u, pos + 1u, err, errlen)) return -1;
+    if (stats) td = now_sec() - tm;
     accepted[0] = first_token;
+    if (stats) qwen35_spec_stats_note(true, 1, t0, tt, td);
     return 1;
 }
 #endif

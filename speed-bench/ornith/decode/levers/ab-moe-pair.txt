@@ -1,0 +1,5 @@
+m4_ab: 2048     base decode 91.9 / lever 73.4  base prefill 1764 / lever 1807
+m4_ab: 32768    base decode 68.9 / lever 57.9  base prefill 1629 / lever 1638
+m4_ab: 131072   base decode 44.3 / lever 38.6  base prefill 824 / lever 808
+m4_ab: cold31k  base decode 61.0 / lever 53.3  base prefill 1322 / lever 1289
+m4_ab: lever run done (no gate; compare against the Task 3 baseline by hand)
