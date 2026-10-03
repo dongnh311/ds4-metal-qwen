@@ -1,5 +1,8 @@
 # Levers L5 (decode3 K/V prefetch) and L1 (multi-flush): measured
 
+> The lever code measured here is not merged into develop. It lives on the local branch
+> `feature/ornith-decode` at `01d4bab0`; see `../REPORT.md`.
+
 Window C, 2026-10-02 23:45 to 2026-10-03 00:24, `8cbfbd29`.
 
 **Exactness.** With `DS4_QWEN35_ATTN_PREFETCH=1 DS4_QWEN35_FLUSH_EVERY=8 DS4_QWEN35_MOE_PAIR=1` all on:

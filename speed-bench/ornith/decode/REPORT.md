@@ -1,8 +1,24 @@
 # Ornith decode speed (sub-project 2): report
 
-Spec: `docs/superpowers/specs/2026-10-02-ornith-decode-design.md`. Branch `feature/ornith-decode`, cut
-from develop `cd4a99ec`. Not merged, not pushed, not deployed. The work ran overnight 2026-10-02/03 under
-the user's delegated autonomy, sharing GPU windows with the Qwen and DS41F sessions.
+Spec: `docs/superpowers/specs/2026-10-02-ornith-decode-design.md`. The work ran overnight 2026-10-02/03
+under the user's delegated autonomy, sharing GPU windows with the Qwen and DS41F sessions.
+
+**Merge scope, chosen by the user on 2026-10-03 ("A").** develop gets the measurement tools and the
+records, not the lever code.
+- Merged:
+  - the env-gated instrumentation `DS4_QWEN35_SPEC_STATS`, `DS4_QWEN35_SPEC_OVERLAP` and
+    `DS4_QWEN35_PROFILE=3`, all off and byte-identical unless set;
+  - the Stage-0 runner and parser;
+  - the spec, the plans, `PROFILE.md`, the lever records and this report.
+- Not merged: the lever code. It stays on the local, unpushed branch `feature/ornith-decode` at
+  `01d4bab0`:
+  - two-row MoE `99ab7419` and `805868c9`;
+  - dual accumulators `8cbfbd29`;
+  - multi-flush `18b68818`;
+  - decode3 prefetch `9f5c0915`.
+
+  The env knobs those records name (`DS4_QWEN35_MOE_PAIR`, `DS4_QWEN35_ATTN_PREFETCH`,
+  `DS4_QWEN35_FLUSH_EVERY`) exist only there.
 
 ## Outcome
 
@@ -18,7 +34,7 @@ the user's delegated autonomy, sharing GPU windows with the Qwen and DS41F sessi
   | 32K | 69.8 | 67.5 | -3.3% |
   | 128K | 45.1 | 44.7 | -0.9% |
 
-- Every knob stays default off, so the branch's default path decodes exactly as develop does.
+- No lever is merged, so develop decodes exactly as before.
 - No deploy, as the spec requires when the target is missed.
 
 ## What was learned (Stage 0, `PROFILE.md`)

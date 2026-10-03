@@ -1,5 +1,8 @@
 # Lever L2: two-row MoE in the MTP verify. Measured, not adopted
 
+> The lever code measured here is not merged into develop. It lives on the local branch
+> `feature/ornith-decode` at `01d4bab0`; see `../REPORT.md`.
+
 Window L, 2026-10-02 22:46-23:18, `3022a4af`, `DS4_QWEN35_MOE_PAIR=0` against `=1`.
 
 **Exactness holds.**
