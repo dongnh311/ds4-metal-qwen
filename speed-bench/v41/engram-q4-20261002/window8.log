@@ -1,0 +1,13 @@
+23:31:46 WINDOW8 START gateway off
+23:31:52 WINDOW8 server-power off rc=0 | ✓ server OFF — no stack port listening, no job loaded. Bring it back with: scripts/server-power.sh on
+23:41:30 WINDOW8 score general rc=0 578s | api_summary ref_tokens=2994 target_tokens=2994 target_mae=0.224269274 target_mean_delta=-0.134665518 top_items=59880 top_mapped=59460 top_coverage=0.9
+23:41:30 WINDOW8 vs v7 sim: delta_new_minus_old	0.000000000 relative_nll_change	0.000% case_wins_new_old_ties	0	0	100 first_token_matches_old_new	81	81 
+23:41:30 WINDOW8 TSV identical to the v7 sim
+phase0: done switch-c8192-gauto-n64-eq4-1 9.09 t/s
+BENCH eq4-1 prefill 188.2 gen 8.38 steady 9.09 first_ms 704 hit 0.631 wired_peak 47.49 contaminated=False
+phase0: done switch-c8192-gauto-n64-eq4-2 9.18 t/s
+BENCH eq4-2 prefill 214.1 gen 8.59 steady 9.18 first_ms 592 hit 0.631 wired_peak 47.37 contaminated=False
+23:43:18 WINDOW8 measurements done
+23:43:18 WINDOW8 restoring gateway
+23:45:29 WINDOW8 server-power on rc=0 | ✓ server ON — gateway reports backend_ok
+23:45:29 WINDOW8 END

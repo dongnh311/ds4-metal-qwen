@@ -12,6 +12,8 @@ DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
 DS41_Q2_FILE="DeepSeek-V4.1-Flash-Q2.gguf"
 DS41_Q4_FILE="DeepSeek-V4.1-Flash-Q4.gguf"
 DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
+DS41_EQ4_REPO="dongnhdev/DeepSeek-V4.1-Flash-Q2-EngramQ4-GGUF"
+DS41_EQ4_FILE="DeepSeek-V4.1-Flash-Q2-EngramQ4.gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
@@ -64,6 +66,7 @@ Usage:
   ./download_model.sh ds4f-vision-encoder [--token TOKEN]
   ./download_model.sh ds4f-vision-dspark [--token TOKEN]
   ./download_model.sh ds41f-q2 [--token TOKEN]
+  ./download_model.sh ds41f-q2-eq4 [--token TOKEN]
   ./download_model.sh ds41f-q4 [--token TOKEN]
   ./download_model.sh ds41f-vision [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
@@ -132,6 +135,12 @@ Targets:
        DeepSeek V4.1 Flash calibrated Q2, about 341 GiB on disk. Main weights
        occupy 152 GiB; Engram tables stay on disk. Metal only: use SSD streaming
        on one 128 GB Mac, tensor parallelism on two, or a larger resident Mac.
+
+  ds41f-q2-eq4
+       The same Q2 with its Engram tables re-encoded to 4 bits (Lloyd codebook,
+       lloyd4_e5m3_32_r136), about 249 GiB on disk; no measurable quality loss.
+       Made with gguf-tools/deepseek41_engram_q4 from ds41f-q2. Only this fork
+       reads it.
 
   ds41f-vision
        Matching V4.1 Flash vision encoder, about 0.9 GiB. Add --vision FILE
@@ -289,6 +298,11 @@ case "$MODEL" in
     ds41f-q2)
         REPO=$DS41_REPO
         MODEL_FILE=$DS41_Q2_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    ds41f-q2-eq4)
+        REPO=$DS41_EQ4_REPO
+        MODEL_FILE=$DS41_EQ4_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
     ds41f-q4)
@@ -460,6 +474,10 @@ artifact_identity() {
         "$DS41_Q2_FILE")
             expected_bytes=365713686528
             expected_sha=1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42
+            ;;
+        "$DS41_EQ4_FILE")
+            expected_bytes=267406761552
+            expected_sha=311f35981bf14ef8e49968ef942e13263bf9011ffdc28c7b6d00a1de45d2f719
             ;;
         "$DS41_Q4_FILE")
             expected_bytes=518596067328

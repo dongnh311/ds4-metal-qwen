@@ -1,0 +1,9 @@
+23:20:52 DISK START 365713686528 bytes, 164Gi free
+23:20:52 DISK ds4 processes now: 9234 /Users/dongnh/.local/share/ai-gateway/ds4-metal/ds4-server --metal -m /Users/dongnh/.local/share/ai-gateway/ds4-models/Ornith-1.5-35B-A3B-Abliterated-CyberTiel_Calibrated-MTPv2-23G-ICE.gguf -c 262144 --mtp --kv-disk-dir /Users/dongnh/.local/share/ai-gateway/ds4-kv-cache-ornith --kv-disk-space-mb 32768 --kv-cache-cold-max-tokens 262144 --host 127.0.0.1 --port 18087
+23:24:25 DISK check rc=0 213s | check ok: 384006168 + 384016682 rows; converted size 267406761552 bytes; tail sha256 b3dbaf6d43f7e88cbec503e5d2c82980e1dbf0f1a85cb4e8f5259859edfa545c 
+23:24:29 DISK sample rc=0 4s | sample ok: 20000 rows per table -> /Users/dongnh/orca/workspaces/ds4-metal-data/v41-engram-q4/20261002/eq4-sample.bin 
+23:28:38 DISK convert rc=0 249s | converted: /Users/dongnh/orca/workspaces/ds4-metal-data/gguf/DeepSeek-V4.1-Flash-Q2.gguf is now 267406761552 bytes (lloyd4_e5m3_32_r136) 
+23:30:49 DISK verify rc=0 131s | verify ok: tail sha256 b3dbaf6d43f7e88cbec503e5d2c82980e1dbf0f1a85cb4e8f5259859edfa545c file sha256 311f35981bf14ef8e49968ef942e13263bf9011ffdc28c7b6d00a1de45d2f719  /Users/dongnh/orca/workspaces/ds4-metal-data/gguf/Deep
+23:30:52 DISK verify-sample rc=0 3s | verify-sample ok: 20000 rows per table are bit-identical 
+23:30:52 DISK layout rc=0 0s |   i8           2 tensors, 97.28 GiB V4.1 complete model layout: PASS 
+23:30:52 DISK END 267406761552 bytes, 205Gi free

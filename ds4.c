@@ -2897,13 +2897,26 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
 /* Engram is deliberately outside the weight mapping, not merely absent from
  * a residency list. Startup warming and any future weight-view code must not
  * turn its 189 GiB of random-access rows into a resident model allocation. */
+/* The original FP8 rows or the 4-bit Lloyd rows (deepseek41_engram_q4). A
+ * file that tool left half converted carries conversion_underway. */
+static ds4_engram_encoding model_engram_encoding(const ds4_model *m) {
+    ds4_str encoding = {0};
+    ds4_engram_encoding e;
+    if (!model_get_string(m, "deepseek41.engram.encoding", &encoding))
+        ds4_die("unsupported V4.1 Engram row encoding");
+    if (ds4_streq(encoding, "conversion_underway"))
+        ds4_die("unsupported V4.1 Engram row encoding: conversion_underway "
+                "(rerun deepseek41_engram_q4 --convert to finish it)");
+    if (!ds4_engram_encoding_from_name(encoding.ptr, encoding.len, &e))
+        ds4_die("unsupported V4.1 Engram row encoding");
+    return e;
+}
+
 static void model_unmap_engram(ds4_model *m) {
-    ds4_str arch = {0}, encoding = {0};
+    ds4_str arch = {0};
     if (!model_get_string(m, "general.architecture", &arch) ||
         !ds4_streq(arch, "deepseek41")) return;
-    if (!model_get_string(m, "deepseek41.engram.encoding", &encoding) ||
-        !ds4_streq(encoding, "e4m3_e8m0_32_row264"))
-        ds4_die("unsupported V4.1 Engram row encoding");
+    const uint32_t width = ds4_engram_row_bytes(model_engram_encoding(m));
     const ds4_tensor *tables[2] = {NULL, NULL};
     uint64_t resident_end = m->tensor_data_pos;
     m->max_tensor_bytes = 0;
@@ -2913,7 +2926,7 @@ static void model_unmap_engram(ds4_model *m) {
                     ds4_streq(t->name, "blk.14.engram_embd.weight") ? 1 : -1;
         if (index >= 0) {
             if (tables[index] || t->ndim != 2 || t->type != 24 ||
-                t->dim[0] != 264 || !t->dim[1] || t->dim[1] > UINT32_MAX)
+                t->dim[0] != width || !t->dim[1] || t->dim[1] > UINT32_MAX)
                 ds4_die("invalid or duplicate V4.1 Engram tensor");
             tables[index] = t;
         } else {
@@ -3324,10 +3337,11 @@ static void model_summary(const ds4_model *m) {
     for (uint64_t i = 0; i < m->n_tensors; i++) {
         tensor_bytes += m->tensors[i].bytes;
         params += m->tensors[i].elements;
-        /* Each validated disk-only Engram row contains 256 weights and eight
-         * scale bytes. Scales count toward storage, not model parameters. */
+        /* Each validated disk-only Engram row holds 256 weights in either
+         * encoding; its bytes count toward storage, not model parameters. */
         if (v41 && m->tensors[i].abs_offset >= m->size)
-            params -= m->tensors[i].dim[1] * (DS4_ENGRAM_ROW_BYTES - DS4_ENGRAM_DIM);
+            params = params - m->tensors[i].elements +
+                     m->tensors[i].dim[1] * DS4_ENGRAM_DIM;
     }
 
     printf("model: %.*s\n", (int)name.len, name.ptr);
@@ -7204,7 +7218,6 @@ static void config_validate_deepseek41_model(const ds4_model *m) {
         {"deepseek41.scoring_func", "sqrtsoftplus"},
         {"deepseek41.hidden_act", "silu"},
         {"deepseek41.topk_method", "noaux_tc"},
-        {"deepseek41.engram.encoding", "e4m3_e8m0_32_row264"},
     };
     for (size_t i = 0; i < sizeof(strings) / sizeof(strings[0]); i++) {
         ds4_str got = {0};
@@ -7226,7 +7239,8 @@ static void config_validate_deepseek41_model(const ds4_model *m) {
                             DS4_N_LAYER);
     for (uint32_t i = 0; i < 2; i++) {
         ds4_tensor *t = required_tensorf(m, "blk.%u.engram_embd.weight", engram[i]);
-        tensor_expect_layout(t, DS4_TENSOR_I8, 2, 264, rows[i], 0);
+        tensor_expect_layout(t, DS4_TENSOR_I8, 2,
+                             ds4_engram_row_bytes(model_engram_encoding(m)), rows[i], 0);
         if (t->abs_offset < m->size) ds4_die("Engram table is still mapped");
     }
 }
@@ -41112,7 +41126,8 @@ static DS4_MAYBE_UNUSED bool ds41_graph_alloc(ds41_gpu_graph *g, const ds4_model
     for (uint32_t i = 0; i < 2; i++) {
         const uint32_t il = i ? 14u : 1u;
         const ds4_tensor *table = required_tensorf(m, "blk.%u.engram_embd.weight", il);
-        if (!ds4_engram_table_open(&g->table[i], path, table->abs_offset, g->engram.rows[i])) goto fail;
+        if (!ds4_engram_table_open(&g->table[i], path, table->abs_offset, g->engram.rows[i],
+                                   model_engram_encoding(m))) goto fail;
         struct stat weights_stat, rows_stat;
         if (fstat(m->fd, &weights_stat) || fstat(g->table[i].fd, &rows_stat) ||
             weights_stat.st_dev != rows_stat.st_dev || weights_stat.st_ino != rows_stat.st_ino)

@@ -86,12 +86,47 @@ bool ds4_engram_hash(const ds4_engram_layout *l, ds4_engram_history *h,
     return true;
 }
 
+const float ds4_engram_lloyd4[8] = {
+    0.0f, 0.095f, 0.1901f, 0.2944f, 0.4126f, 0.5586f, 0.7484f, 1.0f};
+
+static const char *const engram_encoding_names[] = {
+    [DS4_ENGRAM_ENC_E4M3_ROW264] = "e4m3_e8m0_32_row264",
+    [DS4_ENGRAM_ENC_LLOYD4_ROW136] = "lloyd4_e5m3_32_r136",
+};
+
+static bool engram_encoding_valid(ds4_engram_encoding e) {
+    return e == DS4_ENGRAM_ENC_E4M3_ROW264 || e == DS4_ENGRAM_ENC_LLOYD4_ROW136;
+}
+
+uint32_t ds4_engram_row_bytes(ds4_engram_encoding e) {
+    return e == DS4_ENGRAM_ENC_LLOYD4_ROW136 ? DS4_ENGRAM_Q4_ROW_BYTES :
+           e == DS4_ENGRAM_ENC_E4M3_ROW264 ? DS4_ENGRAM_ROW_BYTES : 0;
+}
+
+bool ds4_engram_encoding_from_name(const char *name, size_t len,
+                                   ds4_engram_encoding *e) {
+    for (int i = 0; i < 2; i++) {
+        const char *want = engram_encoding_names[i];
+        if (name && len == strlen(want) && !memcmp(name, want, len)) {
+            if (e) *e = (ds4_engram_encoding)i;
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *ds4_engram_encoding_name(ds4_engram_encoding e) {
+    return engram_encoding_valid(e) ? engram_encoding_names[e] : NULL;
+}
+
 bool ds4_engram_table_open(ds4_engram_table *t, const char *path,
-                           uint64_t offset, uint32_t rows) {
+                           uint64_t offset, uint32_t rows,
+                           ds4_engram_encoding encoding) {
     if (!t) return false;
     *t = (ds4_engram_table){.fd = -1};
-    uint64_t bytes = (uint64_t)rows * DS4_ENGRAM_ROW_BYTES;
-    if (!path || !rows || offset > INT64_MAX || bytes > INT64_MAX - offset) {
+    uint64_t bytes = (uint64_t)rows * ds4_engram_row_bytes(encoding);
+    if (!path || !rows || !engram_encoding_valid(encoding) ||
+        offset > INT64_MAX || bytes > INT64_MAX - offset) {
         errno = EINVAL;
         return false;
     }
@@ -106,7 +141,8 @@ bool ds4_engram_table_open(ds4_engram_table *t, const char *path,
 #ifdef __APPLE__
     if (fcntl(fd, F_NOCACHE, 1) != 0 || fcntl(fd, F_RDAHEAD, 0) != 0) goto fail;
 #endif
-    *t = (ds4_engram_table){.fd = fd, .offset = offset, .rows = rows};
+    *t = (ds4_engram_table){.fd = fd, .offset = offset, .rows = rows,
+                            .encoding = encoding};
     return true;
 fail: {
         int saved = errno;
@@ -122,10 +158,10 @@ void ds4_engram_table_close(ds4_engram_table *t) {
     *t = (ds4_engram_table){.fd = -1};
 }
 
-static bool read_row(int fd, uint64_t offset, uint8_t row[DS4_ENGRAM_ROW_BYTES]) {
+static bool read_row(int fd, uint64_t offset, uint8_t *row, size_t bytes) {
     size_t done = 0;
-    while (done < DS4_ENGRAM_ROW_BYTES) {
-        ssize_t n = pread(fd, row + done, DS4_ENGRAM_ROW_BYTES - done,
+    while (done < bytes) {
+        ssize_t n = pread(fd, row + done, bytes - done,
                           (off_t)(offset + done));
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
@@ -144,6 +180,91 @@ static float e4m3(uint8_t byte) {
     return byte & 128 ? -value : value;
 }
 
+static float engram_f8_up(float x) {
+    int e;
+    const float m = frexpf(x, &e);
+    return ldexpf(ceilf(m * 16.0f) / 16.0f, e);
+}
+
+static float engram_f8_down(float s) {
+    int e;
+    const float m = frexpf(s, &e);
+    const float n = roundf(m * 16.0f) - 1.0f;
+    return n < 8.0f ? ldexpf(15.0f / 16.0f, e - 1) : ldexpf(n / 16.0f, e);
+}
+
+/* Nearest level of |v| / s, ties to the lower index; float squared error in order. */
+static float engram_q4_group(const float *v, uint8_t *idx, float s) {
+    float err = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        const float x = fabsf(v[j]) / s;
+        int best = 0;
+        for (int k = 1; k < 8; k++)
+            if (fabsf(ds4_engram_lloyd4[k] - x) < fabsf(ds4_engram_lloyd4[best] - x)) best = k;
+        idx[j] = (uint8_t)best;
+        const float d = copysignf(ds4_engram_lloyd4[best] * s, v[j]) - v[j];
+        err += d * d;
+    }
+    return err;
+}
+
+static bool engram_scale_byte(float s, uint8_t *byte) {
+    int e;
+    const float m = frexpf(s, &e);
+    const float steps = m * 16.0f - 8.0f;
+    if (!(steps >= 0.0f && steps <= 7.0f) || steps != floorf(steps) ||
+        e + 16 < 0 || e + 16 > 31) return false;
+    *byte = (uint8_t)((e + 16) << 3 | (int)steps);
+    return true;
+}
+
+bool ds4_engram_encode_row136(const uint8_t src[DS4_ENGRAM_ROW_BYTES],
+                              uint8_t dst[DS4_ENGRAM_Q4_ROW_BYTES]) {
+    float v[DS4_ENGRAM_DIM];
+    for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
+        const uint8_t code = src[j], scale = src[DS4_ENGRAM_DIM + j / 32];
+        if ((code & 127) == 127 || scale == 255) {
+            errno = EDOM;
+            return false;
+        }
+        v[j] = ldexpf(e4m3(code), (int)scale - 127);
+        if (!isfinite(v[j])) {
+            errno = EDOM;
+            return false;
+        }
+    }
+    memset(dst, 0, DS4_ENGRAM_Q4_ROW_BYTES);
+    for (int g = 0; g < DS4_ENGRAM_DIM / 32; g++) {
+        const float *gv = v + 32 * g;
+        float amax = 0.0f;
+        for (int j = 0; j < 32; j++) amax = fmaxf(amax, fabsf(gv[j]));
+        uint8_t idx[32] = {0}, byte = 0;
+        if (amax != 0.0f) {   /* an all-zero group keeps level 0 and its signs */
+            const float up = engram_f8_up(amax / ds4_engram_lloyd4[7]);
+            const float down = engram_f8_down(up);
+            uint8_t up_byte, down_byte, idx_down[32];
+            if (!engram_scale_byte(up, &up_byte) || !engram_scale_byte(down, &down_byte)) {
+                errno = EDOM;
+                return false;
+            }
+            const float err_up = engram_q4_group(gv, idx, up);
+            const float err_down = engram_q4_group(gv, idx_down, down);
+            byte = up_byte;
+            if (err_down < err_up) {
+                memcpy(idx, idx_down, sizeof(idx));
+                byte = down_byte;
+            }
+        }
+        for (int j = 0; j < 32; j++) {
+            const int k = 32 * g + j;
+            const uint8_t nibble = (uint8_t)((signbit(gv[j]) ? 8 : 0) | idx[j]);
+            dst[k / 2] |= (uint8_t)(nibble << (4 * (k & 1)));
+        }
+        dst[DS4_ENGRAM_DIM / 2 + g] = byte;
+    }
+    return true;
+}
+
 bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
                      size_t count, float *out) {
     if (!t || t->fd < 0 || (count && (!rows || !out)) ||
@@ -157,16 +278,31 @@ bool ds4_engram_read(const ds4_engram_table *t, const uint32_t *rows,
             return false;
         }
     }
+    if (!engram_encoding_valid(t->encoding)) {
+        errno = EINVAL;
+        return false;
+    }
+    const bool q4 = t->encoding == DS4_ENGRAM_ENC_LLOYD4_ROW136;
+    const size_t row_bytes = ds4_engram_row_bytes(t->encoding);
     uint8_t raw[DS4_ENGRAM_ROW_BYTES];
     for (size_t i = 0; i < count; i++) {
-        if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * sizeof(raw), raw)) return false;
+        if (!read_row(t->fd, t->offset + (uint64_t)rows[i] * row_bytes, raw, row_bytes))
+            return false;
         for (int j = 0; j < DS4_ENGRAM_DIM; j++) {
-            uint8_t code = raw[j], scale = raw[DS4_ENGRAM_DIM + j / 32];
-            if ((code & 127) == 127 || scale == 255) {
-                errno = EDOM;
-                return false;
+            float value;
+            if (q4) {
+                const uint8_t code = (raw[j / 2] >> (4 * (j & 1))) & 15;
+                const uint8_t scale = raw[DS4_ENGRAM_DIM / 2 + j / 32];
+                const float s = ldexpf((float)(8 + (scale & 7)) / 16.0f, (scale >> 3) - 16);
+                value = copysignf(ds4_engram_lloyd4[code & 7] * s, code & 8 ? -1.0f : 1.0f);
+            } else {
+                uint8_t code = raw[j], scale = raw[DS4_ENGRAM_DIM + j / 32];
+                if ((code & 127) == 127 || scale == 255) {
+                    errno = EDOM;
+                    return false;
+                }
+                value = ldexpf(e4m3(code), (int)scale - 127);
             }
-            float value = ldexpf(e4m3(code), (int)scale - 127);
             uint32_t bits;
             memcpy(&bits, &value, sizeof(bits));
             bits = (bits + 0x7fffu + ((bits >> 16) & 1u)) & 0xffff0000u;

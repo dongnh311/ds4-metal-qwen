@@ -12,6 +12,7 @@ Q2 = "DeepSeek-V4.1-Flash-Q2.gguf"
 Q4 = "DeepSeek-V4.1-Flash-Q4.gguf"
 PART1, PART2 = Q4 + ".part1", Q4 + ".part2"
 VISION = "DeepSeek-V4.1-Flash-Vision.gguf"
+EQ4 = "DeepSeek-V4.1-Flash-Q2-EngramQ4.gguf"
 QWEN_Q2 = "Qwen3.8-Flash-Next-Q2.gguf"
 QWEN_Q4 = "Qwen3.8-Flash-Next-Q4.gguf"
 ARTIFACTS = {
@@ -22,6 +23,7 @@ ARTIFACTS = {
     PART1: (480000000000, "6442b1f9224079662c02003c0ef9ef6be6e2aff509510f681dab9e6cc41df246"),
     PART2: (38596067328, "7c3e10646c918eeaffbc39305a75ec96117450262c61454ff194cef00d7617f0"),
     VISION: (970555552, "cc283f032b3e8b8d78aeb5fccaa14e97b859b0c53aae3cd6bffa690ddf0e9e15"),
+    EQ4: (267406761552, "311f35981bf14ef8e49968ef942e13263bf9011ffdc28c7b6d00a1de45d2f719"),
 }
 
 
@@ -57,6 +59,7 @@ import sys
 args = sys.argv[1:]
 assert args[0] == 'download'
 assert args[1] == ('antirez/qwen3.8-flash-next-gguf' if args[2].startswith('Qwen')
+                   else 'dongnhdev/DeepSeek-V4.1-Flash-Q2-EngramQ4-GGUF' if 'EngramQ4' in args[2]
                    else 'antirez/deepseek-v4.1-flash-gguf')
 if os.environ.get('FAIL_DOWNLOAD'):
     sys.exit(7)
@@ -111,6 +114,12 @@ out.mkdir(parents=True, exist_ok=True)
         self.assertIn("Already downloaded", self.run_download("qwen38-iq2"))
         self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / QWEN_Q2)
         self.assertNotIn("--ple", self.run_download("--help"))
+
+    def test_engram_q4_is_one_verified_file(self):
+        self.assertIn("Verifying SHA-256", self.run_download("ds41f-q2-eq4"))
+        self.assertEqual((self.root / "ds4flash.gguf").resolve(), self.out / EQ4)
+        self.assertEqual((self.out / EQ4).read_bytes(), payload(EQ4))
+        self.assertIn("ds41f-q2-eq4", self.run_download("--help"))
 
     def test_failure_does_not_replace_link(self):
         self.run_download("ds41f-q2")

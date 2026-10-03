@@ -1,0 +1,8 @@
+01:31:01 WINDOW10 START gateway off
+01:31:06 WINDOW10 server-power off rc=0 | ✓ server OFF — no stack port listening, no job loaded. Bring it back with: scripts/server-power.sh on
+phase0: done switch-c8192-gauto-n16-eq4-prof 7.91 t/s
+BENCH eq4-prof prefill 218.7 contaminated=False
+01:31:52 WINDOW10 measurements done
+01:31:52 WINDOW10 restoring gateway
+01:34:03 WINDOW10 server-power on rc=0 | ✓ server ON — gateway reports backend_ok
+01:34:03 WINDOW10 END
