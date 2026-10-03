@@ -50336,6 +50336,24 @@ static uint32_t qwen4_expert_row_bytes(uint32_t weight_type, uint32_t in_dim) {
     }
 }
 
+static bool g_qwen4_down_trimmed;
+
+void ds4_gpu_qwen4_set_down_trimmed(bool on) {
+    g_qwen4_down_trimmed = on;
+}
+
+/* Routed down rows: Q2_K and Q4_K pad ff_dim to whole 256-value blocks, except
+ * trimmed Q4_K files, whose last block keeps its 16-byte header and the qs
+ * chunks of the real values only.  Every kernel skips values from ff_dim on
+ * before loading them, so only the row stride differs. */
+static uint32_t qwen4_down_row_bytes(uint32_t type, uint32_t ff_dim) {
+    if (type == 12u && g_qwen4_down_trimmed && (ff_dim % 256u) != 0) {
+        return (ff_dim % 64u) ? 0u : ff_dim / 256u * 144u + 16u + (ff_dim % 256u) / 2u;
+    }
+    const uint32_t dim = (type == 10u || type == 12u) ? (ff_dim + 255u) / 256u * 256u : ff_dim;
+    return qwen4_expert_row_bytes(type, dim);
+}
+
 int ds4_gpu_qwen4_decode_fusions_enabled(void) {
     const int override = ds4_gpu_env_bool("DS4_QWEN4_DECODE_FUSIONS");
     return override >= 0 ? override : ds4_gpu_device_name_contains("M3 Ultra");
@@ -52222,9 +52240,7 @@ int ds4_gpu_qwen4_moe_down_tensor(
         uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
         uint32_t ff_dim, uint32_t out_dim,
         uint64_t shared_down_offset, uint32_t shared_type) {
-    const uint32_t weight_dim = (weight_type == 10u || weight_type == 12u) ?
-        (ff_dim + 255u) / 256u * 256u : ff_dim;
-    const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
+    const uint32_t row_bytes = qwen4_down_row_bytes(weight_type, ff_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     const bool has_shared = shared_type != UINT32_MAX;
     const uint32_t sh_row_bytes = has_shared ? qwen4_expert_row_bytes(shared_type, ff_dim) : 0u;
@@ -52406,9 +52422,7 @@ static int qwen4_stage_union(
         return 0;
     }
     const uint32_t gate_row_bytes = qwen4_expert_row_bytes(gate_type, in_dim);
-    const uint32_t down_dim = (down_type == 10u || down_type == 12u) ?
-        (ff_dim + 255u) / 256u * 256u : ff_dim;
-    const uint32_t down_row_bytes = qwen4_expert_row_bytes(down_type, down_dim);
+    const uint32_t down_row_bytes = qwen4_down_row_bytes(down_type, ff_dim);
     if (gate_row_bytes == 0 || down_row_bytes == 0) return 0;
     const uint64_t gate_expert_bytes = (uint64_t)gate_row_bytes * ff_dim;   /* gate == up */
     const uint64_t down_expert_bytes = (uint64_t)down_row_bytes * out_dim;
@@ -52810,8 +52824,7 @@ int ds4_gpu_qwen4_stream_stage_layer_pipe(
     const int profile = getenv("DS4_METAL_STREAMING_EXPERT_PREAD_PROFILE") != NULL;
     /* Same sizes as the union path. */
     const uint32_t gate_row_bytes = qwen4_expert_row_bytes(gate_type, in_dim);
-    const uint32_t down_dim = (down_type == 10u || down_type == 12u) ? (ff_dim + 255u) / 256u * 256u : ff_dim;
-    const uint32_t down_row_bytes = qwen4_expert_row_bytes(down_type, down_dim);
+    const uint32_t down_row_bytes = qwen4_down_row_bytes(down_type, ff_dim);
     const uint64_t gate_bytes = (uint64_t)gate_row_bytes * ff_dim * n_expert;
     const uint64_t down_bytes = (uint64_t)down_row_bytes * out_dim * n_expert;
     const uint64_t need = 2u * gate_bytes + down_bytes;
@@ -54274,12 +54287,10 @@ int ds4_gpu_qwen4_moe_stream_layer(
         return 0;
     }
     /* Expert slab sizes must match the resident path byte-for-byte. Mid rows are
-     * in_dim long; down rows are ff_dim rounded up to a 256 multiple for the
-     * K-quants (matches ds4_gpu_qwen4_moe_down_tensor). */
+     * in_dim long; down rows follow qwen4_down_row_bytes (matches
+     * ds4_gpu_qwen4_moe_down_tensor). */
     const uint32_t gate_row_bytes = qwen4_expert_row_bytes(gate_type, in_dim);
-    const uint32_t down_dim = (down_type == 10u || down_type == 12u) ?
-        (ff_dim + 255u) / 256u * 256u : ff_dim;
-    const uint32_t down_row_bytes = qwen4_expert_row_bytes(down_type, down_dim);
+    const uint32_t down_row_bytes = qwen4_down_row_bytes(down_type, ff_dim);
     if (gate_row_bytes == 0 || down_row_bytes == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: row_bytes g=%u d=%u\n", layer, gate_row_bytes, down_row_bytes); return 0; }
     const uint64_t gate_expert_bytes = (uint64_t)gate_row_bytes * ff_dim;   /* gate == up */
     const uint64_t down_expert_bytes = (uint64_t)down_row_bytes * out_dim;
@@ -54841,9 +54852,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
         const void *model_map, uint64_t model_size, uint64_t down_offset,
         uint32_t weight_type, uint32_t n_expert, uint32_t n_tokens, uint32_t n_slots, uint32_t n_out,
         uint32_t ff_dim, uint32_t out_dim, uint32_t list_cap) {
-    const uint32_t weight_dim = (weight_type == 10u || weight_type == 12u) ?
-        (ff_dim + 255u) / 256u * 256u : ff_dim;
-    const uint32_t row_bytes = qwen4_expert_row_bytes(weight_type, weight_dim);
+    const uint32_t row_bytes = qwen4_down_row_bytes(weight_type, ff_dim);
     const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
     const uint32_t tiles = qwen4_moe_mm_tiles(n_tokens, false);
     const uint32_t nt = qwen4_moe_mm_nt(n_tokens, weight_type, "DS4_QWEN4_MOE_DOWN_NT");
