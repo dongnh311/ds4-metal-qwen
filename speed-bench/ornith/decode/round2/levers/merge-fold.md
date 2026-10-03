@@ -86,3 +86,18 @@ decode3 with the fold against decode3 with merge3, `memcmp` on the output, rows 
 - **Next.** The kernel tests and gate-1 identity on the flipped default, then spec §1.2's final paired A/B
   (3 blocks, base `=0` against unset). The round's merge-ready bar is +5% at 2K or 32K, with 128K no more
   than 3% below base. This lever alone shows +8.6% at 32K.
+
+## Window r2w4: default on, after the review fixes
+
+- **Run.** 2026-10-03 12:55-14:01 on `e8b9dee0`, ok=1. Receipts: `receipts/r2w4-*`.
+- **Kernel tests:** `qwen35 kernels: ok`.
+  - Every merge fold case is bit-identical, including pos0=63 rows=2 (one split next to two).
+  - The flash and accelerator flash splits are bit-identical too.
+  - The fold does not run before the self-check.
+- **Identity:** 39 of 39 gate-1 dumps identical. `test_mtp_cli` PASS (345/92). Verify-batch, `test_qwen35_mtp`
+  and `test_qwen35_graph` ok.
+- **Final paired A/B (spec §1.2), base `=0` against unset:** 2K +0.0% (n=6, sd 0.5%), 32K +8.1% (n=6,
+  sd 0.6%), 128K +5.8% (n=1), with 0 text mismatches.
+- **The bench lines in `r2w4-progress.txt` do not count.** The review fix gated the fold on the self-check,
+  and the bench did not call it yet, so both rows ran merge3. The bench now calls the check and fails a fold
+  row whose fold did not run.
