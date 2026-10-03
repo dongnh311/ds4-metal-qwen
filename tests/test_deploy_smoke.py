@@ -31,7 +31,7 @@ PORT = 18397
 
 def serve(argv):
     port, tag, ignore_term, no_tool, tool_reply = None, "", False, False, "Huế: 31°C, nắng nhẹ."
-    issued = set()
+    issued, other_first = set(), False
     i = 0
     while i < len(argv):
         if argv[i] == "--port":
@@ -44,6 +44,8 @@ def serve(argv):
             ignore_term = True; i += 1
         elif argv[i] == "--no-tool":
             no_tool = True; i += 1
+        elif argv[i] == "--other-call-first":
+            other_first = True; i += 1
         elif argv[i] == "--tool-reply":
             tool_reply = argv[i + 1]; i += 2
         else:
@@ -74,12 +76,17 @@ def serve(argv):
                 # Like ds4-server: a fresh random id on every call.
                 cid = "call_" + os.urandom(8).hex()
                 issued.add(cid)
+                calls = [{"id": cid, "type": "function", "function": {
+                    "name": "get_weather", "arguments": json.dumps({"city": "Huế"}, ensure_ascii=False)}}]
+                if other_first:
+                    calls.insert(0, {"id": "call_" + os.urandom(8).hex(), "type": "function",
+                                     "function": {"name": "get_time", "arguments": "{}"}})
                 msg = {"role": "assistant", "content": "", "reasoning_content": "Cần gọi get_weather.",
-                       "tool_calls": [{"id": cid, "type": "function", "function": {
-                           "name": "get_weather", "arguments": json.dumps({"city": "Huế"}, ensure_ascii=False)}}]}
+                       "tool_calls": calls}
             elif msgs[-1]["role"] == "tool":
-                # Answer only a well-formed round trip: our own call, sent back with its result.
-                call = (msgs[-2].get("tool_calls") or [{}])[0]
+                # Answer only a well-formed round trip: our own get_weather call, sent back with its result.
+                call = next((c for c in msgs[-2].get("tool_calls") or []
+                             if c["function"]["name"] == "get_weather"), {})
                 ok = (call.get("id") in issued and msgs[-1].get("tool_call_id") == call["id"] and
                       json.loads(msgs[-1]["content"]).get("temp_c") == 31)
                 msg = {"role": "assistant", "content": tool_reply if ok else "bad round trip",
@@ -187,6 +194,11 @@ def main():
 
         p, _ = smoke(tmp, {"ornith": row("ornith", extra=["--no-tool"])})
         check("a reply without a tool call fails the smoke", p.returncode != 0 and "smoke tool" in p.stdout,
+              "rc=%d out=%r err=%r" % (p.returncode, p.stdout[-400:], p.stderr[-400:]))
+
+        p, _ = smoke(tmp, {"ornith": row("ornith", extra=["--other-call-first"])})
+        check("the tool result answers the get_weather call even when it is not the first call",
+              p.returncode == 0 and line(p.stdout, "smoke tool").endswith(", ok"),
               "rc=%d out=%r err=%r" % (p.returncode, p.stdout[-400:], p.stderr[-400:]))
 
         p, _ = smoke(tmp, {"ornith": row("ornith", extra=["--tool-reply", "Trời nắng nhẹ."])})

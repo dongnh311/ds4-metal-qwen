@@ -127,8 +127,9 @@ prompts = {
     "vi": "Giải thích ngắn gọn cách bộ nhớ đệm KV giúp mô hình ngôn ngữ sinh văn bản nhanh hơn.",
     "code": "Write a Python function that returns the n-th Fibonacci number iteratively, with a docstring and two doctests.",
 }
-weather_tools = [{"type": "function", "function": {"name": "get_weather", "description": "Get weather for a city",
-          "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
+weather_tools = [{"type": "function", "function": {
+    "name": "get_weather", "description": "Get weather for a city",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
 failed = False
 
 
@@ -184,10 +185,11 @@ try:
     reply = ((msg.get("reasoning_content") or "") + "\n---\n" + (msg.get("content") or "") + "\n---\n" +
              "\n".join(c["function"]["name"] + " " + c["function"]["arguments"] for c in calls))
     n2 = 0
-    if not any(c["function"]["name"] == "get_weather" for c in calls):
+    call = next((c for c in calls if c["function"]["name"] == "get_weather"), None)
+    if call is None:
         status = "NO TOOL CALL in leg 1"
     else:
-        msgs += [msg, {"role": "tool", "tool_call_id": calls[0]["id"],
+        msgs += [msg, {"role": "tool", "tool_call_id": call["id"],
                        "content": '{"temp_c": 31, "condition": "nắng nhẹ"}'}]
         msg, n2, dt2 = chat(msgs, 4608, weather_tools)
         dt += dt2
