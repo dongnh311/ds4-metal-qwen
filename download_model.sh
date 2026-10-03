@@ -140,7 +140,8 @@ Targets:
        The same Q2 with its Engram tables re-encoded to 4 bits (Lloyd codebook,
        lloyd4_e5m3_32_r136), about 249 GiB on disk; no measurable quality loss.
        Made with gguf-tools/deepseek41_engram_q4 from ds41f-q2. Only this fork
-       reads it.
+       reads it. Downloads six parts and joins them automatically; allow
+       another 43 GiB of free disk space.
 
   ds41f-vision
        Matching V4.1 Flash vision encoder, about 0.9 GiB. Add --vision FILE
@@ -479,6 +480,30 @@ artifact_identity() {
             expected_bytes=267406761552
             expected_sha=311f35981bf14ef8e49968ef942e13263bf9011ffdc28c7b6d00a1de45d2f719
             ;;
+        "$DS41_EQ4_FILE.part1")
+            expected_bytes=45097156608
+            expected_sha=e3a25ed2c0498eea95f4a7b5605f41eeeac9855486414f647b7ddc002e8fa635
+            ;;
+        "$DS41_EQ4_FILE.part2")
+            expected_bytes=45097156608
+            expected_sha=19673581014fb8ee8f0f9f466107a0168fd97859346474c00b05f7e45e5d8dcc
+            ;;
+        "$DS41_EQ4_FILE.part3")
+            expected_bytes=45097156608
+            expected_sha=1512b3d02258b979c8a5a5fec8fca473ae37c134c832daf71ef4546a1b6c5929
+            ;;
+        "$DS41_EQ4_FILE.part4")
+            expected_bytes=45097156608
+            expected_sha=3125d0fae3a2a79ee79c0bdda59e1fb9bdcb0067f49d201549a1a9affbe7d227
+            ;;
+        "$DS41_EQ4_FILE.part5")
+            expected_bytes=45097156608
+            expected_sha=936b8b67e7be53cb09e60d6ca969ef53c494d83b03cb7d84cd4325a4886aeec8
+            ;;
+        "$DS41_EQ4_FILE.part6")
+            expected_bytes=41920978512
+            expected_sha=d485a71b28ea3e9795f1849c06fb8101f60da26de50b58f222678e4b045d3c73
+            ;;
         "$DS41_Q4_FILE")
             expected_bytes=518596067328
             expected_sha=a5e2e2c3ada4b2e98d9f9e4b50f6d9c2a12c2c96f5da165c07e13aff9264984e
@@ -610,26 +635,48 @@ download_one() {
     mv "$part" "$out"
 }
 
-download_ds41_q4() {
-    q4_out="$OUT_DIR/$DS41_Q4_FILE"
-    if [ -e "$q4_out" ]; then
-        verify_download "$DS41_Q4_FILE" "$q4_out"
-        echo "Already downloaded: $q4_out"
+# Downloads FILE as COUNT parts, FILE.part1 .. FILE.partCOUNT, and joins them.
+# Each part is SHA-checked when it is downloaded and removed once it has been
+# appended, so joining needs free space for one more part plus 1 GiB.
+download_joined_hf() {
+    joined=$1
+    count=$2
+    joined_out="$OUT_DIR/$joined"
+    if [ -e "$joined_out" ]; then
+        verify_download "$joined" "$joined_out"
+        # Parts an overlapping run downloaded again are no longer needed.
+        i=1
+        while [ "$i" -le "$count" ]; do
+            rm -f "$joined_out.part$i"
+            i=$((i + 1))
+        done
+        echo "Already downloaded: $joined_out"
         return
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        echo "Joining the Q4 download requires Python 3." >&2
+        echo "Joining the $joined download requires Python 3." >&2
         exit 1
     fi
-    if [ ! -e "$q4_out.assembling" ]; then
-        download_one_hf "$DS41_Q4_FILE.part1"
+    # Parts already appended to an interrupted join are not downloaded again.
+    joined_bytes=-1
+    if [ -e "$joined_out.assembling" ]; then
+        joined_bytes=$(wc -c < "$joined_out.assembling")
     fi
-    download_one_hf "$DS41_Q4_FILE.part2"
-    artifact_identity "$DS41_Q4_FILE"
-    q4_bytes=$expected_bytes
-    q4_sha=$expected_sha
-    artifact_identity "$DS41_Q4_FILE.part1"
-    python3 - "$q4_out" "$expected_bytes" "$q4_bytes" "$q4_sha" <<'PY'
+    part_sizes=
+    part_end=0
+    i=1
+    while [ "$i" -le "$count" ]; do
+        artifact_identity "$joined.part$i"
+        part_sizes="$part_sizes $expected_bytes"
+        part_end=$((part_end + expected_bytes))
+        if [ "$joined_bytes" -lt "$part_end" ]; then
+            download_one_hf "$joined.part$i"
+        fi
+        i=$((i + 1))
+    done
+    artifact_identity "$joined"
+    # shellcheck disable=SC2086
+    python3 - "$joined_out" "$expected_bytes" "$expected_sha" $part_sizes <<'PY'
 import fcntl
 import hashlib
 import os
@@ -638,10 +685,14 @@ import shutil
 import sys
 
 out = Path(sys.argv[1])
-boundary, total = map(int, sys.argv[2:4])
-expected = sys.argv[4]
-first, second, pending = (Path(str(out) + suffix)
-                          for suffix in (".part1", ".part2", ".assembling"))
+total = int(sys.argv[2])
+expected = sys.argv[3]
+sizes = [int(size) for size in sys.argv[4:]]
+parts = [Path(str(out) + ".part" + str(i)) for i in range(1, len(sizes) + 1)]
+starts = [sum(sizes[:i]) for i in range(len(sizes))]
+pending = Path(str(out) + ".assembling")
+if sum(sizes) != total:
+    sys.exit("Part sizes do not add up to " + str(out))
 
 def verify(path):
     if path.stat().st_size != total:
@@ -655,42 +706,72 @@ def verify(path):
         sys.exit("Checksum mismatch: " + str(path) +
                  ". Move this file aside before retrying; it was not accepted.")
 
+def invalid():
+    sys.exit("Invalid partial assembly: " + str(pending) +
+             ". Move it aside before retrying.")
+
+def drop_leftover_parts():
+    for part in parts:
+        try:
+            part.unlink()
+        except FileNotFoundError:
+            pass
+
 # Keep this lock file: unlinking it could allow two different locks for the
 # same download. The first part becomes the output without a second full copy.
 with Path(str(pending) + ".lock").open("a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     if out.exists():
         verify(out)
+        drop_leftover_parts()
         sys.exit(0)
     if not pending.exists():
-        if first.stat().st_size != boundary:
-            sys.exit("Incorrect file size: " + str(first))
-        first.rename(pending)
+        if parts[0].stat().st_size != sizes[0]:
+            sys.exit("Incorrect file size: " + str(parts[0]))
+        parts[0].rename(pending)
     size = pending.stat().st_size
-    if not boundary <= size <= total:
-        sys.exit("Invalid partial assembly: " + str(pending) +
-                 ". Move it aside before retrying.")
-    if second.stat().st_size != total - boundary:
-        sys.exit("Incorrect file size: " + str(second))
-    # An interrupted append restarts only the smaller tail, never the prefix.
+    if not sizes[0] <= size <= total:
+        invalid()
+    # A part is removed only after its append was fsynced, and the next part
+    # is appended only after that. So a part that is still present is appended
+    # again from its start, unless the assembly already runs past it (a copy
+    # left by an overlapping run): then it is dropped. A removed part must
+    # already be in the assembly.
     with pending.open("r+b") as dst:
-        dst.truncate(boundary)
-        dst.seek(boundary)
-        if shutil.disk_usage(out.parent).free < total - boundary + (1 << 30):
-            sys.exit("Not enough disk space to join Q4; keep the parts and retry.")
-        print("Joining Q4 download parts", flush=True)
-        with second.open("rb") as src:
-            shutil.copyfileobj(src, dst, 16 << 20)
-        dst.flush()
-        os.fsync(dst.fileno())
+        for part, start, length in zip(parts[1:], starts[1:], sizes[1:]):
+            if not part.exists():
+                if size < start + length:
+                    invalid()
+                continue
+            if size > start + length:
+                part.unlink()
+                continue
+            if part.stat().st_size != length:
+                sys.exit("Incorrect file size: " + str(part))
+            if size < start:
+                invalid()
+            dst.truncate(start)
+            dst.seek(start)
+            if shutil.disk_usage(out.parent).free < length + (1 << 30):
+                sys.exit("Not enough disk space to join " + out.name +
+                         "; keep the parts and retry.")
+            print("Joining " + part.name, flush=True)
+            with part.open("rb") as src:
+                shutil.copyfileobj(src, dst, 16 << 20)
+            dst.flush()
+            os.fsync(dst.fileno())
+            part.unlink()
+            size = start + length
     verify(pending)
     pending.rename(out)
-    second.unlink()
+    drop_leftover_parts()
 PY
 }
 
 if [ "$MODEL" = "ds41f-q4" ]; then
-    download_ds41_q4
+    download_joined_hf "$DS41_Q4_FILE" 2
+elif [ "$MODEL" = "ds41f-q2-eq4" ]; then
+    download_joined_hf "$DS41_EQ4_FILE" 6
 elif [ -n "$MODEL_FILES" ]; then
     for file in $MODEL_FILES; do
         download_one "$file"

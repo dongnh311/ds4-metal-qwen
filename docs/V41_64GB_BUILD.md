@@ -57,6 +57,10 @@ Non-goals: big-machine / TP (Ivan's lane); rebuilding the Q2 GGUF ourselves
     vs 251 t/s), not under identical conditions. A profile puts Engram at 0.25 s of 36.5 s, so the gap is not the format; it is
     still unexplained.
   - **Download.** `./download_model.sh ds41f-q2-eq4`. Only this fork reads it.
+    - **Where.** The public repo `dongnhdev/DeepSeek-V4.1-Flash-Q2-EngramQ4-GGUF` holds the file as six parts, because HF
+      caps a file at 50 GB.
+    - **What the script does.** It checks each part's SHA-256, joins the parts, and checks the joined file.
+    - **Disk.** Each part is deleted once it is joined, so the join needs about 43 GiB free beyond the file.
   - **Details.** `speed-bench/v41/engram-q4-20261002/RESULTS.md`.
 - **PR #1073 measured 2026-10-02:** D vs P 0.866 (auto cache), M vs P 1.127, 24 GB 0.897; output byte-identical. Decision: no integration — under `--ssd-streaming` the PR loses DSpark and its concurrent FFN, and our streaming pipeline is faster. Side finding: our 8K prefill at the auto cache is 2.3× slower than upstream with the same cache plan (114 vs 260-265 t/s). Open: the PR's +12.7 % over plain upstream under streaming was not profiled. Results: `speed-bench/v41/pr1073-20261002/RESULTS.md`.
 - **FROZEN 2026-09-25 (user decision).** Effort moves back to Qwen3.8-Flash-Next
