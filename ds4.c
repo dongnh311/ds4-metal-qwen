@@ -2629,6 +2629,26 @@ static bool tensor_nbytes(uint32_t type, uint64_t elements, uint64_t *bytes) {
     return true;
 }
 
+/* Bytes of a Q4_K row of n values.  A row that ends inside a super-block
+ * (trimmed qwen4 down experts, n % 256 != 0) keeps that block's 16-byte header
+ * and only the 32-byte qs chunks of its real values (a chunk holds 64
+ * values: sub-blocks 2k and 2k+1); 0 if n is not a multiple of 64. */
+static uint64_t q4k_row_bytes(uint64_t n) {
+    if (n % 64u) return 0;
+    return n / 256u * 144u + ((n % 256u) ? 16u + (n % 256u) / 2u : 0u);
+}
+
+/* tensor_nbytes with the row length: Q4_K rows may end in a short block. */
+static bool tensor_nbytes_dims(uint32_t type, uint64_t dim0, uint64_t elements, uint64_t *bytes) {
+    if (type == DS4_TENSOR_Q4_K && dim0 != 0 && (dim0 % 256u) != 0) {
+        const uint64_t row = q4k_row_bytes(dim0);
+        if (row == 0 || elements % dim0 != 0 || elements / dim0 > UINT64_MAX / row) return false;
+        *bytes = elements / dim0 * row;
+        return true;
+    }
+    return tensor_nbytes(type, elements, bytes);
+}
+
 static ds4_cursor cursor_at(const ds4_model *m, uint64_t pos) {
     ds4_cursor c = {
         .base = m->map,
@@ -2867,7 +2887,7 @@ static void parse_tensors(ds4_model *m, ds4_cursor *c) {
         if (!cursor_u32(c, &t->type)) ds4_die(c->error);
         if (!cursor_u64(c, &t->rel_offset)) ds4_die(c->error);
 
-        if (!tensor_nbytes(t->type, t->elements, &t->bytes)) {
+        if (!tensor_nbytes_dims(t->type, t->ndim ? t->dim[0] : 0, t->elements, &t->bytes)) {
             ds4_log(stderr,
                 DS4_LOG_WARNING,
                 "ds4: warning: tensor %.*s has unsupported GGUF type %u\n",
@@ -5171,6 +5191,11 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
+    if (t->type == DS4_TENSOR_Q4_K) {
+        const uint64_t row = q4k_row_bytes(t->dim[0]);
+        if (row == 0) ds4_die("routed expert Q4_K row is not a multiple of 64 values");
+        return row;
+    }
     const gguf_type_info *info = tensor_type(t->type);
     if (!info || info->block_elems == 0) ds4_die("unsupported routed expert tensor type");
     if ((t->dim[0] % info->block_elems) != 0) ds4_die("routed expert row is not quant block aligned");
@@ -5693,6 +5718,28 @@ static void tensor_expect_qwen4_expert_layout(
     tensor_expect_layout(t, t->type, 3, d0, d1, d2);
 }
 
+/* A routed down tensor stored as trimmed Q4_K rows: ff_dim values per row,
+ * the last super-block cut after its header and real qs chunks. */
+static bool qwen4_down_is_trimmed(const ds4_tensor *t) {
+    return t && t->type == DS4_TENSOR_Q4_K && t->ndim == 3 && t->dim[0] == DS4_N_FF_EXP &&
+           (DS4_N_FF_EXP % 256u) != 0 && (DS4_N_FF_EXP % 64u) == 0;
+}
+
+/* The Metal down stride is one per-model setting, so the Q4_K routed down
+ * tensors must all be trimmed or all padded; other types do not count. */
+static void qwen4_check_down_layouts(const bool *trimmed, const uint32_t *types, uint32_t n) {
+    int first = -1;
+    for (uint32_t i = 0; i < n; i++) {
+        if (types[i] != DS4_TENSOR_Q4_K) continue;
+        if (first < 0) {
+            first = trimmed[i] ? 1 : 0;
+        } else if ((trimmed[i] ? 1 : 0) != first) {
+            fprintf(stderr, "ds4: routed Q4_K down experts mix trimmed and padded rows (layer slot %u)\n", i);
+            exit(1);
+        }
+    }
+}
+
 static void weights_validate_qwen4_layout(
         const ds4_weights *w,
         uint32_t           layer_start,
@@ -5745,6 +5792,9 @@ static void weights_validate_qwen4_layout(
         tensor_expect_qwen4_dense_layout(w->output, 2, DS4_N_EMBD, DS4_N_VOCAB, 0);
     }
 
+    bool down_trimmed[DS4_MAX_LAYER] = {0};
+    uint32_t down_types[DS4_MAX_LAYER] = {0};
+    uint32_t n_down = 0;
     for (uint32_t il = layer_start; il <= layer_end; il++) {
         const ds4_layer_weights *l = &w->layer[il];
         if (!weights_qwen4_layer_has_required(l, il)) {
@@ -5795,12 +5845,16 @@ static void weights_validate_qwen4_layout(
         tensor_expect_qwen4_expert_layout(l->ffn_gate_exps, DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         tensor_expect_qwen4_expert_layout(l->ffn_up_exps,   DS4_N_EMBD, DS4_N_FF_EXP, DS4_N_EXPERT);
         /* Q2_K and Q4_K down rows store 640 logical inputs in three 256-value
-         * blocks (Q4_K super-blocks). Activations remain 640 wide; only the
-         * weight row stride is padded. */
-        const uint32_t down_width = (l->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
-                                     l->ffn_down_exps->type == DS4_TENSOR_Q4_K) ?
+         * blocks (Q4_K super-blocks) unless the Q4_K rows are trimmed to 640
+         * (the last block cut after its real values). Activations remain 640
+         * wide; only the weight row stride differs. */
+        const bool trimmed = qwen4_down_is_trimmed(l->ffn_down_exps);
+        const uint32_t down_width = !trimmed && (l->ffn_down_exps->type == DS4_TENSOR_Q2_K ||
+                                                 l->ffn_down_exps->type == DS4_TENSOR_Q4_K) ?
             (DS4_N_FF_EXP + 255u) / 256u * 256u : DS4_N_FF_EXP;
         tensor_expect_qwen4_expert_layout(l->ffn_down_exps, down_width, DS4_N_EMBD, DS4_N_EXPERT);
+        down_trimmed[n_down] = trimmed;
+        down_types[n_down++] = l->ffn_down_exps->type;
         if (l->ffn_gate_exps->type != l->ffn_up_exps->type) {
             fprintf(stderr, "ds4: routed gate/up experts use different quant types in layer %u\n", il);
             exit(1);
@@ -5823,6 +5877,19 @@ static void weights_validate_qwen4_layout(
             tensor_expect_qwen4_dense_layout(l->nextn_hc_head_up, 2, DS4_N_HC_LOWRANK, hc_dim, 0);
         }
     }
+    qwen4_check_down_layouts(down_trimmed, down_types, n_down);
+    bool any_trimmed = false;
+    for (uint32_t i = 0; i < n_down; i++) any_trimmed |= down_trimmed[i];
+#ifdef DS4_HAS_QWEN4_METAL
+    ds4_gpu_qwen4_set_down_trimmed(any_trimmed);
+#elif defined(DS4_HAS_QWEN4_GPU)
+    if (any_trimmed) {
+        fprintf(stderr, "ds4: trimmed Q4_K down rows need the Metal backend\n");
+        exit(1);
+    }
+#else
+    (void)any_trimmed;   /* CPU builds read trimmed rows through the reference path */
+#endif
 }
 
 static bool weights_layer_has_required(const ds4_layer_weights *l, uint32_t il) {
@@ -70455,6 +70522,30 @@ int ds4_quant_row_to_q8_0(uint32_t type, const void *src, uint64_t n, uint8_t *d
  * gammas except ssm_norm are folded to 1+w, ssm_a holds -exp(A_log).
  * --------------------------------------------------------------------- */
 
+/* One Q4_K row of n values; a trimmed row's last super-block is read only up
+ * to its real values (q4k_row_bytes). */
+static void qwen4_ref_q4k_row(const uint8_t *data, uint64_t n, uint64_t row, float *out) {
+    const uint64_t row_bytes = q4k_row_bytes(n);
+    if (row_bytes == 0) ds4_die("qwen4 reference: Q4_K row is not a multiple of 64 values");
+    const uint8_t *p = data + row * row_bytes;
+    for (uint64_t b = 0; b * 256u < n; b++, p += 144u) {
+        uint16_t dh, mh;
+        memcpy(&dh, p, 2);
+        memcpy(&mh, p + 2, 2);
+        const float d = f16_to_f32(dh), dmin = f16_to_f32(mh);
+        const uint8_t *sc = p + 4;
+        for (uint32_t g = 0; g < 8u && b * 256u + g * 32u < n; g++) {
+            uint32_t s, mn;
+            if (g < 4u) { s = sc[g] & 63u; mn = sc[g + 4] & 63u; }
+            else { s = (sc[g + 4] & 0xFu) | ((sc[g - 4] & 0xC0u) >> 2); mn = (sc[g + 4] >> 4) | ((sc[g] & 0xC0u) >> 2); }
+            const float ds = d * (float)s, dm = dmin * (float)mn;
+            const uint8_t *qs = p + 16 + (g >> 1) * 32u;
+            const uint32_t shift = (g & 1u) * 4u;
+            for (uint32_t j = 0; j < 32u; j++) out[b * 256u + g * 32u + j] = ds * (float)((qs[j] >> shift) & 0xFu) - dm;
+        }
+    }
+}
+
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint64_t n = t->dim[0];
     switch (t->type) {
@@ -70515,27 +70606,9 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
         }
         break;
     }
-    case DS4_TENSOR_Q4_K: {
-        const uint64_t blocks = n / 256u;
-        const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 144u;
-        for (uint64_t b = 0; b < blocks; b++, p += 144u) {
-            uint16_t dh, mh;
-            memcpy(&dh, p, 2);
-            memcpy(&mh, p + 2, 2);
-            const float d = f16_to_f32(dh), dmin = f16_to_f32(mh);
-            const uint8_t *sc = p + 4;
-            for (uint32_t g = 0; g < 8u; g++) {
-                uint32_t s, mn;
-                if (g < 4u) { s = sc[g] & 63u; mn = sc[g + 4] & 63u; }
-                else { s = (sc[g + 4] & 0xFu) | ((sc[g - 4] & 0xC0u) >> 2); mn = (sc[g + 4] >> 4) | ((sc[g] & 0xC0u) >> 2); }
-                const float ds = d * (float)s, dm = dmin * (float)mn;
-                const uint8_t *qs = p + 16 + (g >> 1) * 32u;
-                const uint32_t shift = (g & 1u) * 4u;
-                for (uint32_t j = 0; j < 32u; j++) out[b * 256u + g * 32u + j] = ds * (float)((qs[j] >> shift) & 0xFu) - dm;
-            }
-        }
+    case DS4_TENSOR_Q4_K:
+        qwen4_ref_q4k_row((const uint8_t *)tensor_data(m, t), n, row, out);
         break;
-    }
     case DS4_TENSOR_MXFP4: {
         const uint64_t blocks = n / 32u;
         const uint8_t *p = (const uint8_t *)tensor_data(m, t) + row * blocks * 17u;
