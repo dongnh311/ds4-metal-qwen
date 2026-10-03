@@ -1,0 +1,24 @@
+qwen35 attention merge fold (round 2 Plan B)
+  attn merge fold pos0=2046 split_keys=64 rows=1: bit-identical (unchecked: merge3)
+  attn merge fold pos0=2046 split_keys=64 rows=2: bit-identical (unchecked: merge3)
+  attn merge fold pos0=2046 split_keys=64 rows=1: bit-identical (unchecked: merge3)
+  attn merge fold pos0=2046 split_keys=64 rows=2: bit-identical (unchecked: merge3)
+  attn merge fold pos0=40 split_keys=16 rows=1: bit-identical
+  attn merge fold pos0=40 split_keys=16 rows=2: bit-identical
+  attn merge fold pos0=2046 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=2046 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=2100 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=2100 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=8250 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=8250 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=32766 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=32766 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=63 split_keys=64 rows=1: bit-identical (no merge needed)
+  attn merge fold pos0=63 split_keys=64 rows=2: bit-identical
+  attn flash merge fold pos0=4096 T=64 splits=4: bit-identical
+  attn flash merge fold pos0=8000 T=200 splits=8: bit-identical
+  attn flash merge fold pos0=1000 T=1100 splits=2: bit-identical
+  attn flash nax merge fold pos0=4096 T=64 splits=4: bit-identical
+  attn flash nax merge fold pos0=8000 T=200 splits=8: bit-identical
+  attn flash nax merge fold pos0=1000 T=1100 splits=2: bit-identical
+qwen35 kernels: ok

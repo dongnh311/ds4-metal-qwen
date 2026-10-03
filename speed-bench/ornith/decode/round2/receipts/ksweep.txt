@@ -1,0 +1,32 @@
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /Users/dongnh/orca/workspaces/ds4-metal/foxface (CWD)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.203 ms, residency requested in 46.229 ms, warmup 3.077 ms (mapped 3953.62 MiB from offset 0.00 MiB)
+ds4: Metal mapped mmaped model as 1 overlapping shared buffers
+bench: q8 2048x248320 (lm_head, peak ref)   T1 gpu   1.9659 ms   274.9 GB/s 100.0% of peak (encode 2.3 us/call, 16 calls/rep)
+bench: q8 2048x248320 (lm_head, peak ref)   T2 gpu   1.9198 ms   281.5 GB/s 102.4% of peak (encode 2.4 us/call, 16 calls/rep)
+bench: q8 2048x8192 (attn_qkv, attn_q)      T1 gpu   0.0737 ms   242.0 GB/s  88.1% of peak (encode 1.2 us/call, 61 calls/rep)
+bench: q8 2048x8192 (attn_qkv, attn_q)      T2 gpu   0.0739 ms   241.4 GB/s  87.8% of peak (encode 1.0 us/call, 61 calls/rep)
+bench: q8 2048x4096 (attn_gate)             T1 gpu   0.0360 ms   247.2 GB/s  90.0% of peak (encode 0.8 us/call, 121 calls/rep)
+bench: q8 2048x4096 (attn_gate)             T2 gpu   0.0368 ms   242.1 GB/s  88.1% of peak (encode 0.8 us/call, 121 calls/rep)
+bench: q8 4096x2048 (ssm_out, attn_output)  T1 gpu   0.0410 ms   217.5 GB/s  79.1% of peak (encode 1.2 us/call, 121 calls/rep)
+bench: q8 4096x2048 (ssm_out, attn_output)  T2 gpu   0.0370 ms   240.7 GB/s  87.6% of peak (encode 0.8 us/call, 121 calls/rep)
+bench: moe mid Q5_K + shared                T1 gpu   0.0662 ms   207.9 GB/s  75.6% of peak (encode 1.1 us/call, 79 calls/rep)
+bench: moe mid Q5_K + shared                T2 gpu   0.1225 ms   171.2 GB/s  62.3% of peak (encode 0.7 us/call, 52 calls/rep)
+bench: moe down Q5_K + shared               T1 gpu   0.0442 ms   155.7 GB/s  56.7% of peak (encode 0.5 us/call, 157 calls/rep)
+bench: moe down Q5_K + shared               T2 gpu   0.0828 ms   126.6 GB/s  46.1% of peak (encode 0.7 us/call, 103 calls/rep)
+bench: moe mid Q4_K + shared                T1 gpu   0.0546 ms   213.7 GB/s  77.8% of peak (encode 0.7 us/call, 93 calls/rep)
+bench: moe mid Q4_K + shared                T2 gpu   0.0902 ms   194.7 GB/s  70.8% of peak (encode 0.8 us/call, 62 calls/rep)
+bench: moe down Q4_K + shared               T1 gpu   0.0304 ms   192.2 GB/s  69.9% of peak (encode 1.5 us/call, 185 calls/rep)
+bench: moe down Q4_K + shared               T2 gpu   0.0519 ms   169.3 GB/s  61.6% of peak (encode 1.5 us/call, 123 calls/rep)
+bench: peak-ref 274.9 GB/s (lm_head T1)
+bench: family q8 2048x248320 (lm_head, peak ref)   n= 1 T2 1.9198 ms floor 1.9659 ms half-gap 0.00 ms/cycle -
+bench: family q8 2048x8192 (attn_qkv, attn_q)      n=40 T2 0.0739 ms floor 0.0649 ms half-gap 0.18 ms/cycle -
+bench: family q8 2048x4096 (attn_gate)             n=30 T2 0.0368 ms floor 0.0324 ms half-gap 0.07 ms/cycle -
+bench: family q8 4096x2048 (ssm_out, attn_output)  n=40 T2 0.0370 ms floor 0.0324 ms half-gap 0.09 ms/cycle -
+bench: family moe mid Q5_K + shared                n=15 T2 0.1225 ms floor 0.0763 ms half-gap 0.35 ms/cycle -
+bench: family moe down Q5_K + shared               n=15 T2 0.0828 ms floor 0.0382 ms half-gap 0.34 ms/cycle -
+bench: family moe mid Q4_K + shared                n=25 T2 0.0902 ms floor 0.0639 ms half-gap 0.33 ms/cycle -
+bench: family moe down Q4_K + shared               n=25 T2 0.0519 ms floor 0.0320 ms half-gap 0.25 ms/cycle -
+bench: step model T1 11.41 ms, T2 14.09 ms (projections + routed/shared experts only; bar 0.60 ms)

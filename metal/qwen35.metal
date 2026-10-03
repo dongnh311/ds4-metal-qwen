@@ -1319,6 +1319,80 @@ kernel void kernel_qwen35_attn_merge3(
     out[at] = oo[0] * inv * qwen4_sigmoid(gate[at]);
 }
 
+/* One node of kernel_qwen35_attn_merge3's tree, operand 0 the lower index:
+ * the same expressions as merge3's loop body. */
+static inline void qwen35_merge_node(float m0, float l0, float o0, float m1, float l1, float o1,
+                                     thread float &m, thread float &l, thread float &o) {
+    const float nm = max(m0, m1);
+    const float c0 = l0 > 0.0f ? exp(m0 - nm) : 0.0f;
+    const float c1 = l1 > 0.0f ? exp(m1 - nm) : 0.0f;
+    m = nm; l = l0 * c0 + l1 * c1; o = o0 * c0 + o1 * c1;
+}
+
+/* kernel_qwen35_attn_merge3 with its tree folded in leaf order (round 2
+ * Plan B, DS4_QWEN35_ATTN_MERGE_FOLD): slot lv holds the pending left node
+ * of level lv; an arriving node merges with it (the slot as operand 0, as
+ * merge3 pairs (2i, 2i+1)) and carries up, or parks.  Every neutral pad up
+ * to the next power of two is folded too, so the pairs, the operand order
+ * and the per-node arithmetic are merge3's and the output is bit-identical,
+ * with at most QWEN35_MERGE_LEVELS live nodes in registers instead of three
+ * QWEN35_ATTN_MAX_SPLITS-float private arrays in device memory. */
+#define QWEN35_MERGE_LEVELS 9u   /* 256 leaves -> levels 0..8 */
+kernel void kernel_qwen35_attn_merge3_fold(
+        constant ds4_metal_args_qwen35_attn_decode3 & args,
+        device const float *part,
+        device const float *gate,
+        device float       *out,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    const uint h = tgpig.x, r = tgpig.y;
+    if (h >= args.n_head || r >= args.rows) return;
+    const uint ns = r == 0u ? args.ns0 : args.ns1;
+    if (ns <= 1u) return;
+    constexpr uint D = 256u;
+    const uint H = args.n_head, Hkv = args.n_head_kv;
+    const uint group = H / Hkv;
+    const uint kvh = h / group, g = h % group;
+    const uint64_t row_base = (r == 0u ? 0u : (uint64_t)args.ns0 + (uint64_t)(r - 1u) * args.ns1) * H * (2u + D);
+    const uint64_t stride = (uint64_t)group * (2u + D);
+    device const float *base = part + row_base + ((uint64_t)kvh * ns * group + g) * (2u + D);
+
+    uint p = 1u;
+    while (p < ns) p <<= 1u;
+    float sm[QWEN35_MERGE_LEVELS], sl[QWEN35_MERGE_LEVELS], so[QWEN35_MERGE_LEVELS];
+    uint used = 0u;
+    for (uint s = 0; s < p; s++) {
+        float m, l, o;
+        if (s < ns) {
+            device const float *ps = base + s * stride;
+            m = ps[0]; l = ps[1]; o = ps[2u + tid];
+        } else {
+            m = -3.0e38f; l = 0.0f; o = 0.0f;   /* neutral pad, as merge3 */
+        }
+        bool carry = true;
+#pragma unroll
+        for (uint lv = 0; lv < QWEN35_MERGE_LEVELS; lv++) {
+            if (carry) {
+                if (used & (1u << lv)) {
+                    qwen35_merge_node(sm[lv], sl[lv], so[lv], m, l, o, m, l, o);
+                    used &= ~(1u << lv);
+                } else {
+                    sm[lv] = m; sl[lv] = l; so[lv] = o;
+                    used |= 1u << lv;
+                    carry = false;
+                }
+            }
+        }
+    }
+    float rl = 0.0f, ro = 0.0f;   /* p is a power of two: one slot holds the root */
+#pragma unroll
+    for (uint lv = 0; lv < QWEN35_MERGE_LEVELS; lv++)
+        if (used == (1u << lv)) { rl = sl[lv]; ro = so[lv]; }
+    const float inv = rl > 0.0f ? 1.0f / rl : 0.0f;
+    const uint64_t at = ((uint64_t)r * H + h) * D + tid;
+    out[at] = ro * inv * qwen4_sigmoid(gate[at]);
+}
+
 /* --- M5: flash prefill (query-token tiles, causal) ----------------------- */
 
 struct ds4_metal_args_qwen35_attn_flash {

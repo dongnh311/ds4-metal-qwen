@@ -1,0 +1,4 @@
+ds4: Ornith spec stats: 64 cycles (1 plain), accept 0.698, 1.688 tokens/cycle, ms/cycle target 23.20 draft 2.22 host 0.09 outside 0.06, ms/token 15.15
+ds4: prefill: 1882.36 t/s, generation: 65.36 t/s
+ds4: Ornith spec stats: 64 cycles (1 plain), accept 0.698, 1.688 tokens/cycle, ms/cycle target 17.95 draft 2.36 host 0.15 outside 0.11, ms/token 12.18
+ds4: prefill: 1804.24 t/s, generation: 82.20 t/s

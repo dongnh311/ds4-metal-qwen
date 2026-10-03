@@ -3645,6 +3645,11 @@ int ds4_gpu_qwen35_attn_decode3_tensor(
         uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, uint32_t rows, float scale);
 /* Scratch floats for `rows` rows at decode3's split cap (256). */
 uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32_t head_dim);
+/* Round 2 Plan B: number of kernel_qwen35_attn_merge3_fold dispatches so far
+ * (tests), and the once-per-process fold-vs-merge3 startup check (1 = knob
+ * off or match; 0 = mismatch, fold turned off). */
+uint64_t ds4_gpu_qwen35_attn_merge_fold_dispatches(void);
+int ds4_gpu_qwen35_attn_merge_fold_selfcheck(void);
 /* M5 flash prefill attention: TOK query tokens (x 8 query heads, Ornith's
  * group) per threadgroup share every K/V tile instead of attn_mm's one
  * (kv head, token) threadgroup with padded 8-of-16 rows.  T query tokens at

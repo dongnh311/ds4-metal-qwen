@@ -1,0 +1,70 @@
+12:55:07 window steps-r2w4.sh on e8b9dee0
+paused
+no model processes
+12:55:08 start kernels
+12:55:53 end kernels rc=0
+  attn merge fold pos0=2046 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=2046 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=2100 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=2100 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=8250 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=8250 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=32766 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=32766 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=63 split_keys=64 rows=1: bit-identical (no merge needed)
+  attn merge fold pos0=63 split_keys=64 rows=2: bit-identical
+  attn flash merge fold pos0=4096 T=64 splits=4: bit-identical
+  attn flash merge fold pos0=8000 T=200 splits=8: bit-identical
+  attn flash merge fold pos0=1000 T=1100 splits=2: bit-identical
+  attn flash nax merge fold pos0=4096 T=64 splits=4: bit-identical
+  attn flash nax merge fold pos0=8000 T=200 splits=8: bit-identical
+  attn flash nax merge fold pos0=1000 T=1100 splits=2: bit-identical
+12:55:53 start bench-attn
+12:55:58 end bench-attn rc=0
+bench decode3        decode  pos=2048   T=1    rows=1:    0.601 ms, K/V read 0.004 GB ->    7.0 GB/s (floor 0.017 ms)
+bench decode3-fold   decode  pos=2048   T=1    rows=1:    0.596 ms, K/V read 0.004 GB ->    7.0 GB/s (floor 0.017 ms)
+bench decode3        decode  pos=2048   T=2    rows=2:    0.699 ms, K/V read 0.004 GB ->    6.0 GB/s (floor 0.017 ms)
+bench decode3-fold   decode  pos=2048   T=2    rows=2:    0.689 ms, K/V read 0.004 GB ->    6.1 GB/s (floor 0.017 ms)
+bench decode3        decode  pos=32768  T=1    rows=1:    1.003 ms, K/V read 0.067 GB ->   66.9 GB/s (floor 0.268 ms)
+bench decode3-fold   decode  pos=32768  T=1    rows=1:    0.961 ms, K/V read 0.067 GB ->   69.8 GB/s (floor 0.268 ms)
+bench decode3        decode  pos=32768  T=2    rows=2:    1.054 ms, K/V read 0.067 GB ->   63.7 GB/s (floor 0.268 ms)
+bench decode3-fold   decode  pos=32768  T=2    rows=2:    1.033 ms, K/V read 0.067 GB ->   65.0 GB/s (floor 0.268 ms)
+bench decode3        decode  pos=131072 T=1    rows=1:    1.685 ms, K/V read 0.268 GB ->  159.3 GB/s (floor 1.074 ms)
+bench decode3-fold   decode  pos=131072 T=1    rows=1:    1.645 ms, K/V read 0.268 GB ->  163.2 GB/s (floor 1.074 ms)
+bench decode3        decode  pos=131072 T=2    rows=2:    1.910 ms, K/V read 0.268 GB ->  140.5 GB/s (floor 1.074 ms)
+bench decode3-fold   decode  pos=131072 T=2    rows=2:    1.876 ms, K/V read 0.268 GB ->  143.1 GB/s (floor 1.074 ms)
+12:55:58 start g1-64
+12:56:58 end g1-64 rc=0
+12:56:58 identity chunk 64 (default on) vs window M: 0 differ
+12:56:58 start g1-512
+12:57:28 end g1-512 rc=0
+12:57:28 identity chunk 512 (default on) vs window M: 0 differ
+12:57:28 start g1-2048
+12:57:58 end g1-2048 rc=0
+12:57:58 identity chunk 2048 (default on) vs window M: 0 differ
+12:57:58 start mtp-cli
+13:02:14 end mtp-cli rc=0
+13:02:14 start verify-batch
+13:02:29 end verify-batch rc=0
+13:02:29 start qwen35-mtp
+13:02:49 end qwen35-mtp rc=0
+13:02:49 start qwen35-graph
+13:03:14 end qwen35-graph rc=0
+13:03:14 start ab
+13:39:47 end ab rc=0
+m4_ab: 2048     base decode 89.7 / lever 89.7  base prefill 1798 / lever 1809
+m4_ab: 32768    base decode 68.1 / lever 73.6  base prefill 1620 / lever 1622
+m4_ab: paired 2048     n=6 mean=+0.0% sd=0.5% min=-0.7% max=+0.7% mismatches=0
+m4_ab: paired 32768    n=6 mean=+8.1% sd=0.6% min=+7.0% max=+8.5% mismatches=0
+m4_ab: lever run done (no gate; compare against the Task 3 baseline by hand)
+13:39:47 start ab128
+13:58:54 end ab128 rc=0
+128k m4_ab: 131072   base decode 44.6 / lever 47.2  base prefill 845 / lever 855
+128k m4_ab: paired 131072   n=1 mean=+5.8% sd=0.0% min=+5.8% max=+5.8% mismatches=0
+128k m4_ab: lever run done (no gate; compare against the Task 3 baseline by hand)
+13:58:54 window r2w4 ok=1
+13:58:54 steps rc=0; restore
+restored (backend_ok after 62x2s)
+14:01:01 restored
+status: backend_ok True last_byte_ago_s 3954.8
+14:01:01 window done rc=0

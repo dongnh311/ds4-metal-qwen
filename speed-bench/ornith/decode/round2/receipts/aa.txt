@@ -1,0 +1,5 @@
+m4_ab: 2048     base decode 90.0 / lever 89.4  base prefill 1807 / lever 1791
+m4_ab: 32768    base decode 68.5 / lever 68.0  base prefill 1627 / lever 1621
+m4_ab: paired 2048     n=4 mean=-0.7% sd=0.6% min=-1.3% max=+0.1% mismatches=0
+m4_ab: paired 32768    n=4 mean=-0.7% sd=1.3% min=-2.2% max=+0.4% mismatches=0
+m4_ab: lever run done (no gate; compare against the Task 3 baseline by hand)

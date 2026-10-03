@@ -49923,6 +49923,7 @@ enum {
     QWEN4_K_QWEN35_ATTN_DECODE3_R1,
     QWEN4_K_QWEN35_ATTN_DECODE3_R2,
     QWEN4_K_QWEN35_ATTN_MERGE3,
+    QWEN4_K_QWEN35_ATTN_MERGE3_FOLD,
     QWEN4_K_QWEN35_ATTN_FLASH_TOK2,
     QWEN4_K_QWEN35_ATTN_FLASH_TOK4,
     QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK2,
@@ -50092,6 +50093,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_attn_decode3_r1",
     "kernel_qwen35_attn_decode3_r2",
     "kernel_qwen35_attn_merge3",
+    "kernel_qwen35_attn_merge3_fold",
     "kernel_qwen35_attn_flash_tok2_kt16",
     "kernel_qwen35_attn_flash_tok4_kt8",
     "kernel_qwen35_attn_flash_split_tok2_kt16",
@@ -51514,6 +51516,75 @@ struct ds4_qwen35_attn_decode3_args {
     float scale;
 };
 
+/* Round 2 Plan B: kernel_qwen35_attn_merge3_fold (bit-identical to merge3)
+ * is the default; DS4_QWEN35_ATTN_MERGE_FOLD=0 selects merge3. The knob is
+ * read fresh on every dispatch like the split knob above. The fold runs only
+ * after its self-check has passed in this process (-1 not run, 0 failed,
+ * 1 passed), so a path that skips the check falls back to merge3. */
+static int g_qwen35_merge_fold_checked = -1;
+static uint64_t g_qwen35_merge_fold_dispatches;
+
+static bool qwen35_merge_fold_wanted(void) {
+    const char *e = getenv("DS4_QWEN35_ATTN_MERGE_FOLD");
+    return !(e && strcmp(e, "0") == 0);
+}
+
+static int qwen35_merge3_kernel(void) {
+    if (g_qwen35_merge_fold_checked == 1 && qwen35_merge_fold_wanted()) {
+        g_qwen35_merge_fold_dispatches++;
+        return QWEN4_K_QWEN35_ATTN_MERGE3_FOLD;
+    }
+    return QWEN4_K_QWEN35_ATTN_MERGE3;
+}
+
+uint64_t ds4_gpu_qwen35_attn_merge_fold_dispatches(void) {
+    return g_qwen35_merge_fold_dispatches;
+}
+
+/* Once per process: the shader library is compiled at run time with fast
+ * math, so the fold's equality with merge3 -- pinned by the kernel tests on
+ * the development toolchain -- is checked again here on fixed partials (two
+ * rows, 256 and 37 splits, every eighth partial neutral with l == 0).  A
+ * mismatch or an error turns the fold off for the process. */
+int ds4_gpu_qwen35_attn_merge_fold_selfcheck(void) {
+    if (g_qwen35_merge_fold_checked >= 0) return g_qwen35_merge_fold_checked;
+    if (!qwen35_merge_fold_wanted()) return 1;   /* knob off: nothing to check yet */
+    const uint32_t H = 16u, Hkv = 2u, D = 256u, ns0 = 256u, ns1 = 37u;
+    const uint64_t pf = ((uint64_t)ns0 + ns1) * H * (2u + D), of = 2ull * H * D;
+    float *hp = malloc(pf * sizeof(float)), *hg = malloc(of * sizeof(float));
+    float *ha = malloc(of * sizeof(float)), *hb = malloc(of * sizeof(float));
+    ds4_gpu_tensor *tp = ds4_gpu_tensor_alloc(pf * sizeof(float)), *tg = ds4_gpu_tensor_alloc(of * sizeof(float));
+    ds4_gpu_tensor *ta = ds4_gpu_tensor_alloc(of * sizeof(float)), *tb = ds4_gpu_tensor_alloc(of * sizeof(float));
+    int ok = hp && hg && ha && hb && tp && tg && ta && tb;
+    uint32_t r = 0x2b7e1516u;
+    for (uint64_t i = 0; ok && i < pf; i++) {
+        r = r * 1664525u + 1013904223u;
+        const float v = (float)((int32_t)(r >> 8) - (1 << 23)) / (float)(1 << 23);
+        const uint64_t k = i % (2u + D), slot = i / (2u + D);
+        hp[i] = k == 0 ? 4.0f * v : k == 1 ? (slot % 8u == 7u ? 0.0f : 1.0f + fabsf(v) * 30.0f) : v;
+    }
+    for (uint64_t i = 0; ok && i < of; i++) { r = r * 1664525u + 1013904223u; hg[i] = (float)(int32_t)(r >> 8) / (float)(1 << 23); }
+    struct ds4_qwen35_attn_decode3_args args = { H, Hkv, D, 0u, 2u, ns0, 1u, ns1, 1u, 0.0625f };
+    ok = ok && ds4_gpu_tensor_write(tp, 0, hp, pf * sizeof(float)) && ds4_gpu_tensor_write(tg, 0, hg, of * sizeof(float));
+    for (int pass = 0; pass < 2 && ok; pass++) {
+        qwen4_bind mb[3];
+        ok = qwen4_bind_tensor(&mb[0], tp, pf * sizeof(float), "fold check part") &&
+             qwen4_bind_tensor(&mb[1], tg, of * sizeof(float), "fold check gate") &&
+             qwen4_bind_tensor(&mb[2], pass ? tb : ta, of * sizeof(float), "fold check out") &&
+             ds4_gpu_begin_commands() &&
+             qwen4_dispatch(pass ? QWEN4_K_QWEN35_ATTN_MERGE3_FOLD : QWEN4_K_QWEN35_ATTN_MERGE3, &args,
+                            sizeof(args), mb, 3, MTLSizeMake(H, 2, 1), MTLSizeMake(256, 1, 1), 0) &&
+             ds4_gpu_end_commands() && ds4_gpu_synchronize();
+    }
+    ok = ok && ds4_gpu_tensor_read(ta, 0, ha, of * sizeof(float)) && ds4_gpu_tensor_read(tb, 0, hb, of * sizeof(float)) &&
+         memcmp(ha, hb, of * sizeof(float)) == 0;
+    free(hp); free(hg); free(ha); free(hb);
+    ds4_gpu_tensor_free(tp); ds4_gpu_tensor_free(tg); ds4_gpu_tensor_free(ta); ds4_gpu_tensor_free(tb);
+    if (!ok) fprintf(stderr, "ds4: Ornith attention merge fold off: it failed its startup check against merge3\n");
+    g_qwen35_merge_fold_checked = ok ? 1 : 0;
+    return g_qwen35_merge_fold_checked;
+}
+
 /* One row's solo decode3 dispatch at row_pos0 (kernel_qwen35_attn_decode3<1>,
  * 64 threads), then kernel_qwen35_attn_merge3 if that row's own split count
  * is >1. Used both for a lone rows==1 call and, with one-row tensor views,
@@ -51549,7 +51620,7 @@ static int qwen35_attn_decode3_dispatch1(
     }
     if (!need_part) return 1;   /* this row's own split count was 1: wrote out directly */
     qwen4_bind mb[3] = { b[5], b[1], b[4] };
-    return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_MERGE3, &args, sizeof(args), mb, 3,
+    return qwen4_dispatch(qwen35_merge3_kernel(), &args, sizeof(args), mb, 3,
                           MTLSizeMake(n_head, 1, 1), MTLSizeMake(256, 1, 1), 0)
            ? 1 : 0;
 }
@@ -51621,7 +51692,7 @@ int ds4_gpu_qwen35_attn_decode3_tensor(
         }
         if (!need_part) return 1;   /* every row's own split count was 1: wrote out directly */
         qwen4_bind mb[3] = { b[5], b[1], b[4] };
-        return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_MERGE3, &args, sizeof(args), mb, 3,
+        return qwen4_dispatch(qwen35_merge3_kernel(), &args, sizeof(args), mb, 3,
                               MTLSizeMake(n_head, rows, 1), MTLSizeMake(256, 1, 1), 0)
                ? 1 : 0;
     }
@@ -51765,7 +51836,7 @@ static int qwen35_attn_flash_merge3(const qwen4_bind *part_bind, const ds4_gpu_t
         !qwen4_bind_tensor(&mb[2], out, q_bytes, "flash merge out")) {
         return 0;
     }
-    return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_MERGE3, &margs, sizeof(margs), mb, 3,
+    return qwen4_dispatch(qwen35_merge3_kernel(), &margs, sizeof(margs), mb, 3,
                           MTLSizeMake(n_head, n_tokens, 1), MTLSizeMake(256, 1, 1), 0)
            ? 1 : 0;
 }

@@ -35,6 +35,7 @@ survives SIGTERM is never SIGKILLed: _terminate() raises SystemExit naming
 the pid and leaves it running for a human to investigate.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -341,11 +342,36 @@ def _chat_stream(base, model, text, max_tokens):
                 events.append((time.time() - t0, chunk))
     timing = qwen_gate.sse_timings(events)
     timing["finish_reason"] = _last_finish_reason(events)
+    timing["text_sha"] = stream_text_sha(events)
     return timing, usage
 
 
+def paired_nonce(block, ctx, rep):
+    """The nonce for one request in paired mode: a function of (block, context,
+    rep) only, so every run of an A-B-B-A block sends the same prompts and a
+    lossless lever decodes the same text as base."""
+    return "nonce-b%d-%s-r%d" % (block, ctx, rep)
+
+
+def stream_text_sha(events):
+    """SHA-256 of a stream's reasoning text and answer text, kept apart so
+    text cannot move between the two; independent of how deltas are chunked."""
+    parts = {"reasoning_content": [], "content": []}
+    for _, chunk in events:
+        for choice in chunk.get("choices") or []:
+            delta = choice.get("delta") or {}
+            for key, acc in parts.items():
+                if delta.get(key):
+                    acc.append(delta[key])
+    h = hashlib.sha256()
+    h.update(("r:" + "".join(parts["reasoning_content"])).encode("utf-8"))
+    h.update(b"\0")
+    h.update(("c:" + "".join(parts["content"])).encode("utf-8"))
+    return h.hexdigest()
+
+
 def measure_arm(arm, contexts, filler, max_tokens, warmup=1, cold_tokens=0,
-                swap_used=None, wait_idle=None):
+                swap_used=None, wait_idle=None, nonce_fn=None, reps=1):
     swap_used = swap_used or machine.swap_used_mib
     wait_idle = wait_idle or (lambda: wired.wait_idle_gib())
     wait_idle()
@@ -357,17 +383,28 @@ def measure_arm(arm, contexts, filler, max_tokens, warmup=1, cold_tokens=0,
     for _ in range(warmup):
         arm.stream(build_prompt("nonce-warm", 512, filler, cpt), max_tokens)
     rows = {}
+    samples = []
     targets = list(contexts) + (["cold31k"] if cold_tokens else [])
     for ctx in targets:
         n = cold_tokens if ctx == "cold31k" else ctx
-        nonce = "nonce-%s-%d" % (arm.name, int(time.time() * 1000) % 100000)
-        timing, usage = arm.stream(build_prompt(nonce, n, filler, cpt), max_tokens)
-        assert_cache_cold(usage)
-        rates = qwen_gate.request_rates(timing)
-        rows[str(ctx)] = {**timing, **rates, "cached_tokens": cached_tokens(usage),
-                          "finish_reason": timing.get("finish_reason")}
+        reps_rows = []
+        for rep in range(reps):
+            nonce = (nonce_fn(str(ctx), rep) if nonce_fn else
+                     "nonce-%s-%d-r%d" % (arm.name, int(time.time() * 1000) % 100000, rep))
+            timing, usage = arm.stream(build_prompt(nonce, n, filler, cpt), max_tokens)
+            assert_cache_cold(usage)
+            rates = qwen_gate.request_rates(timing)
+            row = {**timing, **rates, "cached_tokens": cached_tokens(usage),
+                   "finish_reason": timing.get("finish_reason")}
+            reps_rows.append(row)
+            samples.append({"ctx": str(ctx), "rep": rep, "decode_tps": row["decode_tps"],
+                            "text_sha": row.get("text_sha")})
+        row = dict(reps_rows[0])
+        for key in ("decode_tps", "prefill_tps", "ttft_s"):
+            row[key] = statistics.fmean(r[key] for r in reps_rows)
+        rows[str(ctx)] = row
     swap_after = swap_used()
-    return {"arm": arm.name, "rows": rows, "chars_per_token": cpt,
+    return {"arm": arm.name, "rows": rows, "samples": samples, "chars_per_token": cpt,
             "swap_before_mib": swap_before, "swap_after_mib": swap_after,
             "swap_delta_mib": swap_after - swap_before}
 
@@ -380,26 +417,41 @@ def _wait_free():
 
 
 def interleave(makers, contexts, cold_tokens, filler, max_tokens, warmup, order,
-              guard=None, wait_free=None, swap_used=None, wait_idle=None):
-    """Run `order` (a tuple of roles, each a key of `makers`), one process at
-    a time: guard the box is free, start the role's arm, measure it, stop it,
-    wait for the box to be free again, next role. Returns the summary dict
-    (per-role means per context, plus the raw per-run rows)."""
+              guard=None, wait_free=None, swap_used=None, wait_idle=None,
+              blocks=1, paired=False, reps=1):
+    """Run `order` (a tuple of roles, each a key of `makers`) `blocks` times,
+    one process at a time: guard the box is free, start the role's arm,
+    measure it, stop it, wait for the box to be free again, next role. In
+    paired mode every run of a block sends the same prompts (paired_nonce)
+    and the summary gains a per-context "paired" entry. Returns the summary
+    dict (per-role means per context, plus the raw per-run rows)."""
     guard = guard if guard is not None else guard_free
     wait_free = wait_free if wait_free is not None else _wait_free
     runs = {role: [] for role in makers}
-    for role in order:
+    shared_cpt = None
+    for i, role in enumerate(tuple(order) * blocks):
+        block = i // len(order)
+        nonce_fn = (lambda ctx, rep, b=block: paired_nonce(b, ctx, rep)) if paired else None
         guard()
         arm = makers[role]()
+        if paired and shared_cpt is not None:
+            arm._cpt = shared_cpt
         arm.start()
         try:
             arm.ready()
-            runs[role].append(measure_arm(arm, contexts, filler, max_tokens, warmup, cold_tokens,
-                                          swap_used=swap_used, wait_idle=wait_idle))
+            run = measure_arm(arm, contexts, filler, max_tokens, warmup, cold_tokens,
+                              swap_used=swap_used, wait_idle=wait_idle, nonce_fn=nonce_fn, reps=reps)
+            run["block"] = block
+            runs[role].append(run)
+            shared_cpt = run["chars_per_token"]
         finally:
             arm.stop()
         wait_free()
-    return _summarize(runs, contexts, cold_tokens, list(makers.keys()))
+    summary = _summarize(runs, contexts, cold_tokens, list(makers.keys()))
+    if paired:
+        keys = [str(c) for c in contexts] + (["cold31k"] if cold_tokens else [])
+        summary["paired"] = paired_summary(runs, keys)
+    return summary
 
 
 def _summarize(runs, contexts, cold_tokens, roles):
@@ -417,6 +469,45 @@ def _summarize(runs, contexts, cold_tokens, roles):
                 row[role + "_ttft_s"] = statistics.fmean(ttft)
         summary[ctx] = row
     return summary
+
+
+def paired_summary(runs, ctx_keys):
+    """Per context: one gain per (block, rep) sample, mean(lever runs) /
+    mean(base runs) - 1, over samples whose four texts hash the same; a
+    sample whose texts differ is a mismatch (a lever that is not lossless,
+    or nondeterminism) and is left out of the gain."""
+    idx = {}
+    for role in ("base", "lever"):
+        for run in runs.get(role, []):
+            for s in run.get("samples", []):
+                idx.setdefault((role, run.get("block", 0), s["ctx"], s["rep"]), []).append(s)
+    out = {}
+    for ctx in ctx_keys:
+        gains, bad = [], []
+        for block, rep in sorted({(b, r) for (_, b, c, r) in idx if c == ctx}):
+            bs = idx.get(("base", block, ctx, rep), [])
+            ls = idx.get(("lever", block, ctx, rep), [])
+            if not bs or not ls:
+                continue
+            if len({s["text_sha"] for s in bs + ls}) != 1:
+                bad.append({"block": block, "rep": rep})
+                continue
+            gains.append(statistics.fmean(s["decode_tps"] for s in ls) /
+                         statistics.fmean(s["decode_tps"] for s in bs) - 1.0)
+        out[ctx] = {"n": len(gains),
+                    "mean": statistics.fmean(gains) if gains else None,
+                    "sd": statistics.stdev(gains) if len(gains) > 1 else 0.0,
+                    "min": min(gains) if gains else None,
+                    "max": max(gains) if gains else None,
+                    "mismatches": len(bad), "mismatch_samples": bad}
+    return out
+
+
+def format_paired(ctx, p):
+    if not p["n"]:
+        return "m4_ab: paired %-8s n=0 mismatches=%d" % (ctx, p["mismatches"])
+    return "m4_ab: paired %-8s n=%d mean=%+.1f%% sd=%.1f%% min=%+.1f%% max=%+.1f%% mismatches=%d" % (
+        ctx, p["n"], 100 * p["mean"], 100 * p["sd"], 100 * p["min"], 100 * p["max"], p["mismatches"])
 
 
 def verdict(summary):
@@ -463,7 +554,14 @@ def main():
     ap.add_argument("--ds4-env", default="")    # baseline mode: applied to the sole ds4 arm
     ap.add_argument("--base-env", default="")   # lever mode: applied to the "base" ds4 arm
     ap.add_argument("--lever-env", default="")  # lever mode: applied to the "lever" ds4 arm only
+    ap.add_argument("--paired", action="store_true")    # lever mode: same prompts in every run of a block
+    ap.add_argument("--blocks", type=int, default=1)    # lever mode: repeat the A-B-B-A block
+    ap.add_argument("--reps", type=int, default=1)      # lever mode: requests per context per run
     args = ap.parse_args()
+    if args.blocks < 1 or args.reps < 1:
+        ap.error("--blocks and --reps must be >= 1")
+    if args.mode == "baseline" and (args.paired or args.blocks != 1 or args.reps != 1):
+        ap.error("--paired, --blocks and --reps apply to --mode lever only")
     out = os.path.abspath(args.out)
     contexts = [int(x) for x in args.contexts.split(",") if x]
     extra_args = args.ds4_args.split() if args.ds4_args else []
@@ -488,7 +586,8 @@ def main():
         }
         order = LEVER_ORDER
 
-    summary = interleave(makers, contexts, args.cold_tokens, filler, args.max_tokens, args.warmup, order)
+    summary = interleave(makers, contexts, args.cold_tokens, filler, args.max_tokens, args.warmup, order,
+                         blocks=args.blocks, paired=args.paired, reps=args.reps)
     ctx_keys = [str(c) for c in contexts] + (["cold31k"] if args.cold_tokens else [])
     if args.mode == "baseline":
         summary["failures"] = verdict(summary)
@@ -507,6 +606,10 @@ def main():
             print("m4_ab: %-8s base decode %.1f / lever %.1f  base prefill %.0f / lever %.0f" % (
                 ctx, row.get("base_decode", 0), row.get("lever_decode", 0),
                 row.get("base_prefill", 0), row.get("lever_prefill", 0)))
+        for ctx, p in (summary.get("paired") or {}).items():
+            for bad in p["mismatch_samples"]:
+                print("m4_ab: TEXT MISMATCH ctx=%s block=%d rep=%d" % (ctx, bad["block"], bad["rep"]))
+            print(format_paired(ctx, p))
         print("m4_ab: lever run done (no gate; compare against the Task 3 baseline by hand)")
         rc = 0
 

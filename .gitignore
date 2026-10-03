@@ -25,6 +25,7 @@
 !/tests/vision-fixtures/**
 /tests/bench_qwen35_attn
 /tests/bench_qwen35_verify
+/tests/bench_qwen35_decode
 /tests/cuda_long_context_smoke
 *.o
 *.dSYM/

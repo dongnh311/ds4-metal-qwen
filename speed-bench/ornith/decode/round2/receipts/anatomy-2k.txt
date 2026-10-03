@@ -1,0 +1,32 @@
+anatomy: cycles 78, per cycle: 3.0 buffers, 772 encoders, 772 dispatches
+anatomy: per cycle us: buffer GPU 21328, encoder busy 19042, gaps inside buffers 2583, idle between buffers 3796
+anatomy: small encoders (<10 us): 421 per cycle, busy 1958 us, their gaps 1040 us
+anatomy: kernel kernel_qwen35_mv_q8_0_rows2                               106.7/cycle   7062.3 us/cycle   66.18 us each
+anatomy: kernel kernel_qwen4_moe_mid_q4k_nr1                               25.7/cycle   2331.3 us/cycle   90.83 us each
+anatomy: kernel kernel_qwen35_moe_mid_q5k_nr1                              14.8/cycle   1765.4 us/cycle  119.22 us each
+anatomy: kernel kernel_qwen4_moe_down_q4k_nr4                              25.7/cycle   1349.9 us/cycle   52.59 us each
+anatomy: kernel kernel_qwen35_moe_down_q5k_nr4                             14.8/cycle   1208.8 us/cycle   81.63 us each
+anatomy: kernel kernel_mul_mv_q8_0_f32                                      5.4/cycle    758.6 us/cycle  139.55 us each
+anatomy: kernel kernel_mul_mv_f32_f32_4                                    78.9/cycle    709.5 us/cycle    8.99 us each
+anatomy: kernel kernel_qwen4_gdn_front                                     58.5/cycle    580.1 us/cycle    9.92 us each
+anatomy: kernel kernel_qwen4_gdn_scan_r4                                   58.5/cycle    536.4 us/cycle    9.18 us each
+anatomy: kernel kernel_mul_mv_f16_f32_4                                    39.6/cycle    417.9 us/cycle   10.56 us each
+anatomy: kernel kernel_rms_norm_mul_f32_4                                  82.9/cycle    380.1 us/cycle    4.58 us each
+anatomy: kernel kernel_qwen35_attn_decode3_r2                               9.2/cycle    367.6 us/cycle   39.82 us each
+anatomy: kernel kernel_qwen35_attn_merge3                                  10.6/cycle    359.4 us/cycle   34.02 us each
+anatomy: kernel kernel_qwen4_router_topk                                   40.5/cycle    288.4 us/cycle    7.12 us each
+anatomy: kernel kernel_qwen35_gdn_out                                      58.5/cycle    179.4 us/cycle    3.07 us each
+anatomy: kernel kernel_qwen4_moe_reduce                                    40.5/cycle    176.2 us/cycle    4.35 us each
+anatomy: kernel kernel_add2_f32                                            80.9/cycle    166.4 us/cycle    2.06 us each
+anatomy: kernel kernel_qwen4_attn_prep                                     10.9/cycle    160.0 us/cycle   14.72 us each
+anatomy: kernel kernel_mul_mv_ext_q8_0_f32_r1_2                             1.4/cycle     79.3 us/cycle   58.37 us each
+anatomy: kernel kernel_qwen35_attn_decode3_r1                               1.3/cycle     44.9 us/cycle   33.70 us each
+anatomy: kernel kernel_qwen4_attn_decode_npt8                               0.7/cycle     33.0 us/cycle   48.52 us each
+anatomy: kernel kernel_qwen35_mv_q8_0_rows2+kernel_dsv4_tp_keepalive        0.0/cycle     24.5 us/cycle 1911.88 us each
+anatomy: kernel kernel_mul_mv_ext_f16_f32_r1_2                              1.4/cycle     15.4 us/cycle   11.32 us each
+anatomy: kernel kernel_mul_mm_q8_0_f32                                      0.0/cycle     14.9 us/cycle  581.54 us each
+anatomy: kernel kernel_qwen4_attn_merge_wide_npt8                           0.7/cycle     12.7 us/cycle   18.64 us each
+anatomy: kernel kernel_qwen4_argmax                                         2.0/cycle      9.0 us/cycle    4.57 us each
+anatomy: kernel kernel_qwen35_mtp_concat                                    1.0/cycle      6.4 us/cycle    6.37 us each
+anatomy: kernel kernel_mul_mm_f16_f32                                       0.0/cycle      2.2 us/cycle   85.77 us each
+anatomy: kernel blit:tensor_copy                                            1.0/cycle      2.1 us/cycle    2.16 us each

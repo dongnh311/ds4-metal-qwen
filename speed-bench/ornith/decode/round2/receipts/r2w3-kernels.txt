@@ -1,0 +1,12 @@
+qwen35 attention merge fold (round 2 Plan B)
+  attn merge fold pos0=40 split_keys=16 rows=1: bit-identical
+  attn merge fold pos0=40 split_keys=16 rows=2: bit-identical
+  attn merge fold pos0=2046 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=2046 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=2100 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=2100 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=8250 split_keys=64 rows=1: bit-identmerge3_fold dispatched under DS4_QWEN35_ATTN_MERGE_FOLD=1 failed
+  attn merge fold pos0=8250 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=32766 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=32766 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=63 split_keys=64 rows=1: bit-identical (fold did not run)

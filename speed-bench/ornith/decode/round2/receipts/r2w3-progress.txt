@@ -1,0 +1,64 @@
+11:32:57 window steps-r2w3.sh on 3ab9eed7
+paused
+no model processes
+11:32:58 start kernels
+11:33:03 end kernels rc=1
+qwen35 attention merge fold (round 2 Plan B)
+  attn merge fold pos0=40 split_keys=16 rows=1: bit-identical
+  attn merge fold pos0=40 split_keys=16 rows=2: bit-identical
+  attn merge fold pos0=2046 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=2046 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=2100 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=2100 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=8250 split_keys=64 rows=1: bit-identmerge3_fold dispatched under DS4_QWEN35_ATTN_MERGE_FOLD=1 failed
+  attn merge fold pos0=8250 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=32766 split_keys=64 rows=1: bit-identical
+  attn merge fold pos0=32766 split_keys=64 rows=2: bit-identical
+  attn merge fold pos0=63 split_keys=64 rows=1: bit-identical (fold did not run)
+11:33:03 kernel tests failed: stop
+11:33:03 start bench-attn
+11:33:08 end bench-attn rc=0
+bench decode3        decode  pos=2048   T=1    rows=1:    0.503 ms, K/V read 0.004 GB ->    8.3 GB/s (floor 0.017 ms)
+bench decode3-fold   decode  pos=2048   T=1    rows=1:    0.531 ms, K/V read 0.004 GB ->    7.9 GB/s (floor 0.017 ms)
+bench decode3        decode  pos=2048   T=2    rows=2:    0.638 ms, K/V read 0.004 GB ->    6.6 GB/s (floor 0.017 ms)
+bench decode3-fold   decode  pos=2048   T=2    rows=2:    0.646 ms, K/V read 0.004 GB ->    6.5 GB/s (floor 0.017 ms)
+bench decode3        decode  pos=32768  T=1    rows=1:    0.899 ms, K/V read 0.067 GB ->   74.7 GB/s (floor 0.268 ms)
+bench decode3-fold   decode  pos=32768  T=1    rows=1:    0.787 ms, K/V read 0.067 GB ->   85.3 GB/s (floor 0.268 ms)
+bench decode3        decode  pos=32768  T=2    rows=2:    1.127 ms, K/V read 0.067 GB ->   59.6 GB/s (floor 0.268 ms)
+bench decode3-fold   decode  pos=32768  T=2    rows=2:    0.888 ms, K/V read 0.067 GB ->   75.6 GB/s (floor 0.268 ms)
+bench decode3        decode  pos=131072 T=1    rows=1:    1.840 ms, K/V read 0.268 GB ->  145.9 GB/s (floor 1.074 ms)
+bench decode3-fold   decode  pos=131072 T=1    rows=1:    1.679 ms, K/V read 0.268 GB ->  159.9 GB/s (floor 1.074 ms)
+bench decode3        decode  pos=131072 T=2    rows=2:    1.937 ms, K/V read 0.268 GB ->  138.6 GB/s (floor 1.074 ms)
+bench decode3-fold   decode  pos=131072 T=2    rows=2:    1.739 ms, K/V read 0.268 GB ->  154.4 GB/s (floor 1.074 ms)
+11:33:08 start g1-64
+11:34:18 end g1-64 rc=0
+11:34:18 identity chunk 64 (merge fold) vs window M: 0 differ
+11:34:18 start g1-512
+11:34:53 end g1-512 rc=0
+11:34:53 identity chunk 512 (merge fold) vs window M: 0 differ
+11:34:53 start g1-2048
+11:35:23 end g1-2048 rc=0
+11:35:23 identity chunk 2048 (merge fold) vs window M: 0 differ
+11:35:23 start mtp-cli
+11:40:03 end mtp-cli rc=0
+11:40:03 start verify-batch
+11:40:18 end verify-batch rc=0
+11:40:18 identity failed: no A/B
+11:40:18 start ab
+12:04:41 end ab rc=0
+m4_ab: 2048     base decode 89.2 / lever 90.0  base prefill 1758 / lever 1814
+m4_ab: 32768    base decode 68.3 / lever 74.2  base prefill 1620 / lever 1633
+m4_ab: paired 2048     n=4 mean=+0.9% sd=0.9% min=+0.1% max=+1.8% mismatches=0
+m4_ab: paired 32768    n=4 mean=+8.6% sd=1.4% min=+7.0% max=+10.1% mismatches=0
+m4_ab: lever run done (no gate; compare against the Task 3 baseline by hand)
+12:04:41 start ab128
+12:23:38 end ab128 rc=0
+128k m4_ab: 131072   base decode 45.5 / lever 47.8  base prefill 860 / lever 871
+128k m4_ab: paired 131072   n=1 mean=+5.2% sd=0.0% min=+5.2% max=+5.2% mismatches=0
+128k m4_ab: lever run done (no gate; compare against the Task 3 baseline by hand)
+12:23:38 window r2w3 ok=0
+12:23:38 steps rc=1; restore
+restored (backend_ok after 62x2s)
+12:25:46 restored
+status: backend_ok True last_byte_ago_s 3184.4
+12:25:46 window done rc=1
