@@ -37,6 +37,19 @@ class ParseTest(unittest.TestCase):
         self.assertIn("accept 0.870", p.last_line(LOG, "Ornith spec stats:"))
         self.assertIn("3.10 of 8", p.last_line(LOG, "Ornith verify expert overlap:"))
 
+    def test_cb_decode_skips_small_prefill_buffers(self):
+        # an --mtp prefill leaves small buffers (the MTP catch-up) between its big chunks; only the
+        # buffers after the last prefill chunk are decode
+        log = ("ds4: cb command batch: driver 30 us, queue-wait 5 us, gpu 812000 us, gap-from-prev-gpu-end 0 us\n"
+               "ds4: cb command batch: driver 30 us, queue-wait 5 us, gpu 9000 us, gap-from-prev-gpu-end 15000 us\n"
+               "ds4: cb command batch: driver 30 us, queue-wait 5 us, gpu 700000 us, gap-from-prev-gpu-end 0 us\n"
+               "ds4: cb command batch: driver 30 us, queue-wait 5 us, gpu 8000 us, gap-from-prev-gpu-end 12000 us\n"
+               "ds4: cb command batch: driver 20 us, queue-wait 4 us, gpu 9000 us, gap-from-prev-gpu-end 1000 us\n")
+        d = p.cb_decode(log)
+        self.assertEqual(d["n"], 2)           # the two buffers after the last chunk (700 ms)
+        self.assertAlmostEqual(d["gpu_ms"], 17.0)
+        self.assertAlmostEqual(d["gap_ms"], 13.0)
+
     def test_empty_log(self):
         self.assertIsNone(p.gen_tps(""))
         self.assertEqual(p.cb_decode("")["n"], 0)

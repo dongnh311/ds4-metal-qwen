@@ -23,8 +23,12 @@ Spec: `docs/superpowers/specs/2026-10-02-ornith-decode-design.md` §3. Plan A:
   - The cost comes out at 0.16-0.25 ms per mark.
   - Level 2 against level 3 at 2K gives the same order of cost: 0.15-0.21 ms per mark.
 - **Cycle anatomy** comes from `DS4_QWEN35_SPEC_STATS` (wall time per cycle).
-- **GPU busy** comes from `DS4_METAL_CB_TIMES`: decode buffers under 50 ms of GPU time, GPU time over GPU
-  time plus gaps.
+- **GPU busy** comes from `DS4_METAL_CB_TIMES`: the buffers after the last prefill chunk (a buffer over
+  50 ms of GPU time), GPU time over GPU time plus gaps.
+  - An `--mtp` prefill leaves small MTP catch-up buffers between its chunks. The first parser counted
+    them as decode; the final-review fix corrected the 32K and 128K busy figures from 0.932 and 0.835.
+  - The CB log stops after 400 buffers, so at 128K the busy figure covers the first part of decode
+    only.
 
 ## Plain decode, ms per step, corrected
 
@@ -45,9 +49,9 @@ Against the byte floor at ~290 GB/s:
 
 | context | rate | accept | tokens/cycle | cycle ms | verify | draft | host + outside | GPU busy | GPU idle ms/cycle |
 |---|---|---|---|---|---|---|---|---|---|
-| 2K | 84.0 t/s | 0.677 | 1.672 | 20.02 | 18.23 | 1.61 | 0.18 | 0.927 | 1.47 |
-| 32K | 64.9 t/s | 0.709 | 1.703 | 26.29 | 24.08 | 2.09 | 0.12 | 0.932 | 1.78 |
-| 128K | 41.2 t/s | 0.787 | 1.781 | 42.10 | 37.36 | 4.57 | 0.17 | 0.835 | 6.93 |
+| 2K | 84.0 t/s | 0.677 | 1.672 | 20.02 | 18.23 | 1.61 | 0.18 | 0.933 | 1.34 |
+| 32K | 64.9 t/s | 0.709 | 1.703 | 26.29 | 24.08 | 2.09 | 0.12 | 0.959 | 1.08 |
+| 128K | 41.2 t/s | 0.787 | 1.781 | 42.10 | 37.36 | 4.57 | 0.17 | 0.954 | 1.94 |
 
 - **The verify costs 1.26-1.28 plain steps.** The corrected split shows where at 2K:
   - its MoE costs 7.55 ms against 4.82 ms for a plain step (x1.57), because each row reads its 8 experts
@@ -71,7 +75,7 @@ Against the byte floor at ~290 GB/s:
 | lever | projection at 2K | at 32K | basis |
 |---|---|---|---|
 | **L2 two-row MoE** | **+10.6%** | **+7.6%** | verify MoE ms x expert-byte saving, about 25%: (16 - overlap) routed + 1 shared read, against 16 + 2 |
-| L1 cycle overhead | +2-3% | +2-3% | about a third of the measured GPU idle (multi-flush during the verify encode, a shorter readback before the draft); the rest needs the draft on the GPU |
+| L1 cycle overhead | +2% | +1-2% | about a third of the measured GPU idle (1.34 ms per cycle at 2K, 1.08 at 32K): multi-flush during the verify encode, a shorter readback before the draft; the rest needs the draft on the GPU |
 | L3 launch and encode | not projected | not projected | the per-kernel inefficiency is real (MoE ~55%, attention ~50% of floor), but no lossless fusion is identified without a microbench |
 | L4 MTP depth 2 | not built | not built | a 3-row verify adds ~+26% of a plain step per row; at 0.68-0.79 first-draft acceptance, the second draft needs well over 50% conditional acceptance to break even. Unmeasured, so not built (spec: build only on a measured projection of at least +5%) |
 | L5 decode attention, 32K | up to +10% if it reached 70% of floor | same | the order-preserving form is unproven |

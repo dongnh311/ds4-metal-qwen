@@ -1,5 +1,9 @@
 # Ornith decode Plan B: two-row MoE in the MTP verify (lever L2)
 
+> **Status:** executed, measured, and not merged. The levers gave no decode gain (see
+> `speed-bench/ornith/decode/REPORT.md`). Their code and env knobs exist only on the local branch
+> `feature/ornith-decode` at `01d4bab0`, not on develop.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Read each routed expert that both rows of a 2-row MTP verify route to once instead of twice,

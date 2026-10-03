@@ -18,17 +18,17 @@ def gen_tps(text):
 
 
 def cb_decode(text):
-    gpu = gap = 0.0
-    n = 0
-    for g, gp in re.findall(r"ds4: cb [^:]*: driver [\d.]+ us, queue-wait [\d.]+ us, gpu ([\d.]+) us, "
-                            r"gap-from-prev-gpu-end ([\d.]+) us", text):
-        g, gp = float(g), float(gp)
-        if g > PREFILL_GPU_US:
-            continue
-        gpu += g / 1000.0
-        gap += gp / 1000.0
-        n += 1
-    return {"n": n, "gpu_ms": gpu, "gap_ms": gap, "busy": gpu / (gpu + gap) if gpu + gap > 0 else None}
+    """Decode buffers: those after the last prefill chunk (a buffer over PREFILL_GPU_US of GPU
+    time).  An --mtp prefill leaves small MTP catch-up buffers between its chunks, so a
+    per-buffer size filter alone would count them as decode."""
+    rows = [(float(g), float(gp)) for g, gp in
+            re.findall(r"ds4: cb [^:]*: driver [\d.]+ us, queue-wait [\d.]+ us, gpu ([\d.]+) us, "
+                       r"gap-from-prev-gpu-end ([\d.]+) us", text)]
+    last_prefill = max((i for i, (g, _) in enumerate(rows) if g > PREFILL_GPU_US), default=-1)
+    decode = rows[last_prefill + 1:]
+    gpu = sum(g for g, _ in decode) / 1000.0
+    gap = sum(gp for _, gp in decode) / 1000.0
+    return {"n": len(decode), "gpu_ms": gpu, "gap_ms": gap, "busy": gpu / (gpu + gap) if gpu + gap > 0 else None}
 
 
 def split_means(text, what):

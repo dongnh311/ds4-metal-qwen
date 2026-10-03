@@ -46,7 +46,8 @@ records, not the lever code.
   - head 2.0 ms, ~95%.
 - The MTP verify costs 1.26 plain steps. Its MoE is x1.57, because each row reads its experts again.
   The two rows share 3.2 of 8 routed experts per layer.
-- The GPU idles ~7% of an MTP cycle, between the verify, the draft and the next verify.
+- The GPU idles ~7% of an MTP cycle at 2K and ~4-5% at 32K and 128K, between the verify, the draft and
+  the next verify.
 - Acceptance is 0.68 at 2K, 0.71 at 32K and 0.79 at 128K, with 1.67-1.78 tokens per cycle.
 
 ## Levers tried

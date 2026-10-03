@@ -47,7 +47,8 @@ against every lever off, A-B-B-A:
 | 32K | 69.8 | 67.5 | -3.3% |
 | 128K | 45.1 | 44.7 | -0.9% |
 
-Flush every 4 against every 8, at 2K with prefetch on: 92.0 against 92.6 (+0.7%).
+Flush every 4 against every 8, at 2K with prefetch on: every 4 gave 92.6 t/s, every 8 gave 92.0 (+0.7%,
+within noise).
 
 **Decision:** both knobs stay default off. The window-C single-knob gains were within the run-to-run
 noise, and together they gain nothing at 2K and lose a little at 32K.

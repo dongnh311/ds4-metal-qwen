@@ -1,5 +1,9 @@
 # Ornith decode Plan C: decode-attention prefetch (L5) and multi-flush (L1)
 
+> **Status:** executed, measured, and not merged. The levers gave no decode gain (see
+> `speed-bench/ornith/decode/REPORT.md`). Their code and env knobs exist only on the local branch
+> `feature/ornith-decode` at `01d4bab0`, not on develop.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Close the rest of the +15% target after the two-row MoE (+10.6% at 2K, +7.6% at 32K
