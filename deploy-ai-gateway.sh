@@ -127,7 +127,35 @@ prompts = {
     "vi": "Giải thích ngắn gọn cách bộ nhớ đệm KV giúp mô hình ngôn ngữ sinh văn bản nhanh hơn.",
     "code": "Write a Python function that returns the n-th Fibonacci number iteratively, with a docstring and two doctests.",
 }
+weather_tools = [{"type": "function", "function": {
+    "name": "get_weather", "description": "Get weather for a city",
+    "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
 failed = False
+
+
+def chat(messages, max_tokens, tools=None):
+    body = {"model": "ds4", "messages": messages, "max_tokens": max_tokens, "temperature": 0, "stream": False}
+    if tools:
+        body["tools"] = tools
+    t0 = time.time()
+    req = urllib.request.Request(base + "/v1/chat/completions", json.dumps(body).encode(),
+                                 {"Content-Type": "application/json"})
+    o = json.loads(urllib.request.urlopen(req, timeout=900).read())
+    return o["choices"][0]["message"], o.get("usage", {}).get("completion_tokens", 0), time.time() - t0
+
+
+def record(name, reply):
+    """Save a reply and compare it with the reference: (status suffix, differs)."""
+    open(os.path.join(out, name + ".txt"), "w").write(reply)
+    if not ref:
+        return "", False
+    try:
+        same = open(os.path.join(ref, name + ".txt")).read() == reply
+    except OSError:
+        return ", no ref file", False
+    return (", same as ref", False) if same else (", DIFFERS from ref", True)
+
+
 try:
     for _ in range(900):
         if srv.poll() is not None:
@@ -140,26 +168,37 @@ try:
     else:
         sys.exit("deploy: ds4-server did not come up in 900 s")
     for name, text in prompts.items():
-        body = json.dumps({"model": "ds4", "messages": [{"role": "user", "content": text}],
-                           "max_tokens": 300, "temperature": 0, "stream": False}).encode()
-        t0 = time.time()
-        req = urllib.request.Request(base + "/v1/chat/completions", body, {"Content-Type": "application/json"})
-        o = json.loads(urllib.request.urlopen(req, timeout=900).read())
-        dt = time.time() - t0
-        msg = o["choices"][0]["message"]
+        msg, n, dt = chat([{"role": "user", "content": text}], 300)
         reply = (msg.get("reasoning_content") or "") + "\n---\n" + (msg.get("content") or "")
-        open(os.path.join(out, name + ".txt"), "w").write(reply)
-        n = o.get("usage", {}).get("completion_tokens", 0)
         status = "ok" if n > 0 and reply.strip("\n-") else "EMPTY"
-        if ref:
-            try:
-                same = open(os.path.join(ref, name + ".txt")).read() == reply
-                status += ", same as ref" if same else ", DIFFERS from ref"
-                failed |= not same
-            except OSError:
-                status += ", no ref file"
-        failed |= n == 0
-        print(f"deploy: smoke {name}: {n} tokens in {dt:.1f} s ({n / dt:.1f} t/s incl. prefill), {status}")
+        suffix, differs = record(name, reply)
+        failed |= differs or n == 0
+        print(f"deploy: smoke {name}: {n} tokens in {dt:.1f} s ({n / dt:.1f} t/s incl. prefill), {status}{suffix}")
+
+    # A greedy tool round trip: leg 2 answers a tool result on top of leg 1's KV checkpoint, a turn the
+    # single-turn prompts never reach. Its wording is judged only against the reference: Ornith garbles
+    # the first word here ("Thú Huế") and llama.cpp on the same GGUF gives the same text. The call id is
+    # random, so it is not recorded. 4608 tokens leave room for a full --think-budget 4096 before the call.
+    msgs = [{"role": "user", "content": "Thời tiết Huế? Dùng tool rồi tóm tắt."}]
+    msg, n1, dt = chat(msgs, 4608, weather_tools)
+    calls = msg.get("tool_calls") or []
+    reply = ((msg.get("reasoning_content") or "") + "\n---\n" + (msg.get("content") or "") + "\n---\n" +
+             "\n".join(c["function"]["name"] + " " + c["function"]["arguments"] for c in calls))
+    n2 = 0
+    call = next((c for c in calls if c["function"]["name"] == "get_weather"), None)
+    if call is None:
+        status = "NO TOOL CALL in leg 1"
+    else:
+        msgs += [msg, {"role": "tool", "tool_call_id": call["id"],
+                       "content": '{"temp_c": 31, "condition": "nắng nhẹ"}'}]
+        msg, n2, dt2 = chat(msgs, 4608, weather_tools)
+        dt += dt2
+        content = msg.get("content") or ""
+        reply += "\n===\n" + (msg.get("reasoning_content") or "") + "\n---\n" + content
+        status = "ok" if "31" in content else "leg 2 does not use the tool result (no 31)"
+    suffix, differs = record("tool", reply)
+    failed |= differs or status != "ok"
+    print(f"deploy: smoke tool: leg 1 {n1} + leg 2 {n2} tokens in {dt:.1f} s, {status}{suffix}")
 finally:
     srv.terminate()
     try:
