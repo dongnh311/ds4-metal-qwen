@@ -50,6 +50,17 @@ class GgufLiteTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             g.nbytes(99, [32])
 
+    def test_q4k_short_final_block(self):
+        self.assertEqual(g.q4k_row_bytes(768), 432)
+        self.assertEqual(g.q4k_row_bytes(640), 368)
+        self.assertEqual(g.q4k_row_bytes(320), 192)
+        self.assertEqual(g.q4k_row_bytes(704), 400)
+        self.assertEqual(g.q4k_row_bytes(672), 0)
+        self.assertEqual(g.nbytes(12, [640, 3, 2]), 368 * 6)
+        self.assertEqual(g.nbytes(12, [768, 3]), 432 * 3)
+        with self.assertRaises(ValueError):
+            g.nbytes(12, [672, 3])
+
     def test_not_gguf(self):
         (self.p / "x").write_bytes(b"NOPE" + bytes(20))
         with self.assertRaises(ValueError):
