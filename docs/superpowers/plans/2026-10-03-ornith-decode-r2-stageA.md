@@ -874,3 +874,65 @@ git commit -m "speed-bench/ornith/decode: round 2 window 1, kernel roofline and 
     `KERNELS.md`, using superpowers:writing-plans.
   - **With none:** apply spec §7's stopping rule. Write `speed-bench/ornith/decode/round2/REPORT.md` and go to
     the final review of the tool and the records.
+
+### Task 4 (added after window 1): the anatomy of a verify's dispatches
+
+Added by the Task 3 ruling. No kernel family passed §4's rule, and the step-model residual is 4.14 ms per
+verify, 21% of the cycle. This task reads that residual's anatomy before §7's stopping rule applies.
+
+**Files:**
+- Create: `speed-bench/ornith/decode/round2/timeline_anatomy.py`, which parses a `DS4_METAL_ENCODER_TIMELINE`
+  file.
+- Create: `speed-bench/ornith/decode/round2/test_timeline_anatomy.py`.
+- Create: `speed-bench/ornith/decode/round2/ANATOMY.md`, plus receipts.
+- Create (scratch): `$SCR/ornith-decode/steps-r2w2.sh`.
+
+**Interfaces:**
+- Consumes the timeline format written by `ds4_metal.m` `ds4_gpu_timeline_resolve`:
+  - `B <seq> <n_encoders> <gpu_start_ns> <gpu_end_ns>`;
+  - `E <seq> <idx> <start_ns> <end_ns> <dur_us> <gap_us> <caller> <n_dispatch> <tg> <tpt> <kernel>`.
+- Produces:
+  - `parse(lines) -> list[dict]`: one dict per buffer, with `seq`, `start_ns`, `end_ns` and `encs`, a list of
+    dicts with `dur_us`, `gap_us`, `n_dispatch` and `kernel`;
+  - `decode_buffers(bufs, prefill_ms=50.0)`;
+  - `anatomy(bufs, small_us=10.0) -> dict`, per MTP cycle;
+  - a CLI, `python3 timeline_anatomy.py FILE`.
+
+**The anatomy measures, per MTP cycle** (cycles = encoders whose kernel name contains `mtp_concat`, one per
+draft):
+- **Buffer GPU time:** the sum of B `end - start`.
+- **Encoder busy:** the sum of E `dur_us`.
+- **Gaps inside buffers:** the sum of E `gap_us`.
+- **Idle between buffers:** the next B start minus the previous B end, over consecutive decode buffers.
+- **Encoder and dispatch counts.**
+- **Small encoders** (`dur_us < 10`): their count and time.
+- **Per-kernel** count and time.
+
+The B and E timestamps come from different clocks, so the two are never subtracted from each other.
+
+- [ ] **Step 1: RED.** Write `test_timeline_anatomy.py`, with synthetic lines:
+  - one 60 ms prefill buffer;
+  - two cycles, each a verify buffer of 3 encoders and a draft buffer of 2 encoders, the draft holding
+    `kernel_qwen35_mtp_concat`.
+
+  The asserts: cycles = 2, the prefill buffer is excluded, the per-cycle busy, gap, idle and small-encoder
+  figures equal the hand sums, and the kernel table is sorted by time. Run
+  `python3 -m unittest speed-bench/ornith/decode/round2/test_timeline_anatomy.py`. Expected: an ImportError
+  for `timeline_anatomy`.
+- [ ] **Step 2: GREEN.** Write `timeline_anatomy.py`, then run the same command. Expected: OK.
+- [ ] **Step 3: Commit.**
+- [ ] **Step 4: Window r2w2,** about 10 min, with heads-up and "done". Two CLI runs at 2K `--mtp --temp 0`,
+  `-n 128`, on the stage-0 prompt:
+  1. `DS4_METAL_ENCODER_TIMELINE=$S/tl-2k.txt DS4_QWEN35_SPEC_STATS=1`;
+  2. `DS4_QWEN35_SPEC_STATS=1` only, which gives the reference cycle time without the timeline's pass
+     boundaries.
+- [ ] **Step 5: Write `ANATOMY.md`.** It holds:
+  - the per-cycle table;
+  - the top kernels;
+  - the timeline's overhead: its cycle time against run 2's;
+  - the fusion ruling. A candidate is a run of back-to-back small dispatches whose removable time (their gaps
+    plus their launch share) is at least 0.60 ms per cycle, with the per-element code unchanged.
+
+  Then commit, and branch:
+  - **with candidates:** Plan B on those fusions;
+  - **with none:** §7's stopping rule and the round-2 report.
