@@ -51517,14 +51517,19 @@ struct ds4_qwen35_attn_decode3_args {
 };
 
 /* Round 2 Plan B: kernel_qwen35_attn_merge3_fold (bit-identical to merge3)
- * when DS4_QWEN35_ATTN_MERGE_FOLD=1, read fresh on every dispatch like the
- * split knob above; a failed startup self-check pins merge3. */
+ * is the default; DS4_QWEN35_ATTN_MERGE_FOLD=0 selects merge3. The knob is
+ * read fresh on every dispatch like the split knob above, and a failed
+ * startup self-check pins merge3. */
 static bool g_qwen35_merge_fold_off;
 static uint64_t g_qwen35_merge_fold_dispatches;
 
-static int qwen35_merge3_kernel(void) {
+static bool qwen35_merge_fold_wanted(void) {
     const char *e = getenv("DS4_QWEN35_ATTN_MERGE_FOLD");
-    if (!g_qwen35_merge_fold_off && e && strcmp(e, "1") == 0) {
+    return !(e && strcmp(e, "0") == 0);
+}
+
+static int qwen35_merge3_kernel(void) {
+    if (!g_qwen35_merge_fold_off && qwen35_merge_fold_wanted()) {
         g_qwen35_merge_fold_dispatches++;
         return QWEN4_K_QWEN35_ATTN_MERGE3_FOLD;
     }
@@ -51543,8 +51548,7 @@ uint64_t ds4_gpu_qwen35_attn_merge_fold_dispatches(void) {
 int ds4_gpu_qwen35_attn_merge_fold_selfcheck(void) {
     static int done = -1;
     if (done >= 0) return done;
-    const char *e = getenv("DS4_QWEN35_ATTN_MERGE_FOLD");
-    if (!(e && strcmp(e, "1") == 0)) return 1;   /* knob off: nothing to check yet */
+    if (!qwen35_merge_fold_wanted()) return 1;   /* knob off: nothing to check yet */
     const uint32_t H = 16u, Hkv = 2u, D = 256u, ns0 = 256u, ns1 = 37u;
     const uint64_t pf = ((uint64_t)ns0 + ns1) * H * (2u + D), of = 2ull * H * D;
     float *hp = malloc(pf * sizeof(float)), *hg = malloc(of * sizeof(float));
