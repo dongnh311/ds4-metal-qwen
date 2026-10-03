@@ -59990,6 +59990,7 @@ static bool qwen4_graph_expert_ok(const ds4_tensor *t) {
                  t->type == DS4_TENSOR_F16 || t->type == DS4_TENSOR_BF16 || t->type == DS4_TENSOR_F32 ||
                  ((t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K || t->type == DS4_TENSOR_IQ2_XXS) &&
                   (t->dim[0] % 256u) == 0) ||
+                 qwen4_down_is_trimmed(t) ||
                  (qwen4_graph_gsq_ok(t->type) && qwen4_type_is_gsq_expert(t->type) && tensor_type(t->type) &&
                   (t->dim[0] % tensor_type(t->type)->block_elems) == 0));
 }

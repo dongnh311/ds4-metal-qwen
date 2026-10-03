@@ -37,6 +37,18 @@ static void check_trimmed_layouts(void) {
     CHECK(!qwen4_down_is_trimmed(&t));                 /* whole blocks: nothing to trim */
     g_ds4_shape.n_ff_exp = 640;
 
+#ifdef DS4_HAS_QWEN4_GPU
+    /* the Metal graph runs trimmed down rows; a Q4_K row of 640 that is not the ff width stays refused */
+    ds4_tensor down = { .ndim = 3, .dim = {640, 2560, 512}, .type = DS4_TENSOR_Q4_K };
+    CHECK(qwen4_graph_expert_ok(&down));
+    ds4_tensor odd = { .ndim = 3, .dim = {640, 2560, 512}, .type = DS4_TENSOR_Q4_K };
+    g_ds4_shape.n_ff_exp = 512;
+    CHECK(!qwen4_graph_expert_ok(&odd));
+    g_ds4_shape.n_ff_exp = 640;
+    ds4_tensor gate = { .ndim = 3, .dim = {2560, 640, 512}, .type = DS4_TENSOR_Q4_K };
+    CHECK(qwen4_graph_expert_ok(&gate));
+#endif
+
     /* a Q8_0 MTP down beside trimmed Q4_K layers is accepted (the call returns) */
     const bool tr[3] = { true, true, false };
     const uint32_t ty[3] = { DS4_TENSOR_Q4_K, DS4_TENSOR_Q4_K, DS4_TENSOR_Q8_0 };
