@@ -2088,6 +2088,74 @@ static void test_moe_grouped(arena_t *a) {
     free(sel); free(x);
 }
 
+/* Trimmed Q4_K down rows (docs/superpowers/specs/2026-10-03-qwen4-q4k-down-trim-design.md): a padded arena
+ * and its trimmed copy (each row cut after 16 + (F % 256) / 2 bytes of its last block; the padded arena's
+ * tail is random and nonzero) must give bit-identical down outputs through every decode geometry and the
+ * prefill GEMM. */
+static void test_down_trim(arena_t *a, uint32_t F, uint32_t T) {
+    const uint32_t NE = 8, slots = 6, E = 256, DF = (F + 255u) / 256u * 256u;
+    const uint32_t in_row = DF / 256u * 144u, out_row = F / 256u * 144u + 16u + (F % 256u) / 2u;
+    double *dw;
+    const uint64_t pad_off = arena_q4_K(a, (uint64_t)NE * E, DF, &dw, 0.05f);
+    free(dw);
+    const uint64_t trim_off = arena_alloc(a, (uint64_t)NE * E * out_row);
+    for (uint64_t r = 0; r < (uint64_t)NE * E; r++)
+        memcpy(a->base + trim_off + r * out_row, a->base + pad_off + r * in_row, out_row);
+    float *mid = rand_vec((uint64_t)T * slots * F, 1.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * 4);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < slots; s++) sel[t * slots + s] = (int32_t)((t * 5u + s * 3u) % NE);
+    ds4_gpu_tensor *gmid = upload(mid, (uint64_t)T * slots * F);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    require_ok(ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "trim sel write");
+    ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * slots * E);
+    const uint64_t np = (uint64_t)T * slots * E;
+    float *ref = malloc(np * sizeof(float)), *got = malloc(np * sizeof(float));
+    require_ok(ref && got, "trim allocation");
+    const char *mr[] = {"0", "2", "4"};
+    for (uint32_t spec = 0; spec < 2u; spec++) {
+        setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", spec ? "1" : "0", 1);
+        for (uint32_t m = 0; m < 3u; m++) {
+            setenv("DS4_QWEN4_MOE_MR_DOWN", mr[m], 1);
+            ds4_gpu_qwen4_set_down_trimmed(false);
+            require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, pad_off, 12u, NE, T, slots,
+                                                     F, E, 0, UINT32_MAX), "padded down");
+            require_ok(ds4_gpu_tensor_read(gpart, 0, ref, np * sizeof(float)), "padded down read");
+            ds4_gpu_qwen4_set_down_trimmed(true);
+            require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, trim_off, 12u, NE, T, slots,
+                                                     F, E, 0, UINT32_MAX), "trimmed down");
+            require_ok(ds4_gpu_tensor_read(gpart, 0, got, np * sizeof(float)), "trimmed down read");
+            check_exact_f32("trimmed Q4_K down (decode rows)", got, ref, np);
+        }
+    }
+    unsetenv("DS4_QWEN4_MOE_MV_SPECIALIZE");
+    unsetenv("DS4_QWEN4_MOE_MR_DOWN");
+    /* prefill path: lists + tiled GEMM */
+    ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * T * 4);
+    ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc((uint64_t)NE * 4);
+    require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, T), "trim lists");
+    ds4_gpu_qwen4_set_down_trimmed(false);
+    require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, pad_off, 12u,
+                                                NE, T, slots, slots, F, E, T), "padded mm down");
+    require_ok(ds4_gpu_tensor_read(gpart, 0, ref, np * sizeof(float)), "padded mm read");
+    ds4_gpu_qwen4_set_down_trimmed(true);
+    require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, trim_off, 12u,
+                                                NE, T, slots, slots, F, E, T), "trimmed mm down");
+    require_ok(ds4_gpu_tensor_read(gpart, 0, got, np * sizeof(float)), "trimmed mm read");
+    check_exact_f32("trimmed Q4_K down (prefill GEMM)", got, ref, np);
+    /* the flag must not stick: the padded stride again with it cleared */
+    ds4_gpu_qwen4_set_down_trimmed(false);
+    require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, pad_off, 12u,
+                                                NE, T, slots, slots, F, E, T), "padded mm down again");
+    require_ok(ds4_gpu_tensor_read(gpart, 0, got, np * sizeof(float)), "padded again read");
+    check_exact_f32("padded Q4_K down after the flag is cleared", got, ref, np);
+    free(ref); free(got); free(mid); free(sel);
+    ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gcounts);
+    ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gpart);
+    printf("  trimmed Q4_K down F=%u T=%u: decode rows (MR 0/2/4, generic/specialized) and prefill GEMM byte-exact vs padded\n",
+           F, T);
+}
+
 #endif
 
 static void test_hc_pair_groups(arena_t *a) {
@@ -3603,6 +3671,12 @@ int main(void) {
     test_mv_ext_groups(&arena);
 #ifdef __APPLE__
     test_moe_grouped(&arena);
+    test_down_trim(&arena, 640, 1);
+    test_down_trim(&arena, 640, 2);
+    test_down_trim(&arena, 640, 9);
+    test_down_trim(&arena, 640, 128);
+    test_down_trim(&arena, 320, 2);
+    test_down_trim(&arena, 320, 128);
 #endif
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);

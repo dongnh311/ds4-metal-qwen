@@ -46,6 +46,25 @@ class RegistryTest(unittest.TestCase):
         self.assertIn("/prod/ds4-metal/ds4-server", cmd)
         self.assertEqual(cwd, "/prod/ds4-metal")
 
+    def test_retarget_model(self):
+        self.assertEqual(qwen_gate.retarget_model(["s", "-m", "a.gguf", "-c", "8"], "b.gguf"),
+                         ["s", "-m", "b.gguf", "-c", "8"])
+        self.assertEqual(qwen_gate.retarget_model(["s", "-m", "a.gguf"], None), ["s", "-m", "a.gguf"])
+        with self.assertRaises(SystemExit):
+            qwen_gate.retarget_model(["s"], "b.gguf")
+
+    def test_branch_model_only_on_the_branch_side(self):
+        old = qwen_gate.BRANCH_MODEL
+        qwen_gate.BRANCH_MODEL = "/trim.gguf"
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                branch, _ = qwen_gate.registry_command(registry(tmp), "/work", 1, "/kv")
+                prod, _ = qwen_gate.registry_command(registry(tmp), None, 1, "/kv")
+        finally:
+            qwen_gate.BRANCH_MODEL = old
+        self.assertEqual(branch[branch.index("-m") + 1], "/trim.gguf")
+        self.assertEqual(prod[prod.index("-m") + 1], "/m.gguf")
+
     def test_prefers_qwen_row_over_earlier_ds4_rows(self):
         # PROD serves several ds4 models (Ornith first); the gate is for Qwen3.8.
         # Ornith's command also names a Qwen3.8 draft-vocab file; only -m counts.

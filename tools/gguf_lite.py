@@ -1,8 +1,9 @@
 """Minimal GGUF v3 reader/writer for ds4's repack tools: metadata and tensor infos are parsed, tensor data
-is copied by offset (never interpreted)."""
+is copied by offset (never interpreted; a "trim" source copies a prefix of every row)."""
 import hashlib
 import os
 import struct
+import sys
 
 T_U8, T_I8, T_U16, T_I16, T_U32, T_I32, T_F32, T_BOOL, T_STR, T_ARR, T_U64, T_I64, T_F64 = range(13)
 _SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
@@ -13,9 +14,25 @@ BLOCK = {0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 8: (32, 34
 CHUNK = 64 << 20
 
 
+def q4k_row_bytes(n):
+    """Bytes of a Q4_K row of n values. A row that ends inside a super-block (n % 256 != 0) keeps that block's
+    16-byte header (d, dmin, 12 scale bytes) and only the 32-byte qs chunks of its real values; 0 if n is not
+    a multiple of 64 (a chunk holds 64 values)."""
+    if n % 64:
+        return 0
+    return n // 256 * 144 + (16 + n % 256 // 2 if n % 256 else 0)
+
+
 def nbytes(ttype, dims):
     if ttype not in BLOCK:
         raise ValueError("unknown tensor type %d" % ttype)
+    if ttype == 12 and dims[0] % 256:
+        row = q4k_row_bytes(dims[0])
+        if not row:
+            raise ValueError("Q4_K row of %d is not a multiple of 64" % dims[0])
+        for d in dims[1:]:
+            row *= d
+        return row
     elems, size = BLOCK[ttype]
     if dims[0] % elems:
         raise ValueError("row of %d is not a whole number of %d-blocks" % (dims[0], elems))
@@ -23,6 +40,14 @@ def nbytes(ttype, dims):
     for d in dims[1:]:
         n *= d
     return n
+
+
+def trim_rows(buf, in_row, out_row):
+    """The first out_row bytes of every in_row-byte row of buf, concatenated."""
+    if len(buf) % in_row:
+        raise ValueError("%d bytes are not whole %d-byte rows" % (len(buf), in_row))
+    view = memoryview(buf)
+    return b"".join(view[r:r + out_row] for r in range(0, len(buf), in_row))
 
 
 def _align(n, a):
@@ -92,8 +117,18 @@ def _pack_val(vt, v):
     raise ValueError("unknown metadata type %d" % vt)
 
 
-def write(path, kv, tensors, alignment):
-    """Writes a GGUF v3 file; returns {tensor name: sha256 hex of its data}."""
+def _nocache(f):
+    """macOS F_NOCACHE on an open file: a pass over a 50 GB model must not evict a serving model's pages."""
+    if sys.platform == "darwin":
+        import fcntl
+        fcntl.fcntl(f.fileno(), getattr(fcntl, "F_NOCACHE", 48), 1)
+    return f
+
+
+def write(path, kv, tensors, alignment, nocache=False):
+    """Writes a GGUF v3 file; returns {tensor name: sha256 hex of its data}. nocache bypasses the page cache
+    for the output and every source read (macOS)."""
+    keep = _nocache if nocache else (lambda f: f)
     head = [b"GGUF", struct.pack("<IQQ", 3, len(tensors), len(kv))]
     for key, (vt, v) in kv.items():
         head += [_pack_str(key), struct.pack("<I", vt), _pack_val(vt, v)]
@@ -105,7 +140,7 @@ def write(path, kv, tensors, alignment):
         off = _align(off + t["nbytes"], alignment)
     header = b"".join(head)
     shas = {}
-    with open(path, "wb") as out:
+    with keep(open(path, "wb")) as out:
         out.write(header + b"\0" * (_align(len(header), alignment) - len(header)))
         for t in tensors:
             h = hashlib.sha256()
@@ -114,10 +149,25 @@ def write(path, kv, tensors, alignment):
                     raise ValueError("%s: %d bytes of data for %d" % (t["name"], len(t["data"]), t["nbytes"]))
                 out.write(t["data"])
                 h.update(t["data"])
+            elif "trim" in t:
+                src, at, in_row, out_row = t["trim"]
+                rows_left = t["nbytes"] // out_row
+                step = max(1, CHUNK // in_row)
+                with keep(open(src, "rb")) as f:
+                    f.seek(at)
+                    while rows_left:
+                        n = min(step, rows_left)
+                        buf = f.read(n * in_row)
+                        if len(buf) != n * in_row:
+                            raise ValueError("%s: source %s ends early" % (t["name"], src))
+                        piece = trim_rows(buf, in_row, out_row)
+                        out.write(piece)
+                        h.update(piece)
+                        rows_left -= n
             else:
                 src, at = t["src"]
                 left = t["nbytes"]
-                with open(src, "rb") as f:
+                with keep(open(src, "rb")) as f:
                     f.seek(at)
                     while left:
                         buf = f.read(min(CHUNK, left))
