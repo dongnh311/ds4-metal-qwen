@@ -50,6 +50,18 @@ class GgufLiteTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             g.nbytes(99, [32])
 
+    def test_nocache_write_is_identical(self):
+        src = self.p / "src.bin"
+        src.write_bytes(bytes(range(256)) * 4)
+        def tensors():
+            return [{"name": "c", "dims": [64], "type": 0, "nbytes": 256, "src": (str(src), 0)},
+                    {"name": "t", "dims": [320, 2], "type": 12, "nbytes": 2 * 192, "trim": (str(src), 0, 432, 192)}]
+        src.write_bytes(bytes(i & 0xFF for i in range(2 * 432)))
+        a = g.write(self.p / "a.gguf", {}, tensors(), 32)
+        b = g.write(self.p / "b.gguf", {}, tensors(), 32, nocache=True)
+        self.assertEqual(a, b)
+        self.assertEqual((self.p / "a.gguf").read_bytes(), (self.p / "b.gguf").read_bytes())
+
     def test_q4k_short_final_block(self):
         self.assertEqual(g.q4k_row_bytes(768), 432)
         self.assertEqual(g.q4k_row_bytes(640), 368)

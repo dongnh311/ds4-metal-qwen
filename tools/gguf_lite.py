@@ -3,6 +3,7 @@ is copied by offset (never interpreted; a "trim" source copies a prefix of every
 import hashlib
 import os
 import struct
+import sys
 
 T_U8, T_I8, T_U16, T_I16, T_U32, T_I32, T_F32, T_BOOL, T_STR, T_ARR, T_U64, T_I64, T_F64 = range(13)
 _SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
@@ -116,8 +117,18 @@ def _pack_val(vt, v):
     raise ValueError("unknown metadata type %d" % vt)
 
 
-def write(path, kv, tensors, alignment):
-    """Writes a GGUF v3 file; returns {tensor name: sha256 hex of its data}."""
+def _nocache(f):
+    """macOS F_NOCACHE on an open file: a pass over a 50 GB model must not evict a serving model's pages."""
+    if sys.platform == "darwin":
+        import fcntl
+        fcntl.fcntl(f.fileno(), getattr(fcntl, "F_NOCACHE", 48), 1)
+    return f
+
+
+def write(path, kv, tensors, alignment, nocache=False):
+    """Writes a GGUF v3 file; returns {tensor name: sha256 hex of its data}. nocache bypasses the page cache
+    for the output and every source read (macOS)."""
+    keep = _nocache if nocache else (lambda f: f)
     head = [b"GGUF", struct.pack("<IQQ", 3, len(tensors), len(kv))]
     for key, (vt, v) in kv.items():
         head += [_pack_str(key), struct.pack("<I", vt), _pack_val(vt, v)]
@@ -129,7 +140,7 @@ def write(path, kv, tensors, alignment):
         off = _align(off + t["nbytes"], alignment)
     header = b"".join(head)
     shas = {}
-    with open(path, "wb") as out:
+    with keep(open(path, "wb")) as out:
         out.write(header + b"\0" * (_align(len(header), alignment) - len(header)))
         for t in tensors:
             h = hashlib.sha256()
@@ -142,7 +153,7 @@ def write(path, kv, tensors, alignment):
                 src, at, in_row, out_row = t["trim"]
                 rows_left = t["nbytes"] // out_row
                 step = max(1, CHUNK // in_row)
-                with open(src, "rb") as f:
+                with keep(open(src, "rb")) as f:
                     f.seek(at)
                     while rows_left:
                         n = min(step, rows_left)
@@ -156,7 +167,7 @@ def write(path, kv, tensors, alignment):
             else:
                 src, at = t["src"]
                 left = t["nbytes"]
-                with open(src, "rb") as f:
+                with keep(open(src, "rb")) as f:
                     f.seek(at)
                     while left:
                         buf = f.read(min(CHUNK, left))

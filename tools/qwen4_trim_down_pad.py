@@ -52,7 +52,7 @@ def main(argv):
         sys.exit("%s: no padded Q4_K routed down tensor; nothing to trim, nothing written" % in_path)
     tmp = out_path + ".partial"
     try:
-        shas = g.write(tmp, src.kv, tensors, src.alignment)
+        shas = g.write(tmp, src.kv, tensors, src.alignment, nocache=True)   # 100 GB of I/O off the page cache
     except BaseException:
         if os.path.exists(tmp):
             os.remove(tmp)
