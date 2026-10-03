@@ -194,9 +194,12 @@ class PairedModeTest(unittest.TestCase):
     def test_paired_flags_rejected_in_baseline_mode(self):
         with unittest.mock.patch.object(sys, "argv", ["m4_ab.py", "--mode", "baseline", "--ds4-model", "x",
                                                       "--out", _tmp_out(), "--paired"]):
-            with self.assertRaises(SystemExit) as cm:
+            import io
+            err = io.StringIO()
+            with unittest.mock.patch.object(sys, "stderr", err), self.assertRaises(SystemExit) as cm:
                 m.main()
         self.assertEqual(cm.exception.code, 2)
+        self.assertIn("apply to --mode lever only", err.getvalue())
 ```
 
 - [ ] **Step 2: Run the tests and watch them fail.**

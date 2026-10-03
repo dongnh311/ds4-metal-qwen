@@ -362,6 +362,104 @@ class SignalExitTest(unittest.TestCase):
         self.assertEqual(stopped, ["ds4"])
 
 
+class PairedModeTest(unittest.TestCase):
+    def test_paired_nonces_distinct_per_rep_and_block_shared_across_arms(self):
+        a = {m.paired_nonce(b, c, r) for b in (0, 1) for c in ("2048", "32768") for r in (0, 1)}
+        self.assertEqual(len(a), 8)
+        self.assertEqual(m.paired_nonce(0, "2048", 1), m.paired_nonce(0, "2048", 1))
+
+    def test_text_sha_separates_reasoning_and_content(self):
+        def ev(parts):
+            return [(0.0, {"choices": [{"delta": {k: v}}]}) for k, v in parts]
+        one = m.stream_text_sha(ev([("reasoning_content", "ab"), ("content", "c")]))
+        two = m.stream_text_sha(ev([("reasoning_content", "a"), ("content", "bc")]))
+        self.assertNotEqual(one, two)
+        r1 = m.stream_text_sha(ev([("reasoning_content", "x")]))
+        r2 = m.stream_text_sha(ev([("reasoning_content", "y")]))
+        self.assertNotEqual(r1, r2)
+        # chunking does not matter, only the concatenated text
+        self.assertEqual(m.stream_text_sha(ev([("content", "ab")])),
+                         m.stream_text_sha(ev([("content", "a"), ("content", "b")])))
+
+    def _run(self, role, block, samples):
+        return {"arm": role, "block": block, "rows": {},
+                "samples": [{"ctx": c, "rep": r, "decode_tps": t, "text_sha": s} for c, r, t, s in samples]}
+
+    def test_paired_summary_gain_and_spread(self):
+        runs = {"base": [self._run("base", 0, [("2048", 0, 100.0, "h")]),
+                         self._run("base", 0, [("2048", 0, 100.0, "h")])],
+                "lever": [self._run("lever", 0, [("2048", 0, 104.0, "h")]),
+                          self._run("lever", 0, [("2048", 0, 106.0, "h")])]}
+        runs["base"].append(self._run("base", 1, [("2048", 0, 90.0, "k")]))
+        runs["lever"].append(self._run("lever", 1, [("2048", 0, 90.0, "k")]))
+        p = m.paired_summary(runs, ["2048"])["2048"]
+        self.assertEqual(p["n"], 2)
+        self.assertAlmostEqual(p["mean"], 0.025)          # (+5% + 0%) / 2
+        self.assertAlmostEqual(p["min"], 0.0)
+        self.assertAlmostEqual(p["max"], 0.05)
+        self.assertEqual(p["mismatches"], 0)
+        self.assertGreater(p["sd"], 0.0)
+
+    def test_paired_summary_all_mismatch(self):
+        runs = {"base": [self._run("base", 0, [("2048", 0, 100.0, "h")])],
+                "lever": [self._run("lever", 0, [("2048", 0, 80.0, "DIFFERENT")])]}
+        p = m.paired_summary(runs, ["2048"])["2048"]
+        self.assertEqual(p["n"], 0)
+        self.assertIsNone(p["mean"])
+        self.assertEqual(p["mismatches"], 1)
+        self.assertEqual(p["mismatch_samples"], [{"block": 0, "rep": 0}])
+        self.assertIn("n=0", m.format_paired("2048", p))
+
+    def test_interleave_paired_blocks_send_same_prompts_to_both_arms(self):
+        prompts = []
+
+        class _Rec(_FakeArm):
+            def stream(self, prompt, max_tokens):
+                if not prompt.startswith(("nonce-warm", "nonce-cal")):
+                    prompts.append((self.name, prompt[:24]))
+                t, u = _FakeArm.stream(self, prompt, max_tokens)
+                return {**t, "text_sha": "same"}, u
+
+        s = m.interleave({"base": lambda: _Rec(name="base"), "lever": lambda: _Rec(name="lever")},
+                         contexts=[2048], cold_tokens=0, filler="x" * 100000, max_tokens=8, warmup=0,
+                         order=m.LEVER_ORDER, guard=lambda: None, wait_free=lambda: None,
+                         swap_used=iter([0.0] * 32).__next__, wait_idle=lambda: None,
+                         blocks=2, paired=True, reps=2)
+        self.assertEqual(len(prompts), 2 * 4 * 2)                  # blocks x runs x reps
+        b0 = {p for _, p in prompts[:8]}
+        b1 = {p for _, p in prompts[8:]}
+        self.assertEqual(len(b0), 2)                                # 2 reps, shared by all 4 runs
+        self.assertEqual(len(b1), 2)
+        self.assertFalse(b0 & b1)                                   # fresh nonces per block
+        self.assertEqual(s["paired"]["2048"]["n"], 4)               # 2 blocks x 2 reps
+        self.assertEqual(s["paired"]["2048"]["mismatches"], 0)
+
+    def test_reps_average_into_rows(self):
+        rates = iter([100.0, 110.0])
+
+        class _Two(_FakeArm):
+            def stream(self, prompt, max_tokens):
+                t, u = _FakeArm.stream(self, prompt, max_tokens)
+                if prompt.startswith(("nonce-warm", "nonce-cal")):
+                    return t, u
+                return {**t, "decode_s": 7 / next(rates)}, u      # request_rates: (8 - 1) / decode_s
+
+        run = m.measure_arm(_Two(name="base"), [2048], "x" * 100000, 8, warmup=0,
+                            swap_used=iter([0.0, 0.0]).__next__, wait_idle=lambda: None, reps=2)
+        self.assertEqual(len(run["samples"]), 2)
+        self.assertAlmostEqual(run["rows"]["2048"]["decode_tps"], 105.0, places=6)
+
+    def test_paired_flags_rejected_in_baseline_mode(self):
+        with unittest.mock.patch.object(sys, "argv", ["m4_ab.py", "--mode", "baseline", "--ds4-model", "x",
+                                                      "--out", _tmp_out(), "--paired"]):
+            import io
+            err = io.StringIO()
+            with unittest.mock.patch.object(sys, "stderr", err), self.assertRaises(SystemExit) as cm:
+                m.main()
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("apply to --mode lever only", err.getvalue())
+
+
 class _FakeArm:
     base_url = "http://127.0.0.1:18296"
     model_id = "ornith-1.5-35b-a3b"
