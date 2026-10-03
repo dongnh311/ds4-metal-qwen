@@ -51518,9 +51518,10 @@ struct ds4_qwen35_attn_decode3_args {
 
 /* Round 2 Plan B: kernel_qwen35_attn_merge3_fold (bit-identical to merge3)
  * is the default; DS4_QWEN35_ATTN_MERGE_FOLD=0 selects merge3. The knob is
- * read fresh on every dispatch like the split knob above, and a failed
- * startup self-check pins merge3. */
-static bool g_qwen35_merge_fold_off;
+ * read fresh on every dispatch like the split knob above. The fold runs only
+ * after its self-check has passed in this process (-1 not run, 0 failed,
+ * 1 passed), so a path that skips the check falls back to merge3. */
+static int g_qwen35_merge_fold_checked = -1;
 static uint64_t g_qwen35_merge_fold_dispatches;
 
 static bool qwen35_merge_fold_wanted(void) {
@@ -51529,7 +51530,7 @@ static bool qwen35_merge_fold_wanted(void) {
 }
 
 static int qwen35_merge3_kernel(void) {
-    if (!g_qwen35_merge_fold_off && qwen35_merge_fold_wanted()) {
+    if (g_qwen35_merge_fold_checked == 1 && qwen35_merge_fold_wanted()) {
         g_qwen35_merge_fold_dispatches++;
         return QWEN4_K_QWEN35_ATTN_MERGE3_FOLD;
     }
@@ -51546,8 +51547,7 @@ uint64_t ds4_gpu_qwen35_attn_merge_fold_dispatches(void) {
  * rows, 256 and 37 splits, every eighth partial neutral with l == 0).  A
  * mismatch or an error turns the fold off for the process. */
 int ds4_gpu_qwen35_attn_merge_fold_selfcheck(void) {
-    static int done = -1;
-    if (done >= 0) return done;
+    if (g_qwen35_merge_fold_checked >= 0) return g_qwen35_merge_fold_checked;
     if (!qwen35_merge_fold_wanted()) return 1;   /* knob off: nothing to check yet */
     const uint32_t H = 16u, Hkv = 2u, D = 256u, ns0 = 256u, ns1 = 37u;
     const uint64_t pf = ((uint64_t)ns0 + ns1) * H * (2u + D), of = 2ull * H * D;
@@ -51580,12 +51580,9 @@ int ds4_gpu_qwen35_attn_merge_fold_selfcheck(void) {
          memcmp(ha, hb, of * sizeof(float)) == 0;
     free(hp); free(hg); free(ha); free(hb);
     ds4_gpu_tensor_free(tp); ds4_gpu_tensor_free(tg); ds4_gpu_tensor_free(ta); ds4_gpu_tensor_free(tb);
-    if (!ok) {
-        g_qwen35_merge_fold_off = true;
-        fprintf(stderr, "ds4: Ornith attention merge fold off: it failed its startup check against merge3\n");
-    }
-    done = ok ? 1 : 0;
-    return done;
+    if (!ok) fprintf(stderr, "ds4: Ornith attention merge fold off: it failed its startup check against merge3\n");
+    g_qwen35_merge_fold_checked = ok ? 1 : 0;
+    return g_qwen35_merge_fold_checked;
 }
 
 /* One row's solo decode3 dispatch at row_pos0 (kernel_qwen35_attn_decode3<1>,

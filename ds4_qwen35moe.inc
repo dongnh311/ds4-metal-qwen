@@ -157,6 +157,9 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
         qwen4_graph_free(g);
         return false;
     }
+    /* once per process, outside any command batch; both the session and the
+     * one-shot greedy path allocate here, and the fold waits for this check */
+    (void)ds4_gpu_qwen35_attn_merge_fold_selfcheck();
     return true;
 }
 
