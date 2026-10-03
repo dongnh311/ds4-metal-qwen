@@ -931,14 +931,17 @@ static void test_attn_merge_fold(arena_t *a, uint32_t pos0, uint32_t split_keys)
                    "decode3 merge3_fold");
         unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
         const bool ran = ds4_gpu_qwen35_attn_merge_fold_dispatches() > before;
+        /* a row with a single split is written by decode3 itself: no merge runs */
+        const bool needs_merge = pos0 + 1u > split_keys || (rows == 2u && pos0 + 2u > split_keys);
         float *x = malloc(2ull * H * D * sizeof(float)), *y = malloc(2ull * H * D * sizeof(float));
         require_ok(ds4_gpu_tensor_read(o_ref, 0, x, (uint64_t)rows * H * D * sizeof(float)) &&
                    ds4_gpu_tensor_read(o_new, 0, y, (uint64_t)rows * H * D * sizeof(float)), "merge fold read");
         const bool same = memcmp(x, y, (uint64_t)rows * H * D * sizeof(float)) == 0;
         printf("  attn merge fold pos0=%u split_keys=%u rows=%u: %s%s\n", pos0, split_keys, rows,
-               same ? "bit-identical" : "DIFFERS", ran ? "" : " (fold did not run)");
+               same ? "bit-identical" : "DIFFERS",
+               !needs_merge ? " (no merge needed)" : ran ? "" : " (fold did not run)");
         require_ok(same, "merge3_fold output equals merge3");
-        require_ok(ran, "merge3_fold dispatched under DS4_QWEN35_ATTN_MERGE_FOLD=1");
+        require_ok(ran == needs_merge, "merge3_fold dispatched exactly when a merge is needed");
         free(x); free(y);
     }
     unsetenv("DS4_QWEN35_ATTN_SPLIT_KEYS");
