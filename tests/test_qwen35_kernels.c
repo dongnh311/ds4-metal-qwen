@@ -885,9 +885,10 @@ static void test_attn_decode3_rows(arena_t *a, uint32_t pos0, uint32_t split_key
  * host double reference and against today's kernel (qwen4 attn_mm via the
  * qwen4 wrapper). */
 /* Plan B (round 2): kernel_qwen35_attn_merge3_fold folds merge3's fixed
- * binary tree with one register slot per level; the decode3 output with
- * DS4_QWEN35_ATTN_MERGE_FOLD=1 must memcmp-equal the merge3 output, rows
- * 1 and 2, and the fold must actually have run (dispatch counter). */
+ * binary tree with one register slot per level. It is on by default: the
+ * decode3 output with the knob unset must memcmp-equal the merge3 output
+ * (DS4_QWEN35_ATTN_MERGE_FOLD=0), rows 1 and 2, and the fold must actually
+ * have run (dispatch counter). */
 static void test_attn_merge_fold(arena_t *a, uint32_t pos0, uint32_t split_keys) {
     (void)a;
     const uint32_t H = 16u, Hkv = 2u, D = 256u, cap = pos0 + 2u;
@@ -920,16 +921,15 @@ static void test_attn_merge_fold(arena_t *a, uint32_t pos0, uint32_t split_keys)
     require_ok(ds4_gpu_tensor_write(q, 0, f, 2ull * H * D * sizeof(float)) &&
                ds4_gpu_tensor_write(g, 0, f, 2ull * H * D * sizeof(float)), "merge fold q/gate");
     for (uint32_t rows = 1u; rows <= 2u; rows++) {
-        unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
+        setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "0", 1);
         require_ok(ds4_gpu_tensor_fill_f32(o_ref, -1234.5f, 2ull * H * D) &&
                    ds4_gpu_qwen35_attn_decode3_tensor(o_ref, q, g, kc, vc, part, H, Hkv, D, pos0, rows, scale),
                    "decode3 merge3");
         const uint64_t before = ds4_gpu_qwen35_attn_merge_fold_dispatches();
-        setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "1", 1);
+        unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");   /* the default */
         require_ok(ds4_gpu_tensor_fill_f32(o_new, -1234.5f, 2ull * H * D) &&
                    ds4_gpu_qwen35_attn_decode3_tensor(o_new, q, g, kc, vc, part, H, Hkv, D, pos0, rows, scale),
                    "decode3 merge3_fold");
-        unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
         const bool ran = ds4_gpu_qwen35_attn_merge_fold_dispatches() > before;
         /* a row with a single split is written by decode3 itself: no merge runs */
         const bool needs_merge = pos0 + 1u > split_keys || (rows == 2u && pos0 + 2u > split_keys);
@@ -1250,16 +1250,16 @@ int main(void) {
     test_attn_decode3_rows(&arena, 63u, 64u);     /* n0 = 64 (1 split), n1 = 65 (2 splits): ns0 != ns1 */
     test_attn_decode3_rows(&arena, 200u, 16u);    /* shared dispatch, kps 16/16 */
     printf("qwen35 attention merge fold (round 2 Plan B)\n");
+    setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "0", 1);
     require_ok(ds4_gpu_qwen35_attn_merge_fold_selfcheck(), "merge fold self-check (knob off: trivially 1)");
+    unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
     test_attn_merge_fold(&arena, 40u, 16u);       /* n = 41/42: ns 3 (pad to 4) */
     test_attn_merge_fold(&arena, 2046u, 64u);     /* n = 2047/2048: ns 32 (a power of two) */
     test_attn_merge_fold(&arena, 2100u, 64u);     /* ns 33 (pad to 64) */
     test_attn_merge_fold(&arena, 8250u, 64u);     /* ns 129 (pad to 256) */
     test_attn_merge_fold(&arena, 32766u, 64u);    /* ns 256 (the cap) */
     test_attn_merge_fold(&arena, 63u, 64u);       /* n0 = 64 (1 split), n1 = 65 (2): the solo path */
-    setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "1", 1);
-    require_ok(ds4_gpu_qwen35_attn_merge_fold_selfcheck(), "merge fold self-check on this compiler");
-    unsetenv("DS4_QWEN35_ATTN_MERGE_FOLD");
+    require_ok(ds4_gpu_qwen35_attn_merge_fold_selfcheck(), "merge fold self-check on this compiler (knob unset)");
     test_attn_decode3_rows(&arena, 194u, 16u);    /* same ns 13, kps0 = 15 != kps1 = 16 */
     test_attn_decode3_rows(&arena, 4200u, 16u);   /* at the 256-split cap: n / 16 > 256 */
     test_attn_decode3_rows(&arena, 64u, 64u);     /* shared dispatch (ns 2, kps 33): row 1 needs a third tile */
