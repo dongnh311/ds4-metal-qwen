@@ -1072,7 +1072,14 @@ static bool parse_logit_bias_value(const char **p, request *r) {
     if (json_lit(p, "null")) return true;
     if (**p != '{') return false;
     (*p)++;
-    int cap = r->logit_bias_n;
+    /* A repeated "logit_bias" key replaces the earlier one (last key wins). */
+    free(r->logit_bias_ids);
+    free(r->logit_bias_vals);
+    r->logit_bias_ids = NULL;
+    r->logit_bias_vals = NULL;
+    r->logit_bias_n = 0;
+    r->logit_bias_has_soft = false;
+    int cap = 0;
     json_ws(p);
     while (**p && **p != '}') {
         char *key = NULL;
@@ -1080,14 +1087,22 @@ static bool parse_logit_bias_value(const char **p, request *r) {
         char *end = NULL;
         errno = 0;
         const long id = strtol(key, &end, 10);
-        const bool key_ok = key[0] && *end == '\0' && errno == 0 && id >= 0 && id <= INT_MAX;
+        const bool key_ok = isdigit((unsigned char)key[0]) && *end == '\0' && errno == 0 &&
+                            id >= 0 && id <= INT_MAX;
         free(key);
         if (!key_ok) return false;
         json_ws(p);
         if (**p != ':') return false;
         (*p)++;
+        /* A JSON number starts with a digit or '-' and a digit. Checking the text
+         * refuses the NaN/Infinity spellings strtod would accept: this file builds
+         * with -ffast-math, where isfinite() may be folded away. An overflowing
+         * literal (1e999) is a real number and clamps like any other. */
+        json_ws(p);
+        const char *num = *p + (**p == '-');
+        if (!isdigit((unsigned char)*num)) return false;
         double v = 0.0;
-        if (!json_number(p, &v) || !isfinite(v)) return false;
+        if (!json_number(p, &v)) return false;
         if (v < -100.0) v = -100.0;
         if (v > 100.0) v = 100.0;
         if (r->logit_bias_n == cap) {
@@ -1175,9 +1190,11 @@ static bool logit_bias_bans(const request *r, int token) {
 }
 
 /* Tokens after the first of a speculative block were accepted without the bias.
- * Rejecting a banned one there and resampling at that position is exact for
- * bans: p(x) + B * p(x) / (1 - B) = p(x) / (1 - B), the renormalised banned
- * distribution. toks[0] was sampled with the bias, so index 0 never rejects. */
+ * A banned one ends the block there and that position is sampled again with the
+ * bias, so a ban is never emitted. Under exact speculative sampling this is also
+ * distribution-exact (p(x) + B*p(x)/(1-B) = p(x)/(1-B)); under greedy draft
+ * acceptance (Ornith) it replaces an argmax-accepted banned draft with a biased
+ * sample. toks[0] was sampled with the bias, so index 0 never rejects. */
 static bool logit_bias_block_reject(const request *r, int ti, int token) {
     return ti > 0 && logit_bias_bans(r, token);
 }
@@ -4861,6 +4878,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
     bool got_thinking = false;
     bool thinking_enabled = true;
     ds4_think_mode reasoning_effort = request_default_reasoning_effort(r);
+    bool bad_logit_bias = false;
     chat_msgs msgs = {0};
     char *tool_schemas = NULL;
 
@@ -4943,6 +4961,7 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         } else if (!strcmp(key, "logit_bias")) {
             if (!parse_logit_bias_value(&p, r)) {
                 free(key);
+                bad_logit_bias = true;
                 goto bad;
             }
         } else if (!strcmp(key, "top_k")) {
@@ -5067,7 +5086,9 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
 bad:
     chat_msgs_free(&msgs);
     free(tool_schemas);
-    snprintf(err, errlen, "invalid JSON request");
+    snprintf(err, errlen, "%s", bad_logit_bias ?
+             "invalid logit_bias: expected an object mapping token-id strings to numbers" :
+             "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -6376,6 +6397,7 @@ static bool parse_prompt(const char **p, char **out) {
 static bool parse_completion_request(ds4_engine *e, const char *body, int def_tokens,
                                      int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_COMPLETION, def_tokens);
+    bool bad_logit_bias = false;
     r->model_syntax = server_model_syntax_for_engine(e);
     const char *p = body;
     char *prompt = NULL;
@@ -6443,6 +6465,7 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
         } else if (!strcmp(key, "logit_bias")) {
             if (!parse_logit_bias_value(&p, r)) {
                 free(key);
+                bad_logit_bias = true;
                 goto bad;
             }
         } else if (!strcmp(key, "top_k")) {
@@ -6532,7 +6555,9 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     return true;
 bad:
     free(prompt);
-    snprintf(err, errlen, "invalid JSON request");
+    snprintf(err, errlen, "%s", bad_logit_bias ?
+             "invalid logit_bias: expected an object mapping token-id strings to numbers" :
+             "invalid JSON request");
     request_free(r);
     return false;
 }
@@ -13534,6 +13559,11 @@ static int server_generation_rewind(server *s, server_slot *slot,
     ds4_tokens_copy(&prefix, ds4_session_tokens(slot->session));
     bool rebuild = ds4_session_common_prefix(slot->session, &prefix) != prefix.len;
     pthread_mutex_unlock(&s->inference_mu);
+    if (rebuild) {
+        server_log(DS4_LOG_GENERATION,
+                   "ds4-server: rewind to %d rebuilds the kept prefix (%d tokens replayed)",
+                   pos, (int)prefix.len);
+    }
     int rc = rebuild ? server_session_sync_multimodal(s, slot, &prefix,
         r->images, r->image_count, err, errlen) : 0;
     ds4_tokens_free(&prefix);
@@ -14402,7 +14432,21 @@ static int server_select_token(server *s, server_slot *slot, request *r,
     if (n_vocab <= 0) return -1;
     if (!r->logit_bias_scratch)
         r->logit_bias_scratch = xmalloc((size_t)n_vocab * sizeof(r->logit_bias_scratch[0]));
-    if (ds4_session_copy_logits(slot->session, r->logit_bias_scratch, n_vocab) != n_vocab) return -1;
+    if (ds4_session_copy_logits(slot->session, r->logit_bias_scratch, n_vocab) != n_vocab) {
+        /* The output row and the tokenizer disagree on the vocabulary size (equal
+         * for every model this server runs today). Degrade to the unbiased call
+         * rather than failing every request that carries a bias; say so loudly. */
+        server_log(DS4_LOG_DEFAULT,
+                   "ds4-server: logit_bias IGNORED: session logits length differs from the %d-token vocabulary",
+                   n_vocab);
+        r->logit_bias_n = 0;
+        free(r->logit_bias_ban);
+        r->logit_bias_ban = NULL;
+        r->logit_bias_ban_len = 0;
+        return r->ignore_eos ?
+            ds4_session_argmax_ignoring_eos(slot->session, r->think_mode) :
+            ds4_session_sample(slot->session, temperature, top_k, top_p, min_p, rng);
+    }
     logit_bias_apply(r, r->logit_bias_scratch, n_vocab);
     if (r->ignore_eos)
         return logits_argmax_ignoring_stops(s->engine, r->logit_bias_scratch, n_vocab, r->think_mode);
@@ -15075,10 +15119,13 @@ decode_again:
             }
             token = toks[ti];
             if (logit_bias_block_reject(&j->req, ti, token)) {
-                /* A banned draft: keep the prefix, resample this position with
-                 * the bias (the tail below rewinds and re-evaluates). */
+                /* A banned draft: keep the prefix and stop here; the tail below
+                 * rewinds to block_start + kept and the next iteration samples
+                 * this position with the bias. No `resample`: that rewinds one
+                 * token further, to block_start, which on Qwen3.5/Ornith is not
+                 * the after-first-token snapshot and forces a replay of the whole
+                 * context. This is the same exit ignore_eos takes below. */
                 bias_rejects++;
-                resample = true;
                 break;
             }
             if (ds4_token_is_stop_for_think_mode(s->engine,
@@ -19373,6 +19420,16 @@ static void test_logit_bias_parse_and_validate(void) {
     TEST_ASSERT(lg[5] == -91.0f && lg[9] == 100.0f && lg[3] == -100.0f && lg[7] == 2.5f);
     request_free(&r);
 
+    request_init(&r, REQ_CHAT, 128);              /* an overflowing literal clamps */
+    p = "{\"2\":1e999,\"4\":-1e999}";
+    TEST_ASSERT(parse_logit_bias_value(&p, &r));
+    TEST_ASSERT(request_validate_logit_bias(&r, 10, err, sizeof(err)));
+    TEST_ASSERT(logit_bias_bans(&r, 4) && !logit_bias_bans(&r, 2));
+    float big[10] = {0};
+    logit_bias_apply(&r, big, 10);
+    TEST_ASSERT(big[2] == 100.0f && big[4] == -100.0f);
+    request_free(&r);
+
     request_init(&r, REQ_CHAT, 128);              /* duplicate id: the last value wins */
     p = "{\"6\":-100,\"6\":1}";
     TEST_ASSERT(parse_logit_bias_value(&p, &r));
@@ -19391,7 +19448,12 @@ static void test_logit_bias_parse_and_validate(void) {
     TEST_ASSERT(strstr(err, "logit_bias") != NULL);
     request_free(&r);
 
-    const char *bad[] = {"{\"x\":1}", "{\"-1\":1}", "{\"3\":\"a\"}", "{\"3\":1", "[1]", "{\"3.5\":1}"};
+    const char *bad[] = {"{\"x\":1}", "{\"-1\":1}", "{\"3\":\"a\"}", "{\"3\":1", "[1]", "{\"3.5\":1}",
+                         "{\"+5\":1}", "{\" 5\":1}", "{\"\":1}",
+                         /* strtod accepts these spellings; the server builds with -ffast-math,
+                          * where isfinite() cannot be trusted, so they are refused as text */
+                         "{\"3\":NaN}", "{\"3\":nan}", "{\"3\":-Infinity}", "{\"3\":inf}",
+                         "{\"3\":-nan}", "{\"3\":+1}"};
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
         request_init(&r, REQ_CHAT, 128);
         p = bad[i];
@@ -19488,6 +19550,20 @@ static void test_chat_request_carries_logit_bias(void) {
         "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"logit_bias\":{\"x\":1}}",
         64, 4096, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "logit_bias") != NULL);   /* the error names the field */
+    /* A repeated key: the last one wins, like every other JSON key here. */
+    ok = parse_chat_request(NULL, NULL,
+        "{\"logit_bias\":{\"1\":-100,\"2\":-100},\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],"
+        "\"logit_bias\":{\"3\":-100}}",
+        64, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(ok);
+    TEST_ASSERT(r.logit_bias_n == 1 && logit_bias_bans(&r, 3) && !logit_bias_bans(&r, 1));
+    request_free(&r);
+    request_init(&r, REQ_CHAT, 128);
+    ok = parse_completion_request(NULL,
+        "{\"prompt\":\"hi\",\"logit_bias\":{\"x\":1}}", 64, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
+    TEST_ASSERT(strstr(err, "logit_bias") != NULL);
 }
 
 static void test_reasoning_effort_mapping(void) {
