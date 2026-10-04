@@ -890,6 +890,20 @@ typedef struct {
     stop_list anthropic_live_call_ids;
     char *anthropic_live_suffix_text;
     tool_replay_stats tool_replay;
+    /* OpenAI logit_bias: an additive per-token bias, values clamped to [-100, 100].
+     * A value <= -100 is a ban. request_validate_logit_bias keeps the last value per
+     * id and builds logit_bias_ban (one byte per id up to the largest) so the
+     * per-token check on speculative blocks is O(1). logit_bias_scratch is the
+     * biased copy of the session logits, allocated on first use and freed with the
+     * request. */
+    int *logit_bias_ids;
+    float *logit_bias_vals;
+    int logit_bias_n;
+    bool logit_bias_has_soft;
+    unsigned char *logit_bias_ban;
+    int logit_bias_ban_len;
+    int logit_bias_bans_n;
+    float *logit_bias_scratch;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -1050,6 +1064,131 @@ static bool request_validate_ignore_eos(const request *r,
     return false;
 }
 
+/* logit_bias: an object of decimal token-id strings to numbers, or null. Values
+ * are clamped to [-100, 100] as in the OpenAI API. Ids are range-checked later,
+ * by request_validate_logit_bias, once the vocabulary size is known. */
+static bool parse_logit_bias_value(const char **p, request *r) {
+    json_ws(p);
+    if (json_lit(p, "null")) return true;
+    if (**p != '{') return false;
+    (*p)++;
+    int cap = r->logit_bias_n;
+    json_ws(p);
+    while (**p && **p != '}') {
+        char *key = NULL;
+        if (!json_string(p, &key)) return false;
+        char *end = NULL;
+        errno = 0;
+        const long id = strtol(key, &end, 10);
+        const bool key_ok = key[0] && *end == '\0' && errno == 0 && id >= 0 && id <= INT_MAX;
+        free(key);
+        if (!key_ok) return false;
+        json_ws(p);
+        if (**p != ':') return false;
+        (*p)++;
+        double v = 0.0;
+        if (!json_number(p, &v) || !isfinite(v)) return false;
+        if (v < -100.0) v = -100.0;
+        if (v > 100.0) v = 100.0;
+        if (r->logit_bias_n == cap) {
+            cap = cap ? cap * 2 : 64;
+            r->logit_bias_ids = xrealloc(r->logit_bias_ids, (size_t)cap * sizeof(r->logit_bias_ids[0]));
+            r->logit_bias_vals = xrealloc(r->logit_bias_vals, (size_t)cap * sizeof(r->logit_bias_vals[0]));
+        }
+        r->logit_bias_ids[r->logit_bias_n] = (int)id;
+        r->logit_bias_vals[r->logit_bias_n] = (float)v;
+        r->logit_bias_n++;
+        if (v > -100.0 && v != 0.0) r->logit_bias_has_soft = true;
+        json_ws(p);
+        if (**p == ',') {
+            (*p)++;
+            json_ws(p);
+        } else if (**p != '}') {
+            return false;
+        }
+    }
+    if (**p != '}') return false;
+    (*p)++;
+    return true;
+}
+
+/* Range-check the ids (skipped when n_vocab <= 0, i.e. no engine), keep the last
+ * value per id, and build the ban map. */
+static bool request_validate_logit_bias(request *r, int n_vocab, char *err, size_t errlen) {
+    free(r->logit_bias_ban);
+    r->logit_bias_ban = NULL;
+    r->logit_bias_ban_len = 0;
+    r->logit_bias_bans_n = 0;
+    if (r->logit_bias_n == 0) {
+        r->logit_bias_has_soft = false;
+        return true;
+    }
+    int max_id = 0;
+    for (int i = 0; i < r->logit_bias_n; i++) {
+        if (n_vocab > 0 && r->logit_bias_ids[i] >= n_vocab) {
+            snprintf(err, errlen, "logit_bias token id %d is outside the vocabulary (%d tokens)",
+                     r->logit_bias_ids[i], n_vocab);
+            return false;
+        }
+        if (r->logit_bias_ids[i] > max_id) max_id = r->logit_bias_ids[i];
+    }
+    const int len = max_id + 1;
+    unsigned char *map = xmalloc((size_t)len);
+    memset(map, 0, (size_t)len);
+    /* JSON duplicate keys: the last value wins. Walk backwards, keep the first
+     * occurrence seen, and compact the kept entries to the front. */
+    int w = r->logit_bias_n;
+    for (int i = r->logit_bias_n - 1; i >= 0; i--) {
+        const int id = r->logit_bias_ids[i];
+        if (map[id]) continue;
+        map[id] = 1;
+        w--;
+        r->logit_bias_ids[w] = id;
+        r->logit_bias_vals[w] = r->logit_bias_vals[i];
+    }
+    const int kept = r->logit_bias_n - w;
+    memmove(r->logit_bias_ids, r->logit_bias_ids + w, (size_t)kept * sizeof(r->logit_bias_ids[0]));
+    memmove(r->logit_bias_vals, r->logit_bias_vals + w, (size_t)kept * sizeof(r->logit_bias_vals[0]));
+    r->logit_bias_n = kept;
+    memset(map, 0, (size_t)len);
+    r->logit_bias_has_soft = false;
+    for (int i = 0; i < kept; i++) {
+        if (r->logit_bias_vals[i] <= -100.0f) {
+            map[r->logit_bias_ids[i]] = 1;
+            r->logit_bias_bans_n++;
+        } else if (r->logit_bias_vals[i] != 0.0f) {
+            r->logit_bias_has_soft = true;
+        }
+    }
+    if (r->logit_bias_bans_n == 0) {
+        free(map);
+        return true;
+    }
+    r->logit_bias_ban = map;
+    r->logit_bias_ban_len = len;
+    return true;
+}
+
+static bool logit_bias_bans(const request *r, int token) {
+    return r->logit_bias_ban && token >= 0 && token < r->logit_bias_ban_len &&
+           r->logit_bias_ban[token];
+}
+
+/* Tokens after the first of a speculative block were accepted without the bias.
+ * Rejecting a banned one there and resampling at that position is exact for
+ * bans: p(x) + B * p(x) / (1 - B) = p(x) / (1 - B), the renormalised banned
+ * distribution. toks[0] was sampled with the bias, so index 0 never rejects. */
+static bool logit_bias_block_reject(const request *r, int ti, int token) {
+    return ti > 0 && logit_bias_bans(r, token);
+}
+
+static void logit_bias_apply(const request *r, float *logits, int n_vocab) {
+    for (int i = 0; i < r->logit_bias_n; i++) {
+        const int id = r->logit_bias_ids[i];
+        if (id >= 0 && id < n_vocab) logits[id] += r->logit_bias_vals[i];
+    }
+}
+
 static void request_free(request *r) {
     ds4_tokens_free(&r->prompt);
     for (size_t i = 0; i < r->image_count; i++)
@@ -1068,6 +1207,10 @@ static void request_free(request *r) {
     free(r->anthropic_live_call_ids.v);
     free(r->anthropic_live_suffix_text);
     tool_schema_orders_free(&r->tool_orders);
+    free(r->logit_bias_ids);
+    free(r->logit_bias_vals);
+    free(r->logit_bias_ban);
+    free(r->logit_bias_scratch);
     memset(r, 0, sizeof(*r));
 }
 
@@ -4797,6 +4940,11 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->min_p = (float)v;
             r->min_p_set = true;
+        } else if (!strcmp(key, "logit_bias")) {
+            if (!parse_logit_bias_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -4876,6 +5024,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         return false;
     }
     if (!request_validate_ignore_eos(r, err, errlen)) {
+        chat_msgs_free(&msgs);
+        free(tool_schemas);
+        request_free(r);
+        return false;
+    }
+    if (!request_validate_logit_bias(r, ds4_engine_vocab_size(e), err, errlen)) {
         chat_msgs_free(&msgs);
         free(tool_schemas);
         request_free(r);
@@ -6286,6 +6440,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
             }
             r->min_p = (float)v;
             r->min_p_set = true;
+        } else if (!strcmp(key, "logit_bias")) {
+            if (!parse_logit_bias_value(&p, r)) {
+                free(key);
+                goto bad;
+            }
         } else if (!strcmp(key, "top_k")) {
             if (!json_int(&p, &r->top_k)) {
                 free(key);
@@ -6343,6 +6502,11 @@ static bool parse_completion_request(ds4_engine *e, const char *body, int def_to
     if (*p != '}') goto bad;
     if (!prompt) {
         snprintf(err, errlen, "missing prompt");
+        request_free(r);
+        return false;
+    }
+    if (!request_validate_logit_bias(r, ds4_engine_vocab_size(e), err, errlen)) {
+        free(prompt);
         request_free(r);
         return false;
     }
@@ -14213,6 +14377,38 @@ static void *decode_worker_main(void *arg) {
  * shorter than the full prompt, we prefill to that boundary, store it, and
  * immediately continue to the real prompt.  The live graph therefore always
  * moves forward. */
+static int logits_argmax_ignoring_stops(ds4_engine *e, const float *logits, int n_vocab,
+                                        ds4_think_mode think_mode) {
+    int best = -1;
+    for (int i = 0; i < n_vocab; i++) {
+        if (ds4_token_is_stop_for_think_mode(e, i, think_mode)) continue;
+        if (best < 0 || logits[i] > logits[best]) best = i;
+    }
+    return best;
+}
+
+/* Token selection for one decode step. Without logit_bias this is exactly the
+ * old call. With it, the session logits are copied, biased and sampled from the
+ * copy, so the session (and any checkpoint taken from it) keeps raw logits. */
+static int server_select_token(server *s, server_slot *slot, request *r,
+                               float temperature, int top_k, float top_p, float min_p,
+                               uint64_t *rng) {
+    if (r->logit_bias_n == 0) {
+        return r->ignore_eos ?
+            ds4_session_argmax_ignoring_eos(slot->session, r->think_mode) :
+            ds4_session_sample(slot->session, temperature, top_k, top_p, min_p, rng);
+    }
+    const int n_vocab = ds4_engine_vocab_size(s->engine);
+    if (n_vocab <= 0) return -1;
+    if (!r->logit_bias_scratch)
+        r->logit_bias_scratch = xmalloc((size_t)n_vocab * sizeof(r->logit_bias_scratch[0]));
+    if (ds4_session_copy_logits(slot->session, r->logit_bias_scratch, n_vocab) != n_vocab) return -1;
+    logit_bias_apply(r, r->logit_bias_scratch, n_vocab);
+    if (r->ignore_eos)
+        return logits_argmax_ignoring_stops(s->engine, r->logit_bias_scratch, n_vocab, r->think_mode);
+    return ds4_sample_logits(r->logit_bias_scratch, n_vocab, temperature, top_k, top_p, min_p, rng);
+}
+
 static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
@@ -14716,6 +14912,10 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         rng = ((uint64_t)time(NULL) << 32) ^ (uint64_t)(uintptr_t)j;
     }
     if (!rng) rng = UINT64_C(0x9e3779b97f4a7c15);
+    if (j->req.logit_bias_n) {
+        server_log(DS4_LOG_GENERATION, "ds4-server: logit_bias entries=%d bans=%d soft=%d",
+                   j->req.logit_bias_n, j->req.logit_bias_bans_n, j->req.logit_bias_has_soft ? 1 : 0);
+    }
 decode_again:
     ;
     buf text = {0};
@@ -14754,6 +14954,7 @@ decode_again:
     ds4_tokens think_forced = {0};
     int think_forced_next = 0;
     bool think_budget_pending = false;
+    int bias_rejects = 0;
 
     server_generation_enter(s);
     while (!g_stop_requested && !job_cancelled(j) && completion < max_tokens &&
@@ -14801,11 +15002,8 @@ decode_again:
             toks[0] = token;
             ntok = 1;
         } else {
-            token = j->req.ignore_eos ?
-                ds4_session_argmax_ignoring_eos(slot->session,
-                                                j->req.think_mode) :
-                ds4_session_sample(slot->session, temperature, top_k,
-                                   top_p, min_p, &rng);
+            token = server_select_token(s, slot, &j->req, temperature, top_k,
+                                        top_p, min_p, &rng);
             if (token < 0) {
                 finish = "error";
                 snprintf(err, sizeof(err), "failed to select a non-EOS token");
@@ -14822,6 +15020,7 @@ decode_again:
 
             if (!s->batched_mode &&
                 ds4_engine_mtp_draft_tokens(s->engine) > 1 &&
+                !j->req.logit_bias_has_soft &&
                 getenv("DS4_MTP_SPEC_DISABLE") == NULL)
             {
                 if (j->req.ignore_eos) {
@@ -14842,6 +15041,7 @@ decode_again:
                     break;
                 }
             } else if (s->batched_mode && s->qwen4_batch_mtp &&
+                       !j->req.logit_bias_has_soft &&
                        max_tokens - completion >= 2 && !j->req.ignore_eos &&
                        (!ds4_engine_mtp_exact_sampling(s->engine) || temperature == 0.0f) &&
                        getenv("DS4_MTP_SPEC_DISABLE") == NULL) {
@@ -14874,6 +15074,13 @@ decode_again:
                 break;
             }
             token = toks[ti];
+            if (logit_bias_block_reject(&j->req, ti, token)) {
+                /* A banned draft: keep the prefix, resample this position with
+                 * the bias (the tail below rewinds and re-evaluates). */
+                bias_rejects++;
+                resample = true;
+                break;
+            }
             if (ds4_token_is_stop_for_think_mode(s->engine,
                                                  token,
                                                  j->req.think_mode)) {
@@ -15140,6 +15347,10 @@ decode_again:
     }
     server_generation_leave(s);
     ds4_tokens_free(&think_forced);
+    if (bias_rejects) {
+        server_log(DS4_LOG_GENERATION, "ds4-server: logit_bias rejected %d speculative tokens",
+                   bias_rejects);
+    }
 
     if (job_cancelled(j)) {
         request_live_state_clear(s, slot);
@@ -19139,6 +19350,144 @@ static void test_chat_ignore_eos_contract(void) {
         128, 32768, &r, err, sizeof(err));
     TEST_ASSERT(!ok);
     TEST_ASSERT(!strcmp(err, "invalid JSON request"));
+}
+
+static void test_logit_bias_parse_and_validate(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    char err[160] = {0};
+    const char *p = "{\"5\":-100,\"7\":2.5,\"3\":-500,\"9\":500}";
+    TEST_ASSERT(parse_logit_bias_value(&p, &r));
+    TEST_ASSERT(*p == '\0');
+    TEST_ASSERT(r.logit_bias_n == 4);
+    TEST_ASSERT(r.logit_bias_has_soft);
+    TEST_ASSERT(request_validate_logit_bias(&r, 10, err, sizeof(err)));
+    TEST_ASSERT(logit_bias_bans(&r, 5));
+    TEST_ASSERT(logit_bias_bans(&r, 3));          /* -500 clamps to -100: a ban */
+    TEST_ASSERT(!logit_bias_bans(&r, 7));         /* soft, not a ban */
+    TEST_ASSERT(!logit_bias_bans(&r, 9));         /* +500 clamps to +100 */
+    TEST_ASSERT(!logit_bias_bans(&r, 123456));    /* outside the map */
+    float lg[10] = {0};
+    lg[5] = 9.0f; lg[2] = 8.0f;
+    logit_bias_apply(&r, lg, 10);
+    TEST_ASSERT(lg[5] == -91.0f && lg[9] == 100.0f && lg[3] == -100.0f && lg[7] == 2.5f);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);              /* duplicate id: the last value wins */
+    p = "{\"6\":-100,\"6\":1}";
+    TEST_ASSERT(parse_logit_bias_value(&p, &r));
+    TEST_ASSERT(request_validate_logit_bias(&r, 10, err, sizeof(err)));
+    TEST_ASSERT(!logit_bias_bans(&r, 6));
+    TEST_ASSERT(r.logit_bias_n == 1);
+    float dup[10] = {0};
+    logit_bias_apply(&r, dup, 10);
+    TEST_ASSERT(dup[6] == 1.0f);
+    request_free(&r);
+
+    request_init(&r, REQ_CHAT, 128);
+    p = "{\"10\":-100}";
+    TEST_ASSERT(parse_logit_bias_value(&p, &r));
+    TEST_ASSERT(!request_validate_logit_bias(&r, 10, err, sizeof(err)));
+    TEST_ASSERT(strstr(err, "logit_bias") != NULL);
+    request_free(&r);
+
+    const char *bad[] = {"{\"x\":1}", "{\"-1\":1}", "{\"3\":\"a\"}", "{\"3\":1", "[1]", "{\"3.5\":1}"};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+        request_init(&r, REQ_CHAT, 128);
+        p = bad[i];
+        TEST_ASSERT(!parse_logit_bias_value(&p, &r));
+        request_free(&r);
+    }
+    const char *empty[] = {"null", "{}", " { } "};
+    for (size_t i = 0; i < sizeof(empty) / sizeof(empty[0]); i++) {
+        request_init(&r, REQ_CHAT, 128);
+        p = empty[i];
+        TEST_ASSERT(parse_logit_bias_value(&p, &r));
+        TEST_ASSERT(r.logit_bias_n == 0 && !r.logit_bias_has_soft);
+        TEST_ASSERT(request_validate_logit_bias(&r, 10, err, sizeof(err)));
+        TEST_ASSERT(r.logit_bias_ban == NULL && !logit_bias_bans(&r, 0));
+        request_free(&r);
+    }
+}
+
+static void test_logit_bias_large_object(void) {
+    /* The gateway sends ~55K bans on every request; parse 60K in one go. */
+    buf b = {0};
+    buf_putc(&b, '{');
+    for (int i = 0; i < 60000; i++) {
+        char tmp[32];
+        snprintf(tmp, sizeof(tmp), "%s\"%d\":-100", i ? "," : "", i * 2);
+        for (char *c = tmp; *c; c++) buf_putc(&b, *c);
+    }
+    buf_putc(&b, '}');
+    char *s = buf_take(&b);
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    char err[160] = {0};
+    const char *p = s;
+    TEST_ASSERT(parse_logit_bias_value(&p, &r));
+    TEST_ASSERT(r.logit_bias_n == 60000 && !r.logit_bias_has_soft);
+    TEST_ASSERT(request_validate_logit_bias(&r, 248320, err, sizeof(err)));
+    TEST_ASSERT(logit_bias_bans(&r, 119998) && !logit_bias_bans(&r, 119999));
+    request_free(&r);
+    free(s);
+}
+
+static void test_logit_bias_block_reject_rule(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    char err[160] = {0};
+    const char *p = "{\"4\":-100}";
+    TEST_ASSERT(parse_logit_bias_value(&p, &r));
+    TEST_ASSERT(request_validate_logit_bias(&r, 10, err, sizeof(err)));
+    TEST_ASSERT(!logit_bias_block_reject(&r, 0, 4));  /* toks[0] was sampled with the bias */
+    TEST_ASSERT(logit_bias_block_reject(&r, 1, 4));   /* a draft accepted without it */
+    TEST_ASSERT(!logit_bias_block_reject(&r, 1, 3));
+    request_free(&r);
+    request_init(&r, REQ_CHAT, 128);                  /* no field: never rejects */
+    TEST_ASSERT(!logit_bias_block_reject(&r, 1, 4));
+    request_free(&r);
+}
+
+static void test_logit_bias_biased_sampling_never_picks_a_ban(void) {
+    request r;
+    request_init(&r, REQ_CHAT, 128);
+    char err[160] = {0};
+    const char *p = "{\"2\":-100}";
+    TEST_ASSERT(parse_logit_bias_value(&p, &r));
+    TEST_ASSERT(request_validate_logit_bias(&r, 6, err, sizeof(err)));
+    const float raw[6] = {1.0f, 2.0f, 30.0f, 3.0f, 0.5f, 0.0f};
+    float lg[6];
+    memcpy(lg, raw, sizeof(lg));
+    TEST_ASSERT(ds4_sample_logits(lg, 6, 0.0f, 0, 1.0f, 0.0f, NULL) == 2);   /* raw argmax is the ban */
+    logit_bias_apply(&r, lg, 6);
+    TEST_ASSERT(ds4_sample_logits(lg, 6, 0.0f, 0, 1.0f, 0.0f, NULL) == 3);
+    uint64_t rng = 12345;
+    for (int i = 0; i < 2000; i++)
+        TEST_ASSERT(ds4_sample_logits(lg, 6, 1.0f, 0, 1.0f, 0.0f, &rng) != 2);
+    request_free(&r);
+}
+
+static void test_chat_request_carries_logit_bias(void) {
+    request r;
+    char err[160] = {0};
+    bool ok = parse_chat_request(NULL, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],"
+        "\"logit_bias\":{\"11\":-100,\"12\":-100}}",
+        64, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(ok);
+    TEST_ASSERT(r.logit_bias_n == 2 && logit_bias_bans(&r, 11) && logit_bias_bans(&r, 12));
+    request_free(&r);
+    ok = parse_chat_request(NULL, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}",
+        64, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(ok);
+    TEST_ASSERT(r.logit_bias_n == 0 && r.logit_bias_ban == NULL);
+    request_free(&r);
+    ok = parse_chat_request(NULL, NULL,
+        "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"logit_bias\":{\"x\":1}}",
+        64, 4096, &r, err, sizeof(err));
+    TEST_ASSERT(!ok);
 }
 
 static void test_reasoning_effort_mapping(void) {
@@ -24861,6 +25210,11 @@ static void ds4_server_unit_tests_run(void) {
     test_dispatch_routes_alien_request_to_empty_slot();
     test_request_defaults_use_min_p_filtering();
     test_chat_ignore_eos_contract();
+    test_logit_bias_parse_and_validate();
+    test_logit_bias_large_object();
+    test_logit_bias_block_reject_rule();
+    test_logit_bias_biased_sampling_never_picks_a_ban();
+    test_chat_request_carries_logit_bias();
     test_reasoning_effort_mapping();
     test_model_alias_thinking_controls();
     test_api_thinking_controls_parse();
