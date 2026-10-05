@@ -139,16 +139,27 @@ workloads, the controls are `--kv-cache-min-tokens`,
 `--kv-cache-boundary-trim-tokens`, and `--kv-cache-boundary-align-tokens`.
 Check `./ds4-server --help` for their defaults.
 
-`--kv-cache-prompt-end-min-tokens N` (default 0, off) is for Qwen agent
-sessions that compact. A compaction request repeats the last tool turn's
-prompt up to the end of its last message and then adds a user message, but by
-then the live KV has moved on through the assistant reply and the Qwen hybrid
-model cannot rewind. With this flag, every OpenAI-chat Qwen tool-turn prompt of
-at least N tokens stops prefill at the end of its last message and stores a
-checkpoint there (one full-prefix write per such turn), keyed by its visible
-text. The compaction request then loads it and prefills only the new message.
-Only a later prompt-end checkpoint of the same conversation marks an older one
-as the first to evict.
+`--kv-cache-prompt-end-min-tokens N` (default 0, off) is for Qwen3.8 (not
+Ornith) agent sessions that compact. A compaction request repeats the last tool
+turn's prompt up to the end of its last message and then adds a user message,
+but by then the live KV has moved on through the assistant reply and the
+Qwen3.8 hybrid model cannot rewind. With this flag, every OpenAI-chat Qwen3.8
+tool-turn prompt of at least N tokens stops prefill at the end of its last
+message and stores a checkpoint there (one full-prefix write per such turn),
+keyed by its visible text. The compaction request then loads it and prefills
+only the new message. Only a later prompt-end checkpoint of the same
+conversation marks an older one as the first to evict.
+
+The flag needs the disk KV cache (`--kv-disk-dir`); without it nothing is
+stored. A checkpoint is cut only when the end of the last message lies past
+the tokens the request already reuses from the live or disk cache: a request
+whose reused prefix reaches that point stores nothing new. N must be 0 or at
+least `--kv-cache-min-tokens`, otherwise the server exits at startup. Ornith
+is excluded because its template is not proven to replay a past turn as the
+same bytes; DeepSeek and GLM are excluded too. The startup line
+`kv cache prompt-end checkpoints for qwen tool-turn prompts >= N tokens` is
+printed whenever the disk cache is on and N > 0, whatever the model, so on
+Ornith, DeepSeek or GLM it announces a feature that never fires.
 
 Quantization variants may share compatible prefixes. Add
 `--kv-cache-reject-different-quant` for same-quant reuse only.
