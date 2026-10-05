@@ -173,6 +173,11 @@ double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);
+/* The context a store of text_len bytes of text with reason_code evicts
+ * against (ds4_kvstore_store_live_prefix_text builds it here). */
+ds4_kvstore_eviction_context ds4_kvstore_incoming_context(
+        const ds4_kvstore *kc, const char *text, size_t text_len,
+        int model_id, int quant_bits, int ctx_size, uint8_t reason_code);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
 /* Same lookup, but also skips entries whose payload_variant (h[21], Task 14)

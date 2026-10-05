@@ -959,6 +959,20 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
     (void)ok;
 }
 
+ds4_kvstore_eviction_context ds4_kvstore_incoming_context(
+        const ds4_kvstore *kc, const char *text, size_t text_len,
+        int model_id, int quant_bits, int ctx_size, uint8_t reason_code) {
+    return (ds4_kvstore_eviction_context){
+        .text = text,
+        .text_len = text_len,
+        .model_id = (uint8_t)model_id,
+        .quant_bits = (uint8_t)quant_bits,
+        .ctx_size = (uint32_t)ctx_size,
+        .reject_different_quant = kc->reject_different_quant,
+        .reason = reason_code,
+    };
+}
+
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
                                         ds4_session *session,
@@ -1081,15 +1095,9 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         return false;
     }
 
-    ds4_kvstore_eviction_context incoming = {
-        .text = text,
-        .text_len = text_len,
-        .model_id = (uint8_t)model_id,
-        .quant_bits = (uint8_t)quant_bits,
-        .ctx_size = (uint32_t)ds4_session_ctx(session),
-        .reject_different_quant = kc->reject_different_quant,
-        .reason = reason_code,
-    };
+    ds4_kvstore_eviction_context incoming = ds4_kvstore_incoming_context(
+        kc, text, text_len, model_id, quant_bits, ds4_session_ctx(session),
+        reason_code);
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
     kv_buf tmpb = {0};

@@ -12368,32 +12368,71 @@ static int prompt_tail_token_start(const ds4_tokens *prompt, const ds4_tokens *t
     return start;
 }
 
-/* Tokens before this request's generation prompt when a prompt-end checkpoint
- * should be cut there (its key length in *text_len), else 0.  The generation
- * prompt opens with the <|im_start|> special token, so tokenized alone it is
- * exactly the prompt's tail and the cut is a clean token boundary; it must
- * also leave new tokens past what is already cached. */
-static int kv_cache_prompt_end_store_len(server *s, const request *r,
-                                         const ds4_tokens *prompt, int cached,
-                                         size_t *text_len) {
-    *text_len = 0;
-    if (!s || !s->kv.enabled || s->kv.opt.prompt_end_min_tokens <= 0 ||
-        !prompt || prompt->len < s->kv.opt.prompt_end_min_tokens) return 0;
-    const size_t n = prompt_end_text_len(r);
-    if (!n) return 0;
-    ds4_tokens tail = {0};
-    ds4_tokenize_rendered_chat(s->engine, r->prompt_text + n, &tail);
-    const int cut = prompt_tail_token_start(prompt, &tail);
-    ds4_tokens_free(&tail);
+/* The prompt-end checkpoint the cold prefill cuts: prefill len tokens, then
+ * store them with this reason, keyed by key under key_ext/key_kind.  len 0 is
+ * no split. */
+typedef struct {
+    int len;
+    char *key;
+    uint8_t key_ext;
+    const char *reason;
+    const char *key_kind;
+} prompt_end_split;
+
+static void prompt_end_split_free(prompt_end_split *p) {
+    if (!p) return;
+    free(p->key);
+    memset(p, 0, sizeof(*p));
+}
+
+/* The split for a request whose first text_len prompt bytes end its last
+ * message (prompt_end_text_len()) and whose generation prompt, tokenized
+ * alone, is tail.  The generation prompt opens with the <|im_start|> special
+ * token, so it is exactly the prompt's token tail and the cut is a clean token
+ * boundary; the cut must also leave new tokens past what is already cached,
+ * reach the disk cache minimum and lie past any cold checkpoint
+ * (cold_store_len), which already stores everything up to it.  Pure: the
+ * engine-bound tokenizer call stays in kv_cache_prompt_end_split(). */
+static bool prompt_end_split_plan(const kv_disk_cache *kc, const request *r,
+                                  size_t text_len, const ds4_tokens *prompt,
+                                  const ds4_tokens *tail, int cached,
+                                  int cold_store_len, prompt_end_split *out) {
+    memset(out, 0, sizeof(*out));
+    if (!kc || !r || !r->prompt_text || !text_len || !prompt) return false;
+    const int cut = prompt_tail_token_start(prompt, tail);
     if (cut < 0) {
         server_log(DS4_LOG_KVCACHE,
                    "ds4-server: kv cache prompt-end skipped prompt=%d: generation prompt is not the token tail",
                    prompt->len);
-        return 0;
+        return false;
     }
-    if (cut <= cached || cut < s->kv.opt.min_tokens) return 0;
-    *text_len = n;
-    return cut;
+    if (cut <= cached || cut < kc->opt.min_tokens) return false;
+    if (cut <= cold_store_len) return false;
+    out->len = cut;
+    out->key = xstrndup(r->prompt_text, text_len);
+    out->key_ext = KV_EXT_THINKING_VISIBLE | KV_EXT_PROMPT_END;
+    out->reason = "prompt-end";
+    out->key_kind = "prompt-end";
+    return true;
+}
+
+/* Fill *out with this request's prompt-end split, if any.  With the flag off,
+ * the disk cache off, a short prompt or an ineligible request it returns
+ * before tokenizing anything. */
+static bool kv_cache_prompt_end_split(server *s, const request *r,
+                                      const ds4_tokens *prompt, int cached,
+                                      int cold_store_len, prompt_end_split *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s || !s->kv.enabled || s->kv.opt.prompt_end_min_tokens <= 0 ||
+        !prompt || prompt->len < s->kv.opt.prompt_end_min_tokens) return false;
+    const size_t n = prompt_end_text_len(r);
+    if (!n) return false;
+    ds4_tokens tail = {0};
+    ds4_tokenize_rendered_chat(s->engine, r->prompt_text + n, &tail);
+    const bool split = prompt_end_split_plan(&s->kv, r, n, prompt, &tail,
+                                             cached, cold_store_len, out);
+    ds4_tokens_free(&tail);
+    return split;
 }
 
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
@@ -14887,33 +14926,34 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     /* The prompt-end checkpoint is cut the same way, past any cold one: the
      * hybrid session cannot rewind, so prefill stops on the boundary, stores
      * it, and only then evaluates the generation prompt. */
-    size_t prompt_end_text = 0;
-    const int prompt_end_len = prompt_sync_rc != 0 || multimodal ? 0 :
-        kv_cache_prompt_end_store_len(s, &j->req, prompt_for_sync, cached,
-                                      &prompt_end_text);
+    prompt_end_split prompt_end = {0};
+    if (prompt_sync_rc == 0 && !multimodal) {
+        kv_cache_prompt_end_split(s, &j->req, prompt_for_sync, cached,
+                                  cold_store_len, &prompt_end);
+    }
+    const int prompt_end_len = prompt_end.len;
     int suppressed_prompt_end_last = -1;
-    if (prompt_end_len > cold_store_len) {
+    if (prompt_end_len > 0) {
         suppressed_prompt_end_last =
             kv_cache_slot_suppress_continued(s, slot, prompt_end_len);
         ds4_tokens prefix = {0};
         tokens_copy_prefix(&prefix, prompt_for_sync, prompt_end_len);
         prompt_sync_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
         if (prompt_sync_rc == 0) {
-            char *key = xstrndup(j->req.prompt_text, prompt_end_text);
             if (kv_cache_store_live_prefix_text(s, slot, prompt_for_sync,
-                                                prompt_end_len, "prompt-end", key,
-                                                KV_EXT_THINKING_VISIBLE | KV_EXT_PROMPT_END,
-                                                "prompt-end")) {
+                                                prompt_end_len, prompt_end.reason,
+                                                prompt_end.key, prompt_end.key_ext,
+                                                prompt_end.key_kind)) {
                 kv_cache_slot_note_store(slot, prompt_end_len);
             } else {
                 kv_cache_slot_restore_suppressed(slot, suppressed_prompt_end_last,
                                                  prompt_end_len);
             }
             suppressed_prompt_end_last = -1;
-            free(key);
         }
         ds4_tokens_free(&prefix);
     }
+    prompt_end_split_free(&prompt_end);
 
     if (prompt_sync_rc == 0) {
         prompt_sync_rc = multimodal ?
@@ -20278,18 +20318,135 @@ static void test_prompt_end_store_len_gates(void) {
     server s = {0};
     s.kv.enabled = true;
     s.kv.opt = kv_cache_default_options();
-    size_t text_len = 123;
-    TEST_ASSERT(kv_cache_prompt_end_store_len(&s, &r, &prompt, 0, &text_len) == 0);
-    TEST_ASSERT(text_len == 0);
+    prompt_end_split split = {.len = 123};
+    TEST_ASSERT(!kv_cache_prompt_end_split(&s, &r, &prompt, 0, 0, &split));
+    TEST_ASSERT(split.len == 0 && split.key == NULL);
     s.kv.opt.prompt_end_min_tokens = 4097;
-    TEST_ASSERT(kv_cache_prompt_end_store_len(&s, &r, &prompt, 0, &text_len) == 0);
+    TEST_ASSERT(!kv_cache_prompt_end_split(&s, &r, &prompt, 0, 0, &split));
     s.kv.enabled = false;
     s.kv.opt.prompt_end_min_tokens = 1024;
-    TEST_ASSERT(kv_cache_prompt_end_store_len(&s, &r, &prompt, 0, &text_len) == 0);
+    TEST_ASSERT(!kv_cache_prompt_end_split(&s, &r, &prompt, 0, 0, &split));
     s.kv.enabled = true;
     r.has_tools = false;
-    TEST_ASSERT(kv_cache_prompt_end_store_len(&s, &r, &prompt, 0, &text_len) == 0);
+    TEST_ASSERT(!kv_cache_prompt_end_split(&s, &r, &prompt, 0, 0, &split));
+    TEST_ASSERT(split.len == 0 && split.key == NULL);
 
+    ds4_tokens_free(&prompt);
+    free(r.prompt_text);
+    chat_msgs_free(&msgs);
+}
+
+/* What the cold prefill does with a qualifying request once its generation
+ * prompt is tokenized: stop at the token where that generation prompt starts,
+ * provided the cut is past the cached prefix, past any cold checkpoint and at
+ * least --kv-cache-min-tokens deep, and store it keyed by the request's text up
+ * to the end of its last message, which the compaction turn renders byte for
+ * byte. */
+static void test_prompt_end_split_plan(void) {
+    const char *schemas = "{\"name\":\"bash\",\"parameters\":{\"type\":\"object\"}}";
+    chat_msgs msgs = {0};
+    chat_msg sys = {0};
+    sys.role = xstrdup("system");
+    sys.content = xstrdup("You are terse.");
+    chat_msgs_push(&msgs, sys);
+    chat_msg user = {0};
+    user.role = xstrdup("user");
+    user.content = xstrdup("run it");
+    chat_msgs_push(&msgs, user);
+    chat_msg assistant = {0};
+    assistant.role = xstrdup("assistant");
+    assistant.content = xstrdup("");
+    tool_call call = {0};
+    call.name = xstrdup("bash");
+    call.arguments = xstrdup("{}");
+    tool_calls_push(&assistant.calls, call);
+    chat_msgs_push(&msgs, assistant);
+    chat_msg tool = {0};
+    tool.role = xstrdup("tool");
+    tool.content = xstrdup("ok");
+    chat_msgs_push(&msgs, tool);
+
+    request r = {0};
+    r.kind = REQ_CHAT;
+    r.api = API_OPENAI;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    r.has_tools = true;
+    r.think_mode = DS4_THINK_HIGH;
+    r.prompt_text = render_qwen_chat_prompt_text(&msgs, schemas, NULL, r.think_mode);
+    const char *gen = "<|im_start|>assistant\n<think>\n";
+    const char *end = "</tool_response><|im_end|>\n";
+    const size_t want_key_len = strlen(r.prompt_text) - strlen(gen);
+    TEST_ASSERT(!strcmp(r.prompt_text + want_key_len, gen));
+    const size_t text_len = prompt_end_text_len(&r);
+
+    /* 6000 prompt tokens; the generation prompt alone tokenizes to the last 5 */
+    ds4_tokens prompt = {0};
+    for (int i = 0; i < 6000; i++) ds4_tokens_push(&prompt, 1000 + i);
+    ds4_tokens tail = {0};
+    for (int i = 5995; i < 6000; i++) ds4_tokens_push(&tail, 1000 + i);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.opt = kv_cache_default_options();
+    kc.opt.prompt_end_min_tokens = 4096;
+
+    /* cold prefill: nothing cached, no cold checkpoint */
+    prompt_end_split split = {0};
+    TEST_ASSERT(prompt_end_split_plan(&kc, &r, text_len, &prompt, &tail, 0, 0, &split));
+    TEST_ASSERT(split.len == 5995);
+    TEST_ASSERT(split.key != NULL && strlen(split.key) == want_key_len);
+    TEST_ASSERT(split.key != NULL && !strncmp(split.key, r.prompt_text, want_key_len));
+    TEST_ASSERT(split.key != NULL && strlen(split.key) > strlen(end) &&
+                !strcmp(split.key + strlen(split.key) - strlen(end), end));
+    TEST_ASSERT(split.reason != NULL &&
+                ds4_kvstore_reason_code(split.reason) == KV_REASON_PROMPT_END);
+    TEST_ASSERT(split.key_ext == (KV_EXT_THINKING_VISIBLE | KV_EXT_PROMPT_END));
+    TEST_ASSERT(split.key_kind != NULL && !strcmp(split.key_kind, "prompt-end"));
+
+    /* the compaction turn renders the key, then its new user message */
+    chat_msg compact = {0};
+    compact.role = xstrdup("user");
+    compact.content = xstrdup("CRITICAL: Respond with TEXT ONLY.");
+    chat_msgs_push(&msgs, compact);
+    char *next = render_qwen_chat_prompt_text(&msgs, schemas, NULL, r.think_mode);
+    TEST_ASSERT(split.key != NULL && !strncmp(next, split.key, strlen(split.key)));
+    TEST_ASSERT(split.key != NULL &&
+                !strncmp(next + strlen(split.key), "<|im_start|>user\nCRITICAL", 25));
+    free(next);
+    prompt_end_split_free(&split);
+    TEST_ASSERT(split.len == 0 && split.key == NULL);
+
+    /* a cold checkpoint below the cut leaves the split in place */
+    TEST_ASSERT(prompt_end_split_plan(&kc, &r, text_len, &prompt, &tail, 0, 4096, &split));
+    TEST_ASSERT(split.len == 5995);
+    prompt_end_split_free(&split);
+    /* a cold checkpoint at the cut already stores that prefix */
+    TEST_ASSERT(!prompt_end_split_plan(&kc, &r, text_len, &prompt, &tail, 0, 5995, &split));
+    TEST_ASSERT(split.len == 0 && split.key == NULL);
+
+    /* the cut must leave new tokens past the cached prefix */
+    TEST_ASSERT(prompt_end_split_plan(&kc, &r, text_len, &prompt, &tail, 5994, 0, &split));
+    TEST_ASSERT(split.len == 5995);
+    prompt_end_split_free(&split);
+    TEST_ASSERT(!prompt_end_split_plan(&kc, &r, text_len, &prompt, &tail, 5995, 0, &split));
+    TEST_ASSERT(split.len == 0 && split.key == NULL);
+    TEST_ASSERT(!prompt_end_split_plan(&kc, &r, text_len, &prompt, &tail, 5996, 0, &split));
+
+    /* ... and be deep enough for the disk cache */
+    kc.opt.min_tokens = 5996;
+    TEST_ASSERT(!prompt_end_split_plan(&kc, &r, text_len, &prompt, &tail, 0, 0, &split));
+    kc.opt.min_tokens = 5995;
+    TEST_ASSERT(prompt_end_split_plan(&kc, &r, text_len, &prompt, &tail, 0, 0, &split));
+    TEST_ASSERT(split.len == 5995);
+    prompt_end_split_free(&split);
+    kc.opt.min_tokens = kv_cache_default_options().min_tokens;
+
+    /* a generation prompt that is not the prompt's token tail is no boundary */
+    tail.v[0] = 7;
+    TEST_ASSERT(!prompt_end_split_plan(&kc, &r, text_len, &prompt, &tail, 0, 0, &split));
+    TEST_ASSERT(split.len == 0 && split.key == NULL);
+
+    ds4_tokens_free(&tail);
     ds4_tokens_free(&prompt);
     free(r.prompt_text);
     chat_msgs_free(&msgs);
@@ -24177,15 +24334,10 @@ static int test_kv_prompt_end_survivor(const char *texts[2], const uint8_t reaso
     kc.budget_bytes = incoming_bytes + KV_CACHE_FIXED_HEADER + 4u +
                       (strlen(texts[0]) > strlen(texts[1]) ? strlen(texts[0]) : strlen(texts[1])) +
                       2048u;
-    ds4_kvstore_eviction_context incoming = {
-        .text = incoming_text,
-        .text_len = strlen(incoming_text),
-        .model_id = 0,
-        .quant_bits = 2,
-        .ctx_size = 32768,
-        .reject_different_quant = false,
-        .reason = incoming_reason,
-    };
+    /* the context the store path itself builds, so it carries whatever the
+     * store passes for the incoming reason */
+    ds4_kvstore_eviction_context incoming = ds4_kvstore_incoming_context(
+        &kc, incoming_text, strlen(incoming_text), 0, 2, 32768, incoming_reason);
     kv_cache_evict(&kc, NULL, incoming_bytes, &incoming);
     const bool kept0 = access(paths[0], F_OK) == 0;
     const bool kept1 = access(paths[1], F_OK) == 0;
@@ -25695,6 +25847,7 @@ static void ds4_server_unit_tests_run(void) {
     test_qwen_prompt_end_text_boundary();
     test_prompt_tail_token_start();
     test_prompt_end_store_len_gates();
+    test_prompt_end_split_plan();
     test_glm_tool_visible_checkpoint_boundary();
     test_glm_tool_context_answer_visible_prefix();
     test_glm_thinking_off_answer_visible_prefix();
