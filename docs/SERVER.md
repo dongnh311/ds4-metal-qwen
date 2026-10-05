@@ -139,6 +139,17 @@ workloads, the controls are `--kv-cache-min-tokens`,
 `--kv-cache-boundary-trim-tokens`, and `--kv-cache-boundary-align-tokens`.
 Check `./ds4-server --help` for their defaults.
 
+`--kv-cache-prompt-end-min-tokens N` (default 0, off) is for Qwen agent
+sessions that compact. A compaction request repeats the last tool turn's
+prompt up to the end of its last message and then adds a user message, but by
+then the live KV has moved on through the assistant reply and the Qwen hybrid
+model cannot rewind. With this flag, every OpenAI-chat Qwen tool-turn prompt of
+at least N tokens stops prefill at the end of its last message and stores a
+checkpoint there (one full-prefix write per such turn), keyed by its visible
+text. The compaction request then loads it and prefills only the new message.
+Only a later prompt-end checkpoint of the same conversation marks an older one
+as the first to evict.
+
 Quantization variants may share compatible prefixes. Add
 `--kv-cache-reject-different-quant` for same-quant reuse only.
 Cache files contain prompt text and model state: treat the directory as

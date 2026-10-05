@@ -169,6 +169,7 @@ ds4_kvstore_options ds4_kvstore_default_options(void) {
         .boundary_trim_tokens = KV_CACHE_DEFAULT_BOUNDARY_TRIM_TOKENS,
         .boundary_align_tokens = KV_CACHE_DEFAULT_BOUNDARY_ALIGN_TOKENS,
         .continued_dense_max_tokens = 0,
+        .prompt_end_min_tokens = 0,
     };
 }
 
@@ -180,10 +181,12 @@ uint8_t ds4_kvstore_reason_code(const char *reason) {
     if (!strcmp(reason, "shutdown")) return DS4_KVSTORE_REASON_SHUTDOWN;
     if (!strcmp(reason, "agent-system")) return DS4_KVSTORE_REASON_AGENT_SYSTEM;
     if (!strcmp(reason, "agent-session")) return DS4_KVSTORE_REASON_AGENT_SESSION;
+    if (!strcmp(reason, "prompt-end")) return DS4_KVSTORE_REASON_PROMPT_END;
     return DS4_KVSTORE_REASON_UNKNOWN;
 }
 
 const char *ds4_kvstore_key_kind(uint8_t ext_flags) {
+    if (ext_flags & DS4_KVSTORE_EXT_PROMPT_END) return "prompt-end";
     if (ext_flags & DS4_KVSTORE_EXT_RESPONSES_VISIBLE) return "responses-visible";
     if (ext_flags & DS4_KVSTORE_EXT_THINKING_VISIBLE) return "thinking-visible";
     return "token-text";
@@ -441,7 +444,7 @@ bool ds4_kvstore_read_header(FILE *fp, ds4_kvstore_entry *e,
         h[2] != KV_CACHE_MAGIC2 || h[3] != KV_CACHE_VERSION) return false;
     if (h[20] != KV_CACHE_PAYLOAD_ABI) return false;
     e->quant_bits = h[4];
-    e->reason = h[5] <= DS4_KVSTORE_REASON_AGENT_SESSION ? h[5] :
+    e->reason = h[5] <= DS4_KVSTORE_REASON_PROMPT_END ? h[5] :
                 DS4_KVSTORE_REASON_UNKNOWN;
     e->ext_flags = h[6];
     e->model_id = h[7];
@@ -521,11 +524,20 @@ bool ds4_kvstore_touch_file(const char *path, uint32_t hits) {
     return ok;
 }
 
-static bool kv_cache_incoming_supersedes_continued(
+static bool kv_cache_incoming_supersedes(
         const ds4_kvstore_entry *e,
         const ds4_kvstore_eviction_context *incoming) {
     if (!e || !incoming || !incoming->text) return false;
-    if (e->reason != DS4_KVSTORE_REASON_CONTINUED) return false;
+    /* A continued snapshot is dominated by any longer checkpoint of its text.
+     * A prompt-end checkpoint waits for the request that diverges right after
+     * it (a compaction turn), which a longer evict or continued store of the
+     * same turn cannot serve: only the conversation's next prompt-end, written
+     * once the client has moved past this turn, supersedes it. */
+    if (e->reason == DS4_KVSTORE_REASON_PROMPT_END) {
+        if (incoming->reason != DS4_KVSTORE_REASON_PROMPT_END) return false;
+    } else if (e->reason != DS4_KVSTORE_REASON_CONTINUED) {
+        return false;
+    }
     if (e->text_bytes == 0 || e->text_bytes > SIZE_MAX) return false;
     if ((size_t)e->text_bytes >= incoming->text_len) return false;
     if (e->model_id != incoming->model_id) return false;
@@ -569,7 +581,7 @@ double ds4_kvstore_entry_eviction_score(
                    (double)e->tokens / (double)e->file_size;
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
-    if (kv_cache_incoming_supersedes_continued(e, incoming)) {
+    if (kv_cache_incoming_supersedes(e, incoming)) {
         double h = effective_hits > 0.0 ?
             effective_hits / (effective_hits + 1.0) : 0.0;
         score *= KV_CACHE_CONTINUED_PREFIX_MIN_FACTOR +
@@ -1076,6 +1088,7 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
         .quant_bits = (uint8_t)quant_bits,
         .ctx_size = (uint32_t)ds4_session_ctx(session),
         .reject_different_quant = kc->reject_different_quant,
+        .reason = reason_code,
     };
     ds4_kvstore_evict(kc, live_tokens, est_file_bytes, &incoming);
 
