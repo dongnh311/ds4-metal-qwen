@@ -9624,10 +9624,18 @@ uint64_t ds4_gpu_tensor_bytes(const ds4_gpu_tensor *tensor) {
     return obj.bytes;
 }
 
+/* The CPU accessors below run inside their own autorelease pool.  Their C
+ * callers (KV disk-cache store and load, cache zero-fill) have none, and
+ * reading obj.buffer there leaves the MTLBuffer autoreleased into a pool that
+ * never drains: ds4_gpu_tensor_free then cannot give the memory back, and
+ * every KV set freed after a disk-cache store or load stays resident.
+ * tests/test_metal_buffer_release covers write, read and fill. */
 void *ds4_gpu_tensor_contents(ds4_gpu_tensor *tensor) {
     if (!tensor) return NULL;
-    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
-    return (uint8_t *)[obj.buffer contents] + obj.offset;
+    @autoreleasepool {
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        return (uint8_t *)[obj.buffer contents] + obj.offset;
+    }
 }
 
 int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count) {
@@ -9640,20 +9648,24 @@ int ds4_gpu_tensor_fill_f32(ds4_gpu_tensor *tensor, float value, uint64_t count)
 
 int ds4_gpu_tensor_write(ds4_gpu_tensor *tensor, uint64_t offset, const void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
-    DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
-    if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
-    if (bytes != 0) {
-        memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
+    @autoreleasepool {
+        DS4MetalTensor *obj = ds4_gpu_tensor_obj(tensor);
+        if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
+        if (bytes != 0) {
+            memcpy((uint8_t *)[obj.buffer contents] + obj.offset + offset, data, (size_t)bytes);
+        }
     }
     return 1;
 }
 
 int ds4_gpu_tensor_read(const ds4_gpu_tensor *tensor, uint64_t offset, void *data, uint64_t bytes) {
     if (!tensor || (!data && bytes != 0)) return 0;
-    const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
-    if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
-    if (bytes != 0) {
-        memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
+    @autoreleasepool {
+        const DS4MetalTensor *obj = ds4_gpu_tensor_const_obj(tensor);
+        if (offset > obj.bytes || bytes > obj.bytes - offset) return 0;
+        if (bytes != 0) {
+            memcpy(data, (const uint8_t *)[obj.buffer contents] + obj.offset + offset, (size_t)bytes);
+        }
     }
     return 1;
 }

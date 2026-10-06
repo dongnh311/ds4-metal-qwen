@@ -256,6 +256,17 @@ test-metal-command-memory: tests/test_metal_command_memory
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory batch
 	MTL_DEBUG_LAYER=1 ./tests/test_metal_command_memory big
 
+tests/test_metal_buffer_release: tests/test_metal_buffer_release.c ds4_gpu.h ds4_metal.o ds4_image.o
+	$(CC) $(CFLAGS) -I. -o $@ $< ds4_metal.o ds4_image.o $(METAL_LDLIBS)
+
+.PHONY: test-metal-buffer-release
+test-metal-buffer-release: tests/test_metal_buffer_release
+	./tests/test_metal_buffer_release resize
+	./tests/test_metal_buffer_release encode
+	./tests/test_metal_buffer_release write
+	./tests/test_metal_buffer_release read
+	./tests/test_metal_buffer_release fill
+
 tests/test_deepseek41_metal.o: tests/test_deepseek41_metal.c ds4_gpu.h ds4_deepseek41_gpu.h
 	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -I. -c -o $@ $<
 
@@ -1229,6 +1240,7 @@ clean:
 	rm -f tests/test_metal_ssd_experts
 	rm -f tests/test_metal_stream_gate
 	rm -f tests/test_metal_command_memory
+	rm -f tests/test_metal_buffer_release
 	rm -f tests/test_deepseek41_metal
 	rm -f tests/test_deepseek41_cuda
 	rm -f tests/test_cuda_q8_rows
