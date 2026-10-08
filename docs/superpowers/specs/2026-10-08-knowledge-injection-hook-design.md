@@ -117,6 +117,8 @@ Precedence, stated so there is no second reading of it:
 
 The header is the per-request lever; env is the global default. That is what lets the sweep run all six cap arms against one running gateway without restarting it: the harness varies the header, not the process.
 
+`X-Knowledge-Cap: 2000` sets the cap for that request and overrides `MLX_KNOWLEDGE_CAP`. A non-numeric value is ignored and the env default applies — a malformed header must not crash the request path. `policy()` therefore returns `(enabled, corpora, cap)`.
+
 ---
 
 ## 7. Carrier semantics
