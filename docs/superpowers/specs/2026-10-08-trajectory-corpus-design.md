@@ -93,7 +93,13 @@ Sequence:
 **Off-thread.** The write goes to a bounded queue (200 entries) drained by a daemon
 thread, the same shape `analytics` uses for its DB writes. Extraction is synchronous (it
 is a pass over a list already in memory, measured in §6); the SQLite write is not. A full
-queue drops the newest entry and bumps a counter rather than blocking the request.
+queue drops the **oldest pending** entry — the recent trajectories are the ones worth
+keeping — rather than blocking the request.
+
+One identity caveat, stated rather than hidden: `conv_id` is a truncated hash of the
+first user turn, so two sessions that open with the same prompt share an id and their
+trajectories merge under one `doc_id`. The analytics layer already treats `conv_id` as
+a conversation identity with this exact weakness; the corpus inherits it.
 
 **Soft.** Every exception is swallowed, counted (`trajectory_capture_failed`), and
 reported as a measured `trajectory_ms`. A capture crash never changes the request bytes.
