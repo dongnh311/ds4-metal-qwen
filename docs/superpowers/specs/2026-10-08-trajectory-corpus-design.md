@@ -128,11 +128,15 @@ right for a mixed corpus. Checked against the code: the cap is keyed on `path`
 spreads conversations without any change. No new cap is needed — inventing one would be
 a second mechanism doing what the first already does.
 
-The one agentic-specific rule is a **tool-name boost**: a chunk whose tool name appears
-in the query ranks above an equal-scoring chunk that does not. A request about
-`graph_callers` that surfaces five chunks from five conversations about five tools is
-five wasted slots, and BM25 alone cannot tell them apart because the tool name is one
-word in a 600-character excerpt.
+The one agentic-specific rule is a **tool hint**: a chunk about a tool the request is
+holding ranks above an equal-scoring chunk that is not. The first draft keyed this on
+query terms; that is redundant, because BM25 already sees a tool name in the query. The
+signal retrieval genuinely cannot see is the tool catalog the client offered — a user
+asking "why did that call fail" names no tool, but the request does.
+
+A request about `graph_callers` that surfaces five chunks from five conversations about
+five tools is five wasted slots, and BM25 cannot tell them apart because the tool name
+is one word in a 600-character excerpt.
 
 This is deliberately small. A full per-domain policy engine is 3-C.
 
