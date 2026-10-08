@@ -11,6 +11,12 @@
 #define DS4_KVSTORE_FIXED_HEADER 48u
 #define DS4_KVSTORE_DEFAULT_MB 4096
 #define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
+/* Every checkpoint's eviction score also halves per this much idle time.
+ * Hit counts decay to nothing within a day, after which the score is just
+ * tokens per byte, and that grows with prompt length (the recurrent state is a
+ * fixed block).  Without this term a long checkpoint nobody will reuse
+ * outranked every fresh shorter one forever. */
+#define DS4_KVSTORE_IDLE_HALF_LIFE_SECONDS (24ull * 60ull * 60ull)
 
 #define DS4_KVSTORE_EXT_TOOL_MAP          (1u << 0)
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
@@ -244,6 +250,16 @@ void ds4_kvstore_fill_header_v(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                                uint64_t created_at, uint64_t last_used,
                                uint64_t payload_bytes, uint8_t payload_variant);
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
+/* If a compatible checkpoint for `text` already exists at `path`, rewrite its
+ * trailer, refresh its last_used and return true (the store has nothing to
+ * write).  Otherwise false; an incompatible file is unlinked, as by
+ * ds4_kvstore_existing_compatible(). */
+bool ds4_kvstore_reuse_existing(ds4_kvstore *kc, const char *path,
+                                const char sha[41],
+                                const char *text, size_t text_len,
+                                int model_id, int quant_bits, int ctx_size,
+                                int payload_variant,
+                                const ds4_kvstore_trailer_hooks *hooks);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
 char *ds4_kvstore_path_join(const char *dir, const char *name);
