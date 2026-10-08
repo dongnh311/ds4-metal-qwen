@@ -11,6 +11,12 @@
 #define DS4_KVSTORE_FIXED_HEADER 48u
 #define DS4_KVSTORE_DEFAULT_MB 4096
 #define DS4_KVSTORE_HIT_HALF_LIFE_SECONDS (6ull * 60ull * 60ull)
+/* Every checkpoint's eviction score also halves per this much idle time.
+ * Hit counts decay to nothing within a day, after which the score is just
+ * tokens per byte, and that grows with prompt length (the recurrent state is a
+ * fixed block).  Without this term a long checkpoint nobody will reuse
+ * outranked every fresh shorter one forever. */
+#define DS4_KVSTORE_IDLE_HALF_LIFE_SECONDS (24ull * 60ull * 60ull)
 
 #define DS4_KVSTORE_EXT_TOOL_MAP          (1u << 0)
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)

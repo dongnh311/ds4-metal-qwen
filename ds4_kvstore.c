@@ -43,6 +43,11 @@
 /* Disk-hit counts are evidence that a checkpoint was useful, but only while
  * the workload still resembles the one that produced those hits. */
 #define KV_CACHE_MIN_EFFECTIVE_HITS 0.01
+/* The idle factor stops shrinking after this many half-lives (512 days), so
+ * a very old entry keeps a positive score instead of underflowing to 0.0; at
+ * 0.0 every old entry would tie and their density and hit factors would stop
+ * ordering them. */
+#define KV_CACHE_MAX_IDLE_HALF_LIVES 512.0
 /* A continued checkpoint that is a strict prefix of the incoming store is a
  * routine waypoint on the same path. Keep recent hits meaningful, but make
  * never-hit or stale waypoints cheap victims while pre-evicting for the new
@@ -557,6 +562,7 @@ double ds4_kvstore_entry_eviction_score(
     if (!e || e->file_size == 0) return 0.0;
     (void)live;
     double effective_hits = (double)e->hits;
+    double idle_factor = 1.0;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
     if (used_at == 0) {
         effective_hits = 0.0;
@@ -564,8 +570,12 @@ double ds4_kvstore_entry_eviction_score(
         double elapsed = (double)(now - used_at);
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
         if (effective_hits < KV_CACHE_MIN_EFFECTIVE_HITS) effective_hits = 0.0;
+        double idle_half_lives = elapsed / (double)DS4_KVSTORE_IDLE_HALF_LIFE_SECONDS;
+        if (idle_half_lives > KV_CACHE_MAX_IDLE_HALF_LIVES)
+            idle_half_lives = KV_CACHE_MAX_IDLE_HALF_LIVES;
+        idle_factor = exp2(-idle_half_lives);
     }
-    double score = (effective_hits + 1.0) *
+    double score = (effective_hits + 1.0) * idle_factor *
                    (double)e->tokens / (double)e->file_size;
     if (kv_cache_reason_is_anchor(e->reason))
         score *= KV_CACHE_ANCHOR_REASON_SCORE_FACTOR;
@@ -650,7 +660,7 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
     kc->opt = opt;
     ds4_kvstore_evict(kc, NULL, 0, NULL);
     kv_logf(kc, DS4_KVSTORE_LOG_KVCACHE,
-            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus)",
+            "%s: KV disk cache %s (budget=%llu MiB, cross-quant=%s, min=%d, cold_max=%d, continued=%d, trim=%d, align=%d, hit_half_life=%llus, idle_half_life=%llus)",
             kv_log_name(kc),
             kc->dir,
             (unsigned long long)(kc->budget_bytes / (1024ull * 1024ull)),
@@ -660,7 +670,8 @@ bool ds4_kvstore_open(ds4_kvstore *kc, const char *dir, uint64_t budget_mb,
             kc->opt.continued_interval_tokens,
             kc->opt.boundary_trim_tokens,
             kc->opt.boundary_align_tokens,
-            (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);
+            (unsigned long long)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS,
+            (unsigned long long)DS4_KVSTORE_IDLE_HALF_LIFE_SECONDS);
     return true;
 }
 

@@ -23909,6 +23909,71 @@ static void test_kv_cache_eviction_decayed_hits_tie_break_by_age(void) {
     rmdir(dir);
 }
 
+static void test_kv_cache_eviction_score_decays_with_idle_time(void) {
+    /* Two entries identical except for when they were last used: the one
+     * idle longer must score lower, even with zero hits.  Without an idle
+     * term the scores tie and nothing ever ages out once hit counts decay. */
+    const uint64_t now = 1000u + 30u * 24u * 3600u;
+    kv_entry idle = {.tokens = 2048, .hits = 0, .file_size = 4096, .last_used = now - 9u * 24u * 3600u};
+    kv_entry recent = {.tokens = 2048, .hits = 0, .file_size = 4096, .last_used = now - 60u};
+    TEST_ASSERT(kv_entry_eviction_score(&idle, NULL, now, NULL) <
+                kv_entry_eviction_score(&recent, NULL, now, NULL));
+}
+
+static void test_kv_cache_eviction_ages_out_stale_dense_checkpoint(void) {
+    /* Production 2026-10-04: a 9-day-old 129K checkpoint that was never hit
+     * outranked a just-stored 25K one, because tokens-per-byte grows with
+     * prompt length (the recurrent state is a fixed block).  The fresh
+     * checkpoint was evicted one second after it was written and the next
+     * turn re-prefilled 25K tokens.  The stale one must go first. */
+    char tmpl[] = "/tmp/ds4-kv-idle-evict-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *stale_sha = "1111111111111111111111111111111111111111";
+    const char *fresh_sha = "2222222222222222222222222222222222222222";
+    uint64_t now = (uint64_t)time(NULL);
+    /* stale: twice the token density of fresh, idle nine days. */
+    test_kv_stub_file(dir, stale_sha, KV_REASON_COLD, 4096, 0, now - 9ull * 24ull * 3600ull, 2048);
+    test_kv_stub_file(dir, fresh_sha, KV_REASON_COLD, 2048, 0, now, 2048);
+
+    char stale_name[44], fresh_name[44];
+    snprintf(stale_name, sizeof(stale_name), "%.40s.kv", stale_sha);
+    snprintf(fresh_name, sizeof(fresh_name), "%.40s.kv", fresh_sha);
+    char *stale_path = path_join(dir, stale_name);
+    char *fresh_path = path_join(dir, fresh_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    TEST_ASSERT(access(stale_path, F_OK) != 0);
+    TEST_ASSERT(access(fresh_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(stale_path);
+    unlink(fresh_path);
+    free(stale_path);
+    free(fresh_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_keeps_recent_dense_over_fresh_sparse(void) {
+    /* The idle term must not turn the policy into plain LRU: a checkpoint
+     * used an hour ago with twice the token density still beats a sparse one
+     * stored just now (e.g. a 600-token side request whose fixed recurrent
+     * state dominates its file). */
+    const uint64_t now = 1000u + 30u * 24u * 3600u;
+    kv_entry dense = {.tokens = 4096, .hits = 0, .file_size = 4096, .last_used = now - 3600u};
+    kv_entry sparse = {.tokens = 2048, .hits = 0, .file_size = 4096, .last_used = now};
+    TEST_ASSERT(kv_entry_eviction_score(&sparse, NULL, now, NULL) <
+                kv_entry_eviction_score(&dense, NULL, now, NULL));
+}
+
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -25450,6 +25515,9 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_keeps_smaller_context_prefix();
     test_kv_cache_eviction_score_decays_stale_hits();
     test_kv_cache_eviction_decayed_hits_tie_break_by_age();
+    test_kv_cache_eviction_score_decays_with_idle_time();
+    test_kv_cache_eviction_ages_out_stale_dense_checkpoint();
+    test_kv_cache_eviction_keeps_recent_dense_over_fresh_sparse();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
     test_ornith_render_flavor_is_opt_in();
     test_ornith_effort_sent_vs_absent();
