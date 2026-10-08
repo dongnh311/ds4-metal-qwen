@@ -23974,6 +23974,93 @@ static void test_kv_cache_eviction_keeps_recent_dense_over_fresh_sparse(void) {
                 kv_entry_eviction_score(&dense, NULL, now, NULL));
 }
 
+static void test_kv_cache_reuse_existing_refreshes_last_used(void) {
+    /* A store that finds an identical checkpoint already on disk writes
+     * nothing, but the prefix was just used again (e.g. a shared system-prompt
+     * anchor rebuilt from a live slot, never loaded from disk).  With the idle
+     * factor in the eviction score, not refreshing last_used would age a
+     * checkpoint that is in use every turn. Hits are not counted: no load. */
+    char tmpl[] = "/tmp/ds4-kv-reuse-touch-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    const char *text = "<|im_start|>system\nreuse refresh test prefix";
+    test_kv_text_stub_file_model_variant(dir, text, 7, 0, KV_REASON_COLD, 512, 0);
+    char sha[41];
+    sha1_bytes_hex(text, strlen(text), sha);
+    char name[44];
+    snprintf(name, sizeof(name), "%.40s.kv", sha);
+    char *path = path_join(dir, name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+
+    const uint64_t before = (uint64_t)time(NULL);
+    TEST_ASSERT(ds4_kvstore_reuse_existing(&kc, path, sha, text, strlen(text),
+                                           7, 2, 32768, 0, NULL));
+    ds4_kvstore_entry e = {0};
+    TEST_ASSERT(ds4_kvstore_read_entry_file(path, sha, &e));
+    TEST_ASSERT(e.last_used >= before);
+    TEST_ASSERT(e.created_at == 100);
+    TEST_ASSERT(e.hits == 0);
+    ds4_kvstore_entry_free(&e);
+
+    /* An incompatible file is not reused (and is not refreshed). */
+    TEST_ASSERT(!ds4_kvstore_reuse_existing(&kc, path, sha, text, strlen(text),
+                                            7, 2, 32768, 1, NULL));
+
+    kv_cache_close(&kc);
+    unlink(path);
+    free(path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_capped_idle_tie_case(const char *old_sha,
+                                               const char *new_sha) {
+    char tmpl[] = "/tmp/ds4-kv-capped-tie-test.XXXXXX";
+    char *dir = mkdtemp(tmpl);
+    TEST_ASSERT(dir != NULL);
+    if (!dir) return;
+
+    test_kv_stub_file(dir, old_sha, KV_REASON_COLD, 2048, 0, 100, 2048);
+    test_kv_stub_file(dir, new_sha, KV_REASON_COLD, 2048, 0, 200, 2048);
+    char old_name[44], new_name[44];
+    snprintf(old_name, sizeof(old_name), "%.40s.kv", old_sha);
+    snprintf(new_name, sizeof(new_name), "%.40s.kv", new_sha);
+    char *old_path = path_join(dir, old_name);
+    char *new_path = path_join(dir, new_name);
+
+    kv_disk_cache kc = {0};
+    kc.enabled = true;
+    kc.dir = xstrdup(dir);
+    kc.opt = kv_cache_default_options();
+    kc.budget_bytes = (KV_CACHE_FIXED_HEADER + 4u + 2048u) + 16u;
+    kv_cache_evict(&kc, NULL, 0, NULL);
+
+    TEST_ASSERT(access(old_path, F_OK) != 0);
+    TEST_ASSERT(access(new_path, F_OK) == 0);
+
+    kv_cache_close(&kc);
+    unlink(old_path);
+    unlink(new_path);
+    free(old_path);
+    free(new_path);
+    rmdir(dir);
+}
+
+static void test_kv_cache_eviction_capped_idle_ties_break_by_last_used(void) {
+    /* Past the idle cap two equally dense entries score the same, so the
+     * last_used tie-break decides: the older one goes.  Run with the names
+     * swapped so directory order cannot pick the right victim by luck. */
+    test_kv_cache_capped_idle_tie_case("1111111111111111111111111111111111111111",
+                                       "2222222222222222222222222222222222222222");
+    test_kv_cache_capped_idle_tie_case("2222222222222222222222222222222222222222",
+                                       "1111111111111111111111111111111111111111");
+}
+
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -25518,6 +25605,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_score_decays_with_idle_time();
     test_kv_cache_eviction_ages_out_stale_dense_checkpoint();
     test_kv_cache_eviction_keeps_recent_dense_over_fresh_sparse();
+    test_kv_cache_reuse_existing_refreshes_last_used();
+    test_kv_cache_eviction_capped_idle_ties_break_by_last_used();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
     test_ornith_render_flavor_is_opt_in();
     test_ornith_effort_sent_vs_absent();

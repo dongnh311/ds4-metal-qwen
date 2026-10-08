@@ -250,6 +250,16 @@ void ds4_kvstore_fill_header_v(uint8_t h[DS4_KVSTORE_FIXED_HEADER],
                                uint64_t created_at, uint64_t last_used,
                                uint64_t payload_bytes, uint8_t payload_variant);
 bool ds4_kvstore_touch_file(const char *path, uint32_t hits);
+/* If a compatible checkpoint for `text` already exists at `path`, rewrite its
+ * trailer, refresh its last_used and return true (the store has nothing to
+ * write).  Otherwise false; an incompatible file is unlinked, as by
+ * ds4_kvstore_existing_compatible(). */
+bool ds4_kvstore_reuse_existing(ds4_kvstore *kc, const char *path,
+                                const char sha[41],
+                                const char *text, size_t text_len,
+                                int model_id, int quant_bits, int ctx_size,
+                                int payload_variant,
+                                const ds4_kvstore_trailer_hooks *hooks);
 bool ds4_kvstore_sha_hex_name(const char *name, char sha[41]);
 void ds4_kvstore_sha1_bytes_hex(const void *ptr, size_t len, char out[41]);
 char *ds4_kvstore_path_join(const char *dir, const char *name);

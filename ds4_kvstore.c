@@ -958,6 +958,30 @@ static void kv_cache_rewrite_trailer(ds4_kvstore *kc, const char *path,
     (void)ok;
 }
 
+bool ds4_kvstore_reuse_existing(ds4_kvstore *kc, const char *path,
+                                const char sha[41],
+                                const char *text, size_t text_len,
+                                int model_id, int quant_bits, int ctx_size,
+                                int payload_variant,
+                                const ds4_kvstore_trailer_hooks *hooks) {
+    if (!ds4_kvstore_existing_compatible(kc, path, sha, text, text_len,
+                                         model_id, quant_bits, ctx_size,
+                                         payload_variant))
+        return false;
+    kv_cache_rewrite_trailer(kc, path, text, hooks);
+    /* The prefix was just used again, so refresh last_used (the eviction score
+     * decays with idle time).  Not a hit: nothing was loaded from disk. */
+    FILE *fp = fopen(path, "rb");
+    if (fp) {
+        ds4_kvstore_entry e = {0};
+        uint32_t text_bytes = 0;
+        bool ok = ds4_kvstore_read_header(fp, &e, &text_bytes);
+        fclose(fp);
+        if (ok) ds4_kvstore_touch_file(path, e.hits);
+    }
+    return true;
+}
+
 bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
                                         ds4_engine *engine,
                                         ds4_session *session,
@@ -1032,11 +1056,10 @@ bool ds4_kvstore_store_live_prefix_text(ds4_kvstore *kc,
     char *path = ds4_kvstore_path_for_sha(kc, sha);
     const uint8_t reason_code = ds4_kvstore_reason_code(reason);
 
-    if (ds4_kvstore_existing_compatible(kc, path, sha, text, text_len,
-                                     model_id,
-                                     quant_bits, ds4_session_ctx(session),
-                                     ds4_engine_payload_variant(engine))) {
-        kv_cache_rewrite_trailer(kc, path, text, hooks);
+    if (ds4_kvstore_reuse_existing(kc, path, sha, text, text_len,
+                                   model_id,
+                                   quant_bits, ds4_session_ctx(session),
+                                   ds4_engine_payload_variant(engine), hooks)) {
         free(text);
         free(path);
         ds4_tokens_free(&store_tokens);
