@@ -34,6 +34,19 @@ Rules:
    points.
 5. One model process at a time on this 64 GB machine: stop the gateway ds4
    slot before building, testing or smoke-running.
+6. Stop the slot only in a quiet window, never under a live session: run
+   `python3 ~/Documents/GitHub/AI-Gateway-MLX/scripts/quiet-window.py --wait-s 7200`
+   first (nothing in flight, no real request for 600 s). A SIGTERM alone does
+   not keep the slot stopped: the gateway watchdog's canary (every ~2 min)
+   relaunches it within seconds, and ds4 refuses a second process. Pause the
+   watchdog for the window and restore it whatever happens:
+
+   ```sh
+   D=gui/$(id -u); PL=~/Library/LaunchAgents/dev.dongnh.gateway-watchdog.plist
+   trap 'launchctl bootstrap $D $PL' EXIT
+   launchctl bootout $D/dev.dongnh.gateway-watchdog
+   kill -TERM $(pgrep -f "ai-gateway/ds4-metal/ds4-server")   # never SIGKILL
+   ```
 
 ## Procedure
 
@@ -67,7 +80,8 @@ brings (for example `scale3-unc31`, `moe-kernels`).
 
 ### 3. Install it in the PROD checkout
 
-Stop the gateway ds4 slot (no `ds4-server` process may be running), then:
+Stop the gateway ds4 slot in a quiet window (rule 6; no `ds4-server` process
+may be running), then:
 
 ```sh
 ./deploy-ai-gateway.sh install prod/<feature>-YYYYMMDD
