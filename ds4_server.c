@@ -12501,6 +12501,34 @@ static int rewind_point_cut(server *s, const request *r, const ds4_tokens *promp
     return cut;
 }
 
+/* The generation prompt left after the cut is a handful of tokens at full
+ * depth.  As its own prefill pass it costs ~7 ms per 1K tokens of context on
+ * Ornith (215 ms at 30K, 430 ms at 60K, measured), as decode evals ~23 ms per
+ * token (135-160 ms for 7): a tail this short goes through evals. */
+#define REWIND_POINT_EVAL_TAIL_MAX 16
+
+static bool rewind_point_tail_by_eval(int tail) {
+    return tail > 0 && tail <= REWIND_POINT_EVAL_TAIL_MAX;
+}
+
+static bool server_prefill_enter(server *s, server_slot *slot);
+static void server_prefill_leave(server *s);
+
+static int rewind_point_eval_tail(server *s, server_slot *slot, const ds4_tokens *prompt,
+                                  char *err, size_t errlen) {
+    const int pos = ds4_session_pos(slot->session);
+    if (pos < 0 || !rewind_point_tail_by_eval(prompt->len - pos)) return 0;
+    if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
+    int rc = 0;
+    for (int i = pos; i < prompt->len && rc == 0; i++)
+        rc = ds4_session_eval(slot->session, prompt->v[i], err, errlen);
+    server_prefill_leave(s);
+    if (rc == 0)
+        server_log(DS4_LOG_KVCACHE, "ds4-server: rewind point tail by eval tokens=%d",
+                   prompt->len - pos);
+    return rc;
+}
+
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
     if (!s || !slot) return;
     kv_disk_cache *kc = &s->kv;
@@ -15075,10 +15103,12 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             ds4_tokens_free(&prefix);
         }
         if (prompt_sync_rc == 0) {
-            if (ds4_session_mark_rewind_point(slot->session))
+            if (ds4_session_mark_rewind_point(slot->session)) {
                 rewind_point_remember(s, slot, j->req.prompt_text, rewind_text_len, rewind_cut);
-            else
+                prompt_sync_rc = rewind_point_eval_tail(s, slot, prompt_for_sync, err, sizeof(err));
+            } else {
                 rewind_point_clear(s, slot);
+            }
         }
     }
 
@@ -20047,6 +20077,15 @@ static void test_rewind_point_cut_plan(void) {
     TEST_ASSERT(rewind_point_cut_plan(50, &prompt, &tail, 10) == 0);   /* not the token tail */
     ds4_tokens_free(&prompt);
     ds4_tokens_free(&tail);
+}
+
+static void test_rewind_point_tail_by_eval(void) {
+    /* the generation prompt after the cut (3-7 tokens) goes through decode evals */
+    TEST_ASSERT(rewind_point_tail_by_eval(1));
+    TEST_ASSERT(rewind_point_tail_by_eval(7));
+    TEST_ASSERT(rewind_point_tail_by_eval(REWIND_POINT_EVAL_TAIL_MAX));
+    TEST_ASSERT(!rewind_point_tail_by_eval(REWIND_POINT_EVAL_TAIL_MAX + 1));
+    TEST_ASSERT(!rewind_point_tail_by_eval(0));
 }
 
 static void test_rewind_point_reuse_tier(void) {
@@ -26259,6 +26298,7 @@ static void ds4_server_unit_tests_run(void) {
     test_rewind_point_option();
     test_rewind_point_cut_plan();
     test_rewind_point_reuse_tier();
+    test_rewind_point_tail_by_eval();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();
