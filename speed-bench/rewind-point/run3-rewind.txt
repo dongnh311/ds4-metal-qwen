@@ -1,0 +1,15 @@
+watchdog paused 22:17:04
+rewind   r1       ttft     5.9 s  total     6.5 s
+rewind   resend   ttft     0.2 s  total     0.8 s
+rewind   resend2  ttft     0.2 s  total     0.8 s
+rewind   compact  ttft     1.1 s  total     1.7 s
+rewind   reply identical across r1/resend/resend2: True
+rewind   rewind point hits: 3, live misses: 0
+1009 22:18:03 ds4-server: rewind point tail by eval tokens=7
+1009 22:18:04 ds4-server: rewind point hit pos=61286 live=61341 prompt=61293
+1009 22:18:04 ds4-server: rewind point tail by eval tokens=7
+1009 22:18:05 ds4-server: kv cache stored tokens=61341 trimmed=0 reason=evict key=token-text size=1383.07 MiB save=293.4 ms
+1009 22:18:05 ds4-server: rewind point hit pos=61286 live=61341 prompt=61309
+1009 22:18:06 ds4-server: rewind point tail by eval tokens=16
+1009 22:18:06 ds4-server: rewind point remembered pos=61302 text=275512
+1009 22:18:06 ds4-server: rewind point tail by eval tokens=7

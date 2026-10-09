@@ -1118,6 +1118,51 @@ static bool qwen35_graph_set_h_last(ds4_qwen4_gpu_graph *g, const float *h) {
     return true;
 }
 
+/* Rewind point buffers: one GDN state + conv history per recurrent layer,
+ * allocated on the first mark and kept for the graph's life. */
+static bool qwen35_graph_rw_ensure(ds4_qwen4_gpu_graph *g) {
+    if (g->rw_ready) return true;
+    const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->layer_lin_state[il]) continue;
+        g->rw_lin_state[il] = qwen4_graph_alloc_f32(v_dim * DS4_N_LIN_HEAD_DIM);
+        g->rw_lin_hist[il] = qwen4_graph_alloc_f32((uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim);
+        if (!g->rw_lin_state[il] || !g->rw_lin_hist[il]) {
+            for (uint32_t j = 0; j <= il; j++) {
+                ds4_gpu_tensor_free(g->rw_lin_state[j]);
+                ds4_gpu_tensor_free(g->rw_lin_hist[j]);
+                g->rw_lin_state[j] = g->rw_lin_hist[j] = NULL;
+            }
+            return false;
+        }
+    }
+    g->rw_ready = true;
+    return true;
+}
+
+/* Copy every GDN state and conv history into (save) or out of the rewind
+ * point buffers.  A copy, not a swap: the point survives a restore, so the
+ * same prompt can be re-sent any number of times. */
+static bool qwen35_graph_rw_copy(ds4_qwen4_gpu_graph *g, bool save) {
+    if (!g->rw_ready) return false;
+    const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
+    const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
+    const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    bool ok = true;
+    for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
+        if (!g->rw_lin_state[il]) continue;
+        ds4_gpu_tensor *live_s = g->layer_lin_state[il], *rw_s = g->rw_lin_state[il];
+        ds4_gpu_tensor *live_h = g->layer_lin_hist[il], *rw_h = g->rw_lin_hist[il];
+        ok = ds4_gpu_tensor_copy(save ? rw_s : live_s, 0, save ? live_s : rw_s, 0, state_bytes) != 0 &&
+             ds4_gpu_tensor_copy(save ? rw_h : live_h, 0, save ? live_h : rw_h, 0, hist_bytes) != 0;
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    return ok;
+}
+
 static int generate_qwen35_metal_argmax(
         const ds4_model *model, const ds4_vocab *vocab, const ds4_weights *weights,
         const token_vec *prompt, int n_predict, int ctx_size, uint32_t prefill_chunk,

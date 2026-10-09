@@ -59897,6 +59897,11 @@ typedef struct ds4_qwen4_gpu_graph {
     bool draft_head_tried;
     ds4_gpu_tensor *snap_lin_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *snap_lin_hist[DS4_MAX_LAYER];
+    /* Rewind point (qwen35): GDN states and conv histories at the point,
+     * allocated on the first mark (ds4_session_mark_rewind_point). */
+    ds4_gpu_tensor *rw_lin_state[DS4_MAX_LAYER];
+    ds4_gpu_tensor *rw_lin_hist[DS4_MAX_LAYER];
+    bool rw_ready;
     ds4_gpu_tensor *snap_ple_hist;
     int snap_ple_prev[DS4_MAX_PLE_NGRAM];
     uint32_t snap_pos;
@@ -60136,6 +60141,8 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->layer_block_key[il]);
         ds4_gpu_tensor_free(g->snap_lin_state[il]);
         ds4_gpu_tensor_free(g->snap_lin_hist[il]);
+        ds4_gpu_tensor_free(g->rw_lin_state[il]);
+        ds4_gpu_tensor_free(g->rw_lin_hist[il]);
         ds4_gpu_tensor_free(g->snap2_lin_state[il]);
         ds4_gpu_tensor_free(g->snap2_lin_hist[il]);
         ds4_gpu_tensor_free(g->snap0_lin_state[il]);
@@ -63446,6 +63453,12 @@ struct ds4_session {
     uint32_t prefill_cap;
     int ctx_size;
     bool checkpoint_valid;
+    /* Rewind point: see ds4_session_mark_rewind_point(). */
+    bool rewind_valid;
+    int rewind_pos;
+    uint32_t rewind_mtp_pos;
+    float *rewind_logits;   /* DS4_N_VOCAB, the logits at rewind_pos */
+    float *rewind_h_last;   /* DS4_N_EMBD, MTP carry h_{rewind_pos-1}; NULL without MTP */
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
@@ -66696,6 +66709,8 @@ int ds4_session_load_payload(ds4_session *s, FILE *fp, uint64_t payload_bytes, c
         payload_set_err(err, errlen, "invalid session payload load");
         return 1;
     }
+    /* loaded rows replace the ones a rewind point would reuse */
+    s->rewind_valid = false;
     if (s->distributed) {
         return ds4_dist_session_load_payload(s->distributed, s, fp, payload_bytes, err, errlen);
     }
@@ -77080,6 +77095,8 @@ void ds4_session_free(ds4_session *s) {
     token_vec_free(&s->greedy_splitkv_segment);
     free(s->checkpoint_images);
     free(s->logits);
+    free(s->rewind_logits);
+    free(s->rewind_h_last);
     free(s->sample_probs);
 #ifndef DS4_NO_GPU
     free(s->glm_mtp_hc);
@@ -79401,6 +79418,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
             qwen35_graph_reset(g);
             s->checkpoint.len = 0;
             s->checkpoint_valid = false;
+            s->rewind_valid = false;
         }
         if ((uint32_t)prompt->len > g->ctx_cap) {
             snprintf(err, errlen, "prompt of %d tokens exceeds the %u-token context", prompt->len, g->ctx_cap);
@@ -89449,6 +89467,7 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
 
 void ds4_session_invalidate(ds4_session *s) {
     if (!s) return;
+    s->rewind_valid = false;
     if (ds4_session_tp_leader(s) &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
         (void)ds4_tp_send_invalidate(s->engine->tp.ctx, s->tp_session_id);
@@ -89512,7 +89531,24 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     }
 #endif
 #ifdef DS4_HAS_QWEN4_METAL
-    if (s->checkpoint_valid && ds4_session_is_qwen35(s)) {
+    if (s->rewind_valid && pos < s->rewind_pos) s->rewind_valid = false;
+    if (s->checkpoint_valid && ds4_session_is_qwen35(s) && s->rewind_valid &&
+        pos == s->rewind_pos) {
+        /* Rewind point: rows [0, pos) of the attention, MTP and mrope caches
+         * are append-only and untouched since the mark; restore the rest. */
+        ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+        bool ok = qwen35_graph_rw_copy(g, false);
+        g->pos = (uint32_t)pos;
+        if (ok && g->mtp_h) ok = qwen35_graph_set_h_last(g, s->rewind_h_last);
+        if (ok) {
+            g->mtp_pos = s->rewind_mtp_pos;
+            g->snap_valid = false;
+            g->snap_after_first = false;
+            memcpy(s->logits, s->rewind_logits, (size_t)DS4_N_VOCAB * sizeof(float));
+            state_ok = true;
+        }
+    }
+    if (!state_ok && s->checkpoint_valid && ds4_session_is_qwen35(s)) {
         /* One token back after an accepted verify: the after-row-0 GDN
          * snapshot is the state at pos and verify row 0 holds its logits.
          * Recurrent state cannot be trimmed otherwise, so any other rewind
@@ -89541,6 +89577,38 @@ void ds4_session_rewind(ds4_session *s, int pos) {
     s->glm_mtp_rollback_valid = false;
     ds4_session_glm_cap_dense_cache(s);
 #endif
+}
+
+bool ds4_session_mark_rewind_point(ds4_session *s) {
+    if (!s) return false;
+    s->rewind_valid = false;
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_QWEN4_METAL)
+    if (s->distributed || !s->checkpoint_valid || !ds4_session_is_qwen35(s)) return false;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    if (g->pos != (uint32_t)s->checkpoint.len || !qwen35_graph_rw_ensure(g)) return false;
+    if (!s->rewind_logits) s->rewind_logits = malloc((size_t)DS4_N_VOCAB * sizeof(float));
+    if (g->mtp_h && !s->rewind_h_last) s->rewind_h_last = malloc((size_t)DS4_N_EMBD * sizeof(float));
+    if (!s->rewind_logits || (g->mtp_h && !s->rewind_h_last)) return false;
+    if (g->mtp_h && !qwen35_graph_h_last(g, s->rewind_h_last)) return false;
+    if (!qwen35_graph_rw_copy(g, true)) return false;
+    memcpy(s->rewind_logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
+    s->rewind_mtp_pos = g->mtp_pos;
+    s->rewind_pos = s->checkpoint.len;
+    s->rewind_valid = true;
+    return true;
+#else
+    return false;
+#endif
+}
+
+int ds4_session_rewind_point_pos(const ds4_session *s) {
+    return s && s->rewind_valid ? s->rewind_pos : -1;
+}
+
+void ds4_session_set_test_rewind_point(ds4_session *s, int pos) {
+    if (!s) return;
+    s->rewind_valid = pos >= 0;
+    s->rewind_pos = pos >= 0 ? pos : 0;
 }
 
 bool ds4_session_glm_can_rewind(const ds4_session *s, int pos) {

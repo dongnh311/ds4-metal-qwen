@@ -22,6 +22,8 @@
 #define DS4_KVSTORE_EXT_RESPONSES_VISIBLE (1u << 1)
 #define DS4_KVSTORE_EXT_THINKING_VISIBLE  (1u << 2)
 #define DS4_KVSTORE_EXT_SESSION_TITLE     (1u << 3)
+/* A visible key that ends right before a prompt's generation prompt. */
+#define DS4_KVSTORE_EXT_PROMPT_END        (1u << 4)
 
 typedef enum {
     DS4_KVSTORE_REASON_UNKNOWN   = 0,
@@ -31,6 +33,7 @@ typedef enum {
     DS4_KVSTORE_REASON_SHUTDOWN  = 4,
     DS4_KVSTORE_REASON_AGENT_SYSTEM  = 5,
     DS4_KVSTORE_REASON_AGENT_SESSION = 6,
+    DS4_KVSTORE_REASON_PROMPT_END    = 7,
 } ds4_kvstore_reason;
 
 typedef enum {
@@ -77,6 +80,10 @@ typedef struct {
      * interval x 2^k: each one is a full-prefix snapshot, gigabytes deep into a
      * long context. 0 = no limit. ds4-server sets it to the native context. */
     int continued_dense_max_tokens;
+    /* ds4-server: store a qwen tool-turn prompt of at least this many tokens
+     * at the end of its last message, before the generation prompt, for the
+     * compaction turn that diverges there. 0 = off (the default). */
+    int prompt_end_min_tokens;
 } ds4_kvstore_options;
 
 typedef struct {
@@ -101,6 +108,7 @@ typedef struct {
     uint8_t quant_bits;
     uint32_t ctx_size;
     bool reject_different_quant;
+    uint8_t reason;     /* ds4_kvstore_reason of the incoming store */
 } ds4_kvstore_eviction_context;
 
 typedef struct {
@@ -171,6 +179,11 @@ double ds4_kvstore_entry_eviction_score(const ds4_kvstore_entry *e,
 void ds4_kvstore_evict(ds4_kvstore *kc, const ds4_tokens *live,
                        uint64_t extra_bytes,
                        const ds4_kvstore_eviction_context *incoming);
+/* The context a store of text_len bytes of text with reason_code evicts
+ * against (ds4_kvstore_store_live_prefix_text builds it here). */
+ds4_kvstore_eviction_context ds4_kvstore_incoming_context(
+        const ds4_kvstore *kc, const char *text, size_t text_len,
+        int model_id, int quant_bits, int ctx_size, uint8_t reason_code);
 int ds4_kvstore_find_text_prefix(ds4_kvstore *kc, const char *prompt_text,
                                  int model_id, int quant_bits, int ctx_size);
 /* Same lookup, but also skips entries whose payload_variant (h[21], Task 14)
