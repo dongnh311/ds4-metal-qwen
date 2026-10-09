@@ -566,6 +566,9 @@ bool ds4_session_checkpoint_valid(const ds4_session *s);
  * for inference; free with ds4_session_free_test_checkpoint(). */
 ds4_session *ds4_session_new_test_checkpoint(const int *tokens, int n);
 void ds4_session_free_test_checkpoint(ds4_session *s);
+/* Test helper: pretend a rewind point exists at pos on a test checkpoint
+ * session (pos < 0 clears it). */
+void ds4_session_set_test_rewind_point(ds4_session *s, int pos);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,
@@ -675,6 +678,16 @@ void ds4_session_invalidate(ds4_session *s);
  * the checkpoint becomes invalid: sync the retained prefix before eval.
  * Callers retaining images must use sync_multimodal for that rebuild. */
 void ds4_session_rewind(ds4_session *s, int pos);
+/* Rewind point (Ornith/qwen35 only): keep the session's fixed-size state at its
+ * current position (GDN states and conv histories, MTP carry, position, logits)
+ * so that ds4_session_rewind(s, ds4_session_rewind_point_pos(s)) restores it
+ * exactly; the append-only rows before it are reused as they are.  One point
+ * per session; a new mark replaces it; a reset, a payload load, an invalidate
+ * or a rewind below it drops it.  Returns false (and keeps no point) for other
+ * models, distributed sessions or on allocation failure. */
+bool ds4_session_mark_rewind_point(ds4_session *s);
+/* Position of the valid rewind point, or -1. */
+int ds4_session_rewind_point_pos(const ds4_session *s);
 /* True when ds4_session_rewind(s, pos) keeps a valid GLM checkpoint: GLM-5.2
  * truncates its positional cache, GLM-5.3 only rolls back inside the MTP
  * two-token window. False for other families and CPU builds. */
