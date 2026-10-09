@@ -48,6 +48,14 @@
  * 0.0 every old entry would tie and their density and hit factors would stop
  * ordering them. */
 #define KV_CACHE_MAX_IDLE_HALF_LIVES 512.0
+/* A last_used up to this far ahead of `now` is ordinary skew (an entry written
+ * after the evictor read the clock) and counts as just used; further ahead the
+ * age is unknown. */
+#define KV_CACHE_FUTURE_SKEW_SECONDS 3600ull
+/* The idle factor and the superseded-continued factor (0.05, about 2^-4.3)
+ * interact on purpose: a waypoint the incoming store supersedes goes before an
+ * anchor used yesterday, but an anchor idle more than ~5.3 days (it counts x2)
+ * goes before the waypoint. */
 /* A continued checkpoint that is a strict prefix of the incoming store is a
  * routine waypoint on the same path. Keep recent hits meaningful, but make
  * never-hit or stale waypoints cheap victims while pre-evicting for the new
@@ -564,8 +572,12 @@ double ds4_kvstore_entry_eviction_score(
     double effective_hits = (double)e->hits;
     double idle_factor = 1.0;
     uint64_t used_at = e->last_used ? e->last_used : e->created_at;
-    if (used_at == 0) {
+    if (used_at == 0 || used_at > now + KV_CACHE_FUTURE_SKEW_SECONDS) {
+        /* Unknown age: no time in the header, or a time well ahead of ours
+         * (written before the clock was set back).  Rank it as the oldest
+         * entry, not the freshest, and give it no hit credit. */
         effective_hits = 0.0;
+        idle_factor = exp2(-KV_CACHE_MAX_IDLE_HALF_LIVES);
     } else if (now > used_at) {
         double elapsed = (double)(now - used_at);
         effective_hits *= exp2(-elapsed / (double)DS4_KVSTORE_HIT_HALF_LIFE_SECONDS);

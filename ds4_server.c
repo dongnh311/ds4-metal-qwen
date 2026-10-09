@@ -24061,6 +24061,73 @@ static void test_kv_cache_eviction_capped_idle_ties_break_by_last_used(void) {
                                        "1111111111111111111111111111111111111111");
 }
 
+static void test_kv_cache_eviction_unknown_age_ranks_oldest(void) {
+    /* A header with no time at all, or with a time far ahead of ours (a file
+     * from a clock that was later corrected backwards), has an unknown age.
+     * It must rank as the oldest entry, not the freshest: before, both got
+     * idle factor 1.0 and the future one also kept undecayed hits. */
+    const uint64_t day = 24u * 3600u;
+    const uint64_t now = 1000u + 30u * day;
+    kv_entry nine_days = {.tokens = 2048, .hits = 0, .file_size = 4096, .last_used = now - 9u * day};
+    kv_entry no_time = {.tokens = 2048, .hits = 0, .file_size = 4096, .last_used = 0, .created_at = 0};
+    kv_entry future = {.tokens = 2048, .hits = 20, .file_size = 4096, .last_used = now + 2u * day};
+    double old_score = kv_entry_eviction_score(&nine_days, NULL, now, NULL);
+    TEST_ASSERT(kv_entry_eviction_score(&no_time, NULL, now, NULL) < old_score);
+    TEST_ASSERT(kv_entry_eviction_score(&future, NULL, now, NULL) < old_score);
+
+    /* A few seconds ahead is ordinary skew (an entry written after `now` was
+     * read): it still counts as just used, hits included. */
+    kv_entry skew = {.tokens = 2048, .hits = 1, .file_size = 4096, .last_used = now + 30u};
+    TEST_ASSERT(kv_entry_eviction_score(&skew, NULL, now, NULL) ==
+                2.0 * (double)skew.tokens / (double)skew.file_size);
+}
+
+static void test_kv_cache_eviction_idle_half_life_is_about_a_day(void) {
+    /* Both bounds on the idle half-life, so neither "faster" nor "slower"
+     * passes unnoticed.  Same reason, zero hits, density ratios 1.5x and 3x. */
+    const uint64_t now = 1000u + 30u * 24u * 3600u;
+    kv_entry fresh = {.tokens = 2048, .hits = 0, .file_size = 4096, .last_used = now};
+    /* 1.5x denser, idle 12 h: kept over fresh (fails for a half-life < ~20 h). */
+    kv_entry half_day = {.tokens = 3072, .hits = 0, .file_size = 4096, .last_used = now - 12u * 3600u};
+    /* 3x denser, idle 48 h: evicted before fresh (fails for a half-life > ~30 h). */
+    kv_entry two_days = {.tokens = 6144, .hits = 0, .file_size = 4096, .last_used = now - 48u * 3600u};
+    double f = kv_entry_eviction_score(&fresh, NULL, now, NULL);
+    TEST_ASSERT(kv_entry_eviction_score(&half_day, NULL, now, NULL) > f);
+    TEST_ASSERT(kv_entry_eviction_score(&two_days, NULL, now, NULL) < f);
+}
+
+static void test_kv_cache_eviction_idle_anchor_vs_superseded_waypoint(void) {
+    /* The superseded-continued factor (0.05, ~2^-4.3) and the idle factor
+     * meet here, deliberately: a waypoint the incoming store supersedes goes
+     * before an anchor used yesterday, but an anchor idle for six days goes
+     * before the waypoint.  The idle half-life alone decides where the line
+     * falls (~5.3 days for an anchor, which counts x2). */
+    const uint64_t day = 24u * 3600u;
+    const uint64_t now = 1000u + 30u * day;
+    const char *prefix = "system: hello world";
+    const char *incoming_text = "system: hello world\nuser: prompt";
+    kv_entry waypoint = {.reason = KV_REASON_CONTINUED, .tokens = 2048, .hits = 0,
+                         .file_size = 4096, .last_used = now, .ctx_size = 32768,
+                         .text_bytes = strlen(prefix)};
+    sha1_bytes_hex(prefix, strlen(prefix), waypoint.sha);
+    kv_entry anchor_1d = {.reason = KV_REASON_COLD, .tokens = 2048, .hits = 0,
+                          .file_size = 4096, .last_used = now - day};
+    kv_entry anchor_6d = {.reason = KV_REASON_COLD, .tokens = 2048, .hits = 0,
+                          .file_size = 4096, .last_used = now - 6u * day};
+    ds4_kvstore_eviction_context incoming = {
+        .text = incoming_text,
+        .text_len = strlen(incoming_text),
+        .model_id = 0,
+        .quant_bits = 2,
+        .ctx_size = 32768,
+        .reject_different_quant = false,
+    };
+    double w = kv_entry_eviction_score(&waypoint, NULL, now, &incoming);
+    TEST_ASSERT(w < kv_entry_eviction_score(&waypoint, NULL, now, NULL));   /* supersede applied */
+    TEST_ASSERT(kv_entry_eviction_score(&anchor_1d, NULL, now, &incoming) > w);
+    TEST_ASSERT(kv_entry_eviction_score(&anchor_6d, NULL, now, &incoming) < w);
+}
+
 static void test_kv_cache_eviction_keeps_aligned_continued_frontiers(void) {
     char tmpl[] = "/tmp/ds4-kv-live-prefix-test.XXXXXX";
     char *dir = mkdtemp(tmpl);
@@ -25607,6 +25674,9 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_eviction_keeps_recent_dense_over_fresh_sparse();
     test_kv_cache_reuse_existing_refreshes_last_used();
     test_kv_cache_eviction_capped_idle_ties_break_by_last_used();
+    test_kv_cache_eviction_unknown_age_ranks_oldest();
+    test_kv_cache_eviction_idle_half_life_is_about_a_day();
+    test_kv_cache_eviction_idle_anchor_vs_superseded_waypoint();
     test_kv_cache_eviction_keeps_aligned_continued_frontiers();
     test_ornith_render_flavor_is_opt_in();
     test_ornith_effort_sent_vs_absent();
