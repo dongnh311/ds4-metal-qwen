@@ -12484,12 +12484,30 @@ static int rewind_point_cut_plan(int min_tokens, const ds4_tokens *prompt,
     return cut;
 }
 
+/* Only Ornith (qwen35) sessions can hold a rewind point; elsewhere the flag
+ * must not cost a split and a separate tail pass on every turn. */
+static bool rewind_point_supported(void) {
+    return server_qwen_is_ornith();
+}
+
+/* What follows the point is only the generation prompt: the request repeats
+ * the previous one (a retry, a re-send), so the reply it drops is never
+ * resumed.  Anything more (a compaction, a side request) adds a turn there. */
+static bool rewind_point_suffix_is_resend(const request *r, const char *suffix) {
+    if (!r || !suffix) return false;
+    buf gen = {0};
+    append_qwen_generation_prompt(&gen, ds4_think_mode_enabled(r->think_mode));
+    const bool same = strlen(suffix) == gen.len && memcmp(suffix, gen.ptr, gen.len) == 0;
+    buf_free(&gen);
+    return same;
+}
+
 /* Ornith admitted: the key is byte-exact, so a template that does not replay
  * a past turn as these bytes simply never matches. */
 static int rewind_point_cut(server *s, const request *r, const ds4_tokens *prompt,
                             int cached, size_t *text_len) {
     *text_len = 0;
-    if (!s || s->rewind_point_min_tokens <= 0 || !prompt ||
+    if (!s || s->rewind_point_min_tokens <= 0 || !rewind_point_supported() || !prompt ||
         prompt->len < s->rewind_point_min_tokens) return 0;
     const size_t n = prompt_end_text_len_for(r, true);
     if (!n) return 0;
@@ -12514,18 +12532,21 @@ static bool rewind_point_tail_by_eval(int tail) {
 static bool server_prefill_enter(server *s, server_slot *slot);
 static void server_prefill_leave(server *s);
 
-static int rewind_point_eval_tail(server *s, server_slot *slot, const ds4_tokens *prompt,
-                                  char *err, size_t errlen) {
+/* Evaluate prompt[pos, target) with decode evals when that gap is short (the
+ * session must already hold prompt[0, pos)); returns 0 and does nothing for a
+ * longer gap, which the caller prefills. */
+static int rewind_point_eval_to(server *s, server_slot *slot, const ds4_tokens *prompt,
+                                int target, char *err, size_t errlen) {
     const int pos = ds4_session_pos(slot->session);
-    if (pos < 0 || !rewind_point_tail_by_eval(prompt->len - pos)) return 0;
+    if (pos < 0 || target > prompt->len || !rewind_point_tail_by_eval(target - pos)) return 0;
     if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
     int rc = 0;
-    for (int i = pos; i < prompt->len && rc == 0; i++)
+    for (int i = pos; i < target && rc == 0; i++)
         rc = ds4_session_eval(slot->session, prompt->v[i], err, errlen);
     server_prefill_leave(s);
     if (rc == 0)
         server_log(DS4_LOG_KVCACHE, "ds4-server: rewind point tail by eval tokens=%d",
-                   prompt->len - pos);
+                   target - pos);
     return rc;
 }
 
@@ -14856,6 +14877,13 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         break;
     case REUSE_REWIND_POINT: {
         const int live_before = ds4_session_pos(slot->session);
+        /* A request that adds a turn at the point (a compaction, a side
+         * request) abandons the live reply: keep it on disk as a miss would,
+         * so the original conversation can still resume from it.  A pure
+         * re-send repeats the request whose reply it drops: nothing to keep. */
+        if (s->kv.enabled && live_before >= s->kv.opt.min_tokens &&
+            !rewind_point_suffix_is_resend(&j->req, j->req.prompt_text + reuse.suffix_off))
+            kv_cache_store_current(s, slot, "evict");
         pthread_mutex_lock(&s->inference_mu);
         ds4_session_rewind(slot->session, reuse.reuse_tokens);
         const bool rewound = ds4_session_checkpoint_valid(slot->session) &&
@@ -15096,20 +15124,33 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     const int rewind_cut = (prompt_sync_rc == 0 && !multimodal) ?
         rewind_point_cut(s, &j->req, prompt_for_sync, cached, &rewind_text_len) : 0;
     if (rewind_cut > 0) {
-        if (ds4_session_pos(slot->session) != rewind_cut) {
+        /* a short gap to the cut (a compaction's user message after a hit)
+         * also goes through evals rather than its own prefill pass */
+        prompt_sync_rc = rewind_point_eval_to(s, slot, prompt_for_sync, rewind_cut, err, sizeof(err));
+        if (prompt_sync_rc == 0 && ds4_session_pos(slot->session) != rewind_cut) {
             ds4_tokens prefix = {0};
             tokens_copy_prefix(&prefix, prompt_for_sync, rewind_cut);
             prompt_sync_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
             ds4_tokens_free(&prefix);
         }
         if (prompt_sync_rc == 0) {
-            if (ds4_session_mark_rewind_point(slot->session)) {
+            server_inference_lock(s);
+            const bool marked = ds4_session_mark_rewind_point(slot->session);
+            server_inference_unlock(s);
+            if (marked) {
                 rewind_point_remember(s, slot, j->req.prompt_text, rewind_text_len, rewind_cut);
-                prompt_sync_rc = rewind_point_eval_tail(s, slot, prompt_for_sync, err, sizeof(err));
+                prompt_sync_rc = rewind_point_eval_to(s, slot, prompt_for_sync, prompt_for_sync->len,
+                                                      err, sizeof(err));
             } else {
                 rewind_point_clear(s, slot);
             }
         }
+    } else if (prompt_sync_rc == 0 && !multimodal && live_materialized &&
+               reuse.kind == REUSE_REWIND_POINT) {
+        /* a re-send hit: the point is reused as is and its generation prompt
+         * goes through evals, as it did on the original turn */
+        prompt_sync_rc = rewind_point_eval_to(s, slot, prompt_for_sync, prompt_for_sync->len,
+                                              err, sizeof(err));
     }
 
     if (prompt_sync_rc == 0) {
@@ -17484,9 +17525,13 @@ int main(int argc, char **argv) {
         }
     }
     if (s.rewind_point_min_tokens > 0) {
-        server_log(DS4_LOG_KVCACHE,
-                   "ds4-server: rewind point at the prompt end of chat prompts >= %d tokens",
-                   s.rewind_point_min_tokens);
+        if (rewind_point_supported())
+            server_log(DS4_LOG_KVCACHE,
+                       "ds4-server: rewind point at the prompt end of tool-chat prompts >= %d tokens",
+                       s.rewind_point_min_tokens);
+        else
+            server_log(DS4_LOG_DEFAULT,
+                       "ds4-server: --rewind-point-min-tokens ignored: Ornith only");
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -20086,6 +20131,39 @@ static void test_rewind_point_tail_by_eval(void) {
     TEST_ASSERT(rewind_point_tail_by_eval(REWIND_POINT_EVAL_TAIL_MAX));
     TEST_ASSERT(!rewind_point_tail_by_eval(REWIND_POINT_EVAL_TAIL_MAX + 1));
     TEST_ASSERT(!rewind_point_tail_by_eval(0));
+}
+
+static void test_rewind_point_resend_and_model(void) {
+    request r = {0};
+    r.kind = REQ_CHAT;
+    r.model_syntax = SERVER_MODEL_SYNTAX_QWEN;
+    for (int thinking = 0; thinking <= 1; thinking++) {
+        r.think_mode = thinking ? DS4_THINK_HIGH : DS4_THINK_NONE;
+        buf gen = {0};
+        append_qwen_generation_prompt(&gen, ds4_think_mode_enabled(r.think_mode));
+        char *g = xstrndup(gen.ptr, gen.len);
+        /* only the generation prompt after the point: a pure re-send */
+        TEST_ASSERT(rewind_point_suffix_is_resend(&r, g));
+        /* a new user turn before it (a compaction, a side request) is not */
+        buf turn = {0};
+        buf_puts(&turn, "<|im_start|>user\nSummarize.<|im_end|>\n");
+        buf_append(&turn, gen.ptr, gen.len);
+        char *t = xstrndup(turn.ptr, turn.len);
+        TEST_ASSERT(!rewind_point_suffix_is_resend(&r, t));
+        TEST_ASSERT(!rewind_point_suffix_is_resend(&r, ""));
+        free(g);
+        free(t);
+        buf_free(&gen);
+        buf_free(&turn);
+    }
+    /* the flag does nothing on Qwen3.8: its sessions cannot hold a point, so it
+     * must not pay the split either */
+    const server_qwen_flavor saved = g_server_qwen_flavor;
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
+    TEST_ASSERT(!rewind_point_supported());
+    g_server_qwen_flavor = SERVER_QWEN_FLAVOR_ORNITH;
+    TEST_ASSERT(rewind_point_supported());
+    g_server_qwen_flavor = saved;
 }
 
 static void test_rewind_point_reuse_tier(void) {
@@ -26298,6 +26376,7 @@ static void ds4_server_unit_tests_run(void) {
     test_rewind_point_option();
     test_rewind_point_cut_plan();
     test_rewind_point_reuse_tier();
+    test_rewind_point_resend_and_model();
     test_rewind_point_tail_by_eval();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
