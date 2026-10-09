@@ -1,0 +1,19 @@
+rewind   row ention8-bf16recurrence-vision-mtplx-512K
+rewind   grow     ~ 15000 tok  ttft   7.3 s
+rewind   grow     ~ 21000 tok  ttft   3.8 s
+rewind   grow     ~ 27000 tok  ttft   4.2 s
+rewind   grow     ~ 33000 tok  ttft   4.4 s
+rewind   grow     ~ 39000 tok  ttft   4.2 s
+rewind   grow     ~ 45000 tok  ttft   5.2 s
+rewind   grow     ~ 51000 tok  ttft   5.5 s
+rewind   grow     ~ 57000 tok  ttft   5.9 s
+rewind   grow     ~ 63000 tok  ttft   6.3 s
+rewind   r1       ttft     6.6 s  total     7.3 s
+rewind   resend   ttft     0.5 s  total     1.1 s
+rewind   resend2  ttft     0.5 s  total     1.1 s
+rewind   compact  ttft     0.5 s  total     1.3 s
+rewind   reply identical across r1/resend/resend2: True
+rewind   rewind point hits: 3, live misses: 0
+    ds4-server: rewind point hit pos=61286 live=61341 prompt=61293
+    ds4-server: rewind point hit pos=61286 live=61341 prompt=61293
+    ds4-server: rewind point hit pos=61286 live=61341 prompt=61309

@@ -1,0 +1,19 @@
+base     row ention8-bf16recurrence-vision-mtplx-512K
+base     grow     ~ 15000 tok  ttft   7.3 s
+base     grow     ~ 21000 tok  ttft   3.3 s
+base     grow     ~ 27000 tok  ttft   3.5 s
+base     grow     ~ 33000 tok  ttft   3.8 s
+base     grow     ~ 39000 tok  ttft   3.5 s
+base     grow     ~ 45000 tok  ttft   4.4 s
+base     grow     ~ 51000 tok  ttft   4.7 s
+base     grow     ~ 57000 tok  ttft   4.9 s
+base     grow     ~ 63000 tok  ttft   5.2 s
+base     r1       ttft     5.5 s  total     5.5 s
+base     resend   ttft    39.3 s  total    39.3 s
+base     resend2  ttft    39.8 s  total    39.8 s
+base     compact  ttft    42.4 s  total    43.1 s
+base     reply identical across r1/resend/resend2: True
+base     rewind point hits: 0, live misses: 3
+    ds4-server: live kv cache miss live=61287 prompt=61286 common=61286 vision=match reason=prompt-is-live-prefix
+    ds4-server: live kv cache miss live=61287 prompt=61286 common=61286 vision=match reason=prompt-is-live-prefix
+    ds4-server: live kv cache miss live=61287 prompt=61302 common=61280 vision=match reason=token-mismatch
