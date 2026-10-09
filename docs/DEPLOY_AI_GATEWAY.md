@@ -37,15 +37,21 @@ Rules:
 6. Stop the slot only in a quiet window, never under a live session: run
    `python3 ~/Documents/GitHub/AI-Gateway-MLX/scripts/quiet-window.py --wait-s 7200`
    first (nothing in flight, no real request for 600 s). A SIGTERM alone does
-   not keep the slot stopped: the gateway watchdog's canary (every ~2 min)
-   relaunches it within seconds, and ds4 refuses a second process. Pause the
-   watchdog for the window and restore it whatever happens:
+   not keep the slot stopped: `ai-watchdog.sh` (the `dev.dongnh.ai-proxy`
+   job, which also supervises the gateway: never boot it out) sends a canary
+   every ~2 min, and the gateway relaunches ds4 for it within seconds. Hold
+   ds4's own single-instance lock (`flock` on `/tmp/ds4.lock`) for the window
+   instead: the gateway's relaunch then refuses to start ("another ds4 process
+   is already running"), which the watchdog tolerates, and smokes run with a
+   lock file of their own.
 
    ```sh
-   D=gui/$(id -u); PL=~/Library/LaunchAgents/dev.dongnh.gateway-watchdog.plist
-   trap 'launchctl bootstrap $D $PL' EXIT
-   launchctl bootout $D/dev.dongnh.gateway-watchdog
-   kill -TERM $(pgrep -f "ai-gateway/ds4-metal/ds4-server")   # never SIGKILL
+   python3 -c 'import fcntl,os,time; fd=os.open("/tmp/ds4.lock",os.O_RDWR|os.O_CREAT,0o600); fcntl.flock(fd,fcntl.LOCK_EX); os.ftruncate(fd,0); os.write(fd,str(os.getpid()).encode()); time.sleep(3600)' &
+   HOLD=$!
+   kill -TERM $(pgrep -f "ai-gateway/ds4-metal/ds4-server")   # never SIGKILL; the holder takes the lock when it exits
+   ./deploy-ai-gateway.sh install prod/<feature>-YYYYMMDD
+   DS4_LOCK_FILE=/tmp/ds4-smoke.lock ./deploy-ai-gateway.sh smoke --model <row>
+   kill $HOLD                                                 # the next request relaunches the slot
    ```
 
 ## Procedure
