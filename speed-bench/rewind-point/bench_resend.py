@@ -18,6 +18,7 @@ argv: --bin DIR --label NAME --tokens 64000 [--rewind 16384] [--row-match ornith
 import argparse
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -95,12 +96,12 @@ def main():
     ap.add_argument("--rewind", type=int, default=0)
     ap.add_argument("--row-match", default="ornith")
     ap.add_argument("--row-suffix", default="512K")
-    ap.add_argument("--extra", nargs="*", default=[])
+    ap.add_argument("--extra", default="", help='extra ds4-server args as ONE string, e.g. --extra="--flag 1"')
     a = ap.parse_args()
     kv = tempfile.mkdtemp(prefix="rp-kv-")
     logp = os.path.join(HERE, "server-%s.log" % a.label)
     log = open(logp, "w")
-    key, argv = server_argv(a.bin, kv, a.rewind, a.extra, a.row_match, a.row_suffix)
+    key, argv = server_argv(a.bin, kv, a.rewind, shlex.split(a.extra), a.row_match, a.row_suffix)
     print("%-8s row %s" % (a.label, key[-40:]), flush=True)
     srv = subprocess.Popen(argv, stdout=log, stderr=subprocess.STDOUT, cwd=a.bin)
     try:

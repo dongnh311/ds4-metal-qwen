@@ -1,0 +1,29 @@
+qwen38   row ravanti--Qwen3.8-Flash-Next-DS4-IQ2-512K
+qwen38   grow     ~ 15000 tok  ttft  20.3 s
+qwen38   grow     ~ 21000 tok  ttft   8.4 s
+qwen38   grow     ~ 27000 tok  ttft   8.5 s
+qwen38   grow     ~ 33000 tok  ttft   8.5 s
+qwen38   grow     ~ 39000 tok  ttft   7.5 s
+qwen38   grow     ~ 45000 tok  ttft   8.8 s
+qwen38   grow     ~ 51000 tok  ttft   8.9 s
+qwen38   grow     ~ 57000 tok  ttft   9.0 s
+qwen38   grow     ~ 63000 tok  ttft   9.0 s
+qwen38   grow     ~ 69000 tok  ttft   9.3 s
+qwen38   grow     ~ 75000 tok  ttft   8.1 s
+qwen38   grow     ~ 81000 tok  ttft   9.6 s
+qwen38   grow     ~ 87000 tok  ttft   9.9 s
+qwen38   grow     ~ 93000 tok  ttft  10.1 s
+qwen38   grow     ~ 99000 tok  ttft  10.2 s
+qwen38   grow     ~105000 tok  ttft  10.3 s
+qwen38   grow     ~111000 tok  ttft   9.0 s
+qwen38   grow     ~117000 tok  ttft  10.7 s
+qwen38   grow     ~123000 tok  ttft  10.7 s
+qwen38   r1       ttft    11.1 s  total    11.1 s
+qwen38   resend   ttft     1.1 s  total     1.1 s
+qwen38   resend2  ttft     0.3 s  total     0.3 s
+qwen38   compact  ttft     1.3 s  total     2.5 s
+qwen38   reply identical across r1/resend/resend2: True
+qwen38   rewind point hits: 0, live misses: 3
+    ds4-server: live kv cache miss live=113110 prompt=113109 common=113109 vision=match reason=prompt-is-live-prefix
+    ds4-server: live kv cache miss live=113110 prompt=113109 common=113109 vision=match reason=prompt-is-live-prefix
+    ds4-server: live kv cache miss live=113110 prompt=113125 common=113103 vision=match reason=token-mismatch

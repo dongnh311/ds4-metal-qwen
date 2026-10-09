@@ -41,6 +41,16 @@ Then four requests:
 - At production depth (120-230K) the baseline re-prefill would grow to 2-6 minutes, as the
   incidents showed. The rewind cost stays well under 1 s.
 
+## Run 3 (after the review fixes, `1a939358`)
+
+| request | rewind point | notes |
+|---|---|---|
+| r1 (normal turn) | 5.9 s | |
+| **resend** | **0.2 s** | the hit's 7-token generation prompt now goes through evals, as on the original turn |
+| **resend2** | **0.2 s** | |
+| **compact** | **1.1 s** | it first stores the abandoned reply as an evict checkpoint (61341 tokens, 1383 MiB, 293 ms), so the original conversation can still resume; then 16 tokens by eval to the new cut, the mark, and 7 by eval |
+| replies identical | yes | 3 hits, 0 live misses (`run3-rewind.txt`) |
+
 ## Run 1 (before `ba3f4acb`): why the tail goes through decode evals
 
 In run 1, the generation prompt after the cut (7 tokens) was its own prefill pass. On normal turns the
@@ -79,3 +89,20 @@ python3 ~/Documents/GitHub/AI-Gateway-MLX/scripts/quiet-window.py --wait-s 7200 
 python3 bench_resend.py --bin ~/orca/workspaces/ds4-metal/rewind-point --label rewind --tokens 64000 --rewind 16384
 python3 bench_resend.py --bin ~/.local/share/ai-gateway/ds4-metal --label base --tokens 64000
 ```
+
+## Qwen3.8 disk prompt-end checkpoint (Task 9 gate)
+
+These numbers are from the Qwen3.8-512K row's argv plus `--kv-cache-prompt-end-min-tokens 32768`,
+on the same growing session up to 113K tokens (`qwen38.txt`).
+- Re-send: 1.1 s, then 0.3 s. Compaction: 1.3 s.
+- Every tool turn of at least 32K writes a full-prefix checkpoint: **14.8 KB/token**.
+  - At 50K: 808 MiB in 0.20 s.
+  - At 81K: 1245 MiB in 0.31 s.
+  - At 113K: 1681 MiB in 0.49-0.51 s.
+  - Extrapolated to 128K: about 1.9 GB and 0.55 s.
+- The spec's gate is at most 1.5 GB and at most 0.5 s at 128K, so it **fails**, and the flag stays
+  off on the Qwen3.8 rows.
+- A session of about 200 tool turns would write about 300 GB.
+
+The in-memory rewind point is the cheap fix there too. Qwen3.8 (qwen4exp), however, also keeps an
+indexer key ring and block-pooled keys, which a restore would have to cover. That is follow-up work.
