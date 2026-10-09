@@ -1,5 +1,12 @@
-/* Timing harness (REPORT.md "Run 1"): build from the repo root with cost of ds4_session_mark_rewind_point and of a separate
- * 7-token sync at depth, Ornith with MTP (as production). Not committed. */
+/* Timing harness for REPORT.md "Run 1": the cost of ds4_session_mark_rewind_point
+ * and of evaluating a 7-token tail at depth, as one prefill pass and as decode evals
+ * (Ornith with MTP, ctx 524288 as production).  Build from the repo root after
+ * `make ds4`:
+ *   cc -O2 -I. -o /tmp/tail_timing speed-bench/rewind-point/tail_timing.c ds4.o ds4_image.o \
+ *      ds4_distributed.o ds4_tp.o ds4_ssd.o ds4_metal.o ds4_layer_pack.o ds4_engram.o \
+ *      -lm -pthread -framework Foundation -framework Metal -framework Accelerate
+ *   DS4_TEST_MODEL=<Ornith.gguf> DS4_QWEN4_YARN_FACTOR=2 /tmp/tail_timing 60000 tests/long_context_story_prompt.txt
+ * Needs the gateway's ds4 slot stopped (one model process on 64 GB). */
 #include "ds4.h"
 #include <stdio.h>
 #include <stdlib.h>
