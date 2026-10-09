@@ -10870,6 +10870,16 @@ struct server_slot {
     live_tool_state responses_live;
     live_tool_state anthropic_live;
     visible_live_state thinking_live;
+    /* The prompt end of the latest request, where the engine holds a rewind
+     * point: that request's rendered text up to the end of its last message
+     * and the live token count there.  The engine is the authority on whether
+     * the point still exists (ds4_session_rewind_point_pos). Guarded by tool_mu. */
+    struct {
+        bool valid;
+        int live_tokens;
+        char *text;
+        size_t text_len;
+    } rewind_point;
     int continued_last_store_tokens;
     /* Wall time of the last completed job on this slot, stamped by the slot
      * worker; drives the staleness tiers in job_slot_score(). */
@@ -11012,6 +11022,7 @@ struct server {
     bool enable_cors;
     int think_budget;                   /* --think-budget; 0 = off */
     const char *think_budget_message;   /* NULL = DS4_THINK_BUDGET_DEFAULT_MESSAGE */
+    int rewind_point_min_tokens;        /* 0 = no in-memory rewind point */
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -11356,6 +11367,28 @@ static void thinking_live_remember(server *s, server_slot *slot,
     slot->thinking_live.live_tokens = ds4_session_pos(slot->session);
     slot->thinking_live.valid = key != NULL;
     pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void rewind_point_clear(server *s, server_slot *slot) {
+    if (!s || !slot) return;
+    pthread_mutex_lock(&s->tool_mu);
+    free(slot->rewind_point.text);
+    memset(&slot->rewind_point, 0, sizeof(slot->rewind_point));
+    pthread_mutex_unlock(&s->tool_mu);
+}
+
+static void rewind_point_remember(server *s, server_slot *slot, const char *text,
+                                  size_t text_len, int live_tokens) {
+    char *copy = xstrndup(text, text_len);
+    pthread_mutex_lock(&s->tool_mu);
+    free(slot->rewind_point.text);
+    slot->rewind_point.text = copy;
+    slot->rewind_point.text_len = text_len;
+    slot->rewind_point.live_tokens = live_tokens;
+    slot->rewind_point.valid = true;
+    pthread_mutex_unlock(&s->tool_mu);
+    server_log(DS4_LOG_KVCACHE, "ds4-server: rewind point remembered pos=%d text=%zu",
+               live_tokens, text_len);
 }
 
 static void responses_live_remember(server *s, server_slot *slot,
@@ -12337,10 +12370,10 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
  * the payload: protocol continuations bound by call ids may render less than
  * the live KV holds, and vision payloads never reach the disk cache.  Ornith's
  * template is not proven to replay a past turn as these bytes. */
-static size_t prompt_end_text_len(const request *r) {
+static size_t prompt_end_text_len_for(const request *r, bool allow_ornith) {
     if (!r || r->kind != REQ_CHAT || !r->has_tools || r->image_count) return 0;
     if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return 0;
-    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN || server_qwen_is_ornith() ||
+    if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN || (!allow_ornith && server_qwen_is_ornith()) ||
         !r->prompt_text) return 0;
     static const char end[] = "<|im_end|>\n";
     const size_t end_len = sizeof(end) - 1;
@@ -12356,6 +12389,11 @@ static size_t prompt_end_text_len(const request *r) {
     }
     buf_free(&gen);
     return n;
+}
+
+/* The disk prompt-end checkpoint: Qwen3.8 only (Ornith excluded above). */
+static size_t prompt_end_text_len(const request *r) {
+    return prompt_end_text_len_for(r, false);
 }
 
 /* Index where tail starts when prompt ends with it after at least one token. */
@@ -12433,6 +12471,34 @@ static bool kv_cache_prompt_end_split(server *s, const request *r,
                                              cached, cold_store_len, out);
     ds4_tokens_free(&tail);
     return split;
+}
+
+/* The in-memory rewind point's cut: the same clean boundary as the disk
+ * prompt-end checkpoint (the generation prompt is the token tail), with new
+ * tokens before it and at least min_tokens of prompt.  0 = no cut.  Pure. */
+static int rewind_point_cut_plan(int min_tokens, const ds4_tokens *prompt,
+                                 const ds4_tokens *tail, int cached) {
+    if (min_tokens <= 0 || !prompt || prompt->len < min_tokens) return 0;
+    const int cut = prompt_tail_token_start(prompt, tail);
+    if (cut <= 0 || cut <= cached || cut < min_tokens) return 0;
+    return cut;
+}
+
+/* Ornith admitted: the key is byte-exact, so a template that does not replay
+ * a past turn as these bytes simply never matches. */
+static int rewind_point_cut(server *s, const request *r, const ds4_tokens *prompt,
+                            int cached, size_t *text_len) {
+    *text_len = 0;
+    if (!s || s->rewind_point_min_tokens <= 0 || !prompt ||
+        prompt->len < s->rewind_point_min_tokens) return 0;
+    const size_t n = prompt_end_text_len_for(r, true);
+    if (!n) return 0;
+    ds4_tokens tail = {0};
+    ds4_tokenize_rendered_chat(s->engine, r->prompt_text + n, &tail);
+    const int cut = rewind_point_cut_plan(s->rewind_point_min_tokens, prompt, &tail, cached);
+    ds4_tokens_free(&tail);
+    if (cut > 0) *text_len = n;
+    return cut;
 }
 
 static void kv_cache_maybe_store_continued(server *s, server_slot *slot) {
@@ -12615,6 +12681,7 @@ typedef enum {
     REUSE_MEMORY_TOKEN,
     REUSE_THINKING_VISIBLE,
     REUSE_MEMORY_TEXT,
+    REUSE_REWIND_POINT,
 } slot_reuse_kind;
 
 typedef struct {
@@ -12757,6 +12824,23 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         pr.kind = REUSE_MEMORY_TEXT;
         pr.reuse_tokens = live_pos;
         pr.suffix_off = slot->live_text_len;
+        return pr;
+    }
+
+    /* Rewind point: the request re-sends the latest prompt up to the end of its
+     * last message (a retry, a re-send, a compaction) and adds a suffix, while
+     * the live state has moved on through the reply.  The engine restores the
+     * point's fixed-size state; rows before it are reused as they are. */
+    if (ptext && req->kind == REQ_CHAT && req->image_count == 0 &&
+        slot->rewind_point.valid && slot->rewind_point.text &&
+        slot->rewind_point.text_len < plen &&
+        slot->rewind_point.live_tokens <= live_pos &&
+        ds4_session_rewind_point_pos(slot->session) == slot->rewind_point.live_tokens &&
+        byte_prefix_match(ptext, plen, slot->rewind_point.text, slot->rewind_point.text_len))
+    {
+        pr.kind = REUSE_REWIND_POINT;
+        pr.reuse_tokens = slot->rewind_point.live_tokens;
+        pr.suffix_off = slot->rewind_point.text_len;
         return pr;
     }
 
@@ -14742,6 +14826,27 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         cache_source = "memory-text";
         prompt_for_sync = &effective_prompt;
         break;
+    case REUSE_REWIND_POINT: {
+        const int live_before = ds4_session_pos(slot->session);
+        pthread_mutex_lock(&s->inference_mu);
+        ds4_session_rewind(slot->session, reuse.reuse_tokens);
+        const bool rewound = ds4_session_checkpoint_valid(slot->session) &&
+            ds4_session_pos(slot->session) == reuse.reuse_tokens &&
+            ds4_session_rewind_point_pos(slot->session) == reuse.reuse_tokens;
+        pthread_mutex_unlock(&s->inference_mu);
+        if (!rewound || !build_live_prompt_suffix(s, slot, &j->req,
+                j->req.prompt_text + reuse.suffix_off, &effective_prompt)) {
+            cached = 0;
+            cache_source = "none";
+            break;
+        }
+        live_materialized = true;
+        cache_source = "rewind-point";
+        prompt_for_sync = &effective_prompt;
+        server_log(DS4_LOG_KVCACHE, "ds4-server: rewind point hit pos=%d live=%d prompt=%d",
+                   reuse.reuse_tokens, live_before, effective_prompt.len);
+        break;
+    }
     case REUSE_NONE:
     default:
         cached = 0;
@@ -14954,6 +15059,28 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
         ds4_tokens_free(&prefix);
     }
     prompt_end_split_free(&prompt_end);
+
+    /* The rewind point sits on the same boundary: prefill stops there (if the
+     * disk prompt-end split did not already), the engine keeps the state, and
+     * only then is the generation prompt evaluated.  A re-sent, retried or
+     * compaction request that starts with these bytes rewinds here. */
+    size_t rewind_text_len = 0;
+    const int rewind_cut = (prompt_sync_rc == 0 && !multimodal) ?
+        rewind_point_cut(s, &j->req, prompt_for_sync, cached, &rewind_text_len) : 0;
+    if (rewind_cut > 0) {
+        if (ds4_session_pos(slot->session) != rewind_cut) {
+            ds4_tokens prefix = {0};
+            tokens_copy_prefix(&prefix, prompt_for_sync, rewind_cut);
+            prompt_sync_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
+            ds4_tokens_free(&prefix);
+        }
+        if (prompt_sync_rc == 0) {
+            if (ds4_session_mark_rewind_point(slot->session))
+                rewind_point_remember(s, slot, j->req.prompt_text, rewind_text_len, rewind_cut);
+            else
+                rewind_point_clear(s, slot);
+        }
+    }
 
     if (prompt_sync_rc == 0) {
         prompt_sync_rc = multimodal ?
@@ -16717,6 +16844,7 @@ typedef struct {
     int mixed_prefill_quantum;
     int think_budget;
     const char *think_budget_message;
+    int rewind_point_min_tokens;
 } server_config;
 
 static int parse_int_arg(const char *s, const char *opt) {
@@ -16801,6 +16929,7 @@ static void server_close_resources(server *s) {
         live_tool_state_free(&slot->responses_live);
         live_tool_state_free(&slot->anthropic_live);
         visible_live_free(&slot->thinking_live);
+        free(slot->rewind_point.text);
         free(slot->live_text);
         if (slot->session) ds4_session_free(slot->session);
     }
@@ -16981,6 +17110,8 @@ static server_config parse_options(int argc, char **argv) {
             c.kv_cache.boundary_trim_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-boundary-align-tokens")) {
             c.kv_cache.boundary_align_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
+        } else if (!strcmp(arg, "--rewind-point-min-tokens")) {
+            c.rewind_point_min_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-prompt-end-min-tokens")) {
             c.kv_cache.prompt_end_min_tokens = parse_nonneg_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--kv-cache-reject-different-quant")) {
@@ -17253,6 +17384,7 @@ int main(int argc, char **argv) {
     s.tool_mem.max_entries = cfg.tool_memory_max_ids;
     s.enable_cors = cfg.enable_cors;
     s.think_budget = cfg.think_budget;
+    s.rewind_point_min_tokens = cfg.rewind_point_min_tokens;
     s.think_budget_message = cfg.think_budget_message;
     if (s.batched_mode && s.think_budget > 0) {
         server_log(DS4_LOG_WARNING,
@@ -17320,6 +17452,11 @@ int main(int argc, char **argv) {
                        "ds4-server: kv cache prompt-end checkpoints for qwen tool-turn prompts >= %d tokens",
                        s.kv.opt.prompt_end_min_tokens);
         }
+    }
+    if (s.rewind_point_min_tokens > 0) {
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: rewind point at the prompt end of chat prompts >= %d tokens",
+                   s.rewind_point_min_tokens);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -19891,6 +20028,68 @@ static void test_think_budget_options(void) {
                 !strcmp(custom.think_budget_message, "Wrap up now."));
 }
 
+static void test_rewind_point_option(void) {
+    char *d[] = {"ds4-server"};
+    TEST_ASSERT(parse_options(1, d).rewind_point_min_tokens == 0);
+    char *c[] = {"ds4-server", "--rewind-point-min-tokens", "16384"};
+    TEST_ASSERT(parse_options(3, c).rewind_point_min_tokens == 16384);
+}
+
+static void test_rewind_point_cut_plan(void) {
+    ds4_tokens prompt = {0}, tail = {0};
+    for (int i = 0; i < 100; i++) ds4_tokens_push(&prompt, i + 1);
+    for (int i = 96; i < 100; i++) ds4_tokens_push(&tail, i + 1);   /* generation prompt */
+    TEST_ASSERT(rewind_point_cut_plan(50, &prompt, &tail, 10) == 96);
+    TEST_ASSERT(rewind_point_cut_plan(50, &prompt, &tail, 96) == 0);   /* nothing new before the cut */
+    TEST_ASSERT(rewind_point_cut_plan(97, &prompt, &tail, 10) == 0);   /* below the minimum */
+    TEST_ASSERT(rewind_point_cut_plan(0, &prompt, &tail, 10) == 0);    /* option off */
+    tail.v[0] = 999;
+    TEST_ASSERT(rewind_point_cut_plan(50, &prompt, &tail, 10) == 0);   /* not the token tail */
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&tail);
+}
+
+static void test_rewind_point_reuse_tier(void) {
+    server s = {0};
+    int live[300];
+    for (int i = 0; i < 300; i++) live[i] = 7000 + i;
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(live, 300);
+    slot.rewind_point.valid = true;
+    slot.rewind_point.live_tokens = 200;
+    slot.rewind_point.text = (char *)"<sys>turn1<tool>";
+    slot.rewind_point.text_len = strlen(slot.rewind_point.text);
+    ds4_session_set_test_rewind_point(slot.session, 200);
+    job j = {0};
+    ds4_tokens_push(&j.req.prompt, 1);                       /* token prefix diverges at once */
+    j.req.kind = REQ_CHAT;
+    j.req.prompt_text = (char *)"<sys>turn1<tool><user>again";
+    slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+    TEST_ASSERT(pr.kind == REUSE_REWIND_POINT);
+    TEST_ASSERT(pr.reuse_tokens == 200);
+    TEST_ASSERT(pr.suffix_off == slot.rewind_point.text_len);
+    /* alien text: same length class, different bytes */
+    j.req.prompt_text = (char *)"<sys>turnX<tool><user>again";
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind == REUSE_NONE);
+    /* equal text: nothing to add past the point */
+    j.req.prompt_text = (char *)"<sys>turn1<tool>";
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind == REUSE_NONE);
+    /* stale: the engine dropped its point */
+    j.req.prompt_text = (char *)"<sys>turn1<tool><user>again";
+    ds4_session_set_test_rewind_point(slot.session, -1);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind == REUSE_NONE);
+    /* engine point at another position */
+    ds4_session_set_test_rewind_point(slot.session, 150);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind == REUSE_NONE);
+    /* the point past the live frontier (the session was replaced) */
+    ds4_session_set_test_rewind_point(slot.session, 200);
+    slot.rewind_point.live_tokens = 400;
+    ds4_session_set_test_rewind_point(slot.session, 400);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind == REUSE_NONE);
+    ds4_session_free_test_checkpoint(slot.session);
+    ds4_tokens_free(&j.req.prompt);
+}
+
 static void test_kv_cache_prompt_end_option(void) {
     char *default_argv[] = {"ds4-server"};
     server_config defaults = parse_options(1, default_argv);
@@ -20248,6 +20447,9 @@ static void test_qwen_prompt_end_text_boundary(void) {
          * turn is not proven to repeat these bytes */
         g_server_qwen_flavor = SERVER_QWEN_FLAVOR_ORNITH;
         TEST_ASSERT(prompt_end_text_len(&r) == 0);
+        /* the in-memory rewind point admits Ornith: its key is byte-exact,
+         * so a turn the template does not replay identically never matches */
+        TEST_ASSERT(prompt_end_text_len_for(&r, true) == n);
         g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
         /* the generation prompt must be the one this request's mode appends */
         r.think_mode = thinking ? DS4_THINK_NONE : DS4_THINK_HIGH;
@@ -26054,6 +26256,9 @@ static void ds4_server_unit_tests_run(void) {
     test_think_budget_request_fields();
     test_think_budget_options();
     test_kv_cache_prompt_end_option();
+    test_rewind_point_option();
+    test_rewind_point_cut_plan();
+    test_rewind_point_reuse_tier();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
     test_render_drops_old_reasoning_without_tools();

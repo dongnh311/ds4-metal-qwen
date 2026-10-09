@@ -161,6 +161,18 @@ same bytes; DeepSeek and GLM are excluded too. The startup line
 printed whenever the disk cache is on and N > 0, whatever the model, so on
 Ornith, DeepSeek or GLM it announces a feature that never fires.
 
+`--rewind-point-min-tokens N` (default 0, off) keeps an in-memory rewind point
+on Ornith. For every OpenAI-chat request with tools whose prompt has at least
+N tokens, prefill stops at the end of the last message (the boundary the
+prompt-end checkpoint uses), and the session keeps its fixed-size state there:
+GDN states and conv histories, the MTP carry, the position and the logits. A
+later request whose text starts with that prompt up to the cut restores the
+point and prefills only what follows. This covers a client re-sending or
+retrying the last request, and a Claude Code compaction, which drops the last
+reply and adds a user message. It writes nothing to disk and needs no disk
+cache. The log shows `rewind point remembered` and `rewind point hit`. Other
+models ignore the flag.
+
 Quantization variants may share compatible prefixes. Add
 `--kv-cache-reject-different-quant` for same-quant reuse only.
 Cache files contain prompt text and model state: treat the directory as
