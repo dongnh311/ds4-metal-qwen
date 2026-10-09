@@ -100,7 +100,7 @@ Three ordering constraints, each pinned by a test:
 | Env | Default | Why that default |
 |---|---|---|
 | `MLX_KNOWLEDGE_INJECT` | `0` | Off until the pilot gate says otherwise. A hot-path behaviour change with no denominator is how the memory-prefetch regression happened. |
-| `MLX_KNOWLEDGE_CAP` | `0` | Parent §10: no cap is hard-coded. The sweep chooses it. A default cap before the sweep is a guess shipped as a constant. |
+| `MLX_KNOWLEDGE_CAP` | `0` (amended → `2000`, see §16) | Parent §10: no cap is hard-coded. The sweep chooses it. A default cap before the sweep is a guess shipped as a constant. |
 | `MLX_KNOWLEDGE_POSITION` | `fold` | `head` re-prefills the whole context (measured 51.5% hit, 24.7→72.1% swing). `fold` keeps every earlier message byte-identical *and* recalls per turn. |
 | `MLX_KNOWLEDGE_CORPORA` | `code` | The only corpus that exists. |
 | `MLX_KNOWLEDGE_MIN_QUERY_CHARS` | `24` | A three-token query retrieves noise. The value is an open measurement, not a settled one — see §13. |
@@ -184,7 +184,7 @@ Run against the live gateway, ds4 + `ornith-ice-23g`, same checkpoint, same quan
 | 3000 | | | | | | |
 | 4000 | | | | | | |
 
-The chosen cap is the **smallest** that meets the quality target inside the latency budget. Decode tok/s is deliberately not the deciding metric: it is already ~96 tok/s, and a cap that raises decode tok/s while doubling total task latency is a regression.
+The chosen cap is the **smallest** that meets the quality target inside the latency budget *(amended after the sweep — see §16)*. Decode tok/s is deliberately not the deciding metric: it is already ~96 tok/s, and a cap that raises decode tok/s while doubling total task latency is a regression.
 
 The gate outputs one of three verdicts: scale, hold, or abandon. It refuses to scale on either no uplift or a latency blowout — that asymmetry is already implemented in `evals/pilot_gate.py`.
 
@@ -237,5 +237,23 @@ The gate outputs one of three verdicts: scale, hold, or abandon. It refuses to s
 
 - It does not claim the knowledge layer improves answers. That is what the sweep decides; the code only makes the measurement possible.
 - It does not claim Vietnamese coverage. That corpus does not exist yet.
-- It does not claim the cap is known. `KNOWLEDGE_CAP` defaults to 0 precisely because it is not.
+- It does not claim the cap is known. `KNOWLEDGE_CAP` defaulted to 0 precisely because it was not *(amended — see §16)*.
 - It does not claim the hook is engine-independent in the sense of being written for both engines — it is written for the gateway, which is the layer that is engine-independent by construction.
+
+---
+
+## 16. Amendments after the sweep (2026-10-09)
+
+Recorded in the gateway repo: `reports/knowledge-sweep-2026-10-08/RESULT.md` §5 and
+`PRE-REGISTRATION.md` §3, reviewed independently on 2026-10-09.
+
+- **§6 / §15 — cap default.** `MLX_KNOWLEDGE_CAP` defaults to **2000**, chosen by the
+  2026-10-08 sweep. The "defaults to 0" statements describe this spec before the sweep.
+- **§10 — selection rule.** Changed after the run from "smallest qualifying cap" to
+  "highest correctness among qualifying caps, ties to the smaller cap". This replaced
+  the rule's objective. The frozen rule returned 500 on both runs; the changed rule
+  returns 2000. Thresholds (≥10 pp uplift, ≤1.25× latency) are unchanged.
+- **§6 — who may opt in.** The header opt-in applies only to trusted peers (plain
+  loopback, or auth off). An untrusted peer never runs the hook, whatever header or env
+  default applies, and the translated doors carry that decision across their loopback
+  self-call (review findings C1 and I2).
