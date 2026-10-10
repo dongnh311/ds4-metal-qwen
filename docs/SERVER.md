@@ -108,7 +108,10 @@ For the eight-L40S example, see [CUDA GPUs](CUDA_MULTI_GPU.md#serve-multiple-use
 ## Images
 
 Start with the matching language GGUF and `--vision FILE`; see
-[model-specific instructions](MODELS.md#vision).
+[model-specific instructions](MODELS.md#vision). Ornith-1.5-35B-A3B takes the
+Qwen3-VL mmproj published with its GGUFs
+(`mmproj-Ornith-1.5-35B-A3B-f16.gguf` in `bartowski/Ornith-1.5-35B-A3B-GGUF`;
+projection width 2048).
 
 OpenAI chat and Responses accept inline PNG/JPEG data URIs. Anthropic accepts
 base64 image sources. Remote URLs and server-side file paths are rejected.

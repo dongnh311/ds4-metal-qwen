@@ -74163,7 +74163,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
             opt->dspark ? "--dspark" :
             opt->dspark_exact_sampling ? "--mtp-exact-sampling" :
             (opt->mtp_path && opt->mtp_path[0]) ? "--mtp-model" :
-            (opt->vision_path && opt->vision_path[0]) ? "--vision" :
             (opt->ple_path && opt->ple_path[0]) ? "--ple" :
             ((opt->directional_steering_file && opt->directional_steering_file[0]) ||
              opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) ?
@@ -74224,9 +74223,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         model_warm_weights(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
         if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp && !ds4_model_is_qwen4() &&
-            DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
+            !ds4_model_is_qwen35moe() && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
             fprintf(stderr,
-                    "ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next or the pinned "
+                    "ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next, Ornith-1.5-35B-A3B or the pinned "
                     "DeepSeek V4 Flash Vision-Exp or V4.1 Flash model\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -74253,7 +74252,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 ds4_die("unexpected GLM-5.3 vision token IDs");
             }
             e->vision_kind = DS4_VISION_GLM53;
-        } else if (ds4_model_is_qwen4()) {
+        } else if (ds4_model_is_qwen4() || ds4_model_is_qwen35moe()) {
+            /* Ornith-1.5 ships the Qwen3-VL encoder Qwen3.8 uses (27 blocks, width
+             * 1152, merge 2, no deepstack); only the projection width differs, and
+             * the check below holds it to the model's embedding width (2048). */
             qwen4_vision_weights_bind(&e->qwen4_vision_weights, &e->vision_model);
             config_expect_u32("vision projection_dim", e->qwen4_vision_weights.n_out, DS4_N_EMBD);
             e->vision_kind = DS4_VISION_QWEN4;
