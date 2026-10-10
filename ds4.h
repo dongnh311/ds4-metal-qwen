@@ -324,6 +324,10 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
 bool ds4_engine_has_vision(ds4_engine *e);
+/* The tokens of an image block as ds4_prompt_append_vision emits it: start,
+ * the per-row placeholder, end.  False without vision or for a model whose
+ * image block is not start + rows + end (DeepSeek). */
+bool ds4_engine_vision_block_tokens(ds4_engine *e, int out[3]);
 int ds4_engine_vision_encode_file(ds4_engine *e,
                                   const char *path,
                                   ds4_vision_embedding *out,
@@ -569,6 +573,9 @@ void ds4_session_free_test_checkpoint(ds4_session *s);
 /* Test helper: pretend a rewind point exists at pos on a test checkpoint
  * session (pos < 0 clears it). */
 void ds4_session_set_test_rewind_point(ds4_session *s, int pos);
+/* Test helper (Ornith): the (t, h, w) rope position the graph staged for pos.
+ * False for other models or when the read fails. */
+bool ds4_session_test_read_pos3(ds4_session *s, int pos, uint32_t out[3]);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,

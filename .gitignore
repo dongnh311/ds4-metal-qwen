@@ -61,3 +61,4 @@ speed-bench/ornith/oracle/ref-cpu/
 
 # Ornith M4 A/B: keep committed summaries only
 speed-bench/ornith/*/omlx/
+/tests/.qwen35-vision*

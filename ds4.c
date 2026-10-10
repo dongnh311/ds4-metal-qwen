@@ -63459,6 +63459,7 @@ struct ds4_session {
     uint32_t rewind_mtp_pos;
     float *rewind_logits;   /* DS4_N_VOCAB, the logits at rewind_pos */
     float *rewind_h_last;   /* DS4_N_EMBD, MTP carry h_{rewind_pos-1}; NULL without MTP */
+    int32_t rewind_mrope_delta;   /* Ornith M-RoPE offset at rewind_pos */
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
@@ -66230,6 +66231,7 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
         payload_set_err(err, errlen, "Ornith graph is not ready for restore");
         return 1;
     }
+    g->mrope_delta = 0;   /* payloads never hold image-conditioned state */
     const bool mtp = g->mtp_h != NULL;
     const uint32_t rows = h[7];
     const uint32_t want_tag = g->kv_q4 ? DS4_QWEN35_PAYLOAD_TAG_Q4
@@ -74163,7 +74165,6 @@ static int ds4_engine_open_internal(ds4_engine **out,
             opt->dspark ? "--dspark" :
             opt->dspark_exact_sampling ? "--mtp-exact-sampling" :
             (opt->mtp_path && opt->mtp_path[0]) ? "--mtp-model" :
-            (opt->vision_path && opt->vision_path[0]) ? "--vision" :
             (opt->ple_path && opt->ple_path[0]) ? "--ple" :
             ((opt->directional_steering_file && opt->directional_steering_file[0]) ||
              opt->directional_steering_attn != 0.0f || opt->directional_steering_ffn != 0.0f) ?
@@ -74224,9 +74225,9 @@ static int ds4_engine_open_internal(ds4_engine **out,
         model_warm_weights(&e->model);
     if (opt->vision_path && opt->vision_path[0]) {
         if (!ds4_model_is_glm53() && !g_ds4_flash_vision_exp && !ds4_model_is_qwen4() &&
-            DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
+            !ds4_model_is_qwen35moe() && DS4_MODEL_FAMILY != DS4_MODEL_FAMILY_DEEPSEEK41) {
             fprintf(stderr,
-                    "ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next or the pinned "
+                    "ds4: --vision requires GLM-5.3, Qwen3.8-Flash-Next, Ornith-1.5-35B-A3B or the pinned "
                     "DeepSeek V4 Flash Vision-Exp or V4.1 Flash model\n");
             ds4_engine_close(e);
             *out = NULL;
@@ -74253,7 +74254,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 ds4_die("unexpected GLM-5.3 vision token IDs");
             }
             e->vision_kind = DS4_VISION_GLM53;
-        } else if (ds4_model_is_qwen4()) {
+        } else if (ds4_model_is_qwen4() || ds4_model_is_qwen35moe()) {
+            /* Ornith-1.5 ships the Qwen3-VL encoder Qwen3.8 uses (27 blocks, width
+             * 1152, merge 2, no deepstack); only the projection width differs, and
+             * the check below holds it to the model's embedding width (2048). */
             qwen4_vision_weights_bind(&e->qwen4_vision_weights, &e->vision_model);
             config_expect_u32("vision projection_dim", e->qwen4_vision_weights.n_out, DS4_N_EMBD);
             e->vision_kind = DS4_VISION_QWEN4;
@@ -75625,6 +75629,14 @@ uint64_t ds4_engine_model_bytes(ds4_engine *e) {
 
 bool ds4_engine_has_vision(ds4_engine *e) {
     return e && e->vision_ready;
+}
+
+bool ds4_engine_vision_block_tokens(ds4_engine *e, int out[3]) {
+    if (!e || !e->vision_ready || e->vision_kind == DS4_VISION_DEEPSEEK4) return false;
+    out[0] = e->vision_start_token;
+    out[1] = e->vision_image_token;
+    out[2] = e->vision_end_token;
+    return out[0] >= 0 && out[1] >= 0 && out[2] >= 0;
 }
 
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding) {
@@ -79369,6 +79381,11 @@ int ds4_session_sync_multimodal(
     s->graph.prefill_vision_spans = NULL;
     s->graph.prefill_vision_span_count = 0;
 #endif
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_QWEN4_METAL)
+    /* the spans belong to the caller: a later decode must not read them */
+    s->qwen4_graph.vis_spans = NULL;
+    s->qwen4_graph.vis_span_count = 0;
+#endif
     s->sync_images = NULL;
     s->sync_image_count = 0;
     return rc;
@@ -79430,6 +79447,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return 1;
             }
         }
+        g->vis_spans = s->sync_images;          /* NULL for a text sync */
+        g->vis_span_count = s->sync_image_count;
         for (int i = start; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
@@ -89487,6 +89506,16 @@ void ds4_session_invalidate(ds4_session *s) {
 #endif
 }
 
+/* After a rewind to pos, image identities past pos describe rows that no
+ * longer exist; images are stored in prompt order. */
+static void ds4_session_trim_vision_identities(ds4_session *s, int pos) {
+    size_t keep = 0;
+    while (keep < s->checkpoint_image_count &&
+           (uint64_t)s->checkpoint_images[keep].token_start +
+           s->checkpoint_images[keep].token_count <= (uint64_t)pos) keep++;
+    s->checkpoint_image_count = keep;
+}
+
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
     if (pos < 0) pos = 0;
@@ -89541,6 +89570,8 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         g->pos = (uint32_t)pos;
         if (ok && g->mtp_h) ok = qwen35_graph_set_h_last(g, s->rewind_h_last);
         if (ok) {
+            ds4_session_trim_vision_identities(s, pos);
+            g->mrope_delta = s->rewind_mrope_delta;
             g->mtp_pos = s->rewind_mtp_pos;
             g->snap_valid = false;
             g->snap_after_first = false;
@@ -89593,6 +89624,7 @@ bool ds4_session_mark_rewind_point(ds4_session *s) {
     if (!qwen35_graph_rw_copy(g, true)) return false;
     memcpy(s->rewind_logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     s->rewind_mtp_pos = g->mtp_pos;
+    s->rewind_mrope_delta = g->mrope_delta;
     s->rewind_pos = s->checkpoint.len;
     s->rewind_valid = true;
     return true;
@@ -89609,6 +89641,20 @@ void ds4_session_set_test_rewind_point(ds4_session *s, int pos) {
     if (!s) return;
     s->rewind_valid = pos >= 0;
     s->rewind_pos = pos >= 0 ? pos : 0;
+}
+
+bool ds4_session_test_read_pos3(ds4_session *s, int pos, uint32_t out[3]) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_QWEN4_METAL)
+    if (!s || !ds4_session_is_qwen35(s) || pos < 0 || !s->qwen4_graph.pos3) return false;
+    uint32_t v[4];
+    (void)ds4_gpu_synchronize();
+    if (!ds4_gpu_tensor_read(s->qwen4_graph.pos3, (uint64_t)pos * 16u, v, sizeof(v))) return false;
+    memcpy(out, v, 3 * sizeof(uint32_t));
+    return true;
+#else
+    (void)s; (void)pos; (void)out;
+    return false;
+#endif
 }
 
 bool ds4_session_glm_can_rewind(const ds4_session *s, int pos) {
