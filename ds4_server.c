@@ -10877,8 +10877,9 @@ struct server_slot {
     struct {
         bool valid;
         int live_tokens;
-        char *text;
+        char *text;                 /* marker-normalized (visible_prompt_key) */
         size_t text_len;
+        visible_image_key images;   /* image offsets inside text */
     } rewind_point;
     int continued_last_store_tokens;
     /* Wall time of the last completed job on this slot, stamped by the slot
@@ -11377,18 +11378,38 @@ static void rewind_point_clear(server *s, server_slot *slot) {
     pthread_mutex_unlock(&s->tool_mu);
 }
 
-static void rewind_point_remember(server *s, server_slot *slot, const char *text,
+static void rewind_point_remember(server *s, server_slot *slot, const request *req,
                                   size_t text_len, int live_tokens) {
-    char *copy = xstrndup(text, text_len);
+    visible_image_key images;
+    char *key = visible_prompt_key(req, req->prompt_text, &images);
+    if (!key || text_len > strlen(key)) {
+        free(key);
+        rewind_point_clear(s, slot);
+        return;
+    }
+    key[text_len] = '\0';           /* normalization keeps byte offsets */
+    while (images.count && images.offsets[images.count - 1] >= text_len) images.count--;
     pthread_mutex_lock(&s->tool_mu);
     free(slot->rewind_point.text);
-    slot->rewind_point.text = copy;
+    slot->rewind_point.text = key;
     slot->rewind_point.text_len = text_len;
+    slot->rewind_point.images = images;
     slot->rewind_point.live_tokens = live_tokens;
     slot->rewind_point.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
-    server_log(DS4_LOG_KVCACHE, "ds4-server: rewind point remembered pos=%d text=%zu",
-               live_tokens, text_len);
+    server_log(DS4_LOG_KVCACHE, "ds4-server: rewind point remembered pos=%d text=%zu images=%zu",
+               live_tokens, text_len, images.count);
+}
+
+/* Same images at the same offsets up to the point and none after it: what
+ * follows the point is evaluated as text.  Pixels are checked by the probe's
+ * fingerprint gate and again when build_live_prompt_suffix rebases spans. */
+static bool rewind_point_images_match(const visible_image_key *incoming,
+                                      const visible_image_key *old, size_t text_len) {
+    if (incoming->count != old->count) return false;
+    for (size_t i = 0; i < old->count; i++)
+        if (incoming->offsets[i] != old->offsets[i] || incoming->offsets[i] >= text_len) return false;
+    return true;
 }
 
 static void responses_live_remember(server *s, server_slot *slot,
@@ -12502,6 +12523,15 @@ static bool rewind_point_suffix_is_resend(const request *r, const char *suffix) 
     return same;
 }
 
+/* Every image ends at or before limit: the rewind point and the evals after
+ * it only ever see text. */
+static bool rewind_point_images_before(const request *r, int limit) {
+    for (size_t i = 0; r && i < r->image_count; i++)
+        if ((uint64_t)r->images[i].token_start + r->images[i].embedding.token_count > (uint64_t)limit)
+            return false;
+    return true;
+}
+
 /* Ornith admitted: the key is byte-exact, so a template that does not replay
  * a past turn as these bytes simply never matches. */
 static int rewind_point_cut(server *s, const request *r, const ds4_tokens *prompt,
@@ -12535,10 +12565,14 @@ static void server_prefill_leave(server *s);
 /* Evaluate prompt[pos, target) with decode evals when that gap is short (the
  * session must already hold prompt[0, pos)); returns 0 and does nothing for a
  * longer gap, which the caller prefills. */
-static int rewind_point_eval_to(server *s, server_slot *slot, const ds4_tokens *prompt,
-                                int target, char *err, size_t errlen) {
+static int rewind_point_eval_to(server *s, server_slot *slot, const request *r,
+                                const ds4_tokens *prompt, int target, char *err, size_t errlen) {
     const int pos = ds4_session_pos(slot->session);
     if (pos < 0 || target > prompt->len || !rewind_point_tail_by_eval(target - pos)) return 0;
+    for (size_t i = 0; r && i < r->image_count; i++) {
+        const uint64_t a = r->images[i].token_start, b = a + r->images[i].embedding.token_count;
+        if (a < (uint64_t)target && (uint64_t)pos < b) return 0;   /* an image in the gap: prefill it */
+    }
     if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
     int rc = 0;
     for (int i = pos; i < target && rc == 0; i++)
@@ -12880,17 +12914,25 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * last message (a retry, a re-send, a compaction) and adds a suffix, while
      * the live state has moved on through the reply.  The engine restores the
      * point's fixed-size state; rows before it are reused as they are. */
-    if (ptext && req->kind == REQ_CHAT && req->image_count == 0 &&
-        slot->rewind_point.valid && slot->rewind_point.text &&
+    if (ptext && req->kind == REQ_CHAT && slot->rewind_point.valid && slot->rewind_point.text &&
         slot->rewind_point.text_len < plen &&
         slot->rewind_point.live_tokens <= live_pos &&
-        ds4_session_rewind_point_pos(slot->session) == slot->rewind_point.live_tokens &&
-        byte_prefix_match(ptext, plen, slot->rewind_point.text, slot->rewind_point.text_len))
-    {
-        pr.kind = REUSE_REWIND_POINT;
-        pr.reuse_tokens = slot->rewind_point.live_tokens;
-        pr.suffix_off = slot->rewind_point.text_len;
-        return pr;
+        ds4_session_rewind_point_pos(slot->session) == slot->rewind_point.live_tokens) {
+        /* Image markers carry request-local nonces: compare the normalized
+         * key, with the same images at the same offsets and none after the
+         * point (what follows it is evaluated as text). */
+        visible_image_key vimages;
+        char *vkey = visible_prompt_key(req, ptext, &vimages);
+        const bool hit = vkey &&
+            rewind_point_images_match(&vimages, &slot->rewind_point.images, slot->rewind_point.text_len) &&
+            byte_prefix_match(vkey, plen, slot->rewind_point.text, slot->rewind_point.text_len);
+        free(vkey);
+        if (hit) {
+            pr.kind = REUSE_REWIND_POINT;
+            pr.reuse_tokens = slot->rewind_point.live_tokens;
+            pr.suffix_off = slot->rewind_point.text_len;
+            return pr;
+        }
     }
 
     return pr;
@@ -14710,6 +14752,9 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     char err[160];
     err[0] = '\0';
     const bool multimodal = j->req.image_count != 0;
+    if (multimodal)
+        server_log(DS4_LOG_KVCACHE, "ds4-server: request images=%zu prompt=%d",
+                   j->req.image_count, j->req.prompt.len);
     pthread_mutex_lock(&s->inference_mu);
     const int old_pos = ds4_session_pos(slot->session);
     const int common = ds4_session_common_prefix(slot->session, &j->req.prompt);
@@ -15121,16 +15166,20 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
      * only then is the generation prompt evaluated.  A re-sent, retried or
      * compaction request that starts with these bytes rewinds here. */
     size_t rewind_text_len = 0;
-    const int rewind_cut = (prompt_sync_rc == 0 && !multimodal) ?
+    int rewind_cut = prompt_sync_rc == 0 ?
         rewind_point_cut(s, &j->req, prompt_for_sync, cached, &rewind_text_len) : 0;
+    if (rewind_cut > 0 && multimodal && !rewind_point_images_before(&j->req, rewind_cut)) rewind_cut = 0;
     if (rewind_cut > 0) {
         /* a short gap to the cut (a compaction's user message after a hit)
          * also goes through evals rather than its own prefill pass */
-        prompt_sync_rc = rewind_point_eval_to(s, slot, prompt_for_sync, rewind_cut, err, sizeof(err));
+        prompt_sync_rc = rewind_point_eval_to(s, slot, &j->req, prompt_for_sync, rewind_cut, err, sizeof(err));
         if (prompt_sync_rc == 0 && ds4_session_pos(slot->session) != rewind_cut) {
             ds4_tokens prefix = {0};
             tokens_copy_prefix(&prefix, prompt_for_sync, rewind_cut);
-            prompt_sync_rc = server_session_sync(s, slot, &prefix, err, sizeof(err));
+            prompt_sync_rc = multimodal ?
+                server_session_sync_multimodal(s, slot, &prefix, j->req.images, j->req.image_count,
+                                               err, sizeof(err)) :
+                server_session_sync(s, slot, &prefix, err, sizeof(err));
             ds4_tokens_free(&prefix);
         }
         if (prompt_sync_rc == 0) {
@@ -15138,18 +15187,18 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             const bool marked = ds4_session_mark_rewind_point(slot->session);
             server_inference_unlock(s);
             if (marked) {
-                rewind_point_remember(s, slot, j->req.prompt_text, rewind_text_len, rewind_cut);
-                prompt_sync_rc = rewind_point_eval_to(s, slot, prompt_for_sync, prompt_for_sync->len,
+                rewind_point_remember(s, slot, &j->req, rewind_text_len, rewind_cut);
+                prompt_sync_rc = rewind_point_eval_to(s, slot, &j->req, prompt_for_sync, prompt_for_sync->len,
                                                       err, sizeof(err));
             } else {
                 rewind_point_clear(s, slot);
             }
         }
-    } else if (prompt_sync_rc == 0 && !multimodal && live_materialized &&
+    } else if (prompt_sync_rc == 0 && live_materialized &&
                reuse.kind == REUSE_REWIND_POINT) {
         /* a re-send hit: the point is reused as is and its generation prompt
          * goes through evals, as it did on the original turn */
-        prompt_sync_rc = rewind_point_eval_to(s, slot, prompt_for_sync, prompt_for_sync->len,
+        prompt_sync_rc = rewind_point_eval_to(s, slot, &j->req, prompt_for_sync, prompt_for_sync->len,
                                               err, sizeof(err));
     }
 
@@ -20164,6 +20213,68 @@ static void test_rewind_point_resend_and_model(void) {
     g_server_qwen_flavor = SERVER_QWEN_FLAVOR_ORNITH;
     TEST_ASSERT(rewind_point_supported());
     g_server_qwen_flavor = saved;
+}
+
+static void test_rewind_point_images_match(void) {
+    visible_image_key old = {.count = 1, .offsets = {5}};
+    visible_image_key same = {.count = 1, .offsets = {5}};
+    visible_image_key moved = {.count = 1, .offsets = {6}};
+    visible_image_key extra = {.count = 2, .offsets = {5, 40}};
+    visible_image_key none = {0};
+    TEST_ASSERT(rewind_point_images_match(&same, &old, 30));
+    TEST_ASSERT(!rewind_point_images_match(&moved, &old, 30));
+    TEST_ASSERT(!rewind_point_images_match(&extra, &old, 30));   /* an image after the point */
+    TEST_ASSERT(!rewind_point_images_match(&none, &old, 30));
+    TEST_ASSERT(rewind_point_images_match(&none, &none, 30));
+}
+
+static void test_rewind_point_reuse_tier_images(void) {
+    server s = {0};
+    int live[300];
+    for (int i = 0; i < 300; i++) live[i] = 7000 + i;
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(live, 300);
+    ds4_vision_span img = {.token_start = 20};
+    img.embedding.token_count = 16;
+    memset(img.embedding.fingerprint, 7, sizeof(img.embedding.fingerprint));
+    ds4_session_set_test_images(slot.session, &img, 1);
+    ds4_session_set_test_rewind_point(slot.session, 200);
+    char markers[1][SERVER_IMAGE_MARKER_BYTES] = {"\036DS4_IMAGE_aa\037"};
+    request first = {0};
+    first.kind = REQ_CHAT;
+    first.image_count = 1;
+    first.image_markers = markers;
+    first.images = &img;
+    first.prompt_text = (char *)"<sys>u:\036DS4_IMAGE_aa\037 see<tool>";
+    rewind_point_remember(&s, &slot, &first, strlen(first.prompt_text), 200);
+    TEST_ASSERT(slot.rewind_point.valid && slot.rewind_point.images.count == 1);
+
+    /* the re-send carries a fresh nonce: normalized, it matches */
+    char fresh[1][SERVER_IMAGE_MARKER_BYTES] = {"\036DS4_IMAGE_zz\037"};
+    job j = {0};
+    ds4_tokens_push(&j.req.prompt, 1);
+    j.req.kind = REQ_CHAT;
+    j.req.image_count = 1;
+    j.req.image_markers = fresh;
+    j.req.images = &img;
+    j.req.prompt_text = (char *)"<sys>u:\036DS4_IMAGE_zz\037 see<tool><user>again";
+    slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+    TEST_ASSERT(pr.kind == REUSE_REWIND_POINT && pr.reuse_tokens == 200);
+
+    /* the image moved one byte: miss */
+    j.req.prompt_text = (char *)"<sys>u: \036DS4_IMAGE_zz\037see<tool><user>again";
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind != REUSE_REWIND_POINT);
+
+    /* a different picture (fingerprint): the probe's vision gate refuses */
+    ds4_vision_span other = img;
+    memset(other.embedding.fingerprint, 9, sizeof(other.embedding.fingerprint));
+    j.req.images = &other;
+    j.req.prompt_text = (char *)"<sys>u:\036DS4_IMAGE_zz\037 see<tool><user>again";
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind != REUSE_REWIND_POINT);
+
+    rewind_point_clear(&s, &slot);
+    ds4_session_free_test_checkpoint(slot.session);
+    ds4_tokens_free(&j.req.prompt);
 }
 
 static void test_rewind_point_reuse_tier(void) {
@@ -26397,6 +26508,8 @@ static void ds4_server_unit_tests_run(void) {
     test_ornith_render_keeps_image_markers();
     test_rewind_point_cut_plan();
     test_rewind_point_reuse_tier();
+    test_rewind_point_images_match();
+    test_rewind_point_reuse_tier_images();
     test_rewind_point_resend_and_model();
     test_rewind_point_tail_by_eval();
     test_render_think_max_prompt_prefix();
