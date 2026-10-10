@@ -25355,6 +25355,26 @@ static void test_responses_inline_image_content(void) {
     buf_free(&json);
 }
 
+static void test_ornith_render_keeps_image_markers(void) {
+    chat_msg m[3] = {0};
+    m[0].role = (char *)"user";
+    m[0].content = (char *)"look at this \036DS4_IMAGE_aa\037 please";
+    m[1].role = (char *)"assistant";
+    m[1].content = (char *)"Reading the file.";
+    m[2].role = (char *)"tool";
+    m[2].tool_call_id = (char *)"t1";
+    m[2].content = (char *)"\036DS4_IMAGE_bb\037 image read";
+    chat_msgs msgs = {.v = m, .len = 3, .cap = 3};
+    char *text = render_ornith_chat_prompt_text(&msgs, NULL, NULL, DS4_THINK_NONE, &CHAT_TEMPLATE_DEFAULTS);
+    TEST_ASSERT(text != NULL);
+    const char *a = text ? strstr(text, "\036DS4_IMAGE_aa\037") : NULL;
+    const char *b = text ? strstr(text, "\036DS4_IMAGE_bb\037") : NULL;
+    TEST_ASSERT(a && b && a < b);
+    const char *tr = text ? strstr(text, "<tool_response>") : NULL;
+    TEST_ASSERT(tr && b && tr < b && strstr(b, "</tool_response>"));
+    free(text);
+}
+
 static void test_visible_image_key(void) {
     char markers[2][SERVER_IMAGE_MARKER_BYTES] = {"nonce_A", "nonce_B"};
     request req = {.image_count = 1, .image_markers = markers};
@@ -26374,6 +26394,7 @@ static void ds4_server_unit_tests_run(void) {
     test_think_budget_options();
     test_kv_cache_prompt_end_option();
     test_rewind_point_option();
+    test_ornith_render_keeps_image_markers();
     test_rewind_point_cut_plan();
     test_rewind_point_reuse_tier();
     test_rewind_point_resend_and_model();
