@@ -196,6 +196,109 @@ static void case_text_only(ds4_engine *e) {
     ds4_tokens_free(&t);
 }
 
+/* speculative decoding after an image prompt commits exactly the plain
+ * argmax sequence (MTP engine only) */
+static void case_mtp(ds4_engine *e) {
+    char err[256];
+    ds4_tokens prompt = {0};
+    ds4_vision_span spans[2];
+    build_prompt(e, &prompt, spans);
+    ds4_session *spec = NULL, *plain = NULL;
+    if (ds4_session_create(&spec, e, CTX) || ds4_session_create(&plain, e, CTX)) fail("session create");
+    if (ds4_session_sync_multimodal(spec, &prompt, spans, 2, err, sizeof(err))) fail(err);
+    if (ds4_session_sync_multimodal(plain, &prompt, spans, 2, err, sizeof(err))) fail(err);
+    int committed = 0, cycles = 0, accepted = 0;
+    while (committed < 96) {
+        const int first = ds4_session_argmax(spec);
+        int acc[17];
+        err[0] = 0;
+        const int n = ds4_session_eval_speculative_argmax(spec, first, 16, -1, acc, 17, err, sizeof(err));
+        if (n < 1) fail(err[0] ? err : "speculative step");
+        for (int i = 0; i < n; i++) {
+            if (ds4_session_argmax(plain) != acc[i]) fail("speculative token differs from plain argmax");
+            if (ds4_session_eval(plain, acc[i], err, sizeof(err))) fail(err);
+        }
+        committed += n;
+        cycles++;
+        accepted += n - 1;
+    }
+    printf("mtp: %d tokens in %d cycles, %d drafts accepted, identical to plain\n", committed, cycles, accepted);
+    ds4_session_free(spec);
+    ds4_session_free(plain);
+    ds4_tokens_free(&prompt);
+}
+
+/* mark after image A, continue with image B (the offset moves), rewind to the
+ * mark: the offset and the image identities come back, and the next rows
+ * match a session that never saw image B */
+static void case_rewind(ds4_engine *e) {
+    char err[256];
+    ds4_tokens prompt = {0};
+    ds4_vision_span spans[2];
+    build_prompt(e, &prompt, spans);
+    const int mark = (int)(spans[0].token_start + spans[0].embedding.token_count) + 4;
+    ds4_tokens head = {0};
+    for (int i = 0; i < mark; i++) ds4_tokens_push(&head, prompt.v[i]);
+    ds4_session *x = NULL, *y = NULL;
+    if (ds4_session_create(&x, e, CTX) || ds4_session_create(&y, e, CTX)) fail("session create");
+    if (ds4_session_sync_multimodal(x, &head, spans, 1, err, sizeof(err))) fail(err);
+    if (!ds4_session_mark_rewind_point(x)) fail("mark after an image");
+    if (ds4_session_sync_multimodal(x, &prompt, spans, 2, err, sizeof(err))) fail(err);
+    ds4_session_rewind(x, mark);
+    if (!ds4_session_checkpoint_valid(x) || ds4_session_pos(x) != mark) fail("rewind to the point");
+    if (!ds4_session_vision_state_matches(x, spans, 1)) fail("rewind kept image B's identity");
+    if (ds4_session_sync_multimodal(y, &head, spans, 1, err, sizeof(err))) fail(err);
+    const int vocab = ds4_engine_vocab_size(e);
+    float *lx = malloc((size_t)vocab * sizeof(float)), *ly = malloc((size_t)vocab * sizeof(float));
+    if (!lx || !ly) fail("alloc logits");
+    float worst = 0.0f;
+    for (int i = 0; i < 16; i++) {
+        const int tok = prompt.v[i % 8];
+        if (ds4_session_eval(x, tok, err, sizeof(err)) || ds4_session_eval(y, tok, err, sizeof(err))) fail(err);
+        ds4_session_copy_logits(x, lx, vocab);
+        ds4_session_copy_logits(y, ly, vocab);
+        if (ds4_session_argmax(x) != ds4_session_argmax(y)) fail("rewind: argmax differs");
+        for (int k = 0; k < vocab; k++) if (fabsf(lx[k] - ly[k]) > worst) worst = fabsf(lx[k] - ly[k]);
+    }
+    uint32_t px[3], py[3];
+    if (!ds4_session_test_read_pos3(x, mark + 15, px) || !ds4_session_test_read_pos3(y, mark + 15, py) ||
+        memcmp(px, py, sizeof(px))) fail("rewind: offset not restored");
+    if (!(worst <= 1e-2f)) fail("rewind: logits differ");
+    printf("rewind: offset and identities restored, max |dlogit| %.6g\n", worst);
+    free(lx);
+    free(ly);
+    ds4_session_free(x);
+    ds4_session_free(y);
+    ds4_tokens_free(&head);
+    ds4_tokens_free(&prompt);
+}
+
+/* a session that held images, then a text-only payload load: offset zero */
+static void case_payload(ds4_engine *e) {
+    char err[256];
+    ds4_tokens prompt = {0}, text = {0};
+    ds4_vision_span spans[2];
+    build_prompt(e, &prompt, spans);
+    ds4_tokenize_text(e, "<|im_start|>user\nCount to five.<|im_end|>\n<|im_start|>assistant\n", &text);
+    ds4_session *x = NULL, *y = NULL;
+    if (ds4_session_create(&x, e, CTX) || ds4_session_create(&y, e, CTX)) fail("session create");
+    if (ds4_session_sync_multimodal(x, &prompt, spans, 2, err, sizeof(err))) fail(err);
+    if (ds4_session_sync(y, &text, err, sizeof(err))) fail(err);
+    ds4_session_snapshot snap = {0};
+    if (ds4_session_save_snapshot(y, &snap, err, sizeof(err))) fail(err);
+    if (ds4_session_load_snapshot(x, &snap, err, sizeof(err))) fail(err);
+    if (ds4_session_eval(x, text.v[0], err, sizeof(err))) fail(err);
+    uint32_t got[3];
+    if (!ds4_session_test_read_pos3(x, text.len, got)) fail("read pos3");
+    if (got[0] != (uint32_t)text.len) fail("payload load kept the image offset");
+    printf("payload: offset reset on a text-only load\n");
+    ds4_session_snapshot_free(&snap);
+    ds4_session_free(x);
+    ds4_session_free(y);
+    ds4_tokens_free(&prompt);
+    ds4_tokens_free(&text);
+}
+
 int main(void) {
     const char *mmproj = getenv("DS4_TEST_MMPROJ");
     const char *mtp = getenv("DS4_TEST_MTP");
@@ -205,6 +308,9 @@ int main(void) {
     if (vision) {
         case_encode(e);
         case_positions(e);
+        case_rewind(e);
+        case_payload(e);
+        if (mtp && mtp[0] == '1') case_mtp(e);
     }
     printf("PASS: ornith vision (vision=%d mtp=%d)\n", vision ? 1 : 0, mtp && mtp[0] == '1');
     ds4_engine_close(e);

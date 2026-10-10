@@ -63459,6 +63459,7 @@ struct ds4_session {
     uint32_t rewind_mtp_pos;
     float *rewind_logits;   /* DS4_N_VOCAB, the logits at rewind_pos */
     float *rewind_h_last;   /* DS4_N_EMBD, MTP carry h_{rewind_pos-1}; NULL without MTP */
+    int32_t rewind_mrope_delta;   /* Ornith M-RoPE offset at rewind_pos */
     bool mtp_draft_valid;
     bool greedy_splitkv_anchor_valid;
 };
@@ -66230,6 +66231,7 @@ static int qwen35_session_load_payload(ds4_session *s, FILE *fp, const uint32_t 
         payload_set_err(err, errlen, "Ornith graph is not ready for restore");
         return 1;
     }
+    g->mrope_delta = 0;   /* payloads never hold image-conditioned state */
     const bool mtp = g->mtp_h != NULL;
     const uint32_t rows = h[7];
     const uint32_t want_tag = g->kv_q4 ? DS4_QWEN35_PAYLOAD_TAG_Q4
@@ -89496,6 +89498,16 @@ void ds4_session_invalidate(ds4_session *s) {
 #endif
 }
 
+/* After a rewind to pos, image identities past pos describe rows that no
+ * longer exist; images are stored in prompt order. */
+static void ds4_session_trim_vision_identities(ds4_session *s, int pos) {
+    size_t keep = 0;
+    while (keep < s->checkpoint_image_count &&
+           (uint64_t)s->checkpoint_images[keep].token_start +
+           s->checkpoint_images[keep].token_count <= (uint64_t)pos) keep++;
+    s->checkpoint_image_count = keep;
+}
+
 void ds4_session_rewind(ds4_session *s, int pos) {
     if (!s) return;
     if (pos < 0) pos = 0;
@@ -89550,6 +89562,8 @@ void ds4_session_rewind(ds4_session *s, int pos) {
         g->pos = (uint32_t)pos;
         if (ok && g->mtp_h) ok = qwen35_graph_set_h_last(g, s->rewind_h_last);
         if (ok) {
+            ds4_session_trim_vision_identities(s, pos);
+            g->mrope_delta = s->rewind_mrope_delta;
             g->mtp_pos = s->rewind_mtp_pos;
             g->snap_valid = false;
             g->snap_after_first = false;
@@ -89602,6 +89616,7 @@ bool ds4_session_mark_rewind_point(ds4_session *s) {
     if (!qwen35_graph_rw_copy(g, true)) return false;
     memcpy(s->rewind_logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(float));
     s->rewind_mtp_pos = g->mtp_pos;
+    s->rewind_mrope_delta = g->mrope_delta;
     s->rewind_pos = s->checkpoint.len;
     s->rewind_valid = true;
     return true;
