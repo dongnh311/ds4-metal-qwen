@@ -14,6 +14,7 @@ prompts mark. The gateway's ds4 slot was held down for each run (quiet window ch
 | C5 | compaction of C3 (user "summarize" added): `rewind point hit` | PASS | 0.79 s |
 | C6 | C1 without `--mtp`: identical reply | PASS | 1.6 s |
 | C7 | Anthropic `/v1/messages`, image inside a `tool_result`: names `parse_invoice_total` | PASS | 0.5 s |
+| C8 | an image appended to a live text conversation: the next text turn continues live (cached 840 ≥ 827) and the image turn answers as a cold prefill does | PASS | — |
 
 Server log over the run: `request images=` 7, `rewind point remembered` 3, `rewind point hit` 2,
 `multimodal live kv hit` 3. The planned memory of the 512K slot with vision loaded is 33.26 GiB
@@ -30,3 +31,11 @@ The first run passed C1, C2, C6, C7 and failed C3-C5:
   `/v1/chat/completions`, so this was the production path. The tier now compares a view of the request with each
   marker expanded to its block (block strings resolved at startup via `ds4_engine_vision_block_tokens`) and maps the
   match back to a raw suffix offset; the raw comparison stays as the fallback.
+
+## What the final review found (fixed)
+
+`build_live_prompt_suffix` copied only an appended image's placeholder rows: the `<|vision_start|>`/`<|vision_end|>`
+delimiters were copied only for GLM-DSA, so on Ornith (and Qwen3.8) an image added to a live session through the
+memory-text, thinking-visible or tool-output tiers reached the model without its delimiters. C8 does not reach that
+path (its image turn is a memory-token hit, whose suffix comes from the cold tokenization); the model-backed server
+test `test_live_suffix_keeps_image_block_delimiters` does, and failed (2 tokens short) before the fix.

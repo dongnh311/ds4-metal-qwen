@@ -12675,7 +12675,10 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
     ds4_tokens prompt = {0};
     ds4_tokens_copy(&prompt, live);
     const char *cursor = suffix;
-    const int wrapper = ds4_engine_is_glm_dsa(s->engine) ? 1 : 0;
+    /* Qwen-VL and GLM blocks are start + rows + end and a span covers only the
+     * rows, so one delimiter on each side is copied with them; a DeepSeek span
+     * is its whole block. */
+    const int wrapper = (s->vision_block_text[0] || ds4_engine_is_glm_dsa(s->engine)) ? 1 : 0;
     for (size_t i = old_count; i < req->image_count; i++) {
         const char *marker = strstr(cursor, req->image_markers[i]);
         int64_t start = (int64_t)req->images[i].token_start - wrapper;
@@ -20386,8 +20389,88 @@ static void test_memory_text_tier_images(void) {
     j.req.images = &img;
     s.vision_block_text[1] = NULL;
     TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind != REUSE_MEMORY_TEXT);
+    s.vision_block_text[1] = (char *)"<|image_pad|>";
+
+    /* the live text ends inside the image's block: no match */
+    slot.live_text = (char *)"<sys>u:<|vision_start|><|image_pad|>";
+    slot.live_text_len = strlen(slot.live_text);
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind != REUSE_MEMORY_TEXT);
+
+    /* an image after the live prefix: the view matches, nothing to map back */
+    ds4_session_set_test_images(slot.session, NULL, 0);
+    slot.live_text = (char *)"<sys>u: see<a>reply";
+    slot.live_text_len = strlen(slot.live_text);
+    j.req.prompt_text = (char *)"<sys>u: see<a>reply<u>\036DS4_IMAGE_q1\037 new";
+    pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT && pr.suffix_off == strlen(slot.live_text));
+
+    /* the same without block strings: the raw fallback still matches */
+    s.vision_block_text[0] = NULL;
+    pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT && pr.suffix_off == strlen(slot.live_text));
     ds4_session_free_test_checkpoint(slot.session);
     ds4_tokens_free(&j.req.prompt);
+}
+
+/* Model-backed (opt-in: DS4_TEST_VISION_MODEL + DS4_TEST_MMPROJ): an image
+ * appended to a live text session through build_live_prompt_suffix must give
+ * exactly the tokens a cold tokenization gives, delimiters included. */
+static void test_live_suffix_keeps_image_block_delimiters(void) {
+    const char *model = getenv("DS4_TEST_VISION_MODEL"), *mmproj = getenv("DS4_TEST_MMPROJ");
+    if (!model || !model[0] || !mmproj || !mmproj[0]) return;
+    ds4_engine_options opt = {.model_path = model, .vision_path = mmproj, .backend = DS4_BACKEND_METAL,
+                              .n_threads = 1, .context_size = 4096};
+    ds4_engine *e = NULL;
+    TEST_ASSERT(ds4_engine_open(&e, &opt) == 0);
+    if (!e) return;
+    server s = {0};
+    s.engine = e;
+    int bt[3];
+    TEST_ASSERT(ds4_engine_vision_block_tokens(e, bt));
+    for (int i = 0; i < 3; i++) s.vision_block_text[i] = ds4_token_text(e, bt[i], NULL);
+    const char *live_text = "<|im_start|>user\nhello<|im_end|>\n<|im_start|>assistant\nhi<|im_end|>\n";
+    ds4_tokens live = {0};
+    ds4_tokenize_rendered_chat(e, live_text, &live);
+    server_slot slot = {0};
+    char err[160] = {0};
+    TEST_ASSERT(ds4_session_create(&slot.session, e, 4096) == 0);
+    TEST_ASSERT(ds4_session_sync(slot.session, &live, err, sizeof(err)) == 0);
+    char markers[1][SERVER_IMAGE_MARKER_BYTES] = {"\036DS4_IMAGE_t1\037"};
+    buf full = {0};
+    buf_puts(&full, live_text);
+    buf_puts(&full, "<|im_start|>user\nlook \036DS4_IMAGE_t1\037 now<|im_end|>\n<|im_start|>assistant\n");
+    request req = {0};
+    req.kind = REQ_CHAT;
+    req.image_count = 1;
+    req.image_markers = markers;
+    req.prompt_text = full.ptr;
+    ds4_vision_embedding emb = {0};
+    emb.token_count = 4;
+    emb.grid_height = 2;
+    emb.grid_width = 2;
+    emb.data = calloc((size_t)4 * (size_t)ds4_engine_embd_dim(e), sizeof(float));
+    memset(emb.fingerprint, 3, sizeof(emb.fingerprint));
+    ds4_vision_span span = {0};
+    const char *m = strstr(full.ptr, markers[0]);
+    char *pre = xstrndup(full.ptr, (size_t)(m - full.ptr));
+    ds4_tokenize_rendered_chat(e, pre, &req.prompt);
+    free(pre);
+    TEST_ASSERT(ds4_prompt_append_vision(e, &req.prompt, &span, &emb, err, sizeof(err)));
+    ds4_tokenize_rendered_chat(e, m + strlen(markers[0]), &req.prompt);
+    req.images = &span;
+    ds4_tokens eff = {0};
+    TEST_ASSERT(build_live_prompt_suffix(&s, &slot, &req, full.ptr + strlen(live_text), &eff));
+    TEST_ASSERT(eff.len == req.prompt.len);
+    TEST_ASSERT(eff.len == req.prompt.len &&
+                memcmp(eff.v, req.prompt.v, (size_t)eff.len * sizeof(eff.v[0])) == 0);
+    ds4_tokens_free(&eff);
+    ds4_vision_embedding_free(&span.embedding);
+    ds4_tokens_free(&req.prompt);
+    ds4_tokens_free(&live);
+    buf_free(&full);
+    for (int i = 0; i < 3; i++) free(s.vision_block_text[i]);
+    ds4_session_free(slot.session);
+    ds4_engine_close(e);
 }
 
 static void test_rewind_point_reuse_tier(void) {
@@ -26809,6 +26892,8 @@ static void ds4_server_unit_tests_run(void) {
     test_kv_cache_lookup_filters_by_payload_variant();
     test_kv_cache_store_replaces_variant_mismatched_file();
     test_ornith_model_ids();
+    /* last: it opens a real engine, which sets the process-wide model shape */
+    test_live_suffix_keeps_image_block_delimiters();
 }
 
 #ifndef DS4_SERVER_TEST_NO_MAIN

@@ -176,6 +176,23 @@ def main():
         out, dt = post("/v1/messages", anth)
         text = "".join(b.get("text", "") for b in out.get("content") or [] if b.get("type") == "text")
         res["C7"] = {"pass": has(text, "parse_invoice_total"), "s": round(dt, 2)}
+        # C8: an image appended to a live text conversation. The appended block must carry its
+        # <|vision_start|>/<|vision_end|> tokens, so the next text turn continues live and the
+        # image turn answers as a cold prefill of the same messages does.
+        chat8 = [{"role": "system", "content": SYSTEM_TOOLS},
+                 {"role": "user", "content": "Say hello in one word."}]
+        r8a, _, _, _ = chat(chat8, TOOLS)
+        chat8 += [{"role": "assistant", "content": r8a},
+                  {"role": "user", "content": [image_part("newspaper.jpg"),
+                                               {"type": "text", "text": "What is the main headline?"}]}]
+        r8b, p8b, _, _ = chat(chat8, TOOLS)
+        chat8c = chat8 + [{"role": "assistant", "content": r8b},
+                          {"role": "user", "content": "Answer with only the year on the page."}]
+        _r8c, _, cached8c, _ = chat(chat8c, TOOLS)
+        chat(code, max_tokens=8)                 # replace the live state with something unrelated
+        r8b_cold, _, _, _ = chat(chat8, TOOLS)
+        res["C8"] = {"pass": cached8c >= p8b and r8b == r8b_cold, "cached_next": cached8c,
+                     "image_turn_prompt": p8b, "same_as_cold": r8b == r8b_cold}
         res["log"] = {k: srv.count(k) for k in ("request images=", "rewind point remembered",
                                                   "rewind point hit", "multimodal live kv hit")}
     finally:

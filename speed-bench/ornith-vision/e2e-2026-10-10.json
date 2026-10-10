@@ -2,7 +2,7 @@
  "C1": {
   "pass": true,
   "prompt_tokens": 480,
-  "s": 1.79
+  "s": 1.49
  },
  "C2": {
   "pass": true,
@@ -12,7 +12,7 @@
   "cached": 1004,
   "first_prompt": 804,
   "pass": true,
-  "s": 0.37
+  "s": 0.36
  },
  "C4": {
   "pass": true,
@@ -24,16 +24,22 @@
  },
  "C6": {
   "pass": true,
-  "s": 1.58
+  "s": 1.5
  },
  "C7": {
   "pass": true,
   "s": 0.51
  },
+ "C8": {
+  "cached_next": 840,
+  "image_turn_prompt": 827,
+  "pass": true,
+  "same_as_cold": true
+ },
  "log": {
-  "multimodal live kv hit": 3,
-  "request images=": 7,
+  "multimodal live kv hit": 5,
+  "request images=": 11,
   "rewind point hit": 2,
-  "rewind point remembered": 3
+  "rewind point remembered": 7
  }
 }
