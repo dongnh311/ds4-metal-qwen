@@ -115,8 +115,13 @@ Safeguards:
 
 ### 4.4 Retrieval
 
-`agentic-local` joins `NAMED_ONLY` (`retrieval.py:105`): it is never read unless a request names it, like
-`agentic`. Nothing else in retrieval changes.
+`agentic-local` joins `NAMED_ONLY` (`retrieval.py:105`): it is never read unless a request names it, like `agentic`.
+It also gets the rest of `agentic`'s retrieval policy:
+- the tool boost (`retrieval.py:139-148`);
+- holding the requesting conversation out (`retrieval.py:151-159`).
+
+Without the boost, A1 would test plain BM25 rather than the corpus as production reads a trajectory corpus.
+(Amended 2026-10-10 after the final review of the harness; it was "nothing else changes".)
 
 ### 4.5 Case builder — `evals/transcript_cases.py --after DATE`
 
