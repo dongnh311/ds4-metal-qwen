@@ -93,10 +93,33 @@ draft's input embeddings.
   alternative as a follow-up.
 
 ### 4.5 Rewind point (shipped 2026-10-09)
-- **The mark saves `mrope_delta`, and the restore puts it back.** Without this, a re-send after an image would rope
-  every later token at the wrong position.
-- **A rewind-point hit requires the request's image spans to match the live ones**
-  (`ds4_session_vision_state_matches`). A request with different images falls through to the normal paths.
+**Today the server never marks or hits a rewind point for a request that carries images:**
+- the mark requires `!multimodal` (`ds4_server.c:15124`);
+- the probe requires `req->image_count == 0` (`ds4_server.c:12883`).
+
+**What that would cost.** Image markers carry a per-request nonce, so a raw-text key could never match anyway. Native
+vision would therefore strip the re-send and compaction protection from every Ornith session that holds an image,
+together with disk checkpoints (§4.6). Today's sidecar path keeps that protection, because its images become text.
+That would turn the 0.2 s re-send back into a full re-prefill. So this round extends the point to images.
+
+**Engine.**
+- The mark saves `mrope_delta`, and the restore puts it back.
+- The restore drops the checkpoint image identities that end after the point. Otherwise the next multimodal sync sees
+  more live images than the request has, and invalidates.
+
+**Server.**
+- The remembered text is the marker-normalized key (`visible_prompt_key`, `ds4_server.c:10802`) together with its
+  image offsets. Live continuations already key this way.
+- A hit needs all of the following:
+  - the normalized prefix matches;
+  - the image offsets up to the point are the same;
+  - the request has no image after the point;
+  - the engine's image identities equal the request's (`ds4_session_vision_state_matches`, which compares
+    fingerprints).
+- The mark for a multimodal request syncs the prefix with its image spans. If any image ends after the cut, there is
+  no mark.
+- The tail after the point is text (the generation prompt, or a compaction's user turn), so it goes through evals as
+  before.
 
 ### 4.6 Disk KV cache
 - This needs no change, but the cost is stated. Image-conditioned state is never written to the text-keyed disk cache
@@ -158,8 +181,9 @@ The pass criteria are frozen here.
 
 1. **Text-only identity.** The existing Ornith equivalence tests and the rewind-point test pass unchanged. A text prompt's
    logits are bit-identical with and without `--vision` loaded.
-2. **Positions (CPU, no model).** Unit tests for Ornith staging with synthetic spans (the `DS4_QWEN4_FAKE_IMAGE` style),
-   checking the rows taken and the `(t, h, w)` triples:
+2. **Positions (model, synthetic image embeddings).** Ornith staging is fed synthetic spans (deterministic embedding
+   rows; the engine is opened with the mmproj, so image placeholders validate). The `(t, h, w)` triples are read back
+   from `pos3` and compared with an independent implementation of HF `get_rope_index`:
    - inside an image;
    - after one;
    - across a chunk boundary;
@@ -167,9 +191,15 @@ The pass criteria are frozen here.
 3. **Multi-turn equivalence (model).** An image in turn 1 and a text question in turn 2, served as a live continuation,
    gives the same tokens as the two turns sent cold as one prompt.
 4. **MTP losslessness (model).** An image prompt generates the same tokens with and without `--mtp`.
-5. **Rewind point with an image (model).**
-   - A re-send of an image conversation hits the rewind point and replies identically.
-   - A request with a different image does not hit it.
+5. **Rewind point with an image.**
+   - Engine (model):
+     - a point marked after an image prompt survives a later image continuation;
+     - rewinding to it restores `mrope_delta` and the image identities, and matches a never-rewound session.
+   - Server (no model): the probe hits for a re-send with the same images under fresh markers. It misses for:
+     - a different image (fingerprint);
+     - a moved image (offset);
+     - an image after the point.
+   - End to end (§7): a re-send and a compaction of an image conversation both hit, and reply identically.
 6. **Server.** Request parsing and markers for user and tool-result images, through the Ornith renderer.
    - More than 16 images is still refused by ds4.
    - The gateway applies the 16-image cut by arrival order (a hermetic Tier H case).
