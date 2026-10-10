@@ -75631,6 +75631,14 @@ bool ds4_engine_has_vision(ds4_engine *e) {
     return e && e->vision_ready;
 }
 
+bool ds4_engine_vision_block_tokens(ds4_engine *e, int out[3]) {
+    if (!e || !e->vision_ready || e->vision_kind == DS4_VISION_DEEPSEEK4) return false;
+    out[0] = e->vision_start_token;
+    out[1] = e->vision_image_token;
+    out[2] = e->vision_end_token;
+    return out[0] >= 0 && out[1] >= 0 && out[2] >= 0;
+}
+
 void ds4_vision_embedding_free(ds4_vision_embedding *embedding) {
     if (!embedding) return;
     free(embedding->data);

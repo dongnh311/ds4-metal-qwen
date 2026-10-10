@@ -324,6 +324,10 @@ uint64_t ds4_engine_hidden_f32_values(ds4_engine *e);
 int ds4_engine_embd_dim(ds4_engine *e);
 uint64_t ds4_engine_model_bytes(ds4_engine *e);
 bool ds4_engine_has_vision(ds4_engine *e);
+/* The tokens of an image block as ds4_prompt_append_vision emits it: start,
+ * the per-row placeholder, end.  False without vision or for a model whose
+ * image block is not start + rows + end (DeepSeek). */
+bool ds4_engine_vision_block_tokens(ds4_engine *e, int out[3]);
 int ds4_engine_vision_encode_file(ds4_engine *e,
                                   const char *path,
                                   ds4_vision_embedding *out,

@@ -11024,6 +11024,11 @@ struct server {
     int think_budget;                   /* --think-budget; 0 = off */
     const char *think_budget_message;   /* NULL = DS4_THINK_BUDGET_DEFAULT_MESSAGE */
     int rewind_point_min_tokens;        /* 0 = no in-memory rewind point */
+    /* How the live text renders an image's token block (start, pad, end) for
+     * the Qwen-VL-style blocks ds4_prompt_append_vision emits; NULL without
+     * vision or for DeepSeek's block.  Lets the memory-text tier compare a
+     * request whose images are nonce markers with the live text. */
+    char *vision_block_text[3];
     pthread_mutex_t tool_mu;
     pthread_mutex_t kv_mu;
     pthread_mutex_t inference_mu;
@@ -12392,7 +12397,9 @@ static void kv_cache_discard_failed_disk_entry(server *s, server_slot *slot,
  * the live KV holds, and vision payloads never reach the disk cache.  Ornith's
  * template is not proven to replay a past turn as these bytes. */
 static size_t prompt_end_text_len_for(const request *r, bool allow_ornith) {
-    if (!r || r->kind != REQ_CHAT || !r->has_tools || r->image_count) return 0;
+    /* Images: the in-memory rewind point (allow_ornith) holds image state;
+     * a disk prompt-end checkpoint never can. */
+    if (!r || r->kind != REQ_CHAT || !r->has_tools || (r->image_count && !allow_ornith)) return 0;
     if (r->api == API_RESPONSES || r->api == API_ANTHROPIC) return 0;
     if (r->model_syntax != SERVER_MODEL_SYNTAX_QWEN || (!allow_ornith && server_qwen_is_ornith()) ||
         !r->prompt_text) return 0;
@@ -12774,6 +12781,42 @@ typedef struct {
     int matched_ids;    /* tool-output tiers: number of bound call ids */
 } slot_reuse;
 
+/* The request's prompt text as the live session renders it: each image
+ * marker replaced by the image's token block (start, token_count pads, end;
+ * slot->live_text comes from the tokens, the request has a nonce marker).
+ * For image i, starts/ends are its block's offsets in the view and grown is
+ * the view's cumulative growth over the raw text up to that block's end.
+ * NULL when there is nothing to expand or a marker or block string is missing. */
+static char *live_text_view(const server *s, const request *req, const char *ptext,
+                            size_t starts[16], size_t ends[16], size_t grown[16]) {
+    if (!s || !req || !ptext || !req->image_count || req->image_count > 16 || !req->image_markers ||
+        !req->images || !s->vision_block_text[0] || !s->vision_block_text[1] || !s->vision_block_text[2])
+        return NULL;
+    buf out = {0};
+    const char *cursor = ptext;
+    size_t growth = 0;
+    for (size_t i = 0; i < req->image_count; i++) {
+        const char *marker = strstr(cursor, req->image_markers[i]);
+        const size_t mlen = strlen(req->image_markers[i]);
+        if (!marker || !mlen) {
+            buf_free(&out);
+            return NULL;
+        }
+        buf_append(&out, cursor, (size_t)(marker - cursor));
+        starts[i] = out.len;
+        buf_puts(&out, s->vision_block_text[0]);
+        for (uint32_t k = 0; k < req->images[i].embedding.token_count; k++)
+            buf_puts(&out, s->vision_block_text[1]);
+        buf_puts(&out, s->vision_block_text[2]);
+        ends[i] = out.len;
+        growth += (ends[i] - starts[i]) - mlen;
+        grown[i] = growth;
+        cursor = marker + mlen;
+    }
+    buf_puts(&out, cursor);
+    return out.ptr ? out.ptr : xstrdup("");
+}
+
 static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
                                           const request *req) {
     slot_reuse pr = { REUSE_NONE, 0, 0, 0 };
@@ -12900,14 +12943,35 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
         }
     }
 
-    if (ptext && slot->live_text && slot->live_text_pos == live_pos &&
-        slot->live_text_len <= plen &&
-        byte_prefix_match(ptext, plen, slot->live_text, slot->live_text_len))
-    {
-        pr.kind = REUSE_MEMORY_TEXT;
-        pr.reuse_tokens = live_pos;
-        pr.suffix_off = slot->live_text_len;
-        return pr;
+    if (ptext && slot->live_text && slot->live_text_pos == live_pos) {
+        /* With images, compare the request as the live text renders it and
+         * map the matched length back to the raw text; a match that ends
+         * inside an image block is no match. */
+        size_t starts[16], ends[16], grown[16];
+        char *view = req->image_count ? live_text_view(s, req, ptext, starts, ends, grown) : NULL;
+        const size_t off = slot->live_text_len;
+        size_t back = 0;
+        bool ok = false;
+        if (view) {
+            const size_t vlen = strlen(view);
+            ok = off <= vlen && byte_prefix_match(view, vlen, slot->live_text, off);
+            for (size_t i = 0; ok && i < req->image_count; i++) {
+                if (ends[i] <= off) back = grown[i];
+                else if (starts[i] < off) ok = false;
+            }
+            free(view);
+        }
+        /* raw text: no image inside the live prefix (none, or appended ones) */
+        if (!ok) {
+            back = 0;
+            ok = off <= plen && byte_prefix_match(ptext, plen, slot->live_text, off);
+        }
+        if (ok) {
+            pr.kind = REUSE_MEMORY_TEXT;
+            pr.reuse_tokens = live_pos;
+            pr.suffix_off = off - back;
+            return pr;
+        }
     }
 
     /* Rewind point: the request re-sends the latest prompt up to the end of its
@@ -17505,6 +17569,10 @@ int main(int argc, char **argv) {
     s.enable_cors = cfg.enable_cors;
     s.think_budget = cfg.think_budget;
     s.rewind_point_min_tokens = cfg.rewind_point_min_tokens;
+    int vision_block[3];
+    if (engine && ds4_engine_vision_block_tokens(engine, vision_block)) {
+        for (int i = 0; i < 3; i++) s.vision_block_text[i] = ds4_token_text(engine, vision_block[i], NULL);
+    }
     s.think_budget_message = cfg.think_budget_message;
     if (s.batched_mode && s.think_budget > 0) {
         server_log(DS4_LOG_WARNING,
@@ -20277,6 +20345,51 @@ static void test_rewind_point_reuse_tier_images(void) {
     ds4_tokens_free(&j.req.prompt);
 }
 
+/* A multimodal request continues the live session through the memory-text
+ * tier: live_text renders each image as its token block, the request carries a
+ * nonce marker in its place. */
+static void test_memory_text_tier_images(void) {
+    server s = {0};
+    s.vision_block_text[0] = (char *)"<|vision_start|>";
+    s.vision_block_text[1] = (char *)"<|image_pad|>";
+    s.vision_block_text[2] = (char *)"<|vision_end|>";
+    int live[40];
+    for (int i = 0; i < 40; i++) live[i] = 7000 + i;
+    server_slot slot = {0};
+    slot.session = ds4_session_new_test_checkpoint(live, 40);
+    ds4_vision_span img = {.token_start = 3};
+    img.embedding.token_count = 2;
+    memset(img.embedding.fingerprint, 5, sizeof(img.embedding.fingerprint));
+    ds4_session_set_test_images(slot.session, &img, 1);
+    slot.live_text = (char *)"<sys>u:<|vision_start|><|image_pad|><|image_pad|><|vision_end|> see<a>reply";
+    slot.live_text_len = strlen(slot.live_text);
+    slot.live_text_pos = 40;
+    char markers[1][SERVER_IMAGE_MARKER_BYTES] = {"\036DS4_IMAGE_q1\037"};
+    job j = {0};
+    ds4_tokens_push(&j.req.prompt, 1);
+    j.req.kind = REQ_CHAT;
+    j.req.image_count = 1;
+    j.req.image_markers = markers;
+    j.req.images = &img;
+    const char *raw_live = "<sys>u:\036DS4_IMAGE_q1\037 see<a>reply";
+    j.req.prompt_text = (char *)"<sys>u:\036DS4_IMAGE_q1\037 see<a>reply<u>next";
+    slot_reuse pr = slot_probe_reuse_locked(&s, &slot, &j.req);
+    TEST_ASSERT(pr.kind == REUSE_MEMORY_TEXT);
+    TEST_ASSERT(pr.reuse_tokens == 40);
+    TEST_ASSERT(pr.suffix_off == strlen(raw_live));
+    /* a different image size renders a different block: no match */
+    ds4_vision_span big = img;
+    big.embedding.token_count = 3;
+    j.req.images = &big;
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind != REUSE_MEMORY_TEXT);
+    /* no block strings (a model without a Qwen-VL block): no match, as before */
+    j.req.images = &img;
+    s.vision_block_text[1] = NULL;
+    TEST_ASSERT(slot_probe_reuse_locked(&s, &slot, &j.req).kind != REUSE_MEMORY_TEXT);
+    ds4_session_free_test_checkpoint(slot.session);
+    ds4_tokens_free(&j.req.prompt);
+}
+
 static void test_rewind_point_reuse_tier(void) {
     server s = {0};
     int live[300];
@@ -20678,6 +20791,10 @@ static void test_qwen_prompt_end_text_boundary(void) {
         /* the in-memory rewind point admits Ornith: its key is byte-exact,
          * so a turn the template does not replay identically never matches */
         TEST_ASSERT(prompt_end_text_len_for(&r, true) == n);
+        /* an image is held in memory by the rewind point, never on disk */
+        r.image_count = 1;
+        TEST_ASSERT(prompt_end_text_len_for(&r, true) == n);
+        r.image_count = 0;
         g_server_qwen_flavor = SERVER_QWEN_FLAVOR_QWEN38;
         /* the generation prompt must be the one this request's mode appends */
         r.think_mode = thinking ? DS4_THINK_NONE : DS4_THINK_HIGH;
@@ -26510,6 +26627,7 @@ static void ds4_server_unit_tests_run(void) {
     test_rewind_point_reuse_tier();
     test_rewind_point_images_match();
     test_rewind_point_reuse_tier_images();
+    test_memory_text_tier_images();
     test_rewind_point_resend_and_model();
     test_rewind_point_tail_by_eval();
     test_render_think_max_prompt_prefix();
