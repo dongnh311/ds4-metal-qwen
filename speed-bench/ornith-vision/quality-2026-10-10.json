@@ -1,0 +1,158 @@
+{
+ "facts_total": 30,
+ "native_total": 29,
+ "rows": {
+  "../../tests/vision-fixtures/glm53/diagram.png": {
+   "description_chars": 1611,
+   "facts": 5,
+   "native": 5,
+   "native_chars": 775,
+   "native_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "native_s": 6.08,
+   "sidecar": 5,
+   "sidecar_answer_s": 2.14,
+   "sidecar_chars": 753,
+   "sidecar_describe_s": 4.23,
+   "sidecar_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ]
+  },
+  "../../tests/vision-fixtures/glm53/earth.jpg": {
+   "description_chars": 1222,
+   "facts": 5,
+   "native": 4,
+   "native_chars": 852,
+   "native_hits": [
+    true,
+    true,
+    true,
+    false,
+    true
+   ],
+   "native_s": 2.49,
+   "sidecar": 4,
+   "sidecar_answer_s": 2.86,
+   "sidecar_chars": 1034,
+   "sidecar_describe_s": 2.91,
+   "sidecar_hits": [
+    true,
+    true,
+    true,
+    false,
+    true
+   ]
+  },
+  "../../tests/vision-fixtures/glm53/screenshot.png": {
+   "description_chars": 2646,
+   "facts": 5,
+   "native": 5,
+   "native_chars": 814,
+   "native_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "native_s": 8.18,
+   "sidecar": 5,
+   "sidecar_answer_s": 2.49,
+   "sidecar_chars": 747,
+   "sidecar_describe_s": 7.12,
+   "sidecar_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ]
+  },
+  "fixtures/code.png": {
+   "description_chars": 1754,
+   "facts": 5,
+   "native": 5,
+   "native_chars": 804,
+   "native_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "native_s": 2.98,
+   "sidecar": 5,
+   "sidecar_answer_s": 2.59,
+   "sidecar_chars": 814,
+   "sidecar_describe_s": 4.14,
+   "sidecar_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ]
+  },
+  "fixtures/newspaper.jpg": {
+   "description_chars": 4503,
+   "facts": 5,
+   "native": 5,
+   "native_chars": 1514,
+   "native_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "native_s": 5.35,
+   "sidecar": 5,
+   "sidecar_answer_s": 4.69,
+   "sidecar_chars": 1283,
+   "sidecar_describe_s": 18.9,
+   "sidecar_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ]
+  },
+  "fixtures/vietnamese.png": {
+   "description_chars": 1231,
+   "facts": 5,
+   "native": 5,
+   "native_chars": 67,
+   "native_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ],
+   "native_s": 0.88,
+   "sidecar": 5,
+   "sidecar_answer_s": 2.73,
+   "sidecar_chars": 749,
+   "sidecar_describe_s": 3.29,
+   "sidecar_hits": [
+    true,
+    true,
+    true,
+    true,
+    true
+   ]
+  }
+ },
+ "sidecar_total": 29,
+ "verdict": "PASS"
+}
