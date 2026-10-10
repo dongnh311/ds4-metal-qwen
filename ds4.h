@@ -569,6 +569,9 @@ void ds4_session_free_test_checkpoint(ds4_session *s);
 /* Test helper: pretend a rewind point exists at pos on a test checkpoint
  * session (pos < 0 clears it). */
 void ds4_session_set_test_rewind_point(ds4_session *s, int pos);
+/* Test helper (Ornith): the (t, h, w) rope position the graph staged for pos.
+ * False for other models or when the read fails. */
+bool ds4_session_test_read_pos3(ds4_session *s, int pos, uint32_t out[3]);
 /* Attach synthetic image identities to a test checkpoint (copies
  * token_start/row-count/fingerprint per span).  Not usable for inference. */
 void ds4_session_set_test_images(ds4_session *s,

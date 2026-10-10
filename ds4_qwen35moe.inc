@@ -181,6 +181,7 @@ static void qwen35_graph_reset(ds4_qwen4_gpu_graph *g) {
     g->snap_valid = false;
     g->snap_after_first = false;
     g->verify_rows_exact = false;
+    g->mrope_delta = 0;
 }
 
 /* Before a forward at pos0: put h_{pos0-1} into row 0 of the seed rows.  It
@@ -197,15 +198,43 @@ static bool qwen35_graph_carry_h(ds4_qwen4_gpu_graph *g, uint32_t pos0) {
     return k == 0 || ds4_gpu_tensor_copy(g->mtp_h, 0, g->mtp_h, (uint64_t)k * row, row) != 0;
 }
 
-/* Embedding rows (dequantized on the host from Q8_0) and text rope
- * positions (t, h, w) = (p, p, p). */
+/* The M-RoPE offset in force at position p: text after an image continues
+ * at max(rows, cols) past the image's base, so every image that ends at or
+ * before p moves later positions by max(rows, cols) - rows*cols (the update
+ * qwen4_mrope_pos applies at an image's last row).  With spans (a prefill)
+ * it is recomputed from them, so a chunk, a continuation and the MTP pass
+ * over the same positions all agree; without (decode) every image is
+ * behind p and the running g->mrope_delta holds it. */
+static int32_t qwen35_mrope_delta_at(const ds4_qwen4_gpu_graph *g, uint32_t p) {
+    if (!g->vis_span_count) return g->mrope_delta;
+    int32_t d = 0;
+    for (size_t i = 0; i < g->vis_span_count; i++) {
+        const ds4_vision_span *sp = &g->vis_spans[i];
+        const uint32_t cnt = sp->embedding.token_count;
+        if ((uint64_t)sp->token_start + cnt > p) continue;
+        const uint32_t gw = sp->embedding.grid_width > 0 ? sp->embedding.grid_width : cnt;
+        const uint32_t gh = sp->embedding.grid_height > 0 ? sp->embedding.grid_height : 1u;
+        d -= (int32_t)cnt - (int32_t)(gh > gw ? gh : gw);
+    }
+    return d;
+}
+
+/* Rows: the token's embedding (dequantized on the host from Q8_0), or at an
+ * image position the image's row.  Rope positions (t, h, w): (p, p, p) +
+ * the running offset for text, the image grid inside an image. */
 static bool qwen35_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                       const int *tokens, uint32_t T) {
     const uint32_t E = DS4_N_EMBD;
+    const ds4_vision_span *spans = g->vis_spans;
+    const size_t n_spans = g->vis_span_count;
+    if (n_spans) g->mrope_delta = qwen35_mrope_delta_at(g, g->pos);
     for (uint32_t t = 0; t < T; t++) {
-        qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], g->host_row + (uint64_t)t * E);
+        float *dst = g->host_row + (uint64_t)t * E;
+        const float *img = n_spans ? qwen4_span_row(spans, n_spans, g->pos + t) : NULL;
+        if (img) memcpy(dst, img, E * sizeof(float));
+        else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[t], dst);
         uint32_t *p4 = g->host_pos3 + (uint64_t)t * 4u;
-        p4[0] = p4[1] = p4[2] = g->pos + t;
+        qwen4_mrope_pos(spans, n_spans, g->pos + t, &g->mrope_delta, p4);
         p4[3] = 0;
     }
     return ds4_gpu_tensor_write(g->R, 0, g->host_row, (uint64_t)T * E * sizeof(float)) &&
@@ -1013,10 +1042,15 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_mtp(ds4_qwen4_gpu_graph *g, const ds4_
     for (uint32_t done = 0; done < T && ok;) {
         const uint32_t n = T - done < g->cap_tokens ? T - done : g->cap_tokens;
         const uint32_t p = pos0 + done;
+        int32_t d = qwen35_mrope_delta_at(g, p);
         for (uint32_t t = 0; t < n; t++) {
-            qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[done + t], g->host_row + (uint64_t)t * E);
+            float *dst = g->host_row + (uint64_t)t * E;
+            const float *img = g->vis_span_count ?
+                qwen4_span_row(g->vis_spans, g->vis_span_count, p + t) : NULL;
+            if (img) memcpy(dst, img, E * sizeof(float));
+            else qwen4_ref_row(m, w->token_embd, (uint64_t)tokens[done + t], dst);
             uint32_t *p4 = g->host_pos3 + (uint64_t)t * 4u;
-            p4[0] = p4[1] = p4[2] = p + t;
+            qwen4_mrope_pos(g->vis_spans, g->vis_span_count, p + t, &d, p4);
             p4[3] = 0;
         }
         ok = ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, (uint64_t)n * row) &&

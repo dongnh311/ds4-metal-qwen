@@ -79371,6 +79371,11 @@ int ds4_session_sync_multimodal(
     s->graph.prefill_vision_spans = NULL;
     s->graph.prefill_vision_span_count = 0;
 #endif
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_QWEN4_METAL)
+    /* the spans belong to the caller: a later decode must not read them */
+    s->qwen4_graph.vis_spans = NULL;
+    s->qwen4_graph.vis_span_count = 0;
+#endif
     s->sync_images = NULL;
     s->sync_image_count = 0;
     return rc;
@@ -79432,6 +79437,8 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 return 1;
             }
         }
+        g->vis_spans = s->sync_images;          /* NULL for a text sync */
+        g->vis_span_count = s->sync_image_count;
         for (int i = start; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
                 snprintf(err, errlen, "interrupted");
@@ -89611,6 +89618,20 @@ void ds4_session_set_test_rewind_point(ds4_session *s, int pos) {
     if (!s) return;
     s->rewind_valid = pos >= 0;
     s->rewind_pos = pos >= 0 ? pos : 0;
+}
+
+bool ds4_session_test_read_pos3(ds4_session *s, int pos, uint32_t out[3]) {
+#if !defined(DS4_NO_GPU) && defined(DS4_HAS_QWEN4_METAL)
+    if (!s || !ds4_session_is_qwen35(s) || pos < 0 || !s->qwen4_graph.pos3) return false;
+    uint32_t v[4];
+    (void)ds4_gpu_synchronize();
+    if (!ds4_gpu_tensor_read(s->qwen4_graph.pos3, (uint64_t)pos * 16u, v, sizeof(v))) return false;
+    memcpy(out, v, 3 * sizeof(uint32_t));
+    return true;
+#else
+    (void)s; (void)pos; (void)out;
+    return false;
+#endif
 }
 
 bool ds4_session_glm_can_rewind(const ds4_session *s, int pos) {
