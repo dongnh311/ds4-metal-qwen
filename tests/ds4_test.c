@@ -1,6 +1,7 @@
 #define DS4_SERVER_TEST
 #define DS4_SERVER_TEST_NO_MAIN
 #include <inttypes.h>
+#include <sys/mman.h>
 #include "../ds4_server.c"
 #include "quant_fixtures.h"
 #ifndef DS4_NO_GPU
@@ -8249,6 +8250,76 @@ static void test_qwen_kv_grow_policy(void) {
     TEST_ASSERT(ds4_qwen4_kv_reserve("0") == 4096);
 }
 
+bool ds4_model_prefetch_wanted(uint64_t cached_pages, uint64_t total_pages, const char *env_value);
+uint64_t ds4_model_cached_pages(const void *map, uint64_t offset, uint64_t len,
+                                uint32_t max_probes, uint64_t *probed);
+uint64_t ds4_model_read_range(int fd, uint64_t offset, uint64_t len, uint32_t threads);
+
+/* Model read-ahead before Metal residency: the policy, the page-cache count
+ * and the sequential reader, on a scratch file (no model). */
+static void test_model_prefetch(void) {
+    TEST_ASSERT(ds4_model_prefetch_wanted(0, 100, NULL));
+    TEST_ASSERT(ds4_model_prefetch_wanted(49, 100, ""));
+    TEST_ASSERT(!ds4_model_prefetch_wanted(50, 100, NULL));
+    TEST_ASSERT(!ds4_model_prefetch_wanted(100, 100, NULL));
+    TEST_ASSERT(!ds4_model_prefetch_wanted(0, 100, "0"));
+    TEST_ASSERT(ds4_model_prefetch_wanted(100, 100, "1"));
+    TEST_ASSERT(!ds4_model_prefetch_wanted(0, 0, NULL));
+    TEST_ASSERT(!ds4_model_prefetch_wanted(0, 0, "1"));
+
+    const uint64_t size = 3u * 1024u * 1024u + 123u;
+    FILE *fp = tmpfile();
+    TEST_ASSERT(fp != NULL);
+    if (!fp) return;
+    uint8_t *buf = malloc((size_t)size);
+    TEST_ASSERT(buf != NULL);
+    if (!buf) { fclose(fp); return; }
+    for (uint64_t i = 0; i < size; i++) buf[i] = (uint8_t)(i * 31u);
+    TEST_ASSERT(fwrite(buf, 1, (size_t)size, fp) == size);
+    fflush(fp);
+    free(buf);
+    const int fd = fileno(fp);
+
+    TEST_ASSERT(ds4_model_read_range(fd, 7, size - 7, 3) == size - 7);
+    TEST_ASSERT(ds4_model_read_range(fd, 0, size, 1) == size);
+    TEST_ASSERT(ds4_model_read_range(fd, 0, 0, 4) == 0);
+    TEST_ASSERT(ds4_model_read_range(fd, size - 5, 100, 2) == 5);
+
+    const uint64_t page = (uint64_t)getpagesize();
+    const uint8_t *map = mmap(NULL, (size_t)size, PROT_READ, MAP_SHARED, fd, 0);
+    TEST_ASSERT(map != MAP_FAILED);
+    if (map != MAP_FAILED) {
+        volatile uint32_t sum = 0;
+        for (uint64_t i = 0; i < size; i += page) sum += map[i];
+        (void)sum;
+        uint64_t probed = 0;
+        TEST_ASSERT(ds4_model_cached_pages(map, 0, size, 1u << 20, &probed) == probed);
+        TEST_ASSERT(probed == (size + page - 1) / page);
+        /* fewer probes than pages: that many pages, spread over the range */
+        TEST_ASSERT(ds4_model_cached_pages(map, 0, size, 16, &probed) == 16);
+        TEST_ASSERT(probed == 16);
+        /* an unaligned start counts the page it falls in */
+        TEST_ASSERT(ds4_model_cached_pages(map, page + 7, page, 64, &probed) == 2);
+        TEST_ASSERT(probed == 2);
+        TEST_ASSERT(ds4_model_cached_pages(map, 0, size, 0, &probed) == 0);
+        TEST_ASSERT(probed == 0);
+        munmap((void *)map, (size_t)size);
+    }
+    fclose(fp);
+
+    /* the cold direction: untouched anonymous pages are not resident */
+    uint8_t *anon = mmap(NULL, (size_t)(8u * page), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    TEST_ASSERT(anon != MAP_FAILED);
+    if (anon != MAP_FAILED) {
+        for (uint64_t i = 0; i < 8u; i += 2u) anon[i * page] = 1;
+        uint64_t probed = 0;
+        TEST_ASSERT(ds4_model_cached_pages(anon, 0, 8u * page, 64, &probed) == 4);
+        TEST_ASSERT(probed == 8);
+        TEST_ASSERT(ds4_model_prefetch_wanted(3, 8, NULL));
+        munmap(anon, (size_t)(8u * page));
+    }
+}
+
 static void test_quant_dequant(void) {
     for (size_t i = 0; i < sizeof(quant_fixtures) / sizeof(quant_fixtures[0]); i++) {
         const ds4_quant_fixture *f = &quant_fixtures[i];
@@ -8841,6 +8912,7 @@ typedef struct {
 
 static const ds4_test_entry test_entries[] = {
     {"--qwen-kv-grow-policy", "qwen-kv-grow-policy", "Qwen3.8 grow-on-demand KV capacity policy (no model)", test_qwen_kv_grow_policy},
+    {"--model-prefetch", "model-prefetch", "model read-ahead before Metal residency: policy, page count, reader (no model)", test_model_prefetch},
     {"--qwen-yarn-policy", "qwen-yarn-policy", "Qwen3.8 YaRN factor from -c and the rope table (no model)", test_qwen_yarn_policy},
     {"--qwen35-context-policy", "qwen35-context-policy", "Ornith context rule: past 262144 only with a covering YaRN factor (no model)", test_qwen35_context_policy},
     {"--qwen35-decode-stats", "qwen35-decode-stats", "Ornith decode instrumentation: top-k overlap and MTP cycle stats (no model)", test_qwen35_decode_stats},

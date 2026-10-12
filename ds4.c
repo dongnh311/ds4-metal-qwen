@@ -2822,6 +2822,111 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
 #endif
 }
 
+/*
+ * Read-ahead before Metal residency (DS4_METAL_MODEL_PREFETCH=0 off, =1
+ * whenever the cache state can be sampled). Residency faults a cold GGUF in
+ * at ~7 GB/s on an M5 Pro, while one sequential pass runs at ~13 GB/s and
+ * leaves residency only cached pages to map: a cold 40.7 GiB Qwen3.8 load
+ * went 5.5 -> 3.5 s (2.9 s read + 0.6 s residency), a 21.3 GiB Ornith one
+ * 2.9 -> 1.9 s. The pass must finish first; overlapping it with the residency
+ * request gained nothing. A mostly cached range is skipped, since the pass
+ * would only copy cached pages.
+ */
+bool ds4_model_prefetch_wanted(uint64_t cached_pages, uint64_t total_pages, const char *env_value) {
+    if (total_pages == 0) return false;
+    if (env_value && env_value[0]) return strcmp(env_value, "0") != 0;
+    return cached_pages * 2u < total_pages;
+}
+
+/* Resident pages among up to max_probes pages spread evenly over
+ * map[offset, offset + len), widened to whole pages; the range must lie
+ * inside the mapping (Darwin reports pages past it as not resident instead of
+ * failing). *probed receives the pages probed, 0 when mincore fails, which
+ * also skips a forced read-ahead. One mincore over a 40.7 GiB mapping
+ * took 550 ms, longer than a warm load's residency request, so the cache
+ * state is sampled rather than read whole. */
+uint64_t ds4_model_cached_pages(const void *map, uint64_t offset, uint64_t len,
+                                uint32_t max_probes, uint64_t *probed) {
+    if (probed) *probed = 0;
+    if (!map || len == 0 || max_probes == 0) return 0;
+    const uintptr_t page = (uintptr_t)getpagesize();
+    const uintptr_t start = ((uintptr_t)map + offset) & ~(page - 1u);
+    const uintptr_t end = ((uintptr_t)map + offset + len + page - 1u) & ~(page - 1u);
+    const uint64_t n = (uint64_t)((end - start) / page);
+    const uint64_t probes = n < max_probes ? n : max_probes;
+    uint64_t cached = 0;
+    for (uint64_t i = 0; i < probes; i++) {
+        unsigned char v = 0;
+        const uintptr_t p = start + (uintptr_t)(i * n / probes) * page;
+        if (mincore((void *)p, (size_t)page, (void *)&v) != 0) return 0;
+        cached += v & 1u;
+    }
+    if (probed) *probed = probes;
+    return cached;
+}
+
+typedef struct {
+    int fd;
+    uint64_t offset;
+    uint64_t len;
+    uint64_t done;
+} model_read_part;
+
+static void *model_read_part_main(void *arg) {
+    model_read_part *p = arg;
+    const uint64_t block = 8ull << 20;
+    uint8_t *buf = malloc((size_t)block);
+    if (!buf) return NULL;
+    while (p->done < p->len) {
+        const uint64_t want = p->len - p->done < block ? p->len - p->done : block;
+        const ssize_t n = pread(p->fd, buf, (size_t)want, (off_t)(p->offset + p->done));
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) break;
+        p->done += (uint64_t)n;
+    }
+    free(buf);
+    return NULL;
+}
+
+/* Read fd[offset, offset + len) once in `threads` contiguous parts of large
+ * sequential preads and drop the bytes: only the page cache keeps them.
+ * Returns the bytes read, short at end of file or on a read error. */
+uint64_t ds4_model_read_range(int fd, uint64_t offset, uint64_t len, uint32_t threads) {
+    enum { MAX_PARTS = 16 };
+    if (fd < 0 || len == 0) return 0;
+    if (threads == 0) threads = 1;
+    if (threads > MAX_PARTS) threads = MAX_PARTS;
+    model_read_part parts[MAX_PARTS];
+    pthread_t th[MAX_PARTS];
+    bool live[MAX_PARTS] = {false};
+    for (uint32_t i = 0; i < threads; i++) {
+        const uint64_t b = len * i / threads, e = len * (i + 1u) / threads;
+        parts[i] = (model_read_part){fd, offset + b, e - b, 0};
+    }
+    for (uint32_t i = 1; i < threads; i++) {
+        live[i] = pthread_create(&th[i], NULL, model_read_part_main, &parts[i]) == 0;
+    }
+    model_read_part_main(&parts[0]);
+    uint64_t total = parts[0].done;
+    for (uint32_t i = 1; i < threads; i++) {
+        if (live[i]) pthread_join(th[i], NULL);
+        else model_read_part_main(&parts[i]);   /* a thread failed to start: read its part here */
+        total += parts[i].done;
+    }
+    return total;
+}
+
+static void model_prefetch_before_residency(const ds4_model *m, uint64_t offset, uint64_t len) {
+    if (!m || !m->map || m->fd < 0 || getenv("DS4_METAL_NO_RESIDENCY")) return;
+    const double t0 = now_sec();
+    uint64_t total = 0;
+    const uint64_t cached = ds4_model_cached_pages(m->map, offset, len, 1024, &total);
+    if (!ds4_model_prefetch_wanted(cached, total, getenv("DS4_METAL_MODEL_PREFETCH"))) return;
+    const uint64_t got = ds4_model_read_range(m->fd, offset, len, 4);
+    fprintf(stderr, "ds4: model read-ahead %.2f GiB in %.2f s (%.0f%% was cached)\n",
+            (double)got / 1073741824.0, now_sec() - t0, 100.0 * (double)cached / (double)total);
+}
+
 /* Read the GGUF metadata table.  Values stay in the mmap; we store offsets so
  * later validation can decode only the keys it needs. */
 static void parse_metadata(ds4_model *m, ds4_cursor *c) {
@@ -75270,6 +75375,10 @@ static int ds4_engine_open_internal(ds4_engine **out,
         } else {
             e->startup_model_span_bytes = e->model.size > e->model.tensor_data_pos ?
                 e->model.size - e->model.tensor_data_pos : 0;
+            if (e->backend == DS4_BACKEND_METAL) {
+                model_prefetch_before_residency(&e->model, e->model.tensor_data_pos,
+                                                e->startup_model_span_bytes);
+            }
             model_map_ok = ds4_gpu_set_model_map_range(e->model.map,
                                                        e->model.size,
                                                        e->model.tensor_data_pos,
