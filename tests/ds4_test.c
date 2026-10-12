@@ -8306,6 +8306,18 @@ static void test_model_prefetch(void) {
         munmap((void *)map, (size_t)size);
     }
     fclose(fp);
+
+    /* the cold direction: untouched anonymous pages are not resident */
+    uint8_t *anon = mmap(NULL, (size_t)(8u * page), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    TEST_ASSERT(anon != MAP_FAILED);
+    if (anon != MAP_FAILED) {
+        for (uint64_t i = 0; i < 8u; i += 2u) anon[i * page] = 1;
+        uint64_t probed = 0;
+        TEST_ASSERT(ds4_model_cached_pages(anon, 0, 8u * page, 64, &probed) == 4);
+        TEST_ASSERT(probed == 8);
+        TEST_ASSERT(ds4_model_prefetch_wanted(3, 8, NULL));
+        munmap(anon, (size_t)(8u * page));
+    }
 }
 
 static void test_quant_dequant(void) {

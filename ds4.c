@@ -2824,12 +2824,13 @@ static void model_prefetch_cpu_mapping(const ds4_model *m) {
 
 /*
  * Read-ahead before Metal residency (DS4_METAL_MODEL_PREFETCH=0 off, =1
- * always). Residency faults a cold GGUF in at ~7 GB/s on an M5 Pro, while one
- * sequential pass runs at ~13 GB/s and leaves residency only cached pages to
- * map: a cold 40.7 GiB Qwen3.8 load went 5.5 -> 3.5 s (2.9 s read + 0.6 s
- * residency), a 21.3 GiB Ornith one 2.9 -> 1.9 s. The pass must finish first;
- * overlapping it with the residency request gained nothing. A mostly cached
- * range is skipped, since the pass would only copy cached pages.
+ * whenever the cache state can be sampled). Residency faults a cold GGUF in
+ * at ~7 GB/s on an M5 Pro, while one sequential pass runs at ~13 GB/s and
+ * leaves residency only cached pages to map: a cold 40.7 GiB Qwen3.8 load
+ * went 5.5 -> 3.5 s (2.9 s read + 0.6 s residency), a 21.3 GiB Ornith one
+ * 2.9 -> 1.9 s. The pass must finish first; overlapping it with the residency
+ * request gained nothing. A mostly cached range is skipped, since the pass
+ * would only copy cached pages.
  */
 bool ds4_model_prefetch_wanted(uint64_t cached_pages, uint64_t total_pages, const char *env_value) {
     if (total_pages == 0) return false;
@@ -2838,8 +2839,10 @@ bool ds4_model_prefetch_wanted(uint64_t cached_pages, uint64_t total_pages, cons
 }
 
 /* Resident pages among up to max_probes pages spread evenly over
- * map[offset, offset + len), widened to whole pages; *probed receives the
- * pages probed (0 when mincore fails). One mincore over a 40.7 GiB mapping
+ * map[offset, offset + len), widened to whole pages; the range must lie
+ * inside the mapping (Darwin reports pages past it as not resident instead of
+ * failing). *probed receives the pages probed, 0 when mincore fails, which
+ * also skips a forced read-ahead. One mincore over a 40.7 GiB mapping
  * took 550 ms, longer than a warm load's residency request, so the cache
  * state is sampled rather than read whole. */
 uint64_t ds4_model_cached_pages(const void *map, uint64_t offset, uint64_t len,
