@@ -6200,8 +6200,13 @@ static void weights_validate_glm_dsa_layout(
  * so prefill takes the per-token row kernels there. */
 static void tensor_expect_qwen35_expert_layout(const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (t->type != DS4_TENSOR_Q4_K && t->type != DS4_TENSOR_Q5_K && t->type != DS4_TENSOR_Q6_K) {
-        fprintf(stderr, "ds4: %.*s: expert type %s not supported; use a Q4_K/Q5_K tier or the official Q4_K_M (Q4_K gate/up, Q6_K down)\n",
+    /* The routed-expert type superset the per-token MoE path runs by type
+     * (the same table the qwen4 family uses): Q8_0, IQ2_XXS, Q2_K, Q4_K,
+     * Q5_K, Q6_K, MXFP4.  The fused prefill mm still requires gate/up and
+     * down of the same Q4_K/Q5_K type -- other mixes row through the
+     * per-token kernels (see qwen35_graph_moe). */
+    if (!tensor_is_routed_expert_type(t->type)) {
+        fprintf(stderr, "ds4: %.*s: expert type %s not supported; use a Q4_K/Q5_K/Q6_K/UD-IQ2_XXS tier\n",
                 (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
         exit(1);
     }

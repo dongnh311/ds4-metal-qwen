@@ -8338,6 +8338,13 @@ static void test_quant_types(void) {
     /* Q3_K and Q5_0 come only as dense tensors (the ISTA Q2_0 tier): a routed one is refused at load */
     TEST_ASSERT(!ds4_test_routed_expert_type_ok(6, 1) && !ds4_test_routed_expert_type_ok(11, 1));
     TEST_ASSERT(ds4_test_routed_expert_type_ok(16, 0) && ds4_test_routed_expert_type_ok(16, 1));   /* IQ2_XXS */
+    /* the qwen35moe (Ornith) loader takes the same routed superset after the
+     * UD-IQ2_XXS tier widening: MTX/Q2_K/Q8_0/MXFP4 rows all pass, GSQ stays
+     * qwen4-only, and dense-only types stay refused as routed experts */
+    TEST_ASSERT(ds4_test_routed_expert_type_ok(8, 0) && ds4_test_routed_expert_type_ok(10, 0) &&
+                ds4_test_routed_expert_type_ok(39, 0) && ds4_test_routed_expert_type_ok(12, 0) &&
+                ds4_test_routed_expert_type_ok(13, 0) && ds4_test_routed_expert_type_ok(14, 0));
+    TEST_ASSERT(!ds4_test_routed_expert_type_ok(17, 0) && !ds4_test_routed_expert_type_ok(18, 0));
 #if defined(__APPLE__)
     /* prefill routing: GSQ-RCO experts take the tiled MoE GEMM, GSQ-RCO and BF16 dense rows the
      * tiled dense GEMM above 8 rows; PROD's types keep their kernels */
