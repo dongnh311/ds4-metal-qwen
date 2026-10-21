@@ -1,5 +1,6 @@
 """Minimal GGUF v3 reader/writer for ds4's repack tools: metadata and tensor infos are parsed, tensor data
-is copied by offset (never interpreted; a "trim" source copies a prefix of every row)."""
+is copied by offset (never interpreted; a "trim" source copies a prefix of every row) or produced by a
+streaming "proc" callback so multi-tens-of-GB outputs never buffer in memory."""
 import hashlib
 import os
 import struct
@@ -9,8 +10,8 @@ T_U8, T_I8, T_U16, T_I16, T_U32, T_I32, T_F32, T_BOOL, T_STR, T_ARR, T_U64, T_I6
 _SCALAR = {0: "B", 1: "b", 2: "H", 3: "h", 4: "I", 5: "i", 6: "f", 7: "?", 10: "Q", 11: "q", 12: "d"}
 BLOCK = {0: (1, 4), 1: (1, 2), 2: (32, 18), 3: (32, 20), 6: (32, 22), 8: (32, 34), 10: (256, 84), 11: (256, 110),
          12: (256, 144),
-         13: (256, 176), 14: (256, 210), 16: (256, 66), 17: (256, 74), 18: (256, 98), 20: (32, 18),
-         21: (256, 110), 22: (256, 82), 23: (256, 136), 30: (1, 2), 39: (32, 17), 42: (64, 18)}
+         13: (256, 176), 14: (256, 210), 15: (256, 320), 16: (256, 66), 17: (256, 74), 18: (256, 98), 19: (256, 50),
+         20: (32, 18), 21: (256, 110), 22: (256, 82), 23: (256, 136), 30: (1, 2), 39: (32, 17), 42: (64, 18)}
 CHUNK = 64 << 20
 
 
@@ -34,6 +35,8 @@ def nbytes(ttype, dims):
             row *= d
         return row
     elems, size = BLOCK[ttype]
+    if not dims:
+        return size
     if dims[0] % elems:
         raise ValueError("row of %d is not a whole number of %d-blocks" % (dims[0], elems))
     n = dims[0] // elems * size
@@ -164,6 +167,10 @@ def write(path, kv, tensors, alignment, nocache=False):
                         out.write(piece)
                         h.update(piece)
                         rows_left -= n
+            elif "proc" in t:
+                w = t["proc"](out, h)
+                if w != t["nbytes"]:
+                    raise ValueError("%s: proc wrote %d bytes, layout says %d" % (t["name"], w, t["nbytes"]))
             else:
                 src, at = t["src"]
                 left = t["nbytes"]
