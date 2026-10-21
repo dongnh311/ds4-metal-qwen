@@ -6192,12 +6192,16 @@ static void weights_validate_glm_dsa_layout(
     }
 }
 
-/* Ornith routed experts: the ICE 23G/25G tiers use Q4_K and Q5_K; the 19G
- * and 21G tiers (IQ4_XS / IQ3_S) have no Metal kernels here. */
+/* Ornith routed experts: the ICE 23G/25G tiers use Q4_K and Q5_K.  Q6_K rode
+ * along on the official ornith-ai Q4_K_M files (all 256 down experts), and the
+ * runtime supports it end to end: row bytes (1024 % 256 == 0), the Metal row
+ * dot (qwen4_lane_q6_k) and the per-token down kernel.  A Q6_K down disables
+ * the fused MoE mm for that layer (mm requires gate/up == down and Q4_K/Q5_K),
+ * so prefill takes the per-token row kernels there. */
 static void tensor_expect_qwen35_expert_layout(const ds4_tensor *t, uint64_t d0, uint64_t d1, uint64_t d2) {
     if (!t) ds4_die("internal error: missing tensor while validating layout");
-    if (t->type != DS4_TENSOR_Q4_K && t->type != DS4_TENSOR_Q5_K) {
-        fprintf(stderr, "ds4: %.*s: expert type %s not supported; use the 23G or 25G tier (Q4_K/Q5_K experts)\n",
+    if (t->type != DS4_TENSOR_Q4_K && t->type != DS4_TENSOR_Q5_K && t->type != DS4_TENSOR_Q6_K) {
+        fprintf(stderr, "ds4: %.*s: expert type %s not supported; use a Q4_K/Q5_K tier or the official Q4_K_M (Q4_K gate/up, Q6_K down)\n",
                 (int)t->name.len, t->name.ptr, tensor_type_name(t->type));
         exit(1);
     }
