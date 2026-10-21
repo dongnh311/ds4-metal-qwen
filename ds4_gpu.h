@@ -3637,7 +3637,9 @@ int ds4_gpu_qwen35_attn_decode2_tensor(
  * MTP verify's two rows (pos0, pos0+1); each row's own split geometry never
  * depends on the other row, so output row r matches a lone rows==1 call at
  * that row's position bit for bit. F16 K/V only, head_dim must be 256 and
- * n_head/n_head_kv must be 8 (Ornith's group; no padding for other ratios).
+ * n_head/n_head_kv must be a multiple of 8 (Ornith's group; a wider ratio
+ * such as the 122B's 16 runs group/8 dispatches per row set, each covering 8
+ * of every KV head's query heads, with one merge at the end).
  * part needs ds4_gpu_qwen35_attn_part3_floats(rows, n_head, head_dim) floats. */
 int ds4_gpu_qwen35_attn_decode3_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
@@ -3654,7 +3656,9 @@ int ds4_gpu_qwen35_attn_merge_fold_selfcheck(void);
  * group) per threadgroup share every K/V tile instead of attn_mm's one
  * (kv head, token) threadgroup with padded 8-of-16 rows.  T query tokens at
  * positions pos0..pos0+T-1 (their K/V already written), causal, F16 K/V
- * only, head_dim must be 256 and n_head/n_head_kv must be 8; refuses T <= 8
+ * only, head_dim must be 256 and the head ratio must be a multiple of
+ * QWEN35_ATTN_GROUP, 8 (wider ratios run group/8 passes, each covering 8 of
+ * every KV head's query heads); refuses T <= 8
  * (attn_decode_tensor's own attn_mm cutover).  `part == NULL` means no key
  * split.  `part != NULL` splits the key range into Ks parts (the rule is in
  * ds4_gpu_qwen35_attn_flash_part_floats below) when that helps -- short chunks
@@ -3679,7 +3683,11 @@ int ds4_gpu_qwen35_attn_flash_tensor(
  * come out at 1 (no split can happen at that T, so no scratch is ever
  * bound).  This is an upper bound only otherwise (it ignores pos0 and the
  * >=1024 keys-per-part floor the actual call applies), so it is always >=
- * the floats a real call with the same n_tokens actually needs. */
+ * the floats a real call with the same n_tokens actually needs.  The _hkv
+ * variant takes the real n_head_kv (any head ratio the kernels accept); the
+ * plain one assumes the legacy n_head/n_head_kv == 8 ratio, Hkv = n_head/8. */
+uint64_t ds4_gpu_qwen35_attn_flash_part_floats_hkv(uint32_t n_tokens, uint32_t n_head,
+                                                    uint32_t n_head_kv, uint32_t head_dim);
 uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim);
 /* Ks used by the most recent ds4_gpu_qwen35_attn_flash_tensor call (1 when
  * that call took no split, either because part was NULL or because the

@@ -995,13 +995,24 @@ kernel void kernel_qwen35_attn_decode2<8>(
 /* Must match QWEN35_ATTN_MAX_SPLITS in ds4_metal.m (the host cap on a row's
  * own split count). */
 #define QWEN35_ATTN_MAX_SPLITS 256u
-#define QWEN35_ATTN_GROUP 8u   /* Ornith: 16 query heads / 2 KV heads; the
-                                 * wrapper refuses any other group size. */
+#define QWEN35_ATTN_GROUP 8u   /* the per-pass query-head group: head ratios that
+                                * are a multiple of this (35B: 8, 122B: 16) run
+                                * head_stride / G sub-passes over the same kernels,
+                                * each covering G of each KV head's query heads
+                                * (head_sub = pass * G slices the head index). */
 #define QWEN35_ATTN_KT 16u     /* keys per staged tile, as kernel_qwen4_attn_mm */
 
 struct ds4_metal_args_qwen35_attn_decode3 {
     uint32_t n_head, n_head_kv, head_dim, pos0;
     uint32_t rows, ns0, kps0, ns1, kps1;
+    /* Widen: query head = kvh * head_stride + head_sub + g.  head_stride is
+     * the real n_head/n_head_kv ratio (8 for the 35B, 16 for the 122B) so a
+     * group ratio that is a multiple of QWEN35_ATTN_GROUP runs as
+     * head_stride / G sub-passes, each covering G of the KV head's query
+     * heads with head_sub = pass * G; the partial slots interleave the two
+     * passes inside each [kvh][split] block, so merge3 (which computes the
+     * group itself) merges them without any pass sequencing. */
+    uint32_t head_stride, head_sub;
     float scale;
 };
 
@@ -1088,7 +1099,7 @@ kernel void kernel_qwen35_attn_decode3(
 
     for (uint i = tid; i < ROWS * G * D; i += NTHREADS) {
         const uint r = i / (G * D), rem = i % (G * D), g = rem / D, d = rem % D;
-        const uint h = kvh * G + g;
+        const uint h = kvh * args.head_stride + args.head_sub + g;
         Qs[i] = (half)(q[((uint64_t)r * H + h) * D + d] * args.scale);
     }
     if (tid < 64) Id[tid] = (tid >> 3) == (tid & 7u) ? 1.0f : 0.0f;
@@ -1227,19 +1238,19 @@ kernel void kernel_qwen35_attn_decode3(
         const uint64_t row_base = r == 0u ? 0u : (uint64_t)args.ns0 * H * (2u + D);
         for (uint i = tid; i < G * D; i += NTHREADS) {
             const uint g = i / D, d = i % D;
-            const uint h = kvh * G + g;
+            const uint h = kvh * args.head_stride + args.head_sub + g;
             const float ov = ((threadgroup float *)KV)[(r * G + g) * D + d];
             if (direct) {
                 const uint64_t o = ((uint64_t)r * H + h) * D + d;
                 out[o] = ov * qwen4_sigmoid(gate[o]);
             } else {
-                device float *dst = part + row_base + (((uint64_t)kvh * ns_r[r] + split) * G + g) * (2u + D);
+                device float *dst = part + row_base + (((uint64_t)kvh * ns_r[r] + split) * args.head_stride + args.head_sub + g) * (2u + D);
                 dst[2u + d] = ov;
             }
         }
         if (!direct && tid < G) {
             const uint g = tid;
-            device float *dst = part + row_base + (((uint64_t)kvh * ns_r[r] + split) * G + g) * (2u + D);
+            device float *dst = part + row_base + (((uint64_t)kvh * ns_r[r] + split) * args.head_stride + args.head_sub + g) * (2u + D);
             dst[0] = tg_ml[r][g][0];
             dst[1] = tg_ml[r][g][1];
         }
@@ -1397,6 +1408,8 @@ kernel void kernel_qwen35_attn_merge3_fold(
 
 struct ds4_metal_args_qwen35_attn_flash {
     uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0;
+    /* Widen sub-pass fields, as ds4_metal_args_qwen35_attn_decode3. */
+    uint32_t head_stride, head_sub;
     float scale;
 };
 
@@ -1484,7 +1497,7 @@ kernel void kernel_qwen35_attn_flash(
     for (uint i = tid; i < TOK * G * D; i += NTHREADS) {
         const uint r = i / (G * D), rem = i % (G * D), g = rem / D, d = rem % D;
         const uint tok_r = blk * TOK + r;
-        const uint h = kvh * G + g;
+        const uint h = kvh * args.head_stride + args.head_sub + g;
         Qs[i] = hi_r[r] > 0u ? (half)(q[((uint64_t)tok_r * H + h) * D + d] * args.scale) : (half)0.0h;
     }
     if (tid < 64) Id[tid] = (tid >> 3) == (tid & 7u) ? 1.0f : 0.0f;
@@ -1648,7 +1661,7 @@ kernel void kernel_qwen35_attn_flash(
         if (hi_r[r] > 0u) {
             for (uint i = tid; i < G * D; i += NTHREADS) {
                 const uint g = i / D, d = i % D;
-                const uint64_t o = ((uint64_t)tok_r * H + kvh * G + g) * D + d;
+                const uint64_t o = ((uint64_t)tok_r * H + kvh * args.head_stride + args.head_sub + g) * D + d;
                 out[o] = ((threadgroup float *)KV)[i] * qwen4_sigmoid(gate[o]);
             }
         }
@@ -1668,6 +1681,10 @@ kernel void kernel_qwen35_attn_flash<4u, 8u>(
 struct ds4_metal_args_qwen35_attn_flash_split {
     uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0;
     uint32_t kps, n_splits;
+    /* Widen sub-pass fields, as ds4_metal_args_qwen35_attn_decode3.  The
+     * partial slots interleave the two passes inside each [kvh][split]
+     * block, so merge3 folds them once, after every pass, unchanged. */
+    uint32_t head_stride, head_sub;
     float scale;
 };
 
@@ -1736,7 +1753,7 @@ kernel void kernel_qwen35_attn_flash_split(
     for (uint i = tid; i < TOK * G * D; i += NTHREADS) {
         const uint r = i / (G * D), rem = i % (G * D), g = rem / D, d = rem % D;
         const uint tok_r = blk * TOK + r;
-        const uint h = kvh * G + g;
+        const uint h = kvh * args.head_stride + args.head_sub + g;
         Qs[i] = hi_r[r] > 0u ? (half)(q[((uint64_t)tok_r * H + h) * D + d] * args.scale) : (half)0.0h;
     }
     if (tid < 64) Id[tid] = (tid >> 3) == (tid & 7u) ? 1.0f : 0.0f;
@@ -1895,12 +1912,12 @@ kernel void kernel_qwen35_attn_flash_split(
             const uint64_t row_base = (uint64_t)tok_r * args.n_splits * H * (2u + D);
             for (uint i = tid; i < G * D; i += NTHREADS) {
                 const uint g = i / D, d = i % D;
-                device float *dst = part + row_base + (((uint64_t)kvh * args.n_splits + split) * G + g) * (2u + D);
+                device float *dst = part + row_base + (((uint64_t)kvh * args.n_splits + split) * args.head_stride + args.head_sub + g) * (2u + D);
                 dst[2u + d] = ((threadgroup float *)KV)[i];
             }
             if (tid < G) {
                 const uint g = tid;
-                device float *dst = part + row_base + (((uint64_t)kvh * args.n_splits + split) * G + g) * (2u + D);
+                device float *dst = part + row_base + (((uint64_t)kvh * args.n_splits + split) * args.head_stride + args.head_sub + g) * (2u + D);
                 dst[0] = tg_ml[r][g][0];
                 dst[1] = tg_ml[r][g][1];
             }
@@ -2001,6 +2018,8 @@ QWEN35_NAX_UNROLL
 
 struct ds4_metal_args_qwen35_attn_qpack {
     uint32_t n_tokens, n_tokens_pad, n_head, n_head_kv;
+    /* Widen sub-pass fields, as ds4_metal_args_qwen35_attn_decode3. */
+    uint32_t head_stride, head_sub;
     float scale2;                      /* scale * log2(e): scores come out in log2 units */
 };
 
@@ -2021,7 +2040,7 @@ kernel void kernel_qwen35_attn_qpack(
     const uint t = rem / (G * D), g = (rem / D) % G, d = rem % D;
     half4 v = half4(0.0h);
     if (t < args.n_tokens) {
-        const float4 x = *(device const float4 *)(q + ((uint64_t)t * args.n_head + kvh * G + g) * D + d);
+        const float4 x = *(device const float4 *)(q + ((uint64_t)t * args.n_head + kvh * args.head_stride + args.head_sub + g) * D + d);
         v = half4(x * args.scale2);
     }
     *(device half4 *)(qh + e) = v;
@@ -2030,6 +2049,8 @@ kernel void kernel_qwen35_attn_qpack(
 struct ds4_metal_args_qwen35_attn_flash_nax {
     uint32_t n_tokens, n_tokens_pad, n_head, n_head_kv, pos0;
     uint32_t kps, n_splits;            /* SPLIT: keys per split and split count */
+    /* Widen sub-pass fields, as ds4_metal_args_qwen35_attn_decode3. */
+    uint32_t head_stride, head_sub;
 };
 
 /* M6 flash prefill on the accelerators (T > 8, F16 K/V, head_dim 256, group
@@ -2189,7 +2210,7 @@ QWEN35_NAX_UNROLL
         if (t >= T) continue;
         if (!SPLIT) {
             const float inv = l[i] > 0.0f ? 1.0f / l[i] : 0.0f;
-            const uint64_t at = ((uint64_t)t * H + kvh * G + g) * D + dh * 128u;
+            const uint64_t at = ((uint64_t)t * H + kvh * args.head_stride + args.head_sub + g) * D + dh * 128u;
 QWEN35_NAX_UNROLL
             for (short id = 0; id < 8; id++) {
                 const uint d = (uint)(id * 16 + c.x);
@@ -2203,7 +2224,7 @@ QWEN35_NAX_UNROLL
             }
         } else {
             device float *dst = out + (uint64_t)t * args.n_splits * H * (2u + D) +
-                                (((uint64_t)kvh * args.n_splits + split) * G + g) * (2u + D);
+                                (((uint64_t)kvh * args.n_splits + split) * args.head_stride + args.head_sub + g) * (2u + D);
             if (dh == 0u && c.x == 0) { dst[0] = m[i] * 0.6931471805599453f; dst[1] = l[i]; }
 QWEN35_NAX_UNROLL
             for (short id = 0; id < 8; id++) {

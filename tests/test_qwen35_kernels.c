@@ -784,8 +784,9 @@ static void test_attn_decode2_matches_perrow(arena_t *a, uint32_t pos0) {
  * `split_keys` forces small splits so short caches exercise many splits and
  * the split-count boundaries (ns0 != ns1, kps0 != kps1). Outputs are
  * sentinel-filled before every call so a kernel that writes nothing fails. */
-static void test_attn_decode3_rows(arena_t *a, uint32_t pos0, uint32_t split_keys) {
-    const uint32_t H = 16, Hkv = 2, D = 256, n_rot = 64, fill = pos0 + 2u;
+static void test_attn_decode3_rows(arena_t *a, uint32_t pos0, uint32_t split_keys,
+                                   uint32_t H, uint32_t Hkv) {
+    const uint32_t D = 256, n_rot = 64, fill = pos0 + 2u;
     const uint32_t cap = fill + 8u;
     const float scale = 1.0f / sqrtf((float)D);
     char sk[16];
@@ -1000,8 +1001,9 @@ static void test_attn_flash_merge_fold(uint32_t pos0, uint32_t T, int nax) {
     ds4_gpu_tensor_free(o_ref); ds4_gpu_tensor_free(o_new); ds4_gpu_tensor_free(part);
 }
 
-static void test_attn_flash(arena_t *a, uint32_t pos0, uint32_t T, int use_part) {
-    const uint32_t H = 16, Hkv = 2, D = 256, n_rot = 64, fill = pos0 + T, cap = fill + 8u;
+static void test_attn_flash(arena_t *a, uint32_t pos0, uint32_t T, int use_part,
+                            uint32_t H, uint32_t Hkv) {
+    const uint32_t D = 256, n_rot = 64, fill = pos0 + T, cap = fill + 8u;
     const float scale = 1.0f / sqrtf((float)D);
     double *gq, *gk;
     const uint64_t gq_off = arena_f32(a, D, &gq, 0.5f, 1.5f);
@@ -1024,13 +1026,22 @@ static void test_attn_flash(arena_t *a, uint32_t pos0, uint32_t T, int use_part)
     ds4_gpu_tensor *qT = ds4_gpu_tensor_view(pq, (uint64_t)pos0 * H * D * sizeof(float), (uint64_t)T * H * D * sizeof(float));
     ds4_gpu_tensor *gT = ds4_gpu_tensor_view(pg, (uint64_t)pos0 * H * D * sizeof(float), (uint64_t)T * H * D * sizeof(float));
     ds4_gpu_tensor *of = upload(NULL, (uint64_t)T * H * D), *om = upload(NULL, (uint64_t)T * H * D);
-    /* key-split scratch only for the forced-split cases: its size follows the split rule */
-    ds4_gpu_tensor *partf = use_part ? upload(NULL, ds4_gpu_qwen35_attn_flash_part_floats(T, H, D)) : NULL;
+    /* key-split scratch only for the forced-split cases: its size follows the split rule; 0 floats means Ks == 1 (no scratch, like part == NULL) */
+    ds4_gpu_tensor *partf = NULL;
+    if (use_part) {
+        const uint64_t pfl = ds4_gpu_qwen35_attn_flash_part_floats_hkv(T, H, Hkv, D);
+        partf = pfl ? upload(NULL, pfl) : NULL;
+    }
     require_ok(qT && gT && of && om && (!use_part || partf) &&
                ds4_gpu_tensor_fill_f32(of, -1234.5f, (uint64_t)T * H * D), "flash buffers");
     require_ok(ds4_gpu_qwen35_attn_flash_tensor(of, qT, gT, kc, vc, partf, T, H, Hkv, D, pos0, scale), "flash call");
-    require_ok(ds4_gpu_qwen4_attn_decode_tensor(om, qT, gT, kc, vc, NULL, NULL, NULL, T, H, Hkv, D, pos0,
-                   0u, 0u, scale, NULL, NULL, NULL, NULL, 0u), "qwen4 attn reference");
+    /* the qwen4 attn kernels themselves cap the head ratio at 12: skip the
+     * GPU cross-check for a wider ratio (the host double reference covers it) */
+    bool mm_ref_ok = true;
+    if ((H / Hkv) <= 12u) {
+        mm_ref_ok = ds4_gpu_qwen4_attn_decode_tensor(om, qT, gT, kc, vc, NULL, NULL, NULL, T, H, Hkv, D, pos0,
+                                                     0u, 0u, scale, NULL, NULL, NULL, NULL, 0u) != 0;
+    }
     float *gotf = download(of, (uint64_t)T * H * D), *gotm = download(om, (uint64_t)T * H * D);
 
     uint16_t *kh = malloc((uint64_t)cap * Hkv * D * 2u), *vh = malloc((uint64_t)cap * Hkv * D * 2u);
@@ -1064,11 +1075,13 @@ static void test_attn_flash(arena_t *a, uint32_t pos0, uint32_t T, int use_part)
             }
         }
     }
-    printf("  attn flash pos0=%u T=%u: vs host double ref max|d| %.3e (rel %.3e), vs attn_mm %.3e\n",
-           pos0, T, worst_ref, worst_ref / sc, worst_mm);
+    printf("  attn flash pos0=%u T=%u H=%u Hkv=%u: vs host double ref max|d| %.3e (rel %.3e), vs attn_mm %.3e\n",
+           pos0, T, H, Hkv, worst_ref, worst_ref / sc, worst_mm);
     /* queries and K/V are staged as half on the matrix path, like attn_mm */
     require_ok(worst_ref <= 3e-3 * sc, "flash within half-precision staging of the host double reference");
-    require_ok(worst_mm <= 3e-3 * sc, "flash within half-precision staging of qwen4 attn_mm");
+    require_ok(mm_ref_ok, "qwen4 attn reference call");
+    if ((H / Hkv) <= 12u)
+        require_ok(worst_mm <= 3e-3 * sc, "flash within half-precision staging of qwen4 attn_mm");
     free(gq); free(gk); free(pqg); free(pkp); free(pvp); free(pos3); free(gotf); free(gotm);
     free(kh); free(vh); free(qraw); free(graw);
     ds4_gpu_tensor_free(gqg); ds4_gpu_tensor_free(gkp); ds4_gpu_tensor_free(gvp); ds4_gpu_tensor_free(pq);
@@ -1085,8 +1098,9 @@ static void test_attn_flash(arena_t *a, uint32_t pos0, uint32_t T, int use_part)
  * write past T).  Checked against a host double reference (host_ref) and
  * always against the M5 simdgroup flash.  Returns the Ks the accelerator
  * call used (0 when the tensor API is unavailable). */
-static uint32_t test_attn_flash_nax(uint32_t pos0, uint32_t T, int use_part, int host_ref) {
-    const uint32_t H = 16, Hkv = 2, D = 256, fill = pos0 + T, cap = fill + 40u;
+static uint32_t test_attn_flash_nax(uint32_t pos0, uint32_t T, int use_part, int host_ref,
+                                    uint32_t H, uint32_t Hkv) {
+    const uint32_t D = 256, fill = pos0 + T, cap = fill + 40u;
     const uint64_t n_out = (uint64_t)T * H * D, row = (uint64_t)H * D, n_kv = (uint64_t)cap * Hkv * D;
     const float scale = 1.0f / sqrtf((float)D);
     if (!ds4_gpu_tensor_api_available()) {
@@ -1106,7 +1120,11 @@ static uint32_t test_attn_flash_nax(uint32_t pos0, uint32_t T, int use_part, int
     require_ok(kc && vc && ds4_gpu_tensor_write(kc, 0, kh, n_kv * sizeof(uint16_t)) &&
                ds4_gpu_tensor_write(vc, 0, vh, n_kv * sizeof(uint16_t)), "nax cache upload");
     ds4_gpu_tensor *on = upload(NULL, n_out + row), *of = upload(NULL, n_out);
-    ds4_gpu_tensor *part = use_part ? upload(NULL, ds4_gpu_qwen35_attn_flash_part_floats(T, H, D)) : NULL;
+    ds4_gpu_tensor *part = NULL;
+    if (use_part) {
+        const uint64_t pfl = ds4_gpu_qwen35_attn_flash_part_floats_hkv(T, H, Hkv, D);
+        part = pfl ? upload(NULL, pfl) : NULL;   /* 0 floats: Ks == 1, no split will run */
+    }
     require_ok(ds4_gpu_tensor_fill_f32(on, -1234.5f, n_out + row), "nax sentinel");
     require_ok(ds4_gpu_qwen35_attn_flash_nax_tensor(on, q, gt, kc, vc, part, T, H, Hkv, D, pos0, scale),
                "flash nax call");
@@ -1150,8 +1168,8 @@ static uint32_t test_attn_flash_nax(uint32_t pos0, uint32_t T, int use_part, int
             }
         }
     }
-    printf("  attn flash nax pos0=%u T=%u splits=%u: vs M5 flash max|d| %.3e (rel %.3e)", pos0, T, splits,
-           worst_f, worst_f / scf);
+    printf("  attn flash nax pos0=%u T=%u H=%u Hkv=%u splits=%u: vs M5 flash max|d| %.3e (rel %.3e)", pos0, T, H, Hkv,
+           splits, worst_f, worst_f / scf);
     if (host_ref) printf(", vs host double ref rel %.3e", worst_ref / sc);
     printf("\n");
     require_ok(nonfinite == 0, "flash nax output finite (no K/V row past the fill multiplied)");
@@ -1186,7 +1204,7 @@ static void capture_stderr(void (*fn)(void *), void *ctx, char *buf, size_t cap)
 }
 
 static void run_gpu_cleanup(void *ctx) { (void)ctx; ds4_gpu_cleanup(); }
-static void run_nax_2056(void *ctx) { (void)ctx; test_attn_flash_nax(0u, 2056u, 0, 0); }
+static void run_nax_2056(void *ctx) { (void)ctx; test_attn_flash_nax(0u, 2056u, 0, 0, 16u, 2u); }
 
 /* The accelerator flash's packed-query scratch belongs to the Metal teardown
  * like the other accelerator scratch slots: a cleanup (an engine closed in a
@@ -1199,7 +1217,7 @@ static void test_attn_flash_nax_reinit(arena_t *a) {
         return;
     }
     char buf[8192];
-    test_attn_flash_nax(0u, 9u, 0, 0);             /* the slot exists */
+    test_attn_flash_nax(0u, 9u, 0, 0, 16u, 2u);             /* the slot exists */
     capture_stderr(run_gpu_cleanup, NULL, buf, sizeof(buf));
     const bool leaked = strstr(buf, "discarded") != NULL;
     require_ok(ds4_gpu_init(), "GPU re-initialization");
@@ -1295,10 +1313,10 @@ int main(void) {
     test_attn_decode2_matches_perrow(&arena, 31u);
     test_attn_decode2_matches_perrow(&arena, 100u);
     printf("qwen35 attention decode3 (M5)\n");
-    test_attn_decode3_rows(&arena, 6u, 64u);      /* one split per row */
-    test_attn_decode3_rows(&arena, 62u, 64u);     /* n0 = 63 (1 split), n1 = 64 (1 split, full) */
-    test_attn_decode3_rows(&arena, 63u, 64u);     /* n0 = 64 (1 split), n1 = 65 (2 splits): ns0 != ns1 */
-    test_attn_decode3_rows(&arena, 200u, 16u);    /* shared dispatch, kps 16/16 */
+    test_attn_decode3_rows(&arena, 6u, 64u, 16u, 2u);      /* one split per row */
+    test_attn_decode3_rows(&arena, 62u, 64u, 16u, 2u);     /* n0 = 63 (1 split), n1 = 64 (1 split, full) */
+    test_attn_decode3_rows(&arena, 63u, 64u, 16u, 2u);     /* n0 = 64 (1 split), n1 = 65 (2 splits): ns0 != ns1 */
+    test_attn_decode3_rows(&arena, 200u, 16u, 16u, 2u);    /* shared dispatch, kps 16/16 */
     printf("qwen35 attention merge fold (round 2 Plan B)\n");
     test_attn_merge_fold(&arena, 2046u, 64u, false);   /* before any self-check: merge3, knob unset */
     setenv("DS4_QWEN35_ATTN_MERGE_FOLD", "0", 1);
@@ -1312,10 +1330,10 @@ int main(void) {
     test_attn_merge_fold(&arena, 8250u, 64u, true);     /* ns 129 (pad to 256) */
     test_attn_merge_fold(&arena, 32766u, 64u, true);    /* ns 256 (the cap) */
     test_attn_merge_fold(&arena, 63u, 64u, true);       /* n0 = 64 (1 split), n1 = 65 (2): the solo path */
-    test_attn_decode3_rows(&arena, 194u, 16u);    /* same ns 13, kps0 = 15 != kps1 = 16 */
-    test_attn_decode3_rows(&arena, 4200u, 16u);   /* at the 256-split cap: n / 16 > 256 */
-    test_attn_decode3_rows(&arena, 64u, 64u);     /* shared dispatch (ns 2, kps 33): row 1 needs a third tile */
-    test_attn_decode3_rows(&arena, 4112u, 16u);   /* near the cap (ns 242, kps 17), shared dispatch, extra tile */
+    test_attn_decode3_rows(&arena, 194u, 16u, 16u, 2u);    /* same ns 13, kps0 = 15 != kps1 = 16 */
+    test_attn_decode3_rows(&arena, 4200u, 16u, 16u, 2u);   /* at the 256-split cap: n / 16 > 256 */
+    test_attn_decode3_rows(&arena, 64u, 64u, 16u, 2u);     /* shared dispatch (ns 2, kps 33): row 1 needs a third tile */
+    test_attn_decode3_rows(&arena, 4112u, 16u, 16u, 2u);   /* near the cap (ns 242, kps 17), shared dispatch, extra tile */
     printf("qwen4 moe reduce without residual (as Ornith calls it)\n");
     test_reduce_nohc(1, 8, 2048, true);
     test_reduce_nohc(12, 8, 2048, false);
@@ -1324,17 +1342,17 @@ int main(void) {
     test_mtp_concat(&arena, 2048, 7);
     test_mtp_concat(&arena, 256, 3);
     printf("qwen35 attention flash prefill (M5)\n");
-    test_attn_flash(&arena, 0u, 9u, 0);
-    test_attn_flash(&arena, 0u, 65u, 0);
-    test_attn_flash(&arena, 37u, 65u, 0);
-    test_attn_flash(&arena, 37u, 200u, 0);
-    test_attn_flash(&arena, 4096u, 64u, 0);
+    test_attn_flash(&arena, 0u, 9u, 0, 16u, 2u);
+    test_attn_flash(&arena, 0u, 65u, 0, 16u, 2u);
+    test_attn_flash(&arena, 37u, 65u, 0, 16u, 2u);
+    test_attn_flash(&arena, 37u, 200u, 0, 16u, 2u);
+    test_attn_flash(&arena, 4096u, 64u, 0, 16u, 2u);
     setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", "4096", 1);   /* force key splits on short caches */
-    test_attn_flash(&arena, 4096u, 64u, 1);
+    test_attn_flash(&arena, 4096u, 64u, 1, 16u, 2u);
     require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=64)");
-    test_attn_flash(&arena, 8000u, 200u, 1);
+    test_attn_flash(&arena, 8000u, 200u, 1, 16u, 2u);
     require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=200)");
-    test_attn_flash(&arena, 1000u, 1100u, 1);
+    test_attn_flash(&arena, 1000u, 1100u, 1, 16u, 2u);
     require_ok(ds4_gpu_qwen35_attn_flash_last_splits() > 1, "flash key split taken (T=1100, neutral partials)");
     test_attn_flash_merge_fold(4096u, 64u, 0);
     test_attn_flash_merge_fold(8000u, 200u, 0);
@@ -1344,19 +1362,36 @@ int main(void) {
     test_attn_flash_merge_fold(1000u, 1100u, 1);
     unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
     printf("qwen35 attention flash on the neural accelerators (M6)\n");
-    test_attn_flash_nax(0u, 9u, 0, 1);
-    test_attn_flash_nax(0u, 65u, 0, 1);
-    test_attn_flash_nax(37u, 65u, 0, 1);
-    test_attn_flash_nax(37u, 200u, 0, 1);
-    test_attn_flash_nax(4096u, 64u, 0, 1);
-    test_attn_flash_nax(30720u, 2048u, 0, 0);   /* long context: accelerator drift vs the simdgroup flash */
+    test_attn_flash_nax(0u, 9u, 0, 1, 16u, 2u);
+    test_attn_flash_nax(0u, 65u, 0, 1, 16u, 2u);
+    test_attn_flash_nax(37u, 65u, 0, 1, 16u, 2u);
+    test_attn_flash_nax(37u, 200u, 0, 1, 16u, 2u);
+    test_attn_flash_nax(4096u, 64u, 0, 1, 16u, 2u);
+    test_attn_flash_nax(30720u, 2048u, 0, 0, 16u, 2u);   /* long context: accelerator drift vs the simdgroup flash */
     setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", "4096", 1);   /* force key splits on short caches */
-    require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(4096u, 64u, 1, 1) > 1,
+    require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(4096u, 64u, 1, 1, 16u, 2u) > 1,
                "flash nax key split taken (T=64)");
-    require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(8000u, 200u, 1, 1) > 1,
+    require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(8000u, 200u, 1, 1, 16u, 2u) > 1,
                "flash nax key split taken (T=200)");
-    require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(1000u, 1100u, 1, 1) > 1,
+    require_ok(!ds4_gpu_tensor_api_available() || test_attn_flash_nax(1000u, 1100u, 1, 1, 16u, 2u) > 1,
                "flash nax key split taken (T=1100, neutral partials)");
+    unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
+    /* --- widen: the 122B's head ratio of 16 (Hkv 2) runs the same kernels in
+     * group/8 sub-passes per call; every narrowed check above repeats against
+     * the host double reference.  The forced-split env still applies to the
+     * flash rows below, so they exercise the interleaved partial slots and
+     * the single post-pass merge. --- */
+    test_attn_decode3_rows(&arena, 63u, 64u, 32u, 2u);    /* ns0 != ns1: solo path, pass loop */
+    test_attn_decode3_rows(&arena, 64u, 64u, 32u, 2u);    /* shared rows=2 dispatch, pass loop */
+    test_attn_decode3_rows(&arena, 200u, 16u, 32u, 2u);   /* many splits, shared dispatch */
+    test_attn_flash(&arena, 37u, 65u, 0, 32u, 2u);
+    setenv("DS4_QWEN35_ATTN_FLASH_MIN_TG", "4096", 1);   /* force the wide key split again */
+    test_attn_flash(&arena, 1000u, 1100u, 1, 32u, 2u);    /* forced split: interleaved partials */
+    if (ds4_gpu_tensor_api_available()) {
+        test_attn_flash_nax(0u, 65u, 0, 1, 32u, 2u);
+        require_ok(test_attn_flash_nax(8000u, 200u, 1, 1, 32u, 2u) > 1,
+                   "flash nax key split taken wide (T=200)");
+    }
     unsetenv("DS4_QWEN35_ATTN_FLASH_MIN_TG");
     test_attn_flash_nax_reinit(&arena);
     printf("qwen35 kernels: ok\n");

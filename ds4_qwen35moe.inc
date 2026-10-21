@@ -87,7 +87,8 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
     if (T > 8u) {
         uint64_t attn_flash_part_floats = 0;
         for (uint64_t t = 9u; t <= T; t++) {
-            const uint64_t need = ds4_gpu_qwen35_attn_flash_part_floats((uint32_t)t, DS4_N_HEAD, DS4_N_HEAD_DIM);
+            const uint64_t need = ds4_gpu_qwen35_attn_flash_part_floats_hkv((uint32_t)t, DS4_N_HEAD,
+                                                                             DS4_N_HEAD_KV, DS4_N_HEAD_DIM);
             if (need > attn_flash_part_floats) attn_flash_part_floats = need;
         }
         if (attn_flash_part_floats > 0u) QWEN35_ALLOC(attn_flash_part, attn_flash_part_floats);
@@ -511,6 +512,15 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
                                 uint32_t r0, uint32_t n, bool per_row) {
     const float scale = 1.0f / sqrtf((float)DS4_N_HEAD_DIM);
     const bool decode3 = qwen35_attn_decode_env() == 3 && !qwen4_kv_mode(g);
+    /* Widen: the qwen35 attention kernels take any ratio that is a multiple
+     * of QWEN35_ATTN_GROUP (8) -- a wider ratio (the 122B's 16) runs the same
+     * dispatches per 8-head sub-group inside the wrappers.  But the qwen4
+     * decode/attn kernels used as these fallbacks cap the ratio at 12, and
+     * the wide graph's own attn_part covers decode3's partials, so a wide
+     * shape with no qwen35 kernel operating rows through decode3 instead. */
+    const uint32_t group = DS4_N_HEAD / DS4_N_HEAD_KV;
+    const bool wide = (group % 8u) != 0u;
+    const bool wide_decode3 = wide && decode3 && qwen35_attn_decode2_env();
     if (r0 == 0 && !per_row) {
         if (n == 1u && qwen35_attn_decode2_env()) {
             if (decode3) {
@@ -518,27 +528,36 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
                             qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
                             DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 1u, scale) != 0;
             }
-            return ds4_gpu_qwen35_attn_decode2_tensor(g->attn_o, g->q, g->gate,
-                        qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
-                        DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 1u, scale,
-                        g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
-                        g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+            if (!wide) {
+                return ds4_gpu_qwen35_attn_decode2_tensor(g->attn_o, g->q, g->gate,
+                            qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
+                            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 1u, scale,
+                            g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                            g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+            }
+            /* wide + decode2 era: decode2's kernels cap the ratio: fall to the
+             * row loop below, which runs decode3 per row when the era's envs
+             * allow, else hits the qwen4 wrapper's refusal like before. */
         }
         if (n > 8u && qwen35_attn_flash_env() && !qwen4_kv_mode(g)) {
-            if (qwen35_attn_nax_env() && ds4_gpu_tensor_api_available()) {
-                return ds4_gpu_qwen35_attn_flash_nax_tensor(g->attn_o, g->q, g->gate,
+            if (qwen35_attn_nax_env() && ds4_gpu_tensor_api_available() &&
+                ds4_gpu_qwen35_attn_flash_nax_tensor(g->attn_o, g->q, g->gate,
                             qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_flash_part, n,
-                            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale) != 0;
-            }
+                            DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale))
+                return true;
             return ds4_gpu_qwen35_attn_flash_tensor(g->attn_o, g->q, g->gate,
                         qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_flash_part, n,
                         DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, scale) != 0;
         }
-        return ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, qwen4_kcache(g, il), qwen4_vcache(g, il),
-                                                NULL, NULL, n <= 2u ? g->attn_part : NULL, n,
-                                                DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 0u, 0u, scale,
-                                                g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
-                                                g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+        if (!wide) {
+            return ds4_gpu_qwen4_attn_decode_tensor(g->attn_o, g->q, g->gate, qwen4_kcache(g, il), qwen4_vcache(g, il),
+                                                    NULL, NULL, n <= 2u ? g->attn_part : NULL, n,
+                                                    DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 0u, 0u, scale,
+                                                    g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                                                    g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+        }
+        /* wide chunk of up to 8 tokens (short prefill tails): rows the calls
+         * through decode3 below, since the qwen4 kernels cap the ratio. */
     }
     if (per_row && r0 == 0u && n == 2u && qwen35_attn_decode2_env()) {
         if (decode3) {
@@ -546,11 +565,14 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
                         qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
                         DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 2u, scale) != 0;
         }
-        return ds4_gpu_qwen35_attn_decode2_tensor(g->attn_o, g->q, g->gate,
-                    qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
-                    DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 2u, scale,
-                    g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
-                    g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+        if (!wide) {
+            return ds4_gpu_qwen35_attn_decode2_tensor(g->attn_o, g->q, g->gate,
+                        qwen4_kcache(g, il), qwen4_vcache(g, il), g->attn_part,
+                        DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0, 2u, scale,
+                        g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                        g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+        }
+        /* wide + decode2 era: the row loop below dispatches decode3 per row. */
     }
     const uint64_t qrow = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
     const uint32_t step = per_row ? 1u : n;
@@ -561,11 +583,15 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
         ds4_gpu_tensor *gt = ds4_gpu_tensor_view(g->gate, off, bytes);
         ds4_gpu_tensor *o = ds4_gpu_tensor_view(g->attn_o, off, bytes);
         ok = q && gt && o &&
-             ds4_gpu_qwen4_attn_decode_tensor(o, q, gt, qwen4_kcache(g, il), qwen4_vcache(g, il),
-                                              NULL, NULL, step <= 2u ? g->attn_part : NULL, step,
-                                              DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0 + t, 0u, 0u, scale,
-                                              g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
-                                              g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0;
+             (wide_decode3
+                  ? ds4_gpu_qwen35_attn_decode3_tensor(o, q, gt, qwen4_kcache(g, il), qwen4_vcache(g, il),
+                                                       g->attn_part, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
+                                                       pos0 + t, 1u, scale) != 0
+                  : ds4_gpu_qwen4_attn_decode_tensor(o, q, gt, qwen4_kcache(g, il), qwen4_vcache(g, il),
+                                                     NULL, NULL, step <= 2u ? g->attn_part : NULL, step,
+                                                     DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0 + t, 0u, 0u, scale,
+                                                     g->layer_k_cache_fp8[il], g->layer_v_cache_fp8[il],
+                                                     g->layer_k_scale[il], g->layer_v_scale[il], qwen4_kv_mode(g)) != 0);
         ds4_gpu_tensor_free(q);
         ds4_gpu_tensor_free(gt);
         ds4_gpu_tensor_free(o);

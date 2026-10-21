@@ -51488,6 +51488,9 @@ int ds4_gpu_qwen35_attn_decode2_tensor(
 /* Cap on decode3's own split count (vs QWEN4_ATTN_MAX_SPLITS 64 for the older
  * per-row/decode2 path); must match QWEN35_ATTN_MAX_SPLITS in metal/qwen35.metal. */
 #define QWEN35_ATTN_MAX_SPLITS 256u
+/* The kernels' per-pass query-head group; must match QWEN35_ATTN_GROUP in
+ * metal/qwen35.metal. */
+#define QWEN35_ATTN_GROUP 8u
 
 /* Keys per split for decode3 (DS4_QWEN35_ATTN_SPLIT_KEYS overrides). Read
  * fresh on every call, never cached, so a paired A/B harness can switch it
@@ -51525,6 +51528,7 @@ uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32
 struct ds4_qwen35_attn_decode3_args {
     uint32_t n_head, n_head_kv, head_dim, pos0;
     uint32_t rows, ns0, kps0, ns1, kps1;
+    uint32_t head_stride, head_sub;    /* widen sub-pass fields, as the kernel's */
     float scale;
 };
 
@@ -51576,7 +51580,7 @@ int ds4_gpu_qwen35_attn_merge_fold_selfcheck(void) {
         hp[i] = k == 0 ? 4.0f * v : k == 1 ? (slot % 8u == 7u ? 0.0f : 1.0f + fabsf(v) * 30.0f) : v;
     }
     for (uint64_t i = 0; ok && i < of; i++) { r = r * 1664525u + 1013904223u; hg[i] = (float)(int32_t)(r >> 8) / (float)(1 << 23); }
-    struct ds4_qwen35_attn_decode3_args args = { H, Hkv, D, 0u, 2u, ns0, 1u, ns1, 1u, 0.0625f };
+    struct ds4_qwen35_attn_decode3_args args = { H, Hkv, D, 0u, 2u, ns0, 1u, ns1, 1u, 8u, 0u, 0.0625f };
     ok = ok && ds4_gpu_tensor_write(tp, 0, hp, pf * sizeof(float)) && ds4_gpu_tensor_write(tg, 0, hg, of * sizeof(float));
     for (int pass = 0; pass < 2 && ok; pass++) {
         qwen4_bind mb[3];
@@ -51602,12 +51606,16 @@ int ds4_gpu_qwen35_attn_merge_fold_selfcheck(void) {
  * is >1. Used both for a lone rows==1 call and, with one-row tensor views,
  * for each half of a rows==2 verify call whose two rows don't share split
  * geometry (see ds4_gpu_qwen35_attn_decode3_tensor below). q_r/gate_r/out_r
- * are one row's H*head_dim floats; part_r is ignored when ns <= 1. */
+ * are one row's H*head_dim floats; part_r is ignored when ns <= 1.  The widen
+ * sub-pass fields pick this pass's G heads of every KV head (head_stride /
+ * QWEN35_ATTN_GROUP passes): for a group of 8 the pass pair (8, 0) reproduces
+ * the unwidened dispatch exactly, kernel for kernel. */
 static int qwen35_attn_decode3_dispatch1(
         ds4_gpu_tensor *out_r, const ds4_gpu_tensor *q_r, const ds4_gpu_tensor *gate_r,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part_r,
         uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t row_pos0,
-        uint32_t ns, uint32_t kps, float scale) {
+        uint32_t ns, uint32_t kps, float scale, uint32_t head_stride, uint32_t head_sub,
+        bool do_merge) {
     const uint64_t row_bytes = (uint64_t)n_head * head_dim * sizeof(float);
     const uint64_t n_keys = (uint64_t)row_pos0 + 1u;
     const uint64_t cache_bytes = n_keys * n_head_kv * head_dim * 2u;
@@ -51615,7 +51623,7 @@ static int qwen35_attn_decode3_dispatch1(
     const bool need_part = ns > 1u;
     const uint64_t part_floats = need_part ? part_stride * ns : 0u;
     struct ds4_qwen35_attn_decode3_args args =
-        { n_head, n_head_kv, head_dim, row_pos0, 1u, ns, kps, 0u, 0u, scale };
+        { n_head, n_head_kv, head_dim, row_pos0, 1u, ns, kps, 0u, 0u, head_stride, head_sub, scale };
     qwen4_bind b[6];
     if (!qwen4_bind_tensor(&b[0], q_r, row_bytes, "attn3 q") ||
         !qwen4_bind_tensor(&b[1], gate_r, row_bytes, "attn3 gate") ||
@@ -51630,7 +51638,10 @@ static int qwen35_attn_decode3_dispatch1(
                         MTLSizeMake(ns, n_head_kv, 1), MTLSizeMake(64, 1, 1), 0)) {
         return 0;
     }
-    if (!need_part) return 1;   /* this row's own split count was 1: wrote out directly */
+    /* do_merge keeps the merge with the pass that has seen every sub-pass of a
+     * widened group: the sub-passes split each [kvh][split] partial block in
+     * halves, so a mid-pass merge would fold half-written blocks. */
+    if (!need_part || !do_merge) return 1;   /* wrote out directly, or sub-passes pending */
     qwen4_bind mb[3] = { b[5], b[1], b[4] };
     return qwen4_dispatch(qwen35_merge3_kernel(), &args, sizeof(args), mb, 3,
                           MTLSizeMake(n_head, 1, 1), MTLSizeMake(256, 1, 1), 0)
@@ -51652,57 +51663,76 @@ static int qwen35_attn_decode3_dispatch1(
  * key assignment and merge tree depend only on that row's own key count
  * either way, so a rows==2 call matches two rows==1 calls bit for bit
  * regardless of which path ran. F16 K/V only; head_dim must be 256 and the
- * query/KV head ratio must be 8 (Ornith's group; the matrix tiles are sized
- * for it, no padding). */
+ * query/KV head ratio must be a multiple of QWEN35_ATTN_GROUP (8 -- Ornith's
+ * own group; wider ratios run group/8 dispatches per row set, each covering 8
+ * of every KV head's query heads: the dispatch and merge sequence is identical
+ * for a ratio of 8). */
 int ds4_gpu_qwen35_attn_decode3_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
         uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, uint32_t rows, float scale) {
-    if (head_dim != 256u || n_head_kv == 0 || (n_head % n_head_kv) != 0 || n_head / n_head_kv != 8u ||
-        (rows != 1u && rows != 2u)) {
+    if (head_dim != 256u || n_head_kv == 0u || (n_head % n_head_kv) != 0u ||
+        (n_head / n_head_kv) % 8u != 0u || (rows != 1u && rows != 2u)) {
         fprintf(stderr, "ds4: qwen35 attn decode3 refuses head_dim=%u n_head=%u n_head_kv=%u rows=%u\n",
                 head_dim, n_head, n_head_kv, rows);
         return 0;
     }
+    /* Widen: the kernel's threadgroup structure covers QWEN35_ATTN_GROUP (8)
+     * query heads per KV head, so a group ratio of 16 (Ornith-122B) runs the
+     * dispatch twice with head_sub = 0 / 8.  Sub-pass writes are disjoint --
+     * each pass's direct head slots, and each pass's half of every [kvh][split]
+     * partial block -- so nothing is sequenced except the (single) merge, which
+     * kernel_qwen35_attn_merge3 runs over the full ratio it computes itself. */
+    const uint32_t group = n_head / n_head_kv, passes = group / 8u;
     const uint32_t split_keys = qwen35_attn_split_keys3();
     const uint32_t n0 = pos0 + 1u;
     uint32_t ns0, kps0;
     qwen35_attn_row_splits3(n0, split_keys, &ns0, &kps0);
     if (rows == 1u) {
-        return qwen35_attn_decode3_dispatch1(out, q, gate, k_cache, v_cache, part,
-                                              n_head, n_head_kv, head_dim, pos0, ns0, kps0, scale);
+        for (uint32_t p = 0; p < passes; p++)
+            if (!qwen35_attn_decode3_dispatch1(out, q, gate, k_cache, v_cache, part,
+                                               n_head, n_head_kv, head_dim, pos0, ns0, kps0, scale,
+                                               group, p * 8u, p + 1u == passes))
+                return 0;
+        return 1;
     }
     const uint32_t n1 = pos0 + 2u;
     uint32_t ns1, kps1;
     qwen35_attn_row_splits3(n1, split_keys, &ns1, &kps1);
     const uint64_t row_bytes = (uint64_t)n_head * head_dim * sizeof(float);
+    const bool need_part = (ns0 > 1u) || (ns1 > 1u);
+    const uint64_t part_stride = (uint64_t)n_head * (2u + head_dim);
+    const uint64_t row0_part_floats = part_stride * ns0;
+    const uint64_t part_floats = need_part ? row0_part_floats + part_stride * ns1 : 0u;
 
     if (ns0 == ns1 && kps0 == kps1) {
         /* shared dispatch: kernel_qwen35_attn_decode3<2> stages each 16-key
          * tile once for both verify rows. */
         struct ds4_qwen35_attn_decode3_args args =
-            { n_head, n_head_kv, head_dim, pos0, rows, ns0, kps0, ns1, kps1, scale };
+            { n_head, n_head_kv, head_dim, pos0, rows, ns0, kps0, ns1, kps1, 0u, 0u, scale };
         const uint64_t q_bytes = 2u * row_bytes;
         const uint64_t cache_bytes = (uint64_t)n1 * n_head_kv * head_dim * 2u;
-        const uint64_t part_stride = (uint64_t)n_head * (2u + head_dim);
-        const uint64_t row0_part_floats = part_stride * ns0;
-        const bool need_part = (ns0 > 1u) || (ns1 > 1u);
-        const uint64_t part_floats = need_part ? row0_part_floats + part_stride * ns1 : 0u;
         qwen4_bind b[6];
-        if (!qwen4_bind_tensor(&b[0], q, q_bytes, "attn3 q") ||
-            !qwen4_bind_tensor(&b[1], gate, q_bytes, "attn3 gate") ||
-            !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "attn3 k cache") ||
-            !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "attn3 v cache") ||
-            !qwen4_bind_tensor(&b[4], out, q_bytes, "attn3 out") ||
-            !qwen4_bind_tensor(&b[5], need_part ? part : out,
-                               need_part ? part_floats * sizeof(float) : q_bytes, "attn3 part")) {
-            return 0;
-        }
-        if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_DECODE3_R2, &args, sizeof(args), b, 6,
-                            MTLSizeMake(ns0, n_head_kv, 1), MTLSizeMake(128, 1, 1), 0)) {
-            return 0;
+        for (uint32_t p = 0; p < passes; p++) {
+            args.head_stride = group;
+            args.head_sub = p * 8u;
+            if (!qwen4_bind_tensor(&b[0], q, q_bytes, "attn3 q") ||
+                !qwen4_bind_tensor(&b[1], gate, q_bytes, "attn3 gate") ||
+                !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "attn3 k cache") ||
+                !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "attn3 v cache") ||
+                !qwen4_bind_tensor(&b[4], out, q_bytes, "attn3 out") ||
+                !qwen4_bind_tensor(&b[5], need_part ? part : out,
+                                   need_part ? part_floats * sizeof(float) : q_bytes, "attn3 part")) {
+                return 0;
+            }
+            if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_DECODE3_R2, &args, sizeof(args), b, 6,
+                                MTLSizeMake(ns0, n_head_kv, 1), MTLSizeMake(128, 1, 1), 0)) {
+                return 0;
+            }
         }
         if (!need_part) return 1;   /* every row's own split count was 1: wrote out directly */
+        args.head_stride = group;
+        args.head_sub = 0u;
         qwen4_bind mb[3] = { b[5], b[1], b[4] };
         return qwen4_dispatch(qwen35_merge3_kernel(), &args, sizeof(args), mb, 3,
                               MTLSizeMake(n_head, rows, 1), MTLSizeMake(256, 1, 1), 0)
@@ -51713,9 +51743,8 @@ int ds4_gpu_qwen35_attn_decode3_tensor(
      * boundary): run each row through the solo path at its own position, on
      * one-row views of q/gate/out and, when needed, its own compact slice of
      * `part` at the same absolute offset the shared path would have used --
-     * exact by construction, just two dispatches instead of one. */
-    const uint64_t part_stride = (uint64_t)n_head * (2u + head_dim);
-    const uint64_t row0_part_floats = part_stride * ns0;
+     * exact by construction, just two dispatches instead of one.  A widened
+     * group keeps each row's passes whole: only the row's last pass merges. */
     ds4_gpu_tensor *q0 = ds4_gpu_tensor_view(q, 0, row_bytes);
     ds4_gpu_tensor *g0 = ds4_gpu_tensor_view(gate, 0, row_bytes);
     ds4_gpu_tensor *o0 = ds4_gpu_tensor_view(out, 0, row_bytes);
@@ -51726,11 +51755,13 @@ int ds4_gpu_qwen35_attn_decode3_tensor(
     ds4_gpu_tensor *p1 = ns1 > 1u
         ? ds4_gpu_tensor_view(part, row0_part_floats * sizeof(float), part_stride * ns1 * sizeof(float)) : NULL;
     bool ok = q0 && g0 && o0 && q1 && g1 && o1 && (ns0 <= 1u || p0) && (ns1 <= 1u || p1);
-    if (ok) {
+    for (uint32_t p = 0; ok && p < passes; p++) {
         ok = qwen35_attn_decode3_dispatch1(o0, q0, g0, k_cache, v_cache, ns0 > 1u ? p0 : part,
-                                            n_head, n_head_kv, head_dim, pos0, ns0, kps0, scale) &&
+                                            n_head, n_head_kv, head_dim, pos0, ns0, kps0, scale,
+                                            group, p * 8u, p + 1u == passes) &&
              qwen35_attn_decode3_dispatch1(o1, q1, g1, k_cache, v_cache, ns1 > 1u ? p1 : part,
-                                            n_head, n_head_kv, head_dim, pos0 + 1u, ns1, kps1, scale);
+                                            n_head, n_head_kv, head_dim, pos0 + 1u, ns1, kps1, scale,
+                                            group, p * 8u, p + 1u == passes);
     }
     ds4_gpu_tensor_free(q0); ds4_gpu_tensor_free(g0); ds4_gpu_tensor_free(o0);
     ds4_gpu_tensor_free(q1); ds4_gpu_tensor_free(g1); ds4_gpu_tensor_free(o1);
@@ -51742,6 +51773,7 @@ int ds4_gpu_qwen35_attn_decode3_tensor(
  * field. */
 struct ds4_qwen35_attn_flash_args {
     uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0;
+    uint32_t head_stride, head_sub;    /* widen sub-pass fields, as the kernel's */
     float scale;
 };
 
@@ -51785,9 +51817,9 @@ static uint32_t qwen35_attn_flash_min_tg(void) {
  * >=1024-keys-per-part floor a real call also applies (both only ever
  * shrink Ks further), so it is always an upper bound on what a real call
  * with the same n_tokens actually needs. */
-uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
+uint64_t ds4_gpu_qwen35_attn_flash_part_floats_hkv(uint32_t n_tokens, uint32_t n_head,
+                                                    uint32_t n_head_kv, uint32_t head_dim) {
     const uint32_t min_tg = qwen35_attn_flash_min_tg();
-    const uint32_t n_head_kv = n_head / 8u;   /* the only ratio attn_flash_tensor accepts */
     const uint32_t blocks = (n_tokens + 7u) / 8u;   /* ceil(T / 8) */
     const uint32_t denom = n_head_kv * blocks;
     uint32_t ks = denom > 0u ? (min_tg + denom - 1u) / denom : min_tg;   /* ceil(min_tg / (Hkv * blocks)) */
@@ -51795,6 +51827,10 @@ uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_hea
     if (ks > QWEN35_ATTN_MAX_SPLITS) ks = QWEN35_ATTN_MAX_SPLITS;
     if (ks <= 1u) return 0u;   /* no split at this T: part is never bound */
     return (uint64_t)n_tokens * n_head * ks * (2u + head_dim);
+}
+
+uint64_t ds4_gpu_qwen35_attn_flash_part_floats(uint32_t n_tokens, uint32_t n_head, uint32_t head_dim) {
+    return ds4_gpu_qwen35_attn_flash_part_floats_hkv(n_tokens, n_head, n_head / 8u, head_dim);
 }
 
 /* Ks used by the most recent ds4_gpu_qwen35_attn_flash_tensor call. Test
@@ -51831,6 +51867,7 @@ static void qwen35_attn_flash_splits(uint32_t n_last, uint32_t n_head_kv, uint32
 struct ds4_qwen35_attn_flash_split_args {
     uint32_t n_tokens, n_head, n_head_kv, head_dim, pos0;
     uint32_t kps, n_splits;
+    uint32_t head_stride, head_sub;    /* widen sub-pass fields, as the kernel's */
     float scale;
 };
 
@@ -51841,7 +51878,7 @@ static int qwen35_attn_flash_merge3(const qwen4_bind *part_bind, const ds4_gpu_t
                                     uint64_t q_bytes, uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv,
                                     uint32_t head_dim, uint32_t pos0, uint32_t ks, uint32_t kps, float scale) {
     struct ds4_qwen35_attn_decode3_args margs =
-        { n_head, n_head_kv, head_dim, pos0, n_tokens, ks, kps, ks, kps, scale };
+        { n_head, n_head_kv, head_dim, pos0, n_tokens, ks, kps, ks, kps, 0u, 0u, scale };
     qwen4_bind mb[3];
     mb[0] = *part_bind;
     if (!qwen4_bind_tensor(&mb[1], gate, q_bytes, "flash merge gate") ||
@@ -51862,7 +51899,7 @@ static int qwen35_attn_flash_merge3(const qwen4_bind *part_bind, const ds4_gpu_t
  * attn_decode_tensor's own cutover keeps short prefill tails on the
  * decode/attn_mm arithmetic.
  *
- * `part == NULL` never splits. `part != NULL` first derives Ks via
+ * part == NULL` never splits. `part != NULL` first derives Ks via
  * qwen35_attn_flash_splits; Ks == 1 then behaves exactly like `part == NULL`
  * (a single kernel_qwen35_attn_flash dispatch straight to `out`, no merge).
  * Ks > 1 instead dispatches kernel_qwen35_attn_flash_split over grid (Hkv,
@@ -51871,17 +51908,21 @@ static int qwen35_attn_flash_merge3(const qwen4_bind *part_bind, const ds4_gpu_t
  * with the exact bytes the chosen Ks needs, so an undersized buffer fails
  * the bind rather than overrunning it; ds4_gpu_qwen35_attn_flash_part_floats
  * sizes the worst case for a caller that does not want to recompute Ks
- * itself. */
+ * itself.  The head ratio must be a multiple of QWEN35_ATTN_GROUP (8): wider
+ * ratios (the 122B's 16) run group/8 passes with head_sub = pass * 8 -- each
+ * covers 8 of every KV head's query heads; partial slots interleave per pass
+ * so the merge runs once, after the last pass. */
 int ds4_gpu_qwen35_attn_flash_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, float scale) {
-    if (head_dim != 256u || n_head_kv == 0u || (n_head % n_head_kv) != 0u || n_head / n_head_kv != 8u ||
-        n_tokens <= 8u) {
+    if (head_dim != 256u || n_head_kv == 0u || (n_head % n_head_kv) != 0u ||
+        (n_head / n_head_kv) % QWEN35_ATTN_GROUP != 0u || n_tokens <= 8u) {
         fprintf(stderr, "ds4: qwen35 attn flash refuses head_dim=%u n_head=%u n_head_kv=%u n_tokens=%u\n",
                 head_dim, n_head, n_head_kv, n_tokens);
         return 0;
     }
+    const uint32_t group = n_head / n_head_kv, passes = group / QWEN35_ATTN_GROUP;
     const uint32_t tok = qwen35_attn_flash_tok();
     const uint32_t blocks = (n_tokens + tok - 1u) / tok;
     uint32_t ks = 1u, kps = n_tokens + pos0;
@@ -51892,7 +51933,6 @@ int ds4_gpu_qwen35_attn_flash_tensor(
     const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
 
     if (ks <= 1u) {
-        struct ds4_qwen35_attn_flash_args args = { n_tokens, n_head, n_head_kv, head_dim, pos0, scale };
         qwen4_bind b[5];
         if (!qwen4_bind_tensor(&b[0], q, q_bytes, "flash q") ||
             !qwen4_bind_tensor(&b[1], gate, q_bytes, "flash gate") ||
@@ -51902,14 +51942,19 @@ int ds4_gpu_qwen35_attn_flash_tensor(
             return 0;
         }
         const int kernel = tok == 4u ? QWEN4_K_QWEN35_ATTN_FLASH_TOK4 : QWEN4_K_QWEN35_ATTN_FLASH_TOK2;
-        return qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
-                              MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(32u * 2u * tok, 1, 1), 0)
-               ? 1 : 0;
+        for (uint32_t p = 0; p < passes; p++) {
+            struct ds4_qwen35_attn_flash_args args =
+                { n_tokens, n_head, n_head_kv, head_dim, pos0, group, p * QWEN35_ATTN_GROUP, scale };
+            if (!qwen4_dispatch(kernel, &args, sizeof(args), b, 5,
+                                MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(32u * 2u * tok, 1, 1), 0)) {
+                return 0;
+            }
+        }
+        return 1;
     }
 
-    /* Ks > 1: split into `part`, then merge. */
-    struct ds4_qwen35_attn_flash_split_args sargs =
-        { n_tokens, n_head, n_head_kv, head_dim, pos0, kps, ks, scale };
+    /* Ks > 1: split into `part` (each pass's own half of every [kvh][split]
+     * block), then one merge after the last pass. */
     const uint64_t part_floats = (uint64_t)n_tokens * n_head * ks * (2u + head_dim);
     qwen4_bind sb[4];
     if (!qwen4_bind_tensor(&sb[0], q, q_bytes, "flash split q") ||
@@ -51919,9 +51964,13 @@ int ds4_gpu_qwen35_attn_flash_tensor(
         return 0;
     }
     const int split_kernel = tok == 4u ? QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK4 : QWEN4_K_QWEN35_ATTN_FLASH_SPLIT_TOK2;
-    if (!qwen4_dispatch(split_kernel, &sargs, sizeof(sargs), sb, 4,
-                        MTLSizeMake(n_head_kv, blocks, ks), MTLSizeMake(32u * 2u * tok, 1, 1), 0)) {
-        return 0;
+    for (uint32_t p = 0; p < passes; p++) {
+        struct ds4_qwen35_attn_flash_split_args sargs =
+            { n_tokens, n_head, n_head_kv, head_dim, pos0, kps, ks, group, p * QWEN35_ATTN_GROUP, scale };
+        if (!qwen4_dispatch(split_kernel, &sargs, sizeof(sargs), sb, 4,
+                            MTLSizeMake(n_head_kv, blocks, ks), MTLSizeMake(32u * 2u * tok, 1, 1), 0)) {
+            return 0;
+        }
     }
     return qwen35_attn_flash_merge3(&sb[3], gate, out, q_bytes, n_tokens, n_head, n_head_kv, head_dim, pos0,
                                     ks, kps, scale);
@@ -51933,13 +51982,15 @@ static ds4_gpu_tensor *qwen4_nax_scratch(ds4_gpu_tensor **slot, uint64_t *slot_b
 /* Mirrors metal/qwen35.metal's ds4_metal_args_qwen35_attn_qpack. */
 struct ds4_qwen35_attn_qpack_args {
     uint32_t n_tokens, n_tokens_pad, n_head, n_head_kv;
+    uint32_t head_stride, head_sub;    /* widen sub-pass fields, as the kernel's */
     float scale2;
 };
 
 /* Mirrors metal/qwen35.metal's ds4_metal_args_qwen35_attn_flash_nax. */
 struct ds4_qwen35_attn_flash_nax_args {
     uint32_t n_tokens, n_tokens_pad, n_head, n_head_kv, pos0;
-    uint32_t kps, n_splits;
+    uint32_t kps, n_splits;            /* SPLIT: keys per split and split count */
+    uint32_t head_stride, head_sub;    /* widen sub-pass fields, as the kernel's */
 };
 
 /* Packed queries of the accelerator flash: [Hkv][ceil8(T)][8][256] half,
@@ -51949,71 +52000,90 @@ static uint64_t g_qwen35_attn_qh_bytes;
 
 /* M6 flash prefill on the M5 neural accelerators: the contract of
  * ds4_gpu_qwen35_attn_flash_tensor (T > 8 tokens at pos0.., causal, F16
- * K/V, head_dim 256, group 8, gated output) computed by
- * kernel_qwen35_attn_qpack + kernel_qwen35_attn_flash_nax.  Needs the Metal
- * 4 tensor API (ds4_gpu_mpp_available(): not under --quality, not before
- * M5/A19, not with DS4_METAL_DISABLE_METAL4=1) and refuses otherwise, so
- * the caller picks the M5 flash instead.  The key split follows the M5
- * flash's rule (qwen35_attn_flash_splits) over 8-token blocks: `part ==
- * NULL` or Ks == 1 writes `out` directly, Ks > 1 writes partials into `part`
- * (kernel_qwen35_attn_flash_nax_split) and merges them with
- * kernel_qwen35_attn_merge3; ds4_gpu_qwen35_attn_flash_part_floats sizes
- * `part` for both flash kernels. */
+ * K/V, head_dim 256, group a multiple of QWEN35_ATTN_GROUP, gated output)
+ * computed by kernel_qwen35_attn_qpack + kernel_qwen35_attn_flash_nax.
+ * Needs the Metal 4 tensor API (ds4_gpu_mpp_available(): not under
+ * --quality, not before M5/A19, not with DS4_METAL_DISABLE_METAL4=1) and
+ * refuses otherwise, so the caller picks the M5 flash instead.  The key
+ * split follows the M5 flash's rule (qwen35_attn_flash_splits) over 8-token
+ * blocks: `part == NULL` or Ks == 1 writes `out` directly, Ks > 1 writes
+ * partials into `part` (kernel_qwen35_attn_flash_nax_split) and merges them
+ * with kernel_qwen35_attn_merge3; ds4_gpu_qwen35_attn_flash_part_floats
+ * sizes `part` for both flash kernels.  A head ratio of 16 (Ornith-122B)
+ * runs group/8 passes (head_sub 0 / 8): each pass packs and attends 8 of
+ * every KV head's query heads over the same K/V; the packed-q scratch is
+ * reused per pass, the partial slots interleave, and the merge runs once
+ * after the last pass. */
 int ds4_gpu_qwen35_attn_flash_nax_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
         uint32_t n_tokens, uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, float scale) {
     if (!ds4_gpu_mpp_available() || head_dim != 256u || n_head_kv == 0u || (n_head % n_head_kv) != 0u ||
-        n_head / n_head_kv != 8u || n_tokens <= 8u) {
+        (n_head / n_head_kv) % QWEN35_ATTN_GROUP != 0u || n_tokens <= 8u) {
         fprintf(stderr, "ds4: qwen35 attn flash nax refuses tensor_api=%d head_dim=%u n_head=%u n_head_kv=%u "
                         "n_tokens=%u\n", ds4_gpu_mpp_available(), head_dim, n_head, n_head_kv, n_tokens);
         return 0;
     }
+    const uint32_t group = n_head / n_head_kv, passes = group / QWEN35_ATTN_GROUP;
     const uint32_t t_pad = (n_tokens + 7u) & ~7u;
-    const uint64_t qh_count = (uint64_t)n_head_kv * t_pad * 8u * head_dim;
+    const uint64_t qh_count = (uint64_t)n_head_kv * t_pad * QWEN35_ATTN_GROUP * head_dim;
     ds4_gpu_tensor *qh = qwen4_nax_scratch(&g_qwen35_attn_qh, &g_qwen35_attn_qh_bytes, qh_count * sizeof(uint16_t));
     if (!qh) return 0;
     const uint64_t q_bytes = (uint64_t)n_tokens * n_head * head_dim * sizeof(float);
     const uint64_t cache_bytes = (uint64_t)(pos0 + n_tokens) * n_head_kv * head_dim * 2u;
 
-    struct ds4_qwen35_attn_qpack_args pargs = { n_tokens, t_pad, n_head, n_head_kv, scale * 1.4426950408889634f };
-    qwen4_bind pb[2];
-    if (!qwen4_bind_tensor(&pb[0], q, q_bytes, "flash nax q") ||
-        !qwen4_bind_tensor(&pb[1], qh, qh_count * sizeof(uint16_t), "flash nax packed q")) {
-        return 0;
-    }
-    const uint32_t n4 = (uint32_t)(qh_count / 4u);
-    if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_QPACK, &pargs, sizeof(pargs), pb, 2,
-                        MTLSizeMake((n4 + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0)) {
-        return 0;
-    }
-
     const uint32_t blocks = t_pad / 8u;
     uint32_t ks = 1u, kps = pos0 + n_tokens;
     if (part) qwen35_attn_flash_splits(pos0 + n_tokens, n_head_kv, blocks, &ks, &kps);
     g_qwen35_attn_flash_last_splits = ks;
-    struct ds4_qwen35_attn_flash_nax_args args = { n_tokens, t_pad, n_head, n_head_kv, pos0, kps, ks };
-    qwen4_bind b[5];
-    b[0] = pb[1];   /* packed queries, already bound above */
-    if (!qwen4_bind_tensor(&b[1], gate, q_bytes, "flash nax gate") ||
-        !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "flash nax k cache") ||
-        !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "flash nax v cache")) {
-        return 0;
+    qwen4_bind pb[2];
+    qwen4_bind part_bind = {0};
+    for (uint32_t p = 0; p < passes; p++) {
+        /* pack this pass's G query heads of every KV head (the packed layout
+         * itself stays [Hkv][Tpad][G][D] pass for pass, unused slots included) */
+        struct ds4_qwen35_attn_qpack_args pargs =
+            { n_tokens, t_pad, n_head, n_head_kv, group, p * QWEN35_ATTN_GROUP, scale * 1.4426950408889634f };
+        if (!qwen4_bind_tensor(&pb[0], q, q_bytes, "flash nax q") ||
+            !qwen4_bind_tensor(&pb[1], qh, qh_count * sizeof(uint16_t), "flash nax packed q")) {
+            return 0;
+        }
+        const uint32_t n4 = (uint32_t)(qh_count / 4u);
+        if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_QPACK, &pargs, sizeof(pargs), pb, 2,
+                            MTLSizeMake((n4 + 255u) / 256u, 1, 1), MTLSizeMake(256, 1, 1), 0)) {
+            return 0;
+        }
+
+        struct ds4_qwen35_attn_flash_nax_args args =
+            { n_tokens, t_pad, n_head, n_head_kv, pos0, kps, ks, group, p * QWEN35_ATTN_GROUP };
+        qwen4_bind b[5];
+        b[0] = pb[1];   /* packed queries, just bound and packed above */
+        if (!qwen4_bind_tensor(&b[1], gate, q_bytes, "flash nax gate") ||
+            !qwen4_bind_tensor(&b[2], k_cache, cache_bytes, "flash nax k cache") ||
+            !qwen4_bind_tensor(&b[3], v_cache, cache_bytes, "flash nax v cache")) {
+            return 0;
+        }
+        if (ks <= 1u) {
+            if (!qwen4_bind_tensor(&b[4], out, q_bytes, "flash nax out")) return 0;
+            if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_FLASH_NAX, &args, sizeof(args), b, 5,
+                                MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(256, 1, 1), 0)) {
+                return 0;
+            }
+            continue;   /* nothing to merge: this pass wrote its head slots directly */
+        }
+        const uint64_t part_floats = (uint64_t)n_tokens * n_head * ks * (2u + head_dim);
+        if (!qwen4_bind_tensor(&b[4], part, part_floats * sizeof(float), "flash nax split part")) return 0;
+        part_bind = b[4];
+        if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_FLASH_NAX_SPLIT, &args, sizeof(args), b, 5,
+                            MTLSizeMake(n_head_kv, blocks, ks), MTLSizeMake(256, 1, 1), 0)) {
+            return 0;
+        }
+        /* the partial slots interleave the passes, so this once-after-all-passes
+         * merge folds every split with kernel_qwen35_attn_merge3 */
     }
-    if (ks <= 1u) {
-        if (!qwen4_bind_tensor(&b[4], out, q_bytes, "flash nax out")) return 0;
-        return qwen4_dispatch(QWEN4_K_QWEN35_ATTN_FLASH_NAX, &args, sizeof(args), b, 5,
-                              MTLSizeMake(n_head_kv, blocks, 1), MTLSizeMake(256, 1, 1), 0)
-               ? 1 : 0;
-    }
-    const uint64_t part_floats = (uint64_t)n_tokens * n_head * ks * (2u + head_dim);
-    if (!qwen4_bind_tensor(&b[4], part, part_floats * sizeof(float), "flash nax split part")) return 0;
-    if (!qwen4_dispatch(QWEN4_K_QWEN35_ATTN_FLASH_NAX_SPLIT, &args, sizeof(args), b, 5,
-                        MTLSizeMake(n_head_kv, blocks, ks), MTLSizeMake(256, 1, 1), 0)) {
-        return 0;
-    }
-    return qwen35_attn_flash_merge3(&b[4], gate, out, q_bytes, n_tokens, n_head, n_head_kv, head_dim, pos0,
-                                    ks, kps, scale);
+    if (ks > 1u)
+        return qwen35_attn_flash_merge3(&part_bind, gate, out, q_bytes, n_tokens, n_head, n_head_kv, head_dim,
+                                        pos0, ks, kps, scale);
+    return 1;
 }
 
 /* ---- decode batch: attention over rows ----
