@@ -514,12 +514,14 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
     const bool decode3 = qwen35_attn_decode_env() == 3 && !qwen4_kv_mode(g);
     /* Widen: the qwen35 attention kernels take any ratio that is a multiple
      * of QWEN35_ATTN_GROUP (8) -- a wider ratio (the 122B's 16) runs the same
-     * dispatches per 8-head sub-group inside the wrappers.  But the qwen4
-     * decode/attn kernels used as these fallbacks cap the ratio at 12, and
-     * the wide graph's own attn_part covers decode3's partials, so a wide
-     * shape with no qwen35 kernel operating rows through decode3 instead. */
+     * dispatches per 8-head sub-group inside the wrappers.  Wide marks the
+     * shapes those legacy fallbacks can't run (the qwen4 decode/attn kernels
+     * cap the head ratio at 12): a multiple-of-8 ratio above 8 skips every
+     * qwen4 path here and rows through decode3's sub-passes instead, while a
+     * ratio of 8 (and anything <= 12 the qwen4 kernels take) keeps the legacy
+     * dispatches byte-identical. */
     const uint32_t group = DS4_N_HEAD / DS4_N_HEAD_KV;
-    const bool wide = (group % 8u) != 0u;
+    const bool wide = (group % 8u) == 0u && group > 8u;
     const bool wide_decode3 = wide && decode3 && qwen35_attn_decode2_env();
     if (r0 == 0 && !per_row) {
         if (n == 1u && qwen35_attn_decode2_env()) {
