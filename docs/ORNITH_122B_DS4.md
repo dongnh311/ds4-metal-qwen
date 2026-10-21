@@ -10,6 +10,7 @@ This document is the operating manual + receipts for the qwq35moe 122B shape
 | File | Size | Source / verification |
 | --- | --- | --- |
 | `Ornith-1.5-122B-Q4_K_M.gguf` | 75,843,911,648 bytes | official `ornith-ai/Ornith-1.5-122B-GGUF` single file, sha256 `729fe18c2491aaa446074a923e12f184f9f2239ffd5ce3dae47b0ce9cf8df40c` (byte-identical to the HF LFS oid) |
+| `Ornith-1.5-122B-IQ2.gguf` | 38,246,170,592 bytes (35.62 GiB) | phase-3 tier built from the official Q4_K_M by `gguf-tools/ornith_requant.py` (receipt `gguf-tools/ornith_requant.receipt.json`); dense path byte-identical, routed gate/up IQ2_XXS + down Q2_K |
 | `mmproj-Ornith-1.5-122B-BF16.gguf` | 912,263,200 bytes | same repo, vision encoder for a later vision pass |
 
 Both live in `~/.local/share/ai-gateway/ds4-models/ornith-122b/`. The
@@ -144,15 +145,71 @@ ds4: memory detail: ctx=131072 prefill_cap=2048 raw_kv_rows=131072 compressed_kv
   `eval` + `bench` receipt (tokens/sec at 2 K/8 K/32 K) comes with the
   IQ2 tier bench.
 
-## Phase 3 (IQ2 tier) plan
+## Phase 3 (IQ2 tier): requant build (in progress)
 
-1. Artifact: `unsloth/Ornith-1.5-122B-GGUF` `Ornith-1.5-122B-UD-IQ2_XXS.gguf`
-   (single file, 41,967,395,072 bytes) + `imatrix_unsloth.gguf_file`.
-   Download, sha-verify against the HF listing, header-audit the expert
-   quant layout (unsloth UD mixes per-tensor quant choices; engine must
-   gate them).
-2. Engine: widen `tensor_expect_qwen35_expert_layout` to accept the IQ
-   column the artifact aetually uses (IQ2_XXS/Q2_K/Q8_0/MXFP4 via
-   `qwen4_expert_row_bytes` + matching lane kernels); config test with the
-   freshly built artifact; 35B regression re-run.
-3. Bench Q4_K_M vs IQ2 tier at 2 K / 8 K / 32 K (CLI + `ds4 server`).
+**Tier decision (changed from the original plan)**: instead of shipping unsloth's
+`UD-IQ2_XXS` file, we requantize the **official Q4_K_M** ourselves:
+`gguf-tools/ornith_requant.py` reads `Ornith-1.5-122B-Q4_K_M.gguf` and writes
+`Ornith-1.5-122B-IQ2.gguf` with routed gate/up → **IQ2_XXS** and routed down →
+**Q2_K**, per-expert, guided by the unsloth `imatrix_unsloth.gguf_file`
+(sha256-verified `6e5ada71…dc103ab` on load). Every other tensor (attention, GDN,
+shared experts, MTP blk.48 Q8_0, norms, router, embeddings, output) is **copied
+verbatim**, so the dense path stays byte-identical to the official checkpoint and
+all earlier Dense/MTP receipts carry over unchanged. Engine constraint verified in
+`ds4.c` (~6201–6300): gate/up share one type per layer, routed superset
+`{Q4_K,Q5_K,Q6_K,Q2_K,IQ2_XXS,Q8_0,MXFP4}` already widened (commit `9a7d2c12`).
+
+**Checkpoint property (the "Q4_K_M mystery" resolved)**: the official Q4_K_M ships
+*dead ff-rows* — expert blocks whose scale/min words are all zero (d=dmin=scales=0)
+dequantizing to exact zeros. Rates fall with depth (L0 ≈ 79%, L21 ≈ 16%, deeper
+shortly after; MTP unaffected). Position agreement between this file and unsloth's
+independent UD quantization is **97.5%** (7985/8192 sampled blocks against ~66%
+independent-set chance) — a real checkpoint property, not a quantizer bug; both
+files are canonical and the engine reads them as-is (zeros contribute nothing).
+
+**Dequant validation (gguf-tools/ornith_dequant_check.py + tests/q4k_dump.c)** —
+before writing a single byte of output, the numpy dequants used by the requant tool
+were pinned to three oracles:
+- Q6_K (down): bit-match against the repo golden fixture `tests/quant_fixtures.h`
+  (type 14, 420 B → 512 values) — caught that `d` is stored **LAST** in the
+  canonical `block_q6_K` (`ql|qh|scales|d`).
+- Q4_K (gate/up): byte-exact vs a C reference dump (`tests/q4k_dump.c`, built from
+  the repo-verified `tests/test_q4k_dot.c` conventions) on live rows from the file;
+  dead rows dequant to exact zeros.
+- Q2_K / IQ2_XXS: canonical ggml math — note the q2_K scale layout reads **16
+  consecutive bytes at one bit-shift** per group (`qs[32p+16i+l] >> 2j`) with a
+  canonical **MINUS** min-term, and iq2_xxs grid/sign tables are parsed from
+  upstream `ggml-common.h` (`gguf-tools/ggml_tables.py`, npz-cached).
+
+**Pilot QC (gguf-tools/ornith_pilot_qc.py, PASS)**: L0-only requant run
+(`--layers 0`, 69.81 GiB written in 54 s) accepted by `./ds4 --inspect --metal`
+(2×IQ2_XXS + 1×Q2_K in the dir, header/tensor count untouched). Proof chain:
+- **byte determinism 90/90** — re-encoding the same source values through the same
+  `libds4quants` packer with the same per-expert imatrix weights reproduces the
+  pilot's stored bytes exactly, for gate/up/down alike;
+- iq2_xxs golden fixture dequant match (inventory of the grid/sign tables);
+- live-position cosine ≥ 0.94 everywhere; **zero-row agreement: 0 disagreements**
+  (all-zero source rows stay all-zero).
+  Honest note: whole-row rel-RMS is NOT a valid gate for this checkpoint — down
+  rows are ~90% exact zeros (the dead ff-channels), and the coarse Q2_K grid maps
+  those zeros to small min-term offsets while reconstructing live positions at
+  cos ≈ 0.989. GPU perplexity remains the tier-quality arbiter.
+
+**Full build (done)**: `--layers all` wrote `Ornith-1.5-122B-IQ2.gguf` —
+**35.62 GiB** in 1744 s (8 threads), 144 routed tensors requantized
+(65.39 GiB → 30.38 GiB), 899 tensors total, re-read clean. `./ds4 --inspect --metal`
+accepts it: `iq2_xxs 96 tensors (18.56 GiB) + q2_k 48 (11.81 GiB) + q4_k 333 (3.30)
++ q6_k 52 (1.79) + f32 370 (0.15)`; the dense path is byte-identical to the
+official file. Note the source is **mixed**: routed down is Q6_K on 25 layers and
+Q4_K on 24 — the tool dispatches the dequant by actual tensor type (the first
+pilot QC pass assumed Q6_K everywhere and tripped an `nearest_int` assertion in the
+packer on absurd magnitudes; fixed by type-aware dispatch).
+
+**QC across layers 0,6,11,21,24,35,47 (PASS)**: byte determinism **378/378**,
+live-position cosine ≥ 0.94 for every sampled row, zero-row agreement 0
+disagreements.
+
+First residency/throughput probe (`-c 1024 -n 24 --temp 0`): planner
+`KV 0.03 + buffers 1.06 + resident model 35.61 GiB = 36.69 GiB planned`, mapped
+36463.91 MiB, `prefill 22.07 t/s, generation 35.09 t/s` — the IQ2 tier is
+compute-bound on this box where the Q4_K_M tier was IO-bound (0.04–0.06 t/s).

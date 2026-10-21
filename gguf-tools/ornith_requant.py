@@ -235,9 +235,10 @@ class ImatrixMap:
         return np.ascontiguousarray(w, dtype="<f4")
 
 
-def build_plan(src, layers, threads, quantizer, imap):
+def build_plan(src, layers, threads, quantizer, imap, down_type="Q2_K"):
     """Per requantized routed-expert tensor: dims stay, type changes, nbytes shrink; data is
-    produced by a streaming proc(out, h) that writes exactly nbytes bytes (and hashes them)."""
+    produced by a streaming proc(out, h) that writes exactly nbytes bytes (and hashes them).
+    down_type="COPY" leaves routed down tensors verbatim (the conservative fallback tier)."""
     plan = []
     for t in src.tensors:
         n = t["name"]
@@ -250,6 +251,8 @@ def build_plan(src, layers, threads, quantizer, imap):
             continue
         in_dim, out_dim, n_exp = t["dims"]
         is_down = "ffn_down_exps" in n
+        if is_down and down_type == "COPY":
+            continue
         if is_down:
             if t["type"] not in (Q4_K, Q6_K):
                 fail(f"{n}: unexpected routed down source type {t['type']} (want Q4_K/Q6_K)")
@@ -304,6 +307,8 @@ def main():
     ap.add_argument("--imatrix", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="all", help="'all' or a comma list like 0,5,11")
+    ap.add_argument("--down-type", default="Q2_K", choices=("Q2_K", "COPY"),
+                    help="routed down target: requant to Q2_K, or leave the source bytes verbatim")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--trust-imatrix", action="store_true", help="skip the imatrix sha256 check")
     args = ap.parse_args()
@@ -316,7 +321,7 @@ def main():
         layers = {x.strip() for x in layers.split(",") if x.strip()}
     print(f"ornith-requant: layers={args.layers} threads={args.threads}")
 
-    plan = build_plan(src, layers, args.threads, quantizer, imap)
+    plan = build_plan(src, layers, args.threads, quantizer, imap, args.down_type)
     kept = {e["name"]: e for e in plan}
     total_new = sum(e["nbytes"] for e in plan)
     total_old = sum(e["src_nbytes"] for e in plan)
