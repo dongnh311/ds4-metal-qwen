@@ -950,6 +950,16 @@ test-qwen35-mtp: tests/test_qwen35_mtp
 test-qwen35-verify-batch: tests/test_qwen35_verify_batch
 	./tests/test_qwen35_verify_batch "$(DS4_ORNITH_MODEL)"
 
+tests/test_qwen35_config_122b.o: tests/test_qwen35_config_122b.c ds4.c ds4.h
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -Wno-unused-function -I. -c -o $@ $<
+
+tests/test_qwen35_config_122b: tests/test_qwen35_config_122b.o $(filter-out ds4_cpu.o,$(CPU_CORE_OBJS))
+	$(CC) $(filter-out -ffast-math,$(CFLAGS)) -o $@ $^ $(LDLIBS)
+
+.PHONY: test-qwen35-config-122b
+test-qwen35-config-122b: tests/test_qwen35_config_122b
+	./tests/test_qwen35_config_122b
+
 ds4.o ds4_cpu.o ds4_cpu_test_hooks.o ds4_cuda_test_hooks.o ds4_metal.o ds4_cuda.o ds4_rocm.o tests/test_qwen4_cuda.o tests/test_qwen4_kernels.o tests/test_qwen4_ngram_state.o: ds4_qwen4_vision.h
 
 ds4_cuda.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_tp.h ds4_gpu_mgpu.h ds4_linux_memory.h ds4_deepseek41_gpu.h ds4_deepseek41_cuda.cuh ds4_glm53_vision_gpu.cuh ds4_deepseek4_vision_gpu.cuh ds4_qwen4_cuda.cuh ds4_image.h ds4_iq2_tables_cuda.inc cuda/mmq/ds4_mmq.h

@@ -911,6 +911,38 @@ static const ds4_shape DS4_SHAPE_QWEN35_MOE = {
     .rope_orig_ctx = 262144,
 };
 
+/* Ornith-1.5-122B (llama.cpp qwen35moe): the same 3 GDN + 1 gated full
+ * attention repeating trunk as the 35B-A3B profile scaled up to 48 trunk
+ * layers, n_embd 3072, 32 heads, 256 experts (top-8) with ff 1024 and
+ * 64 GDN value heads.  MTP block mirrors the 35B; vision tower is the
+ * Qwen3.5 one, so the qwen35 vision path applies. */
+static const ds4_shape DS4_SHAPE_QWEN35_MOE_122B = {
+    .name = "Ornith-1.5-122B",
+    .family = DS4_MODEL_FAMILY_QWEN35_MOE,
+    .variant = DS4_VARIANT_QWEN35_MOE,
+    .n_layer = 49,
+    .n_embd = 3072,
+    .n_vocab = 248320,
+    .n_head = 32,
+    .n_head_kv = 2,
+    .n_head_dim = 256,
+    .n_value_dim = 256,
+    .n_rot = 64,
+    .n_expert = 256,
+    .n_expert_used = 8,
+    .n_expert_shared = 1,
+    .n_ff_exp = 1024,
+    .n_nextn_predict = 1,
+    .n_lin_k_head = 16,
+    .n_lin_v_head = 64,
+    .n_lin_head_dim = 128,
+    .n_lin_conv = 4,
+    .n_full_attn_interval = 4,
+    .rms_eps = 1.0e-6f,
+    .rope_freq_base = 10000000.0f,
+    .rope_orig_ctx = 262144,
+};
+
 static ds4_shape g_ds4_shape = {
     .name = "DeepSeek V4 Flash",
     .family = DS4_MODEL_FAMILY_DEEPSEEK4,
@@ -7667,13 +7699,22 @@ static void config_validate_qwen4_model(const ds4_model *m) {
     }
 }
 
-/* Ornith-1.5-35B-A3B: every shape value is fixed; a mismatch names the key.
- * RoPE is NEOX partial rotation; past the native context it takes YaRN from
- * -c (qwen35_rope_configure). */
+/* Ornith-1.5 qwen35moe: two pinned profiles selected by embedding_length
+ * (35B-A3B 2048, 122B 3072); every remaining shape value is fixed per
+ * profile, so a mismatch names the key.  RoPE is NEOX partial rotation;
+ * past the native context it takes YaRN from -c (qwen35_rope_configure). */
 static void config_validate_qwen35moe_model(const ds4_model *m) {
-    g_ds4_shape = DS4_SHAPE_QWEN35_MOE;
+    const uint32_t n_embd = required_u32(m, "qwen35moe.embedding_length");
+    if (n_embd == DS4_SHAPE_QWEN35_MOE.n_embd) {
+        g_ds4_shape = DS4_SHAPE_QWEN35_MOE;
+    } else if (n_embd == DS4_SHAPE_QWEN35_MOE_122B.n_embd) {
+        g_ds4_shape = DS4_SHAPE_QWEN35_MOE_122B;
+    } else {
+        fprintf(stderr, "ds4: unsupported qwen35moe embedding_length %u\n", n_embd);
+        exit(1);
+    }
     memset(g_ds4_compress_ratios, 0, sizeof(g_ds4_compress_ratios));
-    config_expect_u32("embedding_length", required_u32(m, "qwen35moe.embedding_length"), DS4_N_EMBD);
+    config_expect_u32("embedding_length", n_embd, DS4_N_EMBD);
     config_expect_u32("block_count", required_u32(m, "qwen35moe.block_count"), DS4_N_LAYER);
     config_expect_u32("nextn_predict_layers", required_u32(m, "qwen35moe.nextn_predict_layers"),
                       DS4_N_NEXTN_PREDICT);
