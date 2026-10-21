@@ -84,13 +84,14 @@ def main():
         for fam, sdeq, qtype, sblk, pblk in FAMS:
             st = next(t for t in s.tensors if t["name"] == f"blk.{il}.{fam}.weight")
             pt = next(t for t in p.tensors if t["name"] == f"blk.{il}.{fam}.weight")
-            if sdeq is None:
-                if st["type"] not in SRC_DEQ:
-                    print(f"L{il} {fam}: unexpected source type {st['type']}")
-                    ok = False
-                    continue
-                sdeq, sblk = SRC_DEQ[st["type"]]
-            pdeq = deq_iq2xxs if qtype == "IQ2_XXS" else deq_q2k
+            OUT_DEQ = {16: deq_iq2xxs, 10: deq_q2k, 12: deq_q4k}
+            OUT_QTYPE = {16: "IQ2_XXS", 10: "Q2_K", 12: "Q4_K"}
+            if pt["type"] not in OUT_DEQ:
+                print(f"L{il} {fam}: unexpected output type {pt['type']}")
+                ok = False
+                continue
+            pdeq = OUT_DEQ[pt["type"]]
+            qtype = OUT_QTYPE[pt["type"]]
             in_dim = st["dims"][0]
             s_row = (in_dim // 256) * sblk
             p_row = (in_dim // 256) * pblk

@@ -44,7 +44,7 @@ import ggml_tables  # noqa: E402
 from qwen4_pack import GGMLQuantizer, default_quantizer_library  # noqa: E402
 
 Q4_K, Q6_K, Q8_0, Q2_K, IQ2_XXS = 12, 14, 8, 10, 16
-QTYPE_NAME = {Q2_K: "Q2_K", IQ2_XXS: "IQ2_XXS"}
+QTYPE_NAME = {Q2_K: "Q2_K", IQ2_XXS: "IQ2_XXS", Q4_K: "Q4_K"}
 IMATRIX_SHA256 = "6e5ada71fe8dc6b458d1087e1a753fa3e3b639c7ab207b644e8d11a14dc103ab"
 
 
@@ -256,22 +256,26 @@ def build_plan(src, layers, threads, quantizer, imap, down_type="Q2_K"):
         if is_down:
             if t["type"] not in (Q4_K, Q6_K):
                 fail(f"{n}: unexpected routed down source type {t['type']} (want Q4_K/Q6_K)")
-            dst_type, src_block = Q2_K, (210 if t["type"] == Q6_K else 144)
+            if down_type == "Q4_K":
+                dst_type, src_block = Q4_K, (210 if t["type"] == Q6_K else 144)
+            else:
+                dst_type, src_block = Q2_K, (210 if t["type"] == Q6_K else 144)
         else:
             if t["type"] != Q4_K:
                 fail(f"{n}: unexpected routed gate/up source type {t['type']} (want Q4_K)")
             dst_type, src_block = IQ2_XXS, 144
         blocks_per_row = in_dim // 256
         src_row_bytes = blocks_per_row * src_block
-        dst_row_size = blocks_per_row * (84 if dst_type == Q2_K else 66)
+        dst_row_size = blocks_per_row * {Q2_K: 84, Q4_K: 144, IQ2_XXS: 66}[dst_type]
         new_nbytes = dst_row_size * out_dim * n_exp
         src_path, src_abs, src_type, src_name = str(src.path), t["abs"], t["type"], n
 
         def proc(out, h, is_down=is_down, in_dim=in_dim, out_dim=out_dim, n_exp=n_exp,
-                 src_path=src_path, src_abs=src_abs, src_type=src_type, src_name=src_name,
-                 src_block=src_block, src_row_bytes=src_row_bytes, dst_row_size=dst_row_size):
+                 dst_type=dst_type, src_path=src_path, src_abs=src_abs, src_type=src_type,
+                 src_name=src_name, src_block=src_block, src_row_bytes=src_row_bytes,
+                 dst_row_size=dst_row_size):
             deq = deq_q6k if (is_down and src_type == Q6_K) else deq_q4k
-            qtype = QTYPE_NAME[Q2_K if is_down else IQ2_XXS]
+            qtype = QTYPE_NAME[dst_type]
 
             def job(e):
                 with open(src_path, "rb") as f:
@@ -307,8 +311,9 @@ def main():
     ap.add_argument("--imatrix", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="all", help="'all' or a comma list like 0,5,11")
-    ap.add_argument("--down-type", default="Q2_K", choices=("Q2_K", "COPY"),
-                    help="routed down target: requant to Q2_K, or leave the source bytes verbatim")
+    ap.add_argument("--down-type", default="Q2_K", choices=("Q2_K", "Q4_K", "COPY"),
+                    help="routed down target: Q2_K (default tier), Q4_K (higher-fidelity "
+                         "fallback), or COPY to leave the source bytes verbatim")
     ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--trust-imatrix", action="store_true", help="skip the imatrix sha256 check")
     args = ap.parse_args()

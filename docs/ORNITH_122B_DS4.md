@@ -31,6 +31,22 @@ export DS4_METAL_NO_RESIDENCY=1                         # 75.8 GB does not fit 6
       -c 1024 -n 16 --temp 0 -p "The capital of France is"
 ```
 
+The phase-3 **IQ2 tier** (`Ornith-1.5-122B-IQ2.gguf`, 35.62 GiB) is the
+performance tier on this box: it plans as `resident model 35.61 GiB` and runs
+compute-bound (prefill 22–94 t/s, generation 35–39 t/s). It is rebuilt from the
+official file by `gguf-tools/ornith_requant.py`:
+
+```sh
+python3 gguf-tools/ornith_requant.py \
+  --src ~/.local/share/ai-gateway/ds4-models/ornith-122b/Ornith-1.5-122B-Q4_K_M.gguf \
+  --imatrix ~/.local/share/ai-gateway/ds4-models/ornith-122b/imatrix_unsloth.gguf_file \
+  --out ~/.local/share/ai-gateway/ds4-models/ornith-122b/Ornith-1.5-122B-IQ2.gguf
+# --layers 0,5,11 for a pilot; --down-type COPY keeps routed down verbatim (the
+# conservative fallback if the Q2_K down ever measures worse).
+python3 gguf-tools/ornith_pilot_qc.py          # byte-determinism + cosine QC
+python3 gguf-tools/ornith_dequant_check.py     # dequants vs golden fixtures/C oracle
+```
+
 - `--temp 0` for deterministic receipts.
 - NO `--ssd-streaming`: it is refused for `qwen35moe` today (engine streams
   the model through the page cache instead).
@@ -213,3 +229,20 @@ First residency/throughput probe (`-c 1024 -n 24 --temp 0`): planner
 `KV 0.03 + buffers 1.06 + resident model 35.61 GiB = 36.69 GiB planned`, mapped
 36463.91 MiB, `prefill 22.07 t/s, generation 35.09 t/s` — the IQ2 tier is
 compute-bound on this box where the Q4_K_M tier was IO-bound (0.04–0.06 t/s).
+The model reads through `ds4_vec_dot_iq2_xxs_f32/_q8_K` and the Q2_K dot kernels
+(dedicated code paths, not a generic dequant fallback), and `--mtp` drafts
+commit normally on the IQ2 file.
+
+**Behaviour + quality battery (IQ2 tier, `-c 2048 -n 80 --temp 0`, warm page cache)**:
+
+| prompt | output | prefill / generation |
+| --- | --- | --- |
+| "What is the capital of Japan?" | `Tokyo.` | 92.17 / 39.41 t/s |
+| "What is 123 * 45?" | `123*40=4920, 123*5=615, Total = 5535` → `5535` | 93.75 / 39.15 t/s |
+| "Who wrote the novel Dune?" | `Frank Herbert` | 93.68 / 39.50 t/s |
+| `--mtp` "Name three colors: red," | `Red, blue, green.` (draft cycles committed) | — |
+
+Perplexity (`/tmp/ppl_probe.txt`, `-c 1024`, 32-token prefix, 992 tokens scored):
+**ppl 3.097** (avg_nll 1.130). The Q4_K_M baseline on the same probe is the
+remaining decision input — note the UD-IQ2_XXS file cannot be the reference: the
+engine gate refuses its `iq1_s` routed gate/up ("expert type iq1_s not supported").
