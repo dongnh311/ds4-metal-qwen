@@ -212,9 +212,26 @@ and `dequantize_q2_K` uses `q + 32*(il/8) + 16*(il&1)`, per-16 masks 3/12/48/192
 Risk #1 ("IQ tiers must be self-checked before trusting speed numbers"): the 35–39 t/s decode
 is real compute, not a generic dequant path.
 
-**UD ladder is not usable on this engine (measured, not assumed).** Header audit of the
-unsloth files (range-request, no download needed) shows their routed experts use types the
-gate refuses:
+**Tier ladder (sizes are measured, not estimated).** `--dry-run` prints the exact plan; the
+routed-fidelity probe (re-encode real source rows, then compare) is why `Q2_K` is the default
+for down and `IQ2_XXS` is not:
+
+| variant | whole file | down-row cosine (mean / min, 192 real rows) | status |
+| --- | --- | --- | --- |
+| `--down-type Q4_K` | 44.06 GiB | 0.9972 / 0.9843 | built, GPU-validated below |
+| **default** (gate/up `IQ2_XXS`, down `Q2_K`) | 35.62 GiB | 0.9446 / 0.8361 | shipped, validated end to end |
+| `--down-type IQ2_XXS` | 33.09 GiB | 0.8829 / 0.7195 | 2.5 GiB cheaper, measurably worse rows |
+| `--down-type COPY` | 48.70 GiB | 1.0 (verbatim) | no down requant at all |
+| `--with-mtp` (adds `blk.48`) | −0.83 GiB vs the same config | n/a (energy imatrix) | built, GPU-validated below |
+
+The down rows are the only place where the tier's quantization visibly bites: gate/up at
+`IQ2_XXS` keeps live-row cosine ~0.95 and the whole model still beats the official Q4_K_M on
+perplexity, but pushing down to `IQ2_XXS` costs 6 points of cosine. So the ladder is
+"smaller is fine down to Q2_K; below that, pay for it".
+
+**The published UD ladder cannot be used on this engine (measured, not assumed).** Header
+audit of the unsloth files (range request, no download) shows their routed experts use types
+the gate refuses:
 
 | UD file | routed expert types | engine verdict |
 | --- | --- | --- |
@@ -223,15 +240,16 @@ gate refuses:
 | `UD-IQ2_XXS` (42.0 GB) | `iq1_s` gate/up | refused |
 
 The engine's routed superset is `{Q8_0, IQ2_XXS, Q2_K, Q4_K, Q5_K, Q6_K, MXFP4}`, so the
-ladder has to be built from the official checkpoint with those types — which is what
-`ornith_requant.py` now does (`--down-type Q2_K|IQ2_XXS|Q4_K|COPY`, `--with-mtp`).
+ladder has to be built from the official checkpoint with those types — which is exactly what
+`ornith_requant.py` does.
 
 **MTP head**: `blk.48` is not a small Q8_0 blob — it carries its own 256 routed experts
-(Q4_K gate/up, Q6_K down) plus the `nextn` draft head. The unsloth imatrix covers the trunk
-only, so `--with-mtp` quantizes those experts with a weight-energy importance matrix (per
-input column: sum of squares over the expert's own rows) — the same fallback the packer uses
-for experts the calibration never saw. The `ornith_pilot_qc.py` byte-determinism check derives
-the identical weights, so the MTP variant is verified the same way as the trunk.
+(Q4_K gate/up, Q6_K down) plus the `nextn` draft head. The default tier leaves it verbatim
+(the draft path keeps the publisher's precision, and the unsloth imatrix has no entries for
+it). `--with-mtp` quantizes those experts with a weight-energy importance matrix (per input
+column: sum of squares over the expert's own rows) — the same fallback the packer uses for
+experts the calibration never saw. `ornith_pilot_qc.py` derives the identical weights, so the
+MTP variant is verified the same way as the trunk.
 
 **Vision path**: `mmproj-Ornith-1.5-122B-BF16.gguf` (912,263,200 B) is in the repo but its
 dense weights are `bf16`, and `qwen4_vision_weights_bind` accepts only `f32|f16|q8_0` — so
@@ -239,9 +257,6 @@ the BF16 mmproj is rejected at bind time. The `mmproj-F16.gguf` variant (908,724
 `f32` + `f16`) is the engine-compatible one; both are now in the model directory under
 `mmproj-Ornith-1.5-122B-{BF16,F16}.gguf`. The mmproj is `clip` / `qwen3vl_merger`,
 embedding 1152, 27 blocks, projection 3072 — matching the 122B trunk.
-256 routed experts (Q4_K gate/up, Q6_K down) plus the `nextn` draft head. The
-requant tool deliberately leaves it verbatim (the draft path keeps the publisher's
-precision); requanting it would save only ~0.8 GiB and is a phase-3.4 idea.
 
 **Pilot QC (gguf-tools/ornith_pilot_qc.py, PASS)**: L0-only requant run
 (`--layers 0`, 69.81 GiB written in 54 s) accepted by `./ds4 --inspect --metal`
