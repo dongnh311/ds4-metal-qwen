@@ -1,10 +1,14 @@
 # Ornith-1.5-122B on ds4 (Metal, M5 Pro 64 GB)
 
 Status: **running end to end** on the `feature/ornith-122b` engine branch.
-Two validated tiers exist: the official Q4_K_M (IO-bound, ~5 t/s prefill /
-0.05 t/s decode) and the **phase-3 IQ2 tier** (`Ornith-1.5-122B-IQ2.gguf`,
-35.62 GiB, resident: 109–168 t/s prefill, 30–40 t/s decode, perplexity 6.6%
-better than Q4_K_M on a matched window).
+Validated tiers: the official Q4_K_M (IO-bound, ~5 t/s prefill / 0.05 t/s
+decode), the **phase-3 IQ2 tier** (`Ornith-1.5-122B-IQ2.gguf`, 35.62 GiB,
+resident: 109–168 t/s prefill, 30–40 t/s decode, perplexity 6.6% better than
+Q4_K_M on a matched window), plus the two **phase-3.4 rungs** — a smaller
+`IQ2-MTP` tier (34.79 GiB, trunk bit-identical, MTP drafts equal-or-better)
+and a higher-fidelity `IQ2-Q4Kdown` tier (44.06 GiB, perplexity −2.5%). The
+vision tower receipts (`test_qwen35_vision` PASS incl. MTP) come from the
+same window.
 This document is the operating manual + receipts for the qwq35moe 122B shape
 (48 layers + MTP head, 3072 d, 32 H / 2 KV (ratio 16), 256 routed experts top
 8, ff 1024) after the attention G-slicing widen.
@@ -15,7 +19,10 @@ This document is the operating manual + receipts for the qwq35moe 122B shape
 | --- | --- | --- |
 | `Ornith-1.5-122B-Q4_K_M.gguf` | 75,843,911,648 bytes | official `ornith-ai/Ornith-1.5-122B-GGUF` single file, sha256 `729fe18c2491aaa446074a923e12f184f9f2239ffd5ce3dae47b0ce9cf8df40c` (byte-identical to the HF LFS oid) |
 | `Ornith-1.5-122B-IQ2.gguf` | 38,246,170,592 bytes (35.62 GiB) | phase-3 tier built from the official Q4_K_M by `gguf-tools/ornith_requant.py` (receipt `gguf-tools/ornith_requant.receipt.json`); dense path byte-identical, routed gate/up IQ2_XXS + down Q2_K |
-| `mmproj-Ornith-1.5-122B-BF16.gguf` | 912,263,200 bytes | same repo, vision encoder for a later vision pass |
+| `Ornith-1.5-122B-IQ2-MTP.gguf` | 37,359,075,296 bytes (34.79 GiB) | same construction **plus** the MTP draft head `blk.48` requantized (IQ2_XXS gate/up, Q2_K down; no imatrix entries exist for it → weight-energy fallback). Trunk bit-identical to the tier above (perplexity nll equal to the last hex digit); spec acceptance measured equal-or-better (receipt `ornith_requant.receipt-mtp.json`) |
+| `Ornith-1.5-122B-IQ2-Q4Kdown.gguf` | 47,305,867,232 bytes (44.06 GiB) | high-fidelity rung: routed down → Q4_K everywhere (Q6_K re-encodes at live-pos cos 0.999). **Perplexity −2.5%** vs the shipped tier (2.9959 vs 3.0723, 1000-token window); prefill ~8–10% slower, +8.4 GiB (receipt `ornith_requant.receipt-q4kdown.json`) |
+| `mmproj-Ornith-1.5-122B-BF16.gguf` | 912,263,200 bytes | official repo vision encoder; **unusable** — `qwen4_vision_weights_bind` accepts only f32|f16|q8_0 and this file's dense weights are bf16 |
+| `mmproj-Ornith-1.5-122B-F16.gguf` | 908,724,544 bytes | unsloth F16 variant — the engine-compatible mmproj; `tests/test_qwen35_vision` PASS on both IQ2 tiers with it |
 
 Both live in `~/.local/share/ai-gateway/ds4-models/ornith-122b/`. The
 unsloth fork (`unsloth/Ornith-1.5-122B-GGUF`) publishes the UD quant ladder
@@ -159,11 +166,16 @@ ds4: memory detail: ctx=131072 prefill_cap=2048 raw_kv_rows=131072 compressed_kv
 
 - `--ssd-streaming` refuses `qwen35moe` (engine streams-of-streams design
   item, not required for the resident IQ2 tier).
-- Vision (`mmproj` BF16, 0.91 GB): the engine has the qwen35 M-RoPE /
-  mmproj-merger path (phase 4, optional).
-- Center-piece MTP: drafts accepted at depth 1 in the CLI smoke; a full
-  `eval` + `bench` receipt (tokens/sec at 2 K/8 K/32 K) comes with the
-  IQ2 tier bench.
+- Vision (`mmproj` BF16, 0.91 GB): **done in phase 3.4** — BF16 was unusable (bind
+  wants f32|f16|q8_0, so the F16 mmproj is the engine variant) and the
+  `test_qwen35_vision` suite PASSES on both IQ2 tiers, including the MTP
+  block (`37 drafts accepted, identical to plain`). A full gateway-side
+  vision/image smoke was NOT run (image round-trips are served by the
+  35B prod slot; the 122B tier is resident-sized the same way if ever
+  swapped in).
+- Center-piece MTP: drafts accepted at depth 1 in the CLI smoke; the
+  phase-3.4 receipt adds spec stats (accept 0.63–0.78, speed = the
+  verbatim head ±1%) and the vision-suite MTP PASS.
 
 ## Phase 3 (IQ2 tier): requant build (in progress)
 
@@ -224,10 +236,30 @@ for down and `IQ2_XXS` is not:
 | `--down-type COPY` | 48.70 GiB | 1.0 (verbatim) | no down requant at all |
 | `--with-mtp` (adds `blk.48`) | −0.83 GiB vs the same config | n/a (energy imatrix) | built, GPU-validated below |
 
-The down rows are the only place where the tier's quantization visibly bites: gate/up at
-`IQ2_XXS` keeps live-row cosine ~0.95 and the whole model still beats the official Q4_K_M on
-perplexity, but pushing down to `IQ2_XXS` costs 6 points of cosine. So the ladder is
-"smaller is fine down to Q2_K; below that, pay for it".
+**Phase-3.4 GPU-validated tier ladder** (all numbers from one exclusive window,
+`ornith_tier_validate.sh`; the reference IQ2 tier was re-run in the *same* window so
+perplexity and bench are apples-to-apples — the phase-3 receipts used a different,
+shorter perplexity window):
+
+| tier | file | ppl (matched /1000-token) | bench 2K / 8K / 32K (prefill / gen t/s) | verdict |
+| --- | --- | --- | --- | --- |
+| **IQ2** (shipped) | `Ornith-1.5-122B-IQ2.gguf` 35.62 GiB | 3.0723 | 167.6/40.1 · 159.7/36.0 · 147.0/28.3 | reference |
+| **IQ2-MTP** | `Ornith-1.5-122B-IQ2-MTP.gguf` 34.79 GiB | **3.0723 — bit-identical** (nll sum equal to the last hex digit) | 170.0/40.1 · 166.3/36.3 · 150.3/29.5 | trunk untouched + **spec accept 0.630–0.776 vs 0.621–0.753 on the verbatim head** (two prompts, `DS4_QWEN35_SPEC_STATS=1`); draft cost 3.2–3.3 ms/cycle both ways → **keep MTP requant, it does not hurt drafting** |
+| **IQ2-Q4Kdown** | `Ornith-1.5-122B-IQ2-Q4Kdown.gguf` 44.06 GiB | **2.9959** (−2.5% vs IQ2; the 500-token window agrees: 4.723 vs 4.841) | 149.1/38.4 · 143.1/33.5 · 128.3/27.9 | down Q6_K→Q4_K at live-pos cos 0.999 (QC byte 256/256); buys +2.5% ppl quality for +8.4 GiB and ~8–10% slower prefill — the "max-fidelity" rung |
+| (evaluated, rejected) | `--down-type IQ2_XXS` 32.21 GiB | — | — | down-row cosine 0.883 vs 0.945 (192 real rows) — not worth 3.4 GiB |
+
+Also new in this window, **first vision receipts for the 122B tier**:
+- `tests/test_qwen35_vision` with `mmproj-Ornith-1.5-122B-F16.gguf` on the shipped IQ2
+  tier: **PASS** (encode 70 rows = 7×10 patches, 116 prefill rows match
+  `get_rope_index`, decode/rewind/payload all clean, `TEXT-CHECKSUM 5e8a564a`).
+- Same test with `DS4_TEST_MTP=1` on the IQ2-MTP tier: **PASS** —
+  `mtp: 97 tokens in 60 cycles, 37 drafts accepted, identical to plain` (the
+  requantized draft head drafts the same tokens the verify path keeps; vision and
+  the 2.6-bpw MTP block coexist).
+- The BF16 mmproj is unusable by design (bind requires f32|f16|q8_0); F16 is the
+  engine-compatible variant.
+- `--decode-consistency 8` re-verified on both new tiers (MTP 0.0106 max_abs —
+  same as phase 3 — and Q4Kdown 0.0176 with rms 0.0057, larger but same shape).
 
 **The published UD ladder cannot be used on this engine (measured, not assumed).** Header
 audit of the unsloth files (range request, no download) shows their routed experts use types

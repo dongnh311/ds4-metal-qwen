@@ -89,6 +89,7 @@ def main():
                 continue
             OUT_DEQ = {16: deq_iq2xxs, 10: deq_q2k, 12: deq_q4k}
             OUT_QTYPE = {16: "IQ2_XXS", 10: "Q2_K", 12: "Q4_K"}
+            OUT_PBLK = {16: 66, 10: 84, 12: 144}
             if pt["type"] not in OUT_DEQ:
                 print(f"L{il} {fam}: unexpected output type {pt['type']}")
                 ok = False
@@ -104,7 +105,7 @@ def main():
             in_dim = st["dims"][0]
             out_full_rows = st["dims"][1]
             s_row = (in_dim // 256) * sblk
-            p_row = (in_dim // 256) * pblk
+            p_row = (in_dim // 256) * OUT_PBLK[pt["type"]]
             cos, cos_live, n_live, both_zero, dead_live, byte_eq, byte_skip = [], [], 0, 0, 0, 0, 0
             with open(str(SRC), "rb") as fs, open(str(out_path), "rb") as fp:
                 for e in experts:

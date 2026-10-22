@@ -16,15 +16,14 @@ What is the boiling point of water in Celsius?'
 echo "== inspect =="
 "$REPO/ds4" --inspect --metal -m "$MODEL" -c 512 2>&1 | sed -n '1,12p'
 
-echo "== behaviour battery (temp 0, 60 tokens) =="
-i=0
-for q in $(printf '%s\n' "$QA"); do
-    i=$((i + 1))
-    out="/tmp/${TAG}_qa${i}.log"
-    "$REPO/ds4" --metal -m "$MODEL" -c 2048 -n 60 --temp 0 -p "$q" >"$out" 2>&1
-    printf '  %s -> ' "$q"
-    grep -v '^ds4: ' "$out" | head -2 | tr '\n' ' '
-    grep -E 'prefill: |generation: ' "$out" | sed 's/^/    /'
+echo "== behaviour battery (temp 0, 40 tokens) =="
+printf '%s\n' 'What is the capital of Japan?' 'What is 123 * 45?' 'Who wrote the novel Dune?' 'What is the boiling point of water in Celsius?' |
+while IFS= read -r q; do
+    out="/tmp/${TAG}_qa.log"
+    "$REPO/ds4" --metal -m "$MODEL" -c 2048 -n 40 --temp 0 -p "$q" >"$out" 2>&1
+    printf '  Q: %s\n    A: ' "$q"
+    head -1 "$out" | grep -v '^ds4: ' | cut -c1-120
+    grep -E 'prefill: |generation: ' "$out" | head -1 | sed 's/^/    /'
 done
 
 echo "== matched-window perplexity (prefix 32, 200 tokens) =="
@@ -32,9 +31,9 @@ echo "== matched-window perplexity (prefix 32, 200 tokens) =="
     grep -E 'tokens=' | sed 's/^/  /'
 
 echo "== mtp draft path (spec stats over ~640 greedy tokens) =="
-"$REPO/ds4" --metal -m "$MODEL" -c 4096 -n 640 --temp 0 --mtp \
+DS4_QWEN35_SPEC_STATS=1 "$REPO/ds4" --metal -m "$MODEL" -c 4096 -n 640 --temp 0 --mtp \
     -p 'Summarise how a bicycle works, then explain why gears matter, then describe one long ride you would plan through the mountains, then list three maintenance tips, then finish with a short poem about wheels.' 2>&1 |
-    grep -E 'spec stats|committed|draft' | sed 's/^/  /'
+    grep -E 'spec stats' | tail -2 | sed 's/^/  /'
 
 echo "== decode-consistency (graph vs fresh re-prefill) =="
 "$REPO/ds4" --metal -m "$MODEL" -c 4096 --decode-consistency 8 --temp 0 \
