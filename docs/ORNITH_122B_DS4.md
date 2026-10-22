@@ -1,6 +1,10 @@
 # Ornith-1.5-122B on ds4 (Metal, M5 Pro 64 GB)
 
 Status: **running end to end** on the `feature/ornith-122b` engine branch.
+Two validated tiers exist: the official Q4_K_M (IO-bound, ~5 t/s prefill /
+0.05 t/s decode) and the **phase-3 IQ2 tier** (`Ornith-1.5-122B-IQ2.gguf`,
+35.62 GiB, resident: 109–168 t/s prefill, 30–40 t/s decode, perplexity 6.6%
+better than Q4_K_M on a matched window).
 This document is the operating manual + receipts for the qwq35moe 122B shape
 (48 layers + MTP head, 3072 d, 32 H / 2 KV (ratio 16), 256 routed experts top
 8, ff 1024) after the attention G-slicing widen.
@@ -266,3 +270,26 @@ the identical window — the decision gate (≤20% worse) is passed with margin.
 ~5.5 h of IO-bound decode, so it stays deferred; the matched short window plus the QA
 battery above is the quality evidence). The UD-IQ2_XXS file cannot serve as a reference:
 the engine gate refuses its `iq1_s` routed gate/up ("expert type iq1_s not supported").
+
+**Decode-consistency self-check** (`--decode-consistency 8`, `-c 4096`, prompt
+"The capital of Australia is"): the incremental-decode session and a fresh
+re-prefill of the same 184-token prefix agree — argmax identical for all 8
+generated tokens (` Canberra` `.` `\n`), `max_abs=0.0106` / `rms=0.0014` on a
+logit at `-30.98`. The IQ2 lanes behave identically across prefill and decode
+paths.
+
+**Bench sweep** (`ds4-bench --prompt-file /tmp/bench_122b.txt --ctx-start 2048
+--ctx-max 32768 --step-mul 4 --gen-tokens 128`, csv `/tmp/bench_iq2.csv`):
+
+| frontier | prefill t/s | gen t/s (steady) | KV bytes |
+| --- | --- | --- | --- |
+| 2048 | 109.71 | 40.19 | 198 MiB |
+| 8192 | 167.72 | 35.38 | 342 MiB |
+| 32768 | 158.54 | 30.26 | 824 MiB (ctx=32897: `38.17 GiB planned` total) |
+
+Against the Q4_K_M tier's own measured numbers (prefill 4.7–5.5 t/s, generation
+0.04–0.06 t/s, IO-bound) this is a **~20–30× prefill and ~600× decode** win: the
+122B IQ2 tier is resident (35.61 GiB model + 0.82 GiB KV at 32K + 1.74 GiB
+buffers = 38.17 GiB planned on a 64 GB box) and compute-bound. A fresh Q4_K_M
+prefill datapoint was skipped — the phase-2 receipts already pin its throughput,
+and re-measuring costs ~30 min of gateway downtime for a number we already have.
