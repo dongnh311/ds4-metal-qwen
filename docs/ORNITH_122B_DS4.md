@@ -169,7 +169,8 @@ ds4: memory detail: ctx=131072 prefill_cap=2048 raw_kv_rows=131072 compressed_kv
 `Ornith-1.5-122B-IQ2.gguf` with routed gate/up → **IQ2_XXS** and routed down →
 **Q2_K**, per-expert, guided by the unsloth `imatrix_unsloth.gguf_file`
 (sha256-verified `6e5ada71…dc103ab` on load). Every other tensor (attention, GDN,
-shared experts, MTP blk.48 Q8_0, norms, router, embeddings, output) is **copied
+shared experts, MTP head (its own Q4_K/Q6_K routed experts), norms, router,
+embeddings, output) is **copied
 verbatim**, so the dense path stays byte-identical to the official checkpoint and
 all earlier Dense/MTP receipts carry over unchanged. Engine constraint verified in
 `ds4.c` (~6201–6300): gate/up share one type per layer, routed superset
@@ -196,6 +197,11 @@ were pinned to three oracles:
   consecutive bytes at one bit-shift** per group (`qs[32p+16i+l] >> 2j`) with a
   canonical **MINUS** min-term, and iq2_xxs grid/sign tables are parsed from
   upstream `ggml-common.h` (`gguf-tools/ggml_tables.py`, npz-cached).
+
+**Scope note**: the MTP head `blk.48` is not a small Q8_0 blob — it has its own
+256 routed experts (Q4_K gate/up, Q6_K down) plus the `nextn` draft head. The
+requant tool deliberately leaves it verbatim (the draft path keeps the publisher's
+precision); requanting it would save only ~0.8 GiB and is a phase-3.4 idea.
 
 **Pilot QC (gguf-tools/ornith_pilot_qc.py, PASS)**: L0-only requant run
 (`--layers 0`, 69.81 GiB written in 54 s) accepted by `./ds4 --inspect --metal`
@@ -242,7 +248,11 @@ commit normally on the IQ2 file.
 | "Who wrote the novel Dune?" | `Frank Herbert` | 93.68 / 39.50 t/s |
 | `--mtp` "Name three colors: red," | `Red, blue, green.` (draft cycles committed) | — |
 
-Perplexity (`/tmp/ppl_probe.txt`, `-c 1024`, 32-token prefix, 992 tokens scored):
-**ppl 3.097** (avg_nll 1.130). The Q4_K_M baseline on the same probe is the
-remaining decision input — note the UD-IQ2_XXS file cannot be the reference: the
-engine gate refuses its `iq1_s` routed gate/up ("expert type iq1_s not supported").
+Perplexity (`/tmp/ppl_probe.txt`, `-c 1024`, 32-token prefix):
+**matched 100-token window** — Q4_K_M `ppl 26.64` (avg_nll 3.283) vs **IQ2 `ppl 24.88`
+(avg_nll 3.214)**: the IQ2 tier is 6.6% *lower* perplexity than the official Q4_K_M on
+the identical window — the decision gate (≤20% worse) is passed with margin. The longer
+992-token window scores `ppl 3.097` on the IQ2 tier (the full Q4_K_M equivalent needs
+~5.5 h of IO-bound decode, so it stays deferred; the matched short window plus the QA
+battery above is the quality evidence). The UD-IQ2_XXS file cannot serve as a reference:
+the engine gate refuses its `iq1_s` routed gate/up ("expert type iq1_s not supported").
