@@ -176,6 +176,12 @@ ds4: memory detail: ctx=131072 prefill_cap=2048 raw_kv_rows=131072 compressed_kv
 - Center-piece MTP: drafts accepted at depth 1 in the CLI smoke; the
   phase-3.4 receipt adds spec stats (accept 0.63–0.78, speed = the
   verbatim head ±1%) and the vision-suite MTP PASS.
+- Q4_K_M perplexity on the 500/1000-token windows (direct tier-apples-to-apples
+  beyond the pinned 100-token compare): **not measured** — each streamed pass
+  walks the full 36k-token corpus in ~2.1 h (2026-10-22 attempt skipped; see
+  task doc 3.4a). Between the self-built tiers the matched-window numbers are
+  exact (trunk bit-identical), so the standing cross-checkpoint claim stays
+  Q4_K_M 26.64 vs IQ2 24.88 at the 100-token matched window (−6.6%).
 
 ## Phase 3 (IQ2 tier): requant build (in progress)
 
