@@ -23,7 +23,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "gguf-tools"))
-from ornith_requant import deq_q2k, deq_q4k, deq_q6k, deq_iq2xxs, ImatrixMap  # noqa: E402
+from ornith_requant import deq_q2k, deq_q4k, deq_q6k, deq_iq2xxs, ImatrixMap, energy_weights  # noqa: E402
 from gguf_lite import Reader  # noqa: E402
 from ornith_dequant_check import parse_fixtures  # noqa: E402
 from qwen4_pack import GGMLQuantizer, default_quantizer_library  # noqa: E402
@@ -84,6 +84,9 @@ def main():
         for fam, sdeq, qtype, sblk, pblk in FAMS:
             st = next(t for t in s.tensors if t["name"] == f"blk.{il}.{fam}.weight")
             pt = next(t for t in p.tensors if t["name"] == f"blk.{il}.{fam}.weight")
+            if pt["type"] == st["type"] and pt["nbytes"] == st["nbytes"]:
+                print(f"L{il} {fam}: verbatim copy (unchanged), skipped")
+                continue
             OUT_DEQ = {16: deq_iq2xxs, 10: deq_q2k, 12: deq_q4k}
             OUT_QTYPE = {16: "IQ2_XXS", 10: "Q2_K", 12: "Q4_K"}
             if pt["type"] not in OUT_DEQ:
@@ -92,15 +95,28 @@ def main():
                 continue
             pdeq = OUT_DEQ[pt["type"]]
             qtype = OUT_QTYPE[pt["type"]]
+            if sdeq is None:
+                if st["type"] not in SRC_DEQ:
+                    print(f"L{il} {fam}: unexpected source type {st['type']}")
+                    ok = False
+                    continue
+                sdeq, sblk = SRC_DEQ[st["type"]]
             in_dim = st["dims"][0]
+            out_full_rows = st["dims"][1]
             s_row = (in_dim // 256) * sblk
             p_row = (in_dim // 256) * pblk
             cos, cos_live, n_live, both_zero, dead_live, byte_eq, byte_skip = [], [], 0, 0, 0, 0, 0
             with open(str(SRC), "rb") as fs, open(str(out_path), "rb") as fp:
                 for e in experts:
+                    # the packer's weights are per-expert, so read the whole expert block
+                    # once and derive the same weights the requant tool used
+                    fs.seek(st["abs"] + e * st["dims"][1] * s_row)
+                    block_vals = sdeq(fs.read(out_full_rows * s_row)).reshape(out_full_rows, in_dim)
+                    w2 = imap.pure_weights(f"blk.{il}.{fam}.weight", st["dims"][2], in_dim, e)
+                    if w2 is None:
+                        w2 = energy_weights(block_vals)
                     for r in out_rows:
-                        fs.seek(st["abs"] + (e * st["dims"][1] + r) * s_row)
-                        src_vals = sdeq(fs.read(s_row)).reshape(-1)
+                        src_vals = block_vals[r]
                         fp.seek(pt["abs"] + (e * pt["dims"][1] + r) * p_row)
                         out_bytes = fp.read(p_row)
                         out_vals = pdeq(out_bytes).reshape(-1)
@@ -113,13 +129,8 @@ def main():
                             both_zero += 1
                         dead_live += int((np.linalg.norm(src_vals) == 0) !=
                                         (np.linalg.norm(out_vals) == 0))
-                        # byte determinism: same input values + same packer + same imatrix weights
-                        w2 = imap.pure_weights(f"blk.{il}.{fam}.weight", st["dims"][2], in_dim, e)
-                        if w2 is None:
-                            byte_skip += 1
-                        else:
-                            reenc = quant.encode(src_vals.reshape(1, in_dim), qtype, w2)
-                            byte_eq += int(bytes(reenc) == out_bytes)
+                        reenc = quant.encode(src_vals.reshape(1, in_dim), qtype, w2)
+                        byte_eq += int(bytes(reenc) == out_bytes)
             cos = np.array(cos)
             live_cos = np.array(cos_live) if cos_live else np.array([1.0])
             tot_eq += byte_eq

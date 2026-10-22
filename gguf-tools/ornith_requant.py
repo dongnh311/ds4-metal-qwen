@@ -177,6 +177,15 @@ def deq_iq2xxs(buf):
     return out.reshape(nb, 256)
 
 
+def energy_weights(values):
+    """Imatrix stand-in for tensors the calibration never saw (the MTP draft head):
+    per-input-column importance = sum of squares over that expert's own rows."""
+    w = np.square(values, dtype=np.float32).sum(axis=0, dtype=np.float32)
+    if not np.all(np.isfinite(w)):
+        fail("nonfinite weight-energy fallback")
+    return np.ascontiguousarray(w, dtype="<f4")
+
+
 class ImatrixMap:
     """unsloth llama.cpp imatrix: '<name>.in_sum2' F32 with gguf dims [in, e] (numpy (e, in)) and
     '<name>.counts'. sha256-checked on load; families load lazily and stay resident."""
@@ -199,7 +208,10 @@ class ImatrixMap:
         st = self.by_name.get(tensor_name + ".in_sum2")
         ct = self.by_name.get(tensor_name + ".counts")
         if st is None or ct is None:
-            fail(f"imatrix entry missing for {tensor_name}")
+            # unsloth's calibration covers the trunk only; the MTP draft head has
+            # no entries, so callers fall back to the weights' own energy.
+            self.cache[tensor_name] = None
+            return None
         with open(self.path, "rb") as f:
             f.seek(st["abs"])
             sums = np.frombuffer(f.read(st["nbytes"]), "<f4").reshape(
@@ -214,7 +226,10 @@ class ImatrixMap:
     def pure_weights(self, tensor_name, n_experts, in_dim, e):
         """seam: the calibrated weights for expert e, or None when the calibration never saw
         that expert (the caller may then compare against its own fallback)."""
-        sums, counts = self._ensure(tensor_name, n_experts)
+        cal = self._ensure(tensor_name, n_experts)
+        if cal is None:
+            return None
+        sums, counts = cal
         if sums.shape[1] != in_dim:
             fail(f"imatrix in-dim mismatch for {tensor_name}: {sums.shape[1]} != {in_dim}")
         if counts[e] == 0.0:
@@ -224,27 +239,30 @@ class ImatrixMap:
     def expert_weights(self, tensor_name, n_experts, in_dim, e, values):
         """weights = sums[e] / counts[e] (llama.cpp convention, per input column); falls back to
         the sum of squares over the expert's own rows when calibration never saw that expert."""
-        sums, counts = self._ensure(tensor_name, n_experts)
+        cal = self._ensure(tensor_name, n_experts)
+        if cal is None:
+            return energy_weights(values)
+        sums, counts = cal
         if sums.shape[1] != in_dim:
             fail(f"imatrix in-dim mismatch for {tensor_name}: {sums.shape[1]} != {in_dim}")
         if counts[e] > 0.0:
             return np.ascontiguousarray(sums[e] / counts[e], dtype="<f4")
-        w = np.square(values, dtype=np.float32).sum(axis=0, dtype=np.float32)
-        if not np.all(np.isfinite(w)):
-            fail(f"{tensor_name}: nonfinite weight-energy fallback for expert {e}")
-        return np.ascontiguousarray(w, dtype="<f4")
+        return energy_weights(values)
 
 
-def build_plan(src, layers, threads, quantizer, imap, down_type="Q2_K"):
+def build_plan(src, layers, threads, quantizer, imap, down_type="Q2_K", include_mtp=False):
     """Per requantized routed-expert tensor: dims stay, type changes, nbytes shrink; data is
     produced by a streaming proc(out, h) that writes exactly nbytes bytes (and hashes them).
-    down_type="COPY" leaves routed down tensors verbatim (the conservative fallback tier)."""
+    down_type="COPY" leaves routed down tensors verbatim (the conservative fallback tier).
+    include_mtp also requants the MTP draft head (blk.48), whose experts have no calibration
+    entry in the unsloth imatrix and therefore use the weight-energy fallback."""
     plan = []
     for t in src.tensors:
         n = t["name"]
         if not (n.startswith("blk.") and n.endswith(".weight") and
-                any(f in n for f in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps")) and
-                not n.startswith("blk.48.")):
+                any(f in n for f in ("ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"))):
+            continue
+        if n.startswith("blk.48.") and not include_mtp:
             continue
         il = int(n.split(".")[1])
         if layers != "all" and str(il) not in layers:
@@ -258,6 +276,8 @@ def build_plan(src, layers, threads, quantizer, imap, down_type="Q2_K"):
                 fail(f"{n}: unexpected routed down source type {t['type']} (want Q4_K/Q6_K)")
             if down_type == "Q4_K":
                 dst_type, src_block = Q4_K, (210 if t["type"] == Q6_K else 144)
+            elif down_type == "IQ2_XXS":
+                dst_type, src_block = IQ2_XXS, (210 if t["type"] == Q6_K else 144)
             else:
                 dst_type, src_block = Q2_K, (210 if t["type"] == Q6_K else 144)
         else:
@@ -311,10 +331,15 @@ def main():
     ap.add_argument("--imatrix", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--layers", default="all", help="'all' or a comma list like 0,5,11")
-    ap.add_argument("--down-type", default="Q2_K", choices=("Q2_K", "Q4_K", "COPY"),
-                    help="routed down target: Q2_K (default tier), Q4_K (higher-fidelity "
-                         "fallback), or COPY to leave the source bytes verbatim")
+    ap.add_argument("--down-type", default="Q2_K", choices=("Q2_K", "IQ2_XXS", "Q4_K", "COPY"),
+                    help="routed down target: Q2_K (default tier), IQ2_XXS (smaller, coarser), "
+                         "Q4_K (higher-fidelity fallback), or COPY for the source bytes verbatim")
+    ap.add_argument("--with-mtp", action="store_true",
+                    help="also requant the MTP draft head (blk.48); its experts are uncalibrated "
+                         "in the unsloth imatrix, so they use the weight-energy fallback")
     ap.add_argument("--threads", type=int, default=8)
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the plan and its sizes, write nothing")
     ap.add_argument("--trust-imatrix", action="store_true", help="skip the imatrix sha256 check")
     args = ap.parse_args()
 
@@ -326,12 +351,18 @@ def main():
         layers = {x.strip() for x in layers.split(",") if x.strip()}
     print(f"ornith-requant: layers={args.layers} threads={args.threads}")
 
-    plan = build_plan(src, layers, args.threads, quantizer, imap, args.down_type)
+    plan = build_plan(src, layers, args.threads, quantizer, imap, args.down_type,
+                     args.with_mtp)
     kept = {e["name"]: e for e in plan}
     total_new = sum(e["nbytes"] for e in plan)
     total_old = sum(e["src_nbytes"] for e in plan)
     print(f"ornith-requant: {len(plan)} routed tensors, {total_old/2**30:.2f} GiB -> "
           f"{total_new/2**30:.2f} GiB")
+    if args.dry_run:
+        print(f"ornith-requant: dry run — down={args.down_type}, mtp={args.with_mtp}, "
+            f"whole-file estimate "
+            f"{(os.path.getsize(args.src) - (total_old - total_new))/2**30:.2f} GiB")
+        return
 
     tensors_out = []
     for t in src.tensors:
