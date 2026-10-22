@@ -31,9 +31,10 @@ echo "== matched-window perplexity (prefix 32, 200 tokens) =="
 "$REPO/ds4" --metal -m "$MODEL" -c 1024 -n 200 --perplexity-file /tmp/ppl_probe.txt 2>&1 |
     grep -E 'tokens=' | sed 's/^/  /'
 
-echo "== mtp draft path =="
-"$REPO/ds4" --metal -m "$MODEL" -c 2048 -n 40 --temp 0 --mtp -p 'Name three colors: red,' 2>&1 |
-    grep -v '^ds4: memory' | grep -vE '^ds4: (Metal|using|drift)' | sed 's/^/  /'
+echo "== mtp draft path (spec stats over ~640 greedy tokens) =="
+"$REPO/ds4" --metal -m "$MODEL" -c 4096 -n 640 --temp 0 --mtp \
+    -p 'Summarise how a bicycle works, then explain why gears matter, then describe one long ride you would plan through the mountains, then list three maintenance tips, then finish with a short poem about wheels.' 2>&1 |
+    grep -E 'spec stats|committed|draft' | sed 's/^/  /'
 
 echo "== decode-consistency (graph vs fresh re-prefill) =="
 "$REPO/ds4" --metal -m "$MODEL" -c 4096 --decode-consistency 8 --temp 0 \
