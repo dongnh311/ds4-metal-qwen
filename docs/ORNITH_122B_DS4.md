@@ -198,6 +198,16 @@ were pinned to three oracles:
   canonical **MINUS** min-term, and iq2_xxs grid/sign tables are parsed from
   upstream `ggml-common.h` (`gguf-tools/ggml_tables.py`, npz-cached).
 
+**Engine lane verification (no fallback, and the tables match upstream)**: `metal/moe.metal`
+has first-class `kernel_mul_mv_*_iq2_xxs_*` / `_q2_k_*` pipelines for the routed experts, and
+the engine's own copies of the tables are **bit-identical** to upstream ggml
+(`ds4_metal_iq2xxs_grid[256]`, `ds4_metal_ksigns_iq2xs[128]` compared against the parsed
+upstream header — IDENTICAL). Its `dequantize_iq2_xxs` uses the same aux32 grid/sign decode,
+and `dequantize_q2_K` uses `q + 32*(il/8) + 16*(il&1)`, per-16 masks 3/12/48/192 and
+`dl*q - ml` — the same canonical MINUS convention the packer writes. This closes the old
+Risk #1 ("IQ tiers must be self-checked before trusting speed numbers"): the 35–39 t/s decode
+is real compute, not a generic dequant path.
+
 **Scope note**: the MTP head `blk.48` is not a small Q8_0 blob — it has its own
 256 routed experts (Q4_K gate/up, Q6_K down) plus the `nextn` draft head. The
 requant tool deliberately leaves it verbatim (the draft path keeps the publisher's
