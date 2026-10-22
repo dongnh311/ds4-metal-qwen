@@ -212,7 +212,33 @@ and `dequantize_q2_K` uses `q + 32*(il/8) + 16*(il&1)`, per-16 masks 3/12/48/192
 Risk #1 ("IQ tiers must be self-checked before trusting speed numbers"): the 35–39 t/s decode
 is real compute, not a generic dequant path.
 
-**Scope note**: the MTP head `blk.48` is not a small Q8_0 blob — it has its own
+**UD ladder is not usable on this engine (measured, not assumed).** Header audit of the
+unsloth files (range-request, no download needed) shows their routed experts use types the
+gate refuses:
+
+| UD file | routed expert types | engine verdict |
+| --- | --- | --- |
+| `UD-Q2_K_XL` (44.5 GB) | `iq1_s`, `iq2_xs`, `iq3_xxs`, `q3_k`, `q5_0` | refused ("expert type … not supported") |
+| `UD-IQ3_XXS` (49.5 GB) | `iq1_s`, `iq2_xs`, `iq4_1`, `q3_k`, `q5_0` | refused |
+| `UD-IQ2_XXS` (42.0 GB) | `iq1_s` gate/up | refused |
+
+The engine's routed superset is `{Q8_0, IQ2_XXS, Q2_K, Q4_K, Q5_K, Q6_K, MXFP4}`, so the
+ladder has to be built from the official checkpoint with those types — which is what
+`ornith_requant.py` now does (`--down-type Q2_K|IQ2_XXS|Q4_K|COPY`, `--with-mtp`).
+
+**MTP head**: `blk.48` is not a small Q8_0 blob — it carries its own 256 routed experts
+(Q4_K gate/up, Q6_K down) plus the `nextn` draft head. The unsloth imatrix covers the trunk
+only, so `--with-mtp` quantizes those experts with a weight-energy importance matrix (per
+input column: sum of squares over the expert's own rows) — the same fallback the packer uses
+for experts the calibration never saw. The `ornith_pilot_qc.py` byte-determinism check derives
+the identical weights, so the MTP variant is verified the same way as the trunk.
+
+**Vision path**: `mmproj-Ornith-1.5-122B-BF16.gguf` (912,263,200 B) is in the repo but its
+dense weights are `bf16`, and `qwen4_vision_weights_bind` accepts only `f32|f16|q8_0` — so
+the BF16 mmproj is rejected at bind time. The `mmproj-F16.gguf` variant (908,724,544 B,
+`f32` + `f16`) is the engine-compatible one; both are now in the model directory under
+`mmproj-Ornith-1.5-122B-{BF16,F16}.gguf`. The mmproj is `clip` / `qwen3vl_merger`,
+embedding 1152, 27 blocks, projection 3072 — matching the 122B trunk.
 256 routed experts (Q4_K gate/up, Q6_K down) plus the `nextn` draft head. The
 requant tool deliberately leaves it verbatim (the draft path keeps the publisher's
 precision); requanting it would save only ~0.8 GiB and is a phase-3.4 idea.
