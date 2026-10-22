@@ -22,6 +22,11 @@ This document is the operating manual + receipts for the qwq35moe 122B shape
 | `Ornith-1.5-122B-IQ2-MTP.gguf` | 37,359,075,296 bytes (34.79 GiB) | same construction **plus** the MTP draft head `blk.48` requantized (IQ2_XXS gate/up, Q2_K down; no imatrix entries exist for it → weight-energy fallback). Trunk bit-identical to the tier above (perplexity nll equal to the last hex digit); spec acceptance measured equal-or-better (receipt `ornith_requant.receipt-mtp.json`) |
 | `Ornith-1.5-122B-IQ2-Q4Kdown.gguf` | 47,305,867,232 bytes (44.06 GiB) | high-fidelity rung: routed down → Q4_K everywhere (Q6_K re-encodes at live-pos cos 0.999). **Perplexity −2.5%** vs the shipped tier (2.9959 vs 3.0723, 1000-token window); prefill ~8–10% slower, +8.4 GiB (receipt `ornith_requant.receipt-q4kdown.json`) |
 | `mmproj-Ornith-1.5-122B-BF16.gguf` | 912,263,200 bytes | official repo vision encoder; **unusable** — `qwen4_vision_weights_bind` accepts only f32|f16|q8_0 and this file's dense weights are bf16 |
+
+`Ornith-1.5-122B-UD-IQ2_XXS.gguf` (unsloth UD ladder, 41,967,395,072 bytes) was
+downloaded for the header audit and **deleted 2026-10-22** — its expert types
+(`iq1_s` / `iq2_xs`) are outside the engine's legal superset, so the file could
+never load; the 42 GiB went back to disk.
 | `mmproj-Ornith-1.5-122B-F16.gguf` | 908,724,544 bytes | unsloth F16 variant — the engine-compatible mmproj; `tests/test_qwen35_vision` PASS on both IQ2 tiers with it |
 
 Both live in `~/.local/share/ai-gateway/ds4-models/ornith-122b/`. The
