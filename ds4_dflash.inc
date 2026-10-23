@@ -159,6 +159,13 @@ static const char *ds4_dfl_tstat_name[DS4_DFL_TSTAT_SLOTS] = {
     } \
 } while (0)
 
+/* always releases the inject k/v plane views (NULL-safe elements)      */
+#define DFLASH_KV_VIEW_FREE(kvw_, vvw_) do { \
+    for (int _il = 0; _il < (int)DS4_DFLASH_MAX_LAYERS; _il++) { \
+        ds4_gpu_tensor_free((kvw_)[_il]); ds4_gpu_tensor_free((vvw_)[_il]); \
+    } \
+} while (0)
+
 /* ------------------------------------------------------------------ */
 /* host math helpers                                                    */
 /* ------------------------------------------------------------------ */
@@ -459,8 +466,14 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     }
     { const char *dv = getenv("DS4_DFLASH_DEBUG");
       df->dbg = dv && dv[0] && dv[0] != '0'; }
+    /* W-D4b receipts (dfl_b4fc*.txt, 2026-10-23): the fc Q4_K gemv with
+     * in-dim taps*E = 24576 runs on the multi-gemv kernel fine — the old
+     * "no GPU kernel path" note was wrong — and the 302 MB host sgemm
+     * (DRAM-bound ~6-8 ms per chunk, re-read every inject) drops to
+     * ~0.6 ms of GPU time, so the GPU path is the default now; an explicit
+     * DS4_DFLASH_GPU_FC=0 keeps the host sgemm for empirical A/B.        */
     { const char *gv = getenv("DS4_DFLASH_GPU_FC");
-      df->gpu_fc = gv && gv[0] && gv[0] != '0'; }
+      df->gpu_fc = !gv || !gv[0] || gv[0] != '0'; }
     { const char *tv = getenv("DS4_DFLASH_TSTAT");
       df->tstat = tv && tv[0] && tv[0] != '0'; }
     df->inj_chunk = DS4_DFLASH_INJ_CAP;
@@ -492,8 +505,8 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     DF_ALLOC(gtap,     (uint64_t)DS4_DFLASH_INJ_CAP * df->n_taps * df->E);
     DF_ALLOC(ginj,     (uint64_t)DS4_DFLASH_INJ_CAP * df->E);
     DF_ALLOC(gfc,      (uint64_t)DS4_DFLASH_INJ_CAP * df->E);
-    DF_ALLOC(gk_inj,   (uint64_t)DS4_DFLASH_INJ_CAP * df->kv_heads * df->hd);
-    DF_ALLOC(gv_inj,   (uint64_t)DS4_DFLASH_INJ_CAP * df->kv_heads * df->hd);
+    DF_ALLOC(gk_inj,   (uint64_t)df->n_layer * DS4_DFLASH_INJ_CAP * df->kv_heads * df->hd);
+    DF_ALLOC(gv_inj,   (uint64_t)df->n_layer * DS4_DFLASH_INJ_CAP * df->kv_heads * df->hd);
     DF_ALLOC(gtap_ring,
              (uint64_t)df->n_taps * df->ring_cap * df->E);
 #undef DF_ALLOC
@@ -530,11 +543,10 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     DF_MALLOC(fc_w, (size_t)df->E * (size_t)df->n_taps * df->E * sizeof(float));
 #undef DF_MALLOC
     if (ok) {
-        /* host fc: the drafter's only tensor whose in-dim (taps*E = 24576)
-         * has no GPU kernel path (both mul_mv_ext and the NAX/plain tensor
-         * matmuls reject that shape) — dequantize once at attach, then
-         * sgemm per inject chunk.  DS4_DFLASH_GPU_FC=1 forces the GPU path
-         * for empirical bisection. */
+        /* host fc fallback (DS4_DFLASH_GPU_FC=0): the drafter's only tensor
+         * with in-dim taps*E = 24576 — W-D4b receipts show the GPU multi-gemv
+         * handles that in-dim, so this host dequant + sgemm only runs on
+         * request (DRAM-bound ~6-8 ms per inject chunk).                    */
         for (uint32_t e = 0; ok && e < df->E; e++)
             ds4_dfl_row(df->dm, dw->fc, e, df->fc_w + (size_t)e * df->n_taps * df->E);
     }
@@ -692,56 +704,71 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
         }
         DS4_DFL_TEND(df, 3, trm);
 
-        /* 2. per layer: k/v projections, k_norm + rope, cache append       */
-        for (uint32_t il = 0; il < df->n_layer && df->wired; il++) {
-            const double tkv = df->tstat ? now_sec() : 0.0;       /* TSTAT inj_kv  */
-            if (ds4_gpu_tensor_write(df->ginj, 0, df->enc, (size_t)n * erow) != 1) {
-                fprintf(stderr, "ds4: dflash: inject ginj write failed\n");
-                df->wired = false;
-                return;
-            }
-            /* the probe runs outside forwards: open the batch ourselves so
-             * gemv dispatch + end_commands pair up (a bare end_commands
-             * fails when no batch is open, and the raw gemvs would run
-             * owned-synchronous and leave the readbacks racing)          */
-            if (!glm_graph_begin_commands_if_needed()) {
-                df->wired = false;
-                return;
-            }
-            if (!qwen4_gemv(df->gk_inj, df->dm, dw->block[il].attn_k, df->ginj, n) ||
-                !qwen4_gemv(df->gv_inj, df->dm, dw->block[il].attn_v, df->ginj, n)) {
+        /* 2. all layers: k/v projections share the same enc rows — one     *
+         * command batch for the whole stack (per-layer planes inside       *
+         * gk_inj/gv_inj), one sync, then per-layer read + cache append     */
+        const double tkv = df->tstat ? now_sec() : 0.0;           /* TSTAT inj_kv  */
+        ds4_gpu_tensor *kvw[DS4_DFLASH_MAX_LAYERS] = {0};
+        ds4_gpu_tensor *vvw[DS4_DFLASH_MAX_LAYERS] = {0};
+        bool kok = true, opened = false;
+        for (uint32_t il = 0; kok && il < df->n_layer; il++) {
+            const uint64_t plane = (uint64_t)il * DS4_DFLASH_INJ_CAP * KV * sizeof(float);
+            const uint64_t bytes = (uint64_t)DS4_DFLASH_INJ_CAP * KV * sizeof(float);
+            kvw[il] = ds4_gpu_tensor_view(df->gk_inj, plane, bytes);
+            vvw[il] = ds4_gpu_tensor_view(df->gv_inj, plane, bytes);
+            kok = kvw[il] && vvw[il];
+        }
+        if (kok && ds4_gpu_tensor_write(df->ginj, 0, df->enc, (size_t)n * erow) != 1) {
+            fprintf(stderr, "ds4: dflash: inject ginj write failed\n");
+            kok = false;
+        }
+        /* the probe runs outside forwards: open the batch ourselves so
+         * gemv dispatch + end_commands pair up (a bare end_commands
+         * fails when no batch is open, and the raw gemvs would run
+         * owned-synchronous and leave the readbacks racing)          */
+        if (kok) opened = glm_graph_begin_commands_if_needed();
+        kok = kok && opened;
+        for (uint32_t il = 0; kok && il < df->n_layer; il++) {
+            if (!qwen4_gemv(kvw[il], df->dm, dw->block[il].attn_k, df->ginj, n) ||
+                !qwen4_gemv(vvw[il], df->dm, dw->block[il].attn_v, df->ginj, n)) {
                 fprintf(stderr, "ds4: dflash: inject k/v gemv failed (layer %u n=%u)\n", il, n);
-                df->wired = false;
-                return;
+                kok = false;
             }
-            if (!ds4_gpu_end_commands()) { df->wired = false; return; }
-            if (ds4_gpu_tensor_read(df->gk_inj, 0, df->ik, (size_t)n * KV * sizeof(float)) != 1 ||
-                ds4_gpu_tensor_read(df->gv_inj, 0, df->iv, (size_t)n * KV * sizeof(float)) != 1) {
-                fprintf(stderr, "ds4: dflash: inject kv read failed (layer %u)\n", il);
-                df->wired = false;
-                return;
-            }
-            DS4_DFL_TEND(df, 4, tkv);
+        }
+        if (opened && !ds4_gpu_end_commands()) kok = false;
+        DS4_DFL_TEND(df, 4, tkv);
+        for (uint32_t il = 0; kok && il < df->n_layer; il++) {
             const double tkh = df->tstat ? now_sec() : 0.0;       /* TSTAT inj_kvhost */
-            const float *knw = ds4_dfl_f32(df->dm, dw->block[il].attn_k_norm);
-            if (!knw) { df->wired = false; return; }
-            const size_t lbase = (size_t)il * df->kv_heads * df->ring_cap * df->hd;
-            for (uint32_t j = 0; j < n; j++) {
-                const uint32_t pos = from + j;
-                const size_t dst = lbase + (size_t)(pos % df->ring_cap) * df->hd;
-                ds4_dfl_head_rms(df->ik + (size_t)j * KV, 1u, df->kv_heads, df->hd, knw, df->eps);
-                for (uint32_t h = 0; h < df->kv_heads; h++) {
-                    float *kh = df->ik + (size_t)j * KV + (size_t)h * df->hd;
-                    ds4_dfl_rope(kh, df->hd, (double)pos, df->rope_base);
-                    memcpy(df->ck + dst + (size_t)h * df->ring_cap * df->hd,
-                           kh, (size_t)df->hd * sizeof(float));
-                    memcpy(df->cv + dst + (size_t)h * df->ring_cap * df->hd,
-                           df->iv + ((size_t)j * KV) + (size_t)h * df->hd,
-                           (size_t)df->hd * sizeof(float));
+            if (ds4_gpu_tensor_read(kvw[il], 0, df->ik, (size_t)n * KV * sizeof(float)) != 1 ||
+                ds4_gpu_tensor_read(vvw[il], 0, df->iv, (size_t)n * KV * sizeof(float)) != 1) {
+                fprintf(stderr, "ds4: dflash: inject kv read failed (layer %u)\n", il);
+                kok = false;
+            }
+            if (kok) {
+                const float *knw = ds4_dfl_f32(df->dm, dw->block[il].attn_k_norm);
+                if (!knw) { kok = false; }
+                else {
+                    const size_t lbase = (size_t)il * df->kv_heads * df->ring_cap * df->hd;
+                    for (uint32_t j = 0; j < n; j++) {
+                        const uint32_t pos = from + j;
+                        const size_t dst = lbase + (size_t)(pos % df->ring_cap) * df->hd;
+                        ds4_dfl_head_rms(df->ik + (size_t)j * KV, 1u, df->kv_heads, df->hd, knw, df->eps);
+                        for (uint32_t h = 0; h < df->kv_heads; h++) {
+                            float *kh = df->ik + (size_t)j * KV + (size_t)h * df->hd;
+                            ds4_dfl_rope(kh, df->hd, (double)pos, df->rope_base);
+                            memcpy(df->ck + dst + (size_t)h * df->ring_cap * df->hd,
+                                   kh, (size_t)df->hd * sizeof(float));
+                            memcpy(df->cv + dst + (size_t)h * df->ring_cap * df->hd,
+                                   df->iv + ((size_t)j * KV) + (size_t)h * df->hd,
+                                   (size_t)df->hd * sizeof(float));
+                        }
+                    }
                 }
             }
             DS4_DFL_TEND(df, 5, tkh);
         }
+        DFLASH_KV_VIEW_FREE(kvw, vvw);              /* always releases views */
+        if (!kok) { df->wired = false; return; }
         df->inj_next = from + n;
     }
 }
@@ -891,22 +918,18 @@ static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t po
             DS4_DFL_TEND(df, 15, t0);
         }
         {
-            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_gate  */
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_gate: merged gate+up batch (W-D4b) */
             if (!glm_graph_begin_commands_if_needed()) return false;
+            /* the gate and up projections share xn and carry no host step
+             * between: one command batch, one sync (the two readbacks ride
+             * the same fence)                                             */
             if (!qwen4_gemv(df->gffn1, df->dm, dw->block[il].ffn_gate, df->gxn, T) ||
+                !qwen4_gemv(df->gffn2, df->dm, dw->block[il].ffn_up, df->gxn, T) ||
                 !ds4_gpu_end_commands() ||
-                ds4_gpu_tensor_read(df->gffn1, 0, df->gw, (size_t)T * ffrow) != 1)
-                return false;
-            DS4_DFL_TEND(df, 16, t0);
-        }
-        {
-            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_up    */
-            if (!glm_graph_begin_commands_if_needed()) return false;
-            if (!qwen4_gemv(df->gffn2, df->dm, dw->block[il].ffn_up, df->gxn, T) ||
-                !ds4_gpu_end_commands() ||
+                ds4_gpu_tensor_read(df->gffn1, 0, df->gw, (size_t)T * ffrow) != 1 ||
                 ds4_gpu_tensor_read(df->gffn2, 0, df->gu, (size_t)T * ffrow) != 1)
                 return false;
-            DS4_DFL_TEND(df, 17, t0);
+            DS4_DFL_TEND(df, 16, t0);
         }
         {
             const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_silu  */
