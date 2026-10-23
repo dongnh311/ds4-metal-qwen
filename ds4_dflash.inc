@@ -52,6 +52,7 @@
 
 #define DS4_DFLASH_WINDOW_DEFAULT 2048u
 #define DS4_DFLASH_INJ_CAP        256u
+#define DS4_DFL_TSTAT_SLOTS       24u
 #define DS4_DFLASH_MAX_DRAFT      15u    /* trained block_size - 1          */
 
 typedef struct ds4_dflash_gpu {
@@ -65,6 +66,9 @@ typedef struct ds4_dflash_gpu {
     uint32_t cap_rows;                      /* = block_size                    */
     bool     probe;                         /* DS4_DFLASH_PROBE                */
     bool     wired;
+    bool     tstat;                         /* DS4_DFLASH_TSTAT=1              */
+    double   tstat_ms[DS4_DFL_TSTAT_SLOTS];          /* cumulative wall ms      */
+    uint64_t tstat_n[DS4_DFL_TSTAT_SLOTS];             /* region occurrences     */
 
     /* model handles: dm = drafter support file, tm/tw = trunk              */
     ds4_model        *dm;
@@ -131,6 +135,29 @@ typedef struct ds4_dflash_gpu {
     uint64_t verify_swaps, verify_fallbacks;
     uint32_t verify_hist[DS4_DFLASH_MAX_DRAFT + 2];
 } ds4_dflash_gpu;
+
+/* ------------------------------------------------------------------ */
+/* W-D4b TSTAT: fine wall decomposition of inject+draft (default off)   */
+/*                                                                      */
+/* The stage picture (inject+draft ≈ 25-40 ms/cycle whole) hides where   */
+/* the time actually sits: sync round trips per gemv batch, the host    */
+/* fc sgemm, cblas attention, or the host conv/rope work.  TSTAT scopes */
+/* every inject/draft sub-region and prints the cumulative mean per     */
+/* occurrence alongside the verify receipts.                            */
+/* ------------------------------------------------------------------ */
+static const char *ds4_dfl_tstat_name[DS4_DFL_TSTAT_SLOTS] = {
+    "inj_taps", "inj_w",  "inj_fc",  "inj_rms", "inj_kv",  "inj_kvhost",
+    "d_rmsw",   "d_cproj", "d_conv0", "d_qkv",  "d_rope",  "d_attn",
+    "d_wo",     "d_hup",   "d_fproj", "d_fconv", "d_gate",  "d_up",
+    "d_silu",   "d_down",  "d_fup2",  "d_final", "d_walk",  "spare22"
+};
+
+#define DS4_DFL_TEND(df, slot_, t0_) do { \
+    if ((df)->tstat && (t0_) > 0.0) { \
+        (df)->tstat_ms[slot_] += (now_sec() - (t0_)) * 1000.0; \
+        (df)->tstat_n[slot_]++; \
+    } \
+} while (0)
 
 /* ------------------------------------------------------------------ */
 /* host math helpers                                                    */
@@ -314,6 +341,15 @@ static void ds4_dflash_verify_flush(ds4_dflash_gpu *df) {
     fprintf(stderr, " | swaps %llu fallbacks %llu\n",
             (unsigned long long)df->verify_swaps, (unsigned long long)df->verify_fallbacks);
     fflush(stderr);
+    if (df->tstat) {
+        fprintf(stderr, "ds4: dfl tstat ms/call:");
+        for (int s = 0; s < DS4_DFL_TSTAT_SLOTS; s++)
+            if (df->tstat_n[s])
+                fprintf(stderr, " %s %.2f", ds4_dfl_tstat_name[s],
+                        df->tstat_ms[s] / (double)df->tstat_n[s]);
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
 }
 
 static void ds4_dflash_free(struct ds4_dflash_gpu *df) {
@@ -425,6 +461,8 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
       df->dbg = dv && dv[0] && dv[0] != '0'; }
     { const char *gv = getenv("DS4_DFLASH_GPU_FC");
       df->gpu_fc = gv && gv[0] && gv[0] != '0'; }
+    { const char *tv = getenv("DS4_DFLASH_TSTAT");
+      df->tstat = tv && tv[0] && tv[0] != '0'; }
     df->inj_chunk = DS4_DFLASH_INJ_CAP;
     {
         const char *cv = getenv("DS4_DFLASH_INJ_CHUNK");
@@ -597,6 +635,7 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
                     (unsigned long long)ds4_gpu_tensor_bytes(df->gk_inj),
                     (unsigned long long)ds4_gpu_tensor_bytes(df->gv_inj),
                     (void *)df->stage);
+        const double ts = df->tstat ? now_sec() : 0.0;           /* TSTAT inj_taps */
         for (uint32_t j = 0; j < n; j++) {
             const uint32_t pos = from + j;
             const uint32_t slot = pos % df->ring_cap;
@@ -613,11 +652,15 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
                 }
             }
         }
+        DS4_DFL_TEND(df, 0, ts);
+        const double tw = df->tstat ? now_sec() : 0.0;            /* TSTAT inj_w   */
         if (ds4_gpu_tensor_write(df->gtap, 0, df->stage, (size_t)n * row_bytes) != 1) {
             fprintf(stderr, "ds4: dflash: inject gtap write failed (n=%u)\n", n);
             df->wired = false;
             return;
         }
+        DS4_DFL_TEND(df, 1, tw);
+        const double tfc = df->tstat ? now_sec() : 0.0;           /* TSTAT inj_fc  */
         if (df->gpu_fc) {
             if (!glm_graph_begin_commands_if_needed()) { df->wired = false; return; }
             if (!qwen4_gemv(df->gfc, df->dm, dw->fc, df->gtap, n)) {
@@ -638,6 +681,8 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
                         df->fc_w, (int)(df->n_taps * df->E),
                         0.0f, df->enc, (int)df->E);
         }
+        DS4_DFL_TEND(df, 2, tfc);
+        const double trm = df->tstat ? now_sec() : 0.0;           /* TSTAT inj_rms */
         {
             const float *ew = ds4_dfl_f32(df->dm, dw->enc_output_norm);
             if (!ew) { df->wired = false; return; }
@@ -645,9 +690,11 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
                 ds4_dfl_rms(df->enc + (size_t)j * df->E, ew, df->E, df->eps,
                             df->enc + (size_t)j * df->E);
         }
+        DS4_DFL_TEND(df, 3, trm);
 
         /* 2. per layer: k/v projections, k_norm + rope, cache append       */
         for (uint32_t il = 0; il < df->n_layer && df->wired; il++) {
+            const double tkv = df->tstat ? now_sec() : 0.0;       /* TSTAT inj_kv  */
             if (ds4_gpu_tensor_write(df->ginj, 0, df->enc, (size_t)n * erow) != 1) {
                 fprintf(stderr, "ds4: dflash: inject ginj write failed\n");
                 df->wired = false;
@@ -674,6 +721,8 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
                 df->wired = false;
                 return;
             }
+            DS4_DFL_TEND(df, 4, tkv);
+            const double tkh = df->tstat ? now_sec() : 0.0;       /* TSTAT inj_kvhost */
             const float *knw = ds4_dfl_f32(df->dm, dw->block[il].attn_k_norm);
             if (!knw) { df->wired = false; return; }
             const size_t lbase = (size_t)il * df->kv_heads * df->ring_cap * df->hd;
@@ -691,6 +740,7 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
                            (size_t)df->hd * sizeof(float));
                 }
             }
+            DS4_DFL_TEND(df, 5, tkh);
         }
         df->inj_next = from + n;
     }
@@ -734,35 +784,46 @@ static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t po
         const size_t lbase = (size_t)il * df->kv_heads * df->ring_cap * df->hd;
         /* --- attention half                                               */
         {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_rmsw */
             const float *aw = ds4_dfl_f32(df->dm, dw->block[il].attn_norm);
             if (!aw) return false;
             for (uint32_t t = 0; t < T; t++)
                 ds4_dfl_rms(df->h + (size_t)t * E, aw, E, df->eps, df->xn + (size_t)t * E);
             if (ds4_gpu_tensor_write(df->gxn, 0, df->xn, (size_t)T * erow) != 1) return false;
+            DS4_DFL_TEND(df, 6, t0);
+            const double t1 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_cproj */
             if (!glm_graph_begin_commands_if_needed()) return false;
             if (!qwen4_gemv(df->gconv, df->dm, dw->block[il].attn_conv_proj, df->gxn, T))
                 return false;
             if (!ds4_gpu_end_commands()) return false;
             if (ds4_gpu_tensor_read(df->gconv, 0, df->dyn, (size_t)T * dk * sizeof(float)) != 1)
                 return false;
+            DS4_DFL_TEND(df, 7, t1);
         }
         {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_conv0 */
             const float *basep = ds4_dfl_f32(df->dm, dw->block[il].attn_conv_base);
             if (!basep) return false;
             ds4_dfl_conv(T, df->block_size, E, df->group, df->kernel,
                          df->dyn, 0, basep, df->xn, df->cr1);
             if (ds4_gpu_tensor_write(df->gxn, 0, df->cr1, (size_t)T * erow) != 1) return false;
+            DS4_DFL_TEND(df, 8, t0);
         }
-        if (!glm_graph_begin_commands_if_needed()) return false;
-        if (!qwen4_gemv(df->gq, df->dm, dw->block[il].attn_q, df->gxn, T) ||
-            !qwen4_gemv(df->gk, df->dm, dw->block[il].attn_k, df->gxn, T) ||
-            !qwen4_gemv(df->gv, df->dm, dw->block[il].attn_v, df->gxn, T) ||
-            !ds4_gpu_end_commands() ||
-            ds4_gpu_tensor_read(df->gq, 0, df->q, (size_t)T * QD * sizeof(float)) != 1 ||
-            ds4_gpu_tensor_read(df->gk, 0, df->kb, (size_t)T * KV * sizeof(float)) != 1 ||
-            ds4_gpu_tensor_read(df->gv, 0, df->vb, (size_t)T * KV * sizeof(float)) != 1)
-            return false;
         {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_qkv   */
+            if (!glm_graph_begin_commands_if_needed()) return false;
+            if (!qwen4_gemv(df->gq, df->dm, dw->block[il].attn_q, df->gxn, T) ||
+                !qwen4_gemv(df->gk, df->dm, dw->block[il].attn_k, df->gxn, T) ||
+                !qwen4_gemv(df->gv, df->dm, dw->block[il].attn_v, df->gxn, T) ||
+                !ds4_gpu_end_commands() ||
+                ds4_gpu_tensor_read(df->gq, 0, df->q, (size_t)T * QD * sizeof(float)) != 1 ||
+                ds4_gpu_tensor_read(df->gk, 0, df->kb, (size_t)T * KV * sizeof(float)) != 1 ||
+                ds4_gpu_tensor_read(df->gv, 0, df->vb, (size_t)T * KV * sizeof(float)) != 1)
+                return false;
+            DS4_DFL_TEND(df, 9, t0);
+        }
+        {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_rope  */
             const float *qw = ds4_dfl_f32(df->dm, dw->block[il].attn_q_norm);
             const float *kw = ds4_dfl_f32(df->dm, dw->block[il].attn_k_norm);
             if (!qw || !kw) return false;
@@ -776,26 +837,38 @@ static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t po
                     ds4_dfl_rope(df->kb + (size_t)t * KV + (size_t)h * df->hd, df->hd,
                                  (double)(pos0 + t), df->rope_base);
             }
+            DS4_DFL_TEND(df, 10, t0);
         }
-        ds4_dfl_attention(df, df->q, df->ck + lbase, df->cv + lbase, n_ctx,
-                          df->kb, df->vb, T, df->o);
-        if (ds4_gpu_tensor_write(df->gattn, 0, df->o, (size_t)T * QD * sizeof(float)) != 1)
-            return false;
-        if (!glm_graph_begin_commands_if_needed()) return false;
-        if (!qwen4_gemv(df->gwo, df->dm, dw->block[il].attn_output, df->gattn, T) ||
-            !ds4_gpu_end_commands() ||
-            ds4_gpu_tensor_read(df->gwo, 0, df->ho, (size_t)T * erow) != 1)
-            return false;
         {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_attn  */
+            ds4_dfl_attention(df, df->q, df->ck + lbase, df->cv + lbase, n_ctx,
+                              df->kb, df->vb, T, df->o);
+            DS4_DFL_TEND(df, 11, t0);
+        }
+        {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_wo    */
+            if (ds4_gpu_tensor_write(df->gattn, 0, df->o, (size_t)T * QD * sizeof(float)) != 1)
+                return false;
+            if (!glm_graph_begin_commands_if_needed()) return false;
+            if (!qwen4_gemv(df->gwo, df->dm, dw->block[il].attn_output, df->gattn, T) ||
+                !ds4_gpu_end_commands() ||
+                ds4_gpu_tensor_read(df->gwo, 0, df->ho, (size_t)T * erow) != 1)
+                return false;
+            DS4_DFL_TEND(df, 12, t0);
+        }
+        {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_hup   */
             const float *basep = ds4_dfl_f32(df->dm, dw->block[il].attn_conv_base);
             if (!basep) return false;
             ds4_dfl_conv(T, df->block_size, E, df->group, df->kernel,
                          df->dyn, 1, basep, df->ho, df->cr2);
+            for (size_t i = 0; i < (size_t)T * E; i++) df->h[i] += df->cr2[i];
+            DS4_DFL_TEND(df, 13, t0);
         }
-        for (size_t i = 0; i < (size_t)T * E; i++) df->h[i] += df->cr2[i];
 
         /* --- ffn half                                                     */
         {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_fproj */
             const float *fwn = ds4_dfl_f32(df->dm, dw->block[il].ffn_norm);
             if (!fwn) return false;
             for (uint32_t t = 0; t < T; t++)
@@ -806,63 +879,89 @@ static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t po
                 !ds4_gpu_end_commands() ||
                 ds4_gpu_tensor_read(df->gconv2, 0, df->dyn2, (size_t)T * dk * sizeof(float)) != 1)
                 return false;
+            DS4_DFL_TEND(df, 14, t0);
+        }
+        {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_fconv */
             const float *basep = ds4_dfl_f32(df->dm, dw->block[il].ffn_conv_base);
             if (!basep) return false;
             ds4_dfl_conv(T, df->block_size, E, df->group, df->kernel,
                          df->dyn2, 0, basep, df->xn, df->cr1);
             if (ds4_gpu_tensor_write(df->gxn, 0, df->cr1, (size_t)T * erow) != 1) return false;
+            DS4_DFL_TEND(df, 15, t0);
         }
-        if (!glm_graph_begin_commands_if_needed()) return false;
-        if (!qwen4_gemv(df->gffn1, df->dm, dw->block[il].ffn_gate, df->gxn, T) ||
-            !ds4_gpu_end_commands() ||
-            ds4_gpu_tensor_read(df->gffn1, 0, df->gw, (size_t)T * ffrow) != 1)
-            return false;
-        if (!glm_graph_begin_commands_if_needed()) return false;
-        if (!qwen4_gemv(df->gffn2, df->dm, dw->block[il].ffn_up, df->gxn, T) ||
-            !ds4_gpu_end_commands() ||
-            ds4_gpu_tensor_read(df->gffn2, 0, df->gu, (size_t)T * ffrow) != 1)
-            return false;
-        for (size_t i = 0; i < (size_t)T * df->ff; i++) {
-            const float v = df->gw[i];
-            df->gm[i] = v / (1.0f + expf(-v)) * df->gu[i];
-        }
-        if (ds4_gpu_tensor_write(df->gmid, 0, df->gm, (size_t)T * ffrow) != 1) return false;
-        if (!glm_graph_begin_commands_if_needed()) return false;
-        if (!qwen4_gemv(df->gwo, df->dm, dw->block[il].ffn_down, df->gmid, T) ||
-            !ds4_gpu_end_commands() ||
-            ds4_gpu_tensor_read(df->gwo, 0, df->ho, (size_t)T * erow) != 1)
-            return false;
         {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_gate  */
+            if (!glm_graph_begin_commands_if_needed()) return false;
+            if (!qwen4_gemv(df->gffn1, df->dm, dw->block[il].ffn_gate, df->gxn, T) ||
+                !ds4_gpu_end_commands() ||
+                ds4_gpu_tensor_read(df->gffn1, 0, df->gw, (size_t)T * ffrow) != 1)
+                return false;
+            DS4_DFL_TEND(df, 16, t0);
+        }
+        {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_up    */
+            if (!glm_graph_begin_commands_if_needed()) return false;
+            if (!qwen4_gemv(df->gffn2, df->dm, dw->block[il].ffn_up, df->gxn, T) ||
+                !ds4_gpu_end_commands() ||
+                ds4_gpu_tensor_read(df->gffn2, 0, df->gu, (size_t)T * ffrow) != 1)
+                return false;
+            DS4_DFL_TEND(df, 17, t0);
+        }
+        {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_silu  */
+            for (size_t i = 0; i < (size_t)T * df->ff; i++) {
+                const float v = df->gw[i];
+                df->gm[i] = v / (1.0f + expf(-v)) * df->gu[i];
+            }
+            if (ds4_gpu_tensor_write(df->gmid, 0, df->gm, (size_t)T * ffrow) != 1) return false;
+            DS4_DFL_TEND(df, 18, t0);
+        }
+        {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_down  */
+            if (!glm_graph_begin_commands_if_needed()) return false;
+            if (!qwen4_gemv(df->gwo, df->dm, dw->block[il].ffn_down, df->gmid, T) ||
+                !ds4_gpu_end_commands() ||
+                ds4_gpu_tensor_read(df->gwo, 0, df->ho, (size_t)T * erow) != 1)
+                return false;
+            DS4_DFL_TEND(df, 19, t0);
+        }
+        {
+            const double t0 = df->tstat ? now_sec() : 0.0;        /* TSTAT d_fup2  */
             const float *basep = ds4_dfl_f32(df->dm, dw->block[il].ffn_conv_base);
             if (!basep) return false;
             ds4_dfl_conv(T, df->block_size, E, df->group, df->kernel,
                          df->dyn2, 1, basep, df->ho, df->cr2);
+            for (size_t i = 0; i < (size_t)T * E; i++) df->h[i] += df->cr2[i];
+            DS4_DFL_TEND(df, 20, t0);
         }
-        for (size_t i = 0; i < (size_t)T * E; i++) df->h[i] += df->cr2[i];
     }
 
     /* 3. final norm + the trunk's output head + selector gate              */
     {
+        const double t0 = df->tstat ? now_sec() : 0.0;            /* TSTAT d_final */
         const float *ow = ds4_dfl_f32(df->dm, dw->output_norm);
         if (!ow) return false;
         for (uint32_t t = 0; t < T; t++)
             ds4_dfl_rms(df->h + (size_t)t * E, ow, E, df->eps, df->xn + (size_t)t * E);
         if (ds4_gpu_tensor_write(df->gxn, 0, df->xn, (size_t)T * erow) != 1) return false;
+        if (!glm_graph_begin_commands_if_needed()) return false;
+        if (!qwen4_gemv(df->glogits, df->tm, df->tw->output, df->gxn, T) ||
+            !qwen4_gemv(df->ggate, df->dm, dw->sel_hidden, df->gxn, T) ||
+            !ds4_gpu_end_commands() ||
+            ds4_gpu_tensor_read(df->glogits, 0, df->logits,
+                                (size_t)T * DS4_N_VOCAB * sizeof(float)) != 1 ||
+            ds4_gpu_tensor_read(df->ggate, 0, df->gate,
+                                (size_t)T * df->rank * sizeof(float)) != 1)
+            return false;
+        DS4_DFL_TEND(df, 21, t0);
     }
-    if (!glm_graph_begin_commands_if_needed()) return false;
-    if (!qwen4_gemv(df->glogits, df->tm, df->tw->output, df->gxn, T) ||
-        !qwen4_gemv(df->ggate, df->dm, dw->sel_hidden, df->gxn, T) ||
-        !ds4_gpu_end_commands() ||
-        ds4_gpu_tensor_read(df->glogits, 0, df->logits,
-                            (size_t)T * DS4_N_VOCAB * sizeof(float)) != 1 ||
-        ds4_gpu_tensor_read(df->ggate, 0, df->gate,
-                            (size_t)T * df->rank * sizeof(float)) != 1)
-        return false;
 
     /* 4. candidates then the greedy lattice walk                           */
+    const double dwt = df->tstat ? now_sec() : 0.0;              /* TSTAT d_walk  */
     for (uint32_t i = 1; i <= n_draft; i++)
-        ds4_dfl_topk(df->logits + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB, df->top_k,
-                     df->cand + (size_t)i * df->top_k, df->uv + (size_t)i * df->top_k);
+    ds4_dfl_topk(df->logits + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB, df->top_k,
+                 df->cand + (size_t)i * df->top_k, df->uv + (size_t)i * df->top_k);
     int32_t carried = 0;
     for (uint32_t i = 1; i <= n_draft; i++) {
         const uint32_t K = df->top_k, R = df->rank;
@@ -887,6 +986,7 @@ static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t po
         carried = (int32_t)best;
         drafts[i - 1] = df->cand[(size_t)i * K + best];
     }
+    DS4_DFL_TEND(df, 22, dwt);
     if (df->dbg) {                             /* row-0 argmax: the drafter's
                                                 * own next-token prediction */
         int32_t b0 = 0;
