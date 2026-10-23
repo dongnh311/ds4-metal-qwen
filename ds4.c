@@ -60449,7 +60449,14 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *mtp_h;
     uint32_t mtp_h_pos0;
     uint32_t mtp_h_rows;
+    /* DFlash2 drafter state (ds4_dflash.inc); attached per session when
+     * --dflash is set.  Defined later, after the dflash include. */
+    struct ds4_dflash_gpu *dflash_gpu;
 } ds4_qwen4_gpu_graph;
+
+/* W-D3: DFlash2 drafter lifecycle hook; defined in ds4_dflash.inc. */
+struct ds4_dflash_gpu;
+static void ds4_dflash_free(struct ds4_dflash_gpu *df);
 
 /* GSQ-RCO types in the Metal graph: qwen4_row_dot has them; CUDA does not. */
 static bool qwen4_graph_gsq_ok(uint32_t type) {
@@ -60576,6 +60583,8 @@ static bool qwen4_graph_weights_supported(const ds4_weights *w) {
 
 static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
     if (!g) return;
+    ds4_dflash_free(g->dflash_gpu);
+    g->dflash_gpu = NULL;
     ds4_gpu_tensor **all[] = {
         &g->ple_hist, &g->logits,
         &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
@@ -62886,6 +62895,7 @@ static int generate_qwen4_metal_argmax(
 }
 
 #ifdef DS4_HAS_QWEN4_METAL
+#include "ds4_dflash.inc"
 #include "ds4_qwen35moe.inc"
 #endif
 
@@ -77266,6 +77276,13 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
             return 1;
         }
         qwen35_graph_reset(&s->qwen4_graph);
+        if (e->dflash && !ds4_dflash_attach(&e->dflash_weights, e->dflash_mask_vals,
+                                            &e->mtp_model, &e->model, &e->weights,
+                                            &s->qwen4_graph)) {
+            qwen4_graph_free(&s->qwen4_graph);
+            free(s);
+            return 1;
+        }
         if (e->glm_mtp) qwen35_verify_batch_selfcheck(&e->model, &e->weights);
         s->qwen35_graph_ready = true;
         s->prefill_cap = (uint32_t)ctx_size;
@@ -82330,6 +82347,11 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
             return 1;
         }
         if (!s->glm_spec_inside) s->glm_mtp_have = 0;
+        /* W-D3 probe: inject the drafter ctx cache with the rows committed
+         * since the last step, score the previous block's drafts against
+         * this token, and run one draft cycle anchored here.  Never gates
+         * the decode: failures just disable the probe. */
+        if (g->dflash_gpu) ds4_dflash_probe_step(g, token);
         if (!qwen35_graph_forward_tokens(g, &e->model, &e->weights, &token, 1, s->logits, false)) {
             if (errlen) snprintf(err, errlen, "Ornith decode failed at position %u", g->pos);
             s->checkpoint_valid = false;

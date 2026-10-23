@@ -165,6 +165,7 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
 }
 
 static void qwen35_graph_reset(ds4_qwen4_gpu_graph *g) {
+    ds4_dflash_reset(g);
     (void)ds4_gpu_synchronize();
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
@@ -945,6 +946,9 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     bool ok = qwen35_graph_carry_h(g, pos0);
     for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER && ok; il++) {
         ok = qwen35_graph_layer(g, m, w, il, pos0, T);
+        /* DFlash2 taps: blit this layer's residual rows into the drafter's
+         * GPU ring while the batch is open (ds4_dflash.inc). */
+        if (ok) ds4_dflash_tap_hook(g, il, pos0, T);
         /* 1 gdn, 2 attn (moe folded into the layer's own bucket); at level 3 the MoE half goes to 5 / 6 */
         QWEN35_PROF(g_qwen35_prof_split ? (ds4_qwen35_layer_is_attention(il) ? 6 : 5)
                                         : (ds4_qwen35_layer_is_attention(il) ? 2 : 1));
