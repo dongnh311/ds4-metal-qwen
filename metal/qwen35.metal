@@ -2366,14 +2366,14 @@ kernel void kernel_df_conv(
         device const float *inr,
         device float       *out,
         uint3 tgpig [[threadgroup_position_in_grid]],
-        ushort tid  [[thread_index_in_threadgroup]],
-        ushort ntg  [[threads_per_threadgroup]]) {
+        ushort tid  [[thread_index_in_threadgroup]]) {
     const uint t = tgpig.x;
     if (t >= args.rows) return;
     const uint b = t % args.bs;
+    constexpr uint NTG = 256u;                   /* launched with 256 threads  */
     device const float *drow = dyn + (uint64_t)t * (2u * args.tapk * args.ngroups)
                              + (uint64_t)args.side * (args.tapk * args.ngroups);
-    for (uint e = tid; e < args.edim; e += ntg) {
+    for (uint e = tid; e < args.edim; e += NTG) {
         float acc = 0.0f;
         const uint g = e / args.grpsz;
         for (uint k = 0; k < args.tapk; k++) {
