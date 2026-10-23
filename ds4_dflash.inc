@@ -913,6 +913,18 @@ static bool ds4_dfl_read_walk(ds4_dflash_gpu *df, const ds4_dflash_weights *dw,
         drafts[i - 1] = df->cand[(size_t)i * K + best];
     }
     DS4_DFL_TEND(df, 22, dwt);
+    if (df->dbg) {                             /* A/B the draft stream (used
+                                                * by the W-D4b dgp receipts) */
+        static uint32_t walkdbg = 0u;
+        if (walkdbg < 12u) {
+            walkdbg++;
+            fprintf(stderr, "ds4: dfl walk #%u anchor=%d draft=%d,%d,%d\n",
+                    walkdbg, anchor,
+                    n_draft > 0 ? drafts[0] : -1,
+                    n_draft > 1 ? drafts[1] : -1,
+                    n_draft > 2 ? drafts[2] : -1);
+        }
+    }
     if (df->dbg) {                             /* row-0 argmax: the drafter's
                                                 * own next-token prediction */
         int32_t b0 = 0;
