@@ -2356,7 +2356,7 @@ kernel void kernel_qwen35_mv_q8_0_rows2(
  * ds4_dfl_conv in ds4_dflash.inc: out[t][e] = sum_{k<=t%bs}
  * (dyn[t][side,k,g(e)] + base[k][side][e]) * in[t-k][e]. */
 struct ds4_metal_args_df_conv {
-    uint32_t T, E, ngroup, group, kernel, bs, side;
+    uint32_t rows, edim, ngroups, grpsz, tapk, bs, side;
 };
 
 kernel void kernel_df_conv(
@@ -2369,21 +2369,21 @@ kernel void kernel_df_conv(
         ushort tid  [[thread_index_in_threadgroup]],
         ushort ntg  [[threads_per_threadgroup]]) {
     const uint t = tgpig.x;
-    if (t >= args.T) return;
+    if (t >= args.rows) return;
     const uint b = t % args.bs;
-    device const float *drow = dyn + (uint64_t)t * (2u * args.kernel * args.ngroup)
-                             + (uint64_t)args.side * (args.kernel * args.ngroup);
-    for (uint e = tid; e < args.E; e += ntg) {
+    device const float *drow = dyn + (uint64_t)t * (2u * args.tapk * args.ngroups)
+                             + (uint64_t)args.side * (args.tapk * args.ngroups);
+    for (uint e = tid; e < args.edim; e += ntg) {
         float acc = 0.0f;
-        const uint g = e / args.group;
-        for (uint k = 0; k < args.kernel; k++) {
+        const uint g = e / args.grpsz;
+        for (uint k = 0; k < args.tapk; k++) {
             if (k > b) break;                       /* taps read the left pad */
-            acc += (drow[(uint64_t)k * args.ngroup + g] +
-                    base[(uint64_t)e + (uint64_t)k * args.E +
-                         (uint64_t)args.side * ((uint64_t)args.E * args.kernel)])
-                 * inr[(uint64_t)(t - k) * args.E + e];
+            acc += (drow[(uint64_t)k * args.ngroups + g] +
+                    base[(uint64_t)e + (uint64_t)k * args.edim +
+                         (uint64_t)args.side * ((uint64_t)args.edim * args.tapk)])
+                 * inr[(uint64_t)(t - k) * args.edim + e];
         }
-        out[(uint64_t)t * args.E + e] = acc;
+        out[(uint64_t)t * args.edim + e] = acc;
     }
 }
 
