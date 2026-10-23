@@ -78400,17 +78400,52 @@ static bool qwen35_session_draft(ds4_session *s, const int *tokens, uint32_t T, 
     return false;
 }
 
-/* One Ornith MTP cycle at depth 1, shaped like ds4_session_qwen4_spec_cycle:
- * evaluate first_token, or verify [first_token, draft] in one 2-row pass
+/* Draft depth policy for the Ornith cycle: DS4_QWEN35_MTP_DEPTH=2 or =3
+ * forces a fixed depth (read per cycle so A/B harnesses can switch it per
+ * step); 0/auto gates the chained second draft behind the same rolling
+ * window the Qwen3.8 cycle uses — engage only on a perfect recent
+ * first-draft window and leave at the first sign the chained draft stopped
+ * paying.  Depth 2 is always the baseline (same as today's single-draft
+ * cycle); a value of 1 keeps the pre-3.4 behaviour when the engine's global
+ * MTP default changes. */
+static int qwen35_spec_depth(ds4_session *s) {
+    const char *env = getenv("DS4_QWEN35_MTP_DEPTH");
+    const int v = env && env[0] ? atoi(env) : 0;
+    if (v == 2 || v == 3) return v;
+    const uint32_t window = s->qwen4_depth_window & 255u;
+    uint32_t bits = 0;
+    for (uint32_t i = 0; i < 8u; i++) bits += (window >> i) & 1u;
+    const char *adapt = getenv("DS4_QWEN35_MTP_DEPTH_ADAPT");
+    if (!(adapt && adapt[0] && adapt[0] != '0')) {
+        /* Default off until the depth-2 receipt lands: no behaviour change
+         * for existing runs, which is exactly what phase 3.4 shipped. */
+        return 2;
+    }
+    if (!s->qwen4_depth3_engaged) {
+        if (bits >= 8u && s->qwen4_depth_cycles >= 8u && s->qwen4_reject2_streak == 0u) {
+            s->qwen4_depth3_engaged = true;
+        }
+    } else if (bits < 6u || s->qwen4_reject2_streak >= 2u) {
+        s->qwen4_depth3_engaged = false;
+    }
+    return s->qwen4_depth3_engaged ? 3 : 2;
+}
+
+/* One Ornith MTP cycle at depth 1 or 2, shaped like ds4_session_qwen4_spec_cycle:
+ * evaluate first_token, or verify [first_token, draft] — plus a chained second
+ * draft when the depth policy engages it — in one 2- or 3-row pass
  * whose attention, dense projections and GDN layers run one row per
  * dispatch, so every row equals plain decoding bit for bit.  A draft is
  * accepted when it is the target argmax (greedy and
  * opportunistic sampling: the caller samples first_token and the token
  * after the block from s->logits, so the sampling parameters are unused);
  * a rejected one restores the GDN snapshot the verify took after its first
- * row.  The MTP block then catches up over the committed tokens and drafts
+ * row — with a 3-row verify a rejected second draft restores the same
+ * snapshot and replays the accepted first draft as a plain one-row forward,
+ * which reproduces the after-first-row state exactly.  The MTP block then
+ * catches up over the committed tokens and drafts
  * from the argmax parent the caller will most likely pass back.  Exact
- * sampling is refused at open.  Returns the committed count (1 or 2) with
+ * sampling is refused at open.  Returns the committed count (1..3) with
  * s->logits at the last one, or -1. */
 static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float temperature, int top_k,
                                          float top_p, float min_p, uint64_t *rng, bool exact_sampling,
@@ -78424,6 +78459,15 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
     const bool stats = qwen35_spec_stats_enabled();
     const double t0 = stats ? now_sec() : 0.0;
     double tt = 0.0, td = 0.0, tm = 0.0;
+    const int depth = qwen35_spec_depth(s);
+    /* A 3-row verify runs row-exact through the same per-row dispatch the
+     * 2-row pass uses; g->verify_rows_exact is set below right before the
+     * forward, so qwen4_graph_fused(g, 3u) cannot be consulted here.  The
+     * margin also covers the post-accept T=3 catch-up, which stages the
+     * parent row at pos+3 and so needs pos+4 <= ctx_cap to precheck. */
+    const bool deep = depth == 3 && s->glm_mtp_have && s->glm_mtp_have2 &&
+        accepted_cap >= 3 && pos + 4u <= g->ctx_cap && g->cap_tokens >= 3u &&
+        g->mtp_R != NULL;
     if (s->glm_mtp_have && first_token != s->glm_mtp_parent) s->glm_mtp_have = 0;
     if (!s->glm_mtp_have || accepted_cap < 2 || pos + 2u > g->ctx_cap || g->cap_tokens < 2u ||
         !qwen4_graph_fused(g, 2u)) {
@@ -78438,21 +78482,35 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
         tm = stats ? now_sec() : 0.0;
         if (!qwen35_session_draft(s, toks, 2u, pos, err, errlen)) return -1;
         if (stats) td = now_sec() - tm;
+        s->glm_mtp_have2 = false;
+        if (s->glm_mtp_have && depth == 3 && pos + 2u < g->ctx_cap) {
+            /* chain the second pending draft off the predictor's own stream:
+             * the staging staged rows pos..pos+1, so the chain row continues
+             * at pos+2 (the position the pending draft proposes) */
+            int draft2 = -1;
+            if (qwen35_graph_mtp_chain(g, m, w, s->glm_mtp_draft, pos + 2u, 1u, &draft2)) {
+                s->glm_mtp_draft2 = draft2;
+                s->glm_mtp_have2 = true;
+            }
+        }
         if (qwen35_spec_trace()) fprintf(stderr, "ds4: Ornith spec pos %u token %d plain\n", pos, first_token);
         accepted[0] = first_token;
+        qwen4_spec_note_first_draft(s, true);
         if (stats) qwen35_spec_stats_note(false, 1, t0, tt, td);
         return 1;
     }
     s->glm_mtp_have = 0;
     const int d = s->glm_mtp_draft;
-    const int toks[2] = { first_token, d };
-    /* rows 0 and 1 hold the verify rows (4 rows, as Qwen3.8 sizes it) */
+    const int d2 = deep ? s->glm_mtp_draft2 : -1;
+    const int toks[3] = { first_token, d, d2 };
+    const uint32_t T = deep ? 3u : 2u;
+    /* verify rows (4 slots, as Qwen3.8 sizes it) */
     if (!s->qwen4_verify_logits) s->qwen4_verify_logits = xmalloc(4u * (size_t)V * sizeof(float));
     float *rows = s->qwen4_verify_logits;
     g->snap_after_first = true;
     g->verify_rows_exact = true;
     tm = stats ? now_sec() : 0.0;
-    const bool ok = qwen35_graph_forward_tokens(g, m, w, toks, 2u, rows, true);
+    const bool ok = qwen35_graph_forward_tokens(g, m, w, toks, T, rows, true);
     if (stats) tt = now_sec() - tm;
     g->verify_rows_exact = false;
     if (!ok) {
@@ -78465,24 +78523,80 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
     s->checkpoint_valid = true;
     s->mtp_draft_valid = false;
     const bool accept = sample_argmax(rows, V) == d || qwen35_spec_force_accept();
-    if (qwen35_spec_trace()) {
-        fprintf(stderr, "ds4: Ornith spec pos %u token %d draft %d %s\n", pos, first_token, d,
-                accept ? "accept" : "reject");
+    bool accept2 = false;
+    if (deep) accept2 = accept && (sample_argmax(rows + V, V) == d2 || qwen35_spec_force_accept());
+    qwen4_spec_note_first_draft(s, accept);
+    if (deep) {
+        if (accept2) s->qwen4_reject2_streak = 0u;
+        else if (accept) s->qwen4_reject2_streak++;
     }
-    if (accept) {
+    if (qwen35_spec_trace()) {
+        fprintf(stderr, "ds4: Ornith spec pos %u token %d draft %d %s%s\n", pos, first_token, d,
+                accept ? "accept" : "reject", deep ? (accept2 ? " +accept2" : " +reject2") : "");
+    }
+    if (accept && (!deep || accept2)) {
         token_vec_push(&s->checkpoint, d);
-        memcpy(s->logits, rows + V, (size_t)V * sizeof(float));
-        /* rows pos+1 (d with h_pos) and pos+2 (the parent with h_{pos+1}) */
-        const int next[2] = { d, sample_argmax(s->logits, V) };
-        tm = stats ? now_sec() : 0.0;
-        if (!qwen35_session_draft(s, next, 2u, pos + 1u, err, errlen)) return -1;
-        if (stats) td = now_sec() - tm;
+        if (deep) token_vec_push(&s->checkpoint, d2);
+        memcpy(s->logits, rows + (T - 1u) * V, (size_t)V * sizeof(float));
+        const int parent = sample_argmax(s->logits, V);
+        bool have_next = false;
+        int draft = -1;
+        if (deep) {
+            /* catch the predictor up over all three committed rows (the
+             * speculative chain rows at pos and pos+1 are re-run with the
+             * true trunk streams h_pos..h_{pos+2}, all resident in mtp_h
+             * after the verify), then the next draft follows the parent */
+            const int next_tokens[3] = { d, d2, parent };
+            tm = stats ? now_sec() : 0.0;
+            have_next = qwen35_graph_mtp(g, m, w, next_tokens, 3u, pos + 1u, true, &draft);
+            if (stats) td = now_sec() - tm;
+        } else {
+            /* rows pos+1 (d with h_pos) and pos+2 (the parent with h_{pos+1}) */
+            const int next[2] = { d, parent };
+            tm = stats ? now_sec() : 0.0;
+            have_next = qwen35_session_draft(s, next, 2u, pos + 1u, err, errlen);
+            if (stats) td = now_sec() - tm;
+            if (have_next) draft = s->glm_mtp_draft;
+        }
+        if (have_next) {
+            s->glm_mtp_parent = parent;
+            s->glm_mtp_have = 1;
+            s->glm_mtp_have2 = false;
+            if (depth == 3 && pos + (deep ? 4u : 3u) < g->ctx_cap) {
+                int draft2 = -1;
+                /* the chain row continues one position past the catch-up
+                 * staging's last row: pos+4 after the T=3 deep catch-up
+                 * (rows pos+1..pos+3), pos+3 after the T=2 re-staging */
+                if (qwen35_graph_mtp_chain(g, m, w, draft, deep ? pos + 4u : pos + 3u,
+                                           deep ? 2u : 1u, &draft2)) {
+                    s->glm_mtp_draft2 = draft2;
+                    s->glm_mtp_have2 = true;
+                }
+            }
+        } else if (deep) {
+            /* a failed deep catch-up is not fatal: the three committed
+             * tokens stand, the caller samples from s->logits as usual,
+             * and the next cycle re-drafts through the plain path */
+            s->glm_mtp_have = 0;
+            s->glm_mtp_have2 = 0;
+        } else {
+            s->checkpoint_valid = false;
+            if (errlen) snprintf(err, errlen, "Ornith mtp: draft failed");
+            return -1;
+        }
         s->qwen4_spec_accepted++;
         accepted[0] = first_token;
         accepted[1] = d;
-        if (stats) qwen35_spec_stats_note(true, 2, t0, tt, td);
-        return 2;
+        if (deep) accepted[2] = d2;
+        if (stats) qwen35_spec_stats_note(true, (int)T, t0, tt, td);
+        return deep ? 3 : 2;
     }
+    /* A chained second draft that rejected (or a rejected first draft) takes
+     * the same restore path: the after-first-row snapshot is valid in both
+     * cases, rows[0] holds the logits after first_token, and the caller's
+     * next cycle re-derives the accepted-but-uncommitted draft as its own
+     * first token.  A pending second draft never survives a rejection. */
+    s->glm_mtp_have2 = false;
     if (!qwen35_graph_state_swap(g)) {
         if (errlen) snprintf(err, errlen, "Ornith mtp: rejection restore failed");
         s->checkpoint_valid = false;

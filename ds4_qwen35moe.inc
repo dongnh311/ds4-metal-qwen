@@ -1136,12 +1136,93 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_mtp(ds4_qwen4_gpu_graph *g, const ds4_
     return ok;
 }
 
+/* One chained draft step (depth-2): condition the nextn block on its own
+ * previous output — the src_row qwen35_graph_mtp last staged into mtp_R is
+ * the predictor's raw hidden for the position after the drafted token —
+ * plus the embedding of that drafted token, run exactly one nextn row, and
+ * take its argmax as the second pending draft.  Mirrors the qwen4 chain
+ * step but re-uses the Ornith head tensor flow (qwen35 concat/attend/moe +
+ * nextn_shared_head_norm), so the proposal shares the depth-1 draft's
+ * exact math.  src_row indexes the mtp_R rows staged by the immediately
+ * preceding qwen35_graph_mtp call (its T - 1): a false return is treated
+ * as "no second draft this cycle" by the session. */
+static DS4_MAYBE_UNUSED bool qwen35_graph_mtp_chain(ds4_qwen4_gpu_graph *g, const ds4_model *m,
+                                                    const ds4_weights *w, int next_token,
+                                                    uint32_t idx, uint32_t src_row, int *draft_out) {
+    const uint32_t il = DS4_N_LAYER - 1u, E = DS4_N_EMBD;
+    const ds4_layer_weights *l = &w->layer[il];
+    const uint64_t row = (uint64_t)E * sizeof(float);
+    const uint64_t qrow = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
+    if (!g->mtp_R || !g->mtp_e || !g->mtp_cat || !draft_out || src_row >= (uint64_t)g->cap_tokens ||
+        idx >= g->alloc_cap || next_token < 0 || next_token >= (int)DS4_N_VOCAB)
+        return false;
+    qwen4_ref_row(m, w->token_embd, (uint64_t)next_token, g->host_row);
+    {
+        int32_t d = qwen35_mrope_delta_at(g, idx);
+        uint32_t *p4 = g->host_pos3;
+        qwen4_mrope_pos(g->vis_spans, g->vis_span_count, idx, &d, p4);
+        p4[3] = 0;
+    }
+    bool ok = ds4_gpu_tensor_write(g->mtp_e, 0, g->host_row, row) &&
+              ds4_gpu_tensor_write(g->pos3, (uint64_t)idx * 16u, g->host_pos3, 16u) &&
+              glm_graph_begin_commands_if_needed();
+    if (ok) {
+        ds4_gpu_tensor *R_src = ds4_gpu_tensor_view(g->mtp_R, (uint64_t)src_row * row, row);
+        ok = R_src &&
+             ds4_gpu_qwen35_mtp_concat_tensor(g->mtp_cat, g->mtp_e, R_src, m->map, m->size,
+                                              l->nextn_enorm->abs_offset, l->nextn_hnorm->abs_offset,
+                                              E, 1u, DS4_RMS_EPS) != 0 &&
+             qwen4_gemv(g->mtp_R, m, l->nextn_eh_proj, g->mtp_cat, 1u) &&
+             ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, g->mtp_R, m->map, m->size,
+                                                 l->attn_norm->abs_offset, E, 1u, DS4_RMS_EPS) != 0;
+        ds4_gpu_tensor_free(R_src);
+    }
+    if (ok) {
+        ok = qwen35_graph_attention_prep(g, m, l, il, idx, 1u);
+    }
+    if (ok) {
+        ds4_gpu_tensor *x = ds4_gpu_tensor_view(g->mtp_R, 0, row);
+        ds4_gpu_tensor *o = ds4_gpu_tensor_view(g->attn_o, 0, qrow);
+        ok = x && o &&
+             qwen35_graph_attend(g, il, idx, 0u, 1u, false) &&
+             qwen4_gemv(g->blk, m, l->attn_output, o, 1u) &&
+             ds4_gpu_add_tensor(x, x, g->blk, E) != 0 &&
+             ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, x, m->map, m->size,
+                                                 l->ffn_norm->abs_offset, E, 1u, DS4_RMS_EPS) != 0 &&
+             qwen35_graph_moe(g, m, l, 1u) &&
+             ds4_gpu_add_tensor(x, x, g->blk, E) != 0 &&
+             ds4_gpu_rms_norm_weight_rows_tensor(g->mixed, x, m->map, m->size,
+                                                 l->nextn_shared_head_norm->abs_offset,
+                                                 E, 1u, DS4_RMS_EPS) != 0;
+        ds4_gpu_tensor_free(x);
+        ds4_gpu_tensor_free(o);
+    }
+    if (ok) {
+        const bool gathered = qwen35_mtp_draft_head_load(g, m, w->output);
+        const uint32_t head_rows = gathered ? g->draft_rows : (uint32_t)DS4_N_VOCAB;
+        ok = (gathered ? ds4_gpu_qwen4_matmul_q8_0_weights_tensor(g->logits, g->draft_head,
+                              (uint32_t)w->output->dim[0], head_rows, g->mixed)
+                       : qwen4_gemv(g->logits, m, w->output, g->mixed, 1u)) &&
+             ds4_gpu_qwen4_argmax_tensor(g->mtp_argmax, g->mtp_argmax_tmp, g->logits, head_rows) != 0;
+        if (ok) {
+            int32_t token = -1;
+            ok = ds4_gpu_tensor_read(g->mtp_argmax, 0, &token, sizeof(token)) != 0 &&
+                 token >= 0 && token < (int32_t)head_rows;
+            if (ok && gathered) token = g->draft_ids[token];
+            if (ok && (token < 0 || token >= (int32_t)DS4_N_VOCAB)) ok = false;
+            if (ok) *draft_out = token;
+        }
+    }
+    if (!ds4_gpu_end_commands()) ok = false;
+    if (ok) g->mtp_pos = idx + 1u;
+    return ok;
+}
+
 /* A rejected draft returns to the state the verify snapshotted after its
  * first row: swap the live and snapshot GDN buffers, as the qwen4 cycle
  * does, without the PLE state Ornith does not have.  K/V rows past the
  * restored position are overwritten by the next forward, and the seed row
- * for it is still resident (the verify's row 1). */
-static DS4_MAYBE_UNUSED bool qwen35_graph_state_swap(ds4_qwen4_gpu_graph *g) {
+ * for it is still resident (the verify's row 1). */static DS4_MAYBE_UNUSED bool qwen35_graph_state_swap(ds4_qwen4_gpu_graph *g) {
     if (!g->snap_valid) return false;
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!g->snap_lin_state[il]) continue;
