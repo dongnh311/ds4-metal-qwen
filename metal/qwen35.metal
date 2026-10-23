@@ -2485,17 +2485,17 @@ kernel void kernel_df_attn(
     const uint dh = sgitg;                     /* key half of the tile      */
     constexpr uint NT = 64u, KT = DF_ATTN_KT;
 
-    threadgroup float KV[2u * KT * D];
-    threadgroup float *Ks = KV, *Vs = KV + KT * D;
-    threadgroup float Qs[8u * D];
+    threadgroup half KV[2u * KT * D];
+    threadgroup half *Ks = KV, *Vs = KV + KT * D;
+    threadgroup half Qs[8u * D];
     threadgroup float Sx[2u][64u];
-    threadgroup float Ps[2u][128u];
+    threadgroup half  Ps[2u][128u];
     threadgroup float Dg[2u][64u];
     threadgroup float Id[64u];
 
     for (uint i = tid; i < 8u * D; i += NT) {
         const uint u = i / D, d = i % D;
-        Qs[i] = u < rows ? q[((uint64_t)u * H + head) * D + d] * args.scale : 0.0f;
+        Qs[i] = u < rows ? (half)(q[((uint64_t)u * H + head) * D + d] * args.scale) : (half)0.0f;
     }
     if (tid < 64u) Id[tid] = (tid >> 3) == (tid & 7u) ? 1.0f : 0.0f;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2512,9 +2512,7 @@ kernel void kernel_df_attn(
 
     for (uint t0 = 0; t0 < N; t0 += KT) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        {   /* stage 16 keys/values of this head, ring slots first (fp32:
-             * the drafter's accept rate is sensitive to score drift, so
-             * unlike the trunk kernels we do not half-stage here)        */
+        {   /* stage 16 keys/values of this head as half, ring slots first */
             constexpr uint UNITS = KT * 32u;       /* 16 keys x 32 float4  */
             for (uint i = tid; i < 2u * UNITS; i += NT) {
                 const bool isv = i >= UNITS;
@@ -2526,10 +2524,10 @@ kernel void kernel_df_attn(
                     row = (isv ? ring_v : ring_k) + (isv ? vplane : kplane) + (uint64_t)idx * D;
                 else
                     row = (isv ? vb : kb) + (uint64_t)(idx - args.n_ctx) * Hkv * D;
-                threadgroup float *kd = (isv ? Vs : Ks) + (uint64_t)key * D + (uint64_t)quad * 4u;
-                const device float4 *fr = (const device float4 *)row + (uint64_t)quad;
-                kd[0] = fr[0].x; kd[1] = fr[0].y;
-                kd[2] = fr[0].z; kd[3] = fr[0].w;
+                device const float *fr = row + (uint64_t)quad * 4u;
+                threadgroup half *kd = (isv ? Vs : Ks) + (uint64_t)key * D + (uint64_t)quad * 4u;
+                kd[0] = (half)fr[0]; kd[1] = (half)fr[1];
+                kd[2] = (half)fr[2]; kd[3] = (half)fr[3];
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2541,7 +2539,7 @@ kernel void kernel_df_attn(
         for (uint kk = 0; kk < 4; kk++) {
 #pragma unroll
             for (uint i = 0; i < 4; i++) {
-                simdgroup_float8x8 Qt, Kt;
+                simdgroup_half8x8 Qt, Kt;
                 simdgroup_load(Qt, Qs + (kk * 4 + i) * 8, D, 0, false);
                 simdgroup_load(Kt, Ks + (dh * 8) * D + (kk * 4 + i) * 8, D, 0, true);
                 simdgroup_multiply_accumulate(S[i], Qt, Kt, S[i]);
@@ -2570,7 +2568,7 @@ kernel void kernel_df_attn(
         for (uint c = 0; c < 4; c++) {
             pv[c] = exp(sv[c] - m_new);
             rs += pv[c];
-            Ps[sgitg][lr * 16 + lc + c] = pv[c];
+            Ps[sgitg][lr * 16 + lc + c] = (half)pv[c];
         }
         rs += simd_shuffle_xor(rs, 1);
         rs += simd_shuffle_xor(rs, 2);
@@ -2588,12 +2586,12 @@ kernel void kernel_df_attn(
 #pragma unroll
             for (uint j = 0; j < 8; j++) { simdgroup_float8x8 t; simdgroup_multiply(t, Dm, O[j]); O[j] = t; }
         }
-        simdgroup_float8x8 P0, P1;
+        simdgroup_half8x8 P0, P1;
         simdgroup_load(P0, Ps[sgitg], 16, 0, false);
         simdgroup_load(P1, Ps[sgitg] + 8, 16, 0, false);
 #pragma unroll
         for (uint j = 0; j < 8; j++) {
-            simdgroup_float8x8 V0, V1;
+            simdgroup_half8x8 V0, V1;
             simdgroup_load(V0, Vs + dh * 64 + j * 8, D, 0, false);
             simdgroup_load(V1, Vs + 8 * D + dh * 64 + j * 8, D, 0, false);
             simdgroup_multiply_accumulate(O[j], P0, V0, O[j]);
@@ -2603,7 +2601,7 @@ kernel void kernel_df_attn(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
     {
-        threadgroup float *Osc = KV + dh * 64;
+        threadgroup float *Osc = (threadgroup float *)KV + dh * 64;
         const float inv = l_row > 0.0f ? 1.0f / l_row : 0.0f;
         for (uint i = tiisg; i < 64; i += 32)
             Dg[sgitg][i] = (i >> 3) == (i & 7u) ? simd_shuffle(inv, (ushort)((i >> 3) * 4)) : 0.0f;
@@ -2614,12 +2612,13 @@ kernel void kernel_df_attn(
         for (uint j = 0; j < 8; j++) {
             simdgroup_float8x8 t;
             simdgroup_multiply(t, Dm, O[j]);
-            simdgroup_store(t, Osc + (uint64_t)j * 8, D, 0, false);
+            simdgroup_store(t, Osc + (uint64_t)j * 8, D, 0, false);   /* wait: Osc base... */
         }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint u = tid; u < rows * D; u += NT) {
         const uint r = u / D, d = u % D;
-        out[((uint64_t)r * H + head) * D + d] = KV[r * D + d];   /* both halves staged */
+        out[((uint64_t)r * H + head) * D + d] =
+            ((threadgroup float *)KV)[r * D + d];   /* both halves staged */
     }
 }
