@@ -79389,10 +79389,16 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
         return -1;
     }
     g->verify_rows_exact = !batched;
+    /* W-D4: dispatch parity for the exact 3-row verify (the GPU side takes
+     * g_qwen4_verify_rows_exact for 3-row row-tiling choices, the way the
+     * MTP verify sets it); batched mode leaves it false on purpose - the
+     * prefill shapes own that width. */
+    ds4_gpu_qwen4_set_verify_rows_exact(!batched);
     if (trace) tverify = now_sec();
     const bool ok = qwen35_graph_forward_tokens(g, m, w, toks, T, rows, true);
     if (trace) tverify = now_sec() - tverify;
     g->verify_rows_exact = false;
+    ds4_gpu_qwen4_set_verify_rows_exact(false);
     if (!ok) {
         s->checkpoint_valid = false;
         if (errlen) snprintf(err, errlen, "Ornith dflash: verify failed");
