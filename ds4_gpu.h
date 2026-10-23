@@ -3645,6 +3645,28 @@ int ds4_gpu_qwen35_attn_decode3_tensor(
         ds4_gpu_tensor *out, const ds4_gpu_tensor *q, const ds4_gpu_tensor *gate,
         const ds4_gpu_tensor *k_cache, const ds4_gpu_tensor *v_cache, ds4_gpu_tensor *part,
         uint32_t n_head, uint32_t n_head_kv, uint32_t head_dim, uint32_t pos0, uint32_t rows, float scale);
+/* W-D4b DFlash2 drafter-block kernels (see ds4_metal.m for the semantics):
+ * conv side split / per-head norm+RoPE (+ring scatter) / non-causal ring
+ * attention. All join the caller's open command batch. */
+int ds4_gpu_df_conv_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *dyn,
+                           const void *model_map, uint64_t model_size,
+                           uint64_t base_offset, const ds4_gpu_tensor *in,
+                           uint32_t T, uint32_t E, uint32_t ngroup,
+                           uint32_t group, uint32_t kernel, uint32_t bs,
+                           uint32_t side);
+int ds4_gpu_df_rope_tensor(const ds4_gpu_tensor *src, ds4_gpu_tensor *dst,
+                           const void *model_map, uint64_t model_size,
+                           uint64_t weight_offset, uint32_t rows, uint32_t heads,
+                           uint32_t hd, uint32_t pos0, uint32_t cap,
+                           uint32_t rbase_elems, uint32_t do_norm,
+                           uint32_t do_rope, uint32_t scatter,
+                           float eps, float rope_base);
+int ds4_gpu_df_attn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+                           const ds4_gpu_tensor *ring_k, const ds4_gpu_tensor *ring_v,
+                           const ds4_gpu_tensor *kb, const ds4_gpu_tensor *vb,
+                           uint32_t heads, uint32_t kvh, uint32_t hd, uint32_t rows,
+                           uint32_t n_ctx, uint32_t cap, uint32_t rbase_k,
+                           uint32_t rbase_v, float scale);
 /* Scratch floats for `rows` rows at decode3's split cap (256). */
 uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32_t head_dim);
 /* Round 2 Plan B: number of kernel_qwen35_attn_merge3_fold dispatches so far

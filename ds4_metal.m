@@ -49943,6 +49943,9 @@ enum {
     QWEN4_K_QWEN35_ATTN_QPACK,
     QWEN4_K_QWEN35_ATTN_FLASH_NAX,
     QWEN4_K_QWEN35_ATTN_FLASH_NAX_SPLIT,
+    QWEN4_K_DF_CONV,
+    QWEN4_K_DF_ROPE,
+    QWEN4_K_DF_ATTN,
     QWEN4_K_COUNT,
 };
 
@@ -50113,6 +50116,9 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_attn_qpack",
     "kernel_qwen35_attn_flash_nax",
     "kernel_qwen35_attn_flash_nax_split",
+    "kernel_df_conv",
+    "kernel_df_rope",
+    "kernel_df_attn",
 };
 
 typedef struct {
@@ -51646,6 +51652,103 @@ static int qwen35_attn_decode3_dispatch1(
     return qwen4_dispatch(qwen35_merge3_kernel(), &args, sizeof(args), mb, 3,
                           MTLSizeMake(n_head, 1, 1), MTLSizeMake(256, 1, 1), 0)
            ? 1 : 0;
+}
+
+/* ----------------------------------------------------------------------
+ * W-D4b (Ornith DFlash2 drafter, metal/qwen35.metal): the block-diffusion
+ * draft runs the whole drafter block — conv, per-head norm+RoPE, and the
+ * non-causal ctx-ring attention — inside the caller's open command batch.
+ * Like every qwen4 entry these join the active batch (qwen4_dispatch), so
+ * the sync points stay exactly where the host needs a result: the anchor
+ * embeddings write and the logits readback.
+ * ---------------------------------------------------------------------- */
+
+int ds4_gpu_df_conv_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *dyn,
+                           const void *model_map, uint64_t model_size,
+                           uint64_t base_offset, const ds4_gpu_tensor *in,
+                           uint32_t T, uint32_t E, uint32_t ngroup,
+                           uint32_t group, uint32_t kernel, uint32_t bs,
+                           uint32_t side) {
+    if (T == 0u || E == 0u || group == 0u || kernel == 0u || ngroup == 0u ||
+        bs == 0u || side > 1u)
+        return 0;
+    struct { uint32_t T, E, ngroup, group, kernel, bs, side; } args =
+        { T, E, ngroup, group, kernel, bs, side };
+    const uint64_t dyn_bytes = (uint64_t)T * 2u * kernel * ngroup * sizeof(float);
+    const uint64_t act_bytes = (uint64_t)T * E * sizeof(float);
+    qwen4_bind b[4];
+    if (!qwen4_bind_tensor(&b[0], dyn, dyn_bytes, "df conv dyn") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, base_offset,
+                          2ull * kernel * E * sizeof(float), "df conv base") ||
+        !qwen4_bind_tensor(&b[2], in, act_bytes, "df conv input") ||
+        !qwen4_bind_tensor(&b[3], out, act_bytes, "df conv out"))
+        return 0;
+    return qwen4_dispatch(QWEN4_K_DF_CONV, &args, sizeof(args), b, 4,
+                         MTLSizeMake(T, 1, 1), MTLSizeMake(256, 1, 1), 0) ? 1 : 0;
+}
+
+/* Per-head RMS + NeoX RoPE for rows x heads.  dst == src (in place) for the
+ * q and block-k rows; with scatter set, dst is the ctx-ring tensor and the
+ * result lands at rbase + head*cap*hd + ((pos0+row)%cap)*hd.  A row with
+ * neither norm nor rope (the v pass) is a plain copy into the ring. */
+int ds4_gpu_df_rope_tensor(const ds4_gpu_tensor *src, ds4_gpu_tensor *dst,
+                           const void *model_map, uint64_t model_size,
+                           uint64_t weight_offset, uint32_t rows, uint32_t heads,
+                           uint32_t hd, uint32_t pos0, uint32_t cap,
+                           uint32_t rbase_elems, uint32_t do_norm,
+                           uint32_t do_rope, uint32_t scatter,
+                           float eps, float rope_base) {
+    if (rows == 0u || heads == 0u || hd == 0u || hd > 128u || (hd & 31u) != 0u)
+        return 0;
+    if (scatter && cap == 0u) return 0;
+    struct { uint32_t heads, rows, hd, pos0, cap, rbase;
+             uint32_t do_norm, do_rope, scatter; float eps, rope_base; } args =
+        { heads, rows, hd, pos0, cap, rbase_elems, do_norm, do_rope, scatter, eps, rope_base };
+    const uint64_t src_bytes = (uint64_t)rows * heads * hd * sizeof(float);
+    const uint64_t dst_bytes = scatter
+        ? ((uint64_t)rbase_elems + (uint64_t)heads * cap * hd) * sizeof(float)
+        : src_bytes;
+    qwen4_bind b[3];
+    if (!qwen4_bind_tensor(&b[0], src, src_bytes, "df rope src") ||
+        !qwen4_bind_tensor(&b[1], dst, dst_bytes, "df rope dst") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, weight_offset,
+                          (uint64_t)hd * sizeof(float), "df rope weight"))
+        return 0;
+    return qwen4_dispatch(QWEN4_K_DF_ROPE, &args, sizeof(args), b, 3,
+                         MTLSizeMake(heads, rows, 1), MTLSizeMake(32, 1, 1), 0) ? 1 : 0;
+}
+
+/* rows query rows (<= 8) of head (kvh*qph+qi) against the ring's valid slots
+ * [0, n_ctx) and the block rows' own keys, non-causal, softmax over all of
+ * them.  head_dim is 128 (the drafter's), the same tile/softmax structure as
+ * kernel_qwen35_attn_decode3. */
+int ds4_gpu_df_attn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
+                           const ds4_gpu_tensor *ring_k, const ds4_gpu_tensor *ring_v,
+                           const ds4_gpu_tensor *kb, const ds4_gpu_tensor *vb,
+                           uint32_t heads, uint32_t kvh, uint32_t hd, uint32_t rows,
+                           uint32_t n_ctx, uint32_t cap, uint32_t rbase_k,
+                           uint32_t rbase_v, float scale) {
+    if (hd != 128u || rows == 0u || rows > 8u || kvh == 0u || heads % kvh != 0u)
+        return 0;
+    const uint32_t qph = heads / kvh;
+    struct { uint32_t heads, kvh, qph, hd, rows, n_ctx, rbase_k, rbase_v, cap_planes;
+             float scale; } args =
+        { heads, kvh, qph, hd, rows, n_ctx, rbase_k, rbase_v, cap * hd, scale };
+    const uint64_t q_bytes = (uint64_t)rows * heads * hd * sizeof(float);
+    const uint64_t kb_bytes = (uint64_t)rows * kvh * hd * sizeof(float);
+    const uint64_t ring_bytes = (uint64_t)(rbase_k + (uint64_t)kvh * cap * hd) * sizeof(float);
+    qwen4_bind b[6];
+    if (!qwen4_bind_tensor(&b[0], q, q_bytes, "df attn q") ||
+        !qwen4_bind_tensor(&b[1], ring_k, ring_bytes, "df attn ring k") ||
+        !qwen4_bind_tensor(&b[2], ring_v,
+                          (uint64_t)(rbase_v + (uint64_t)kvh * cap * hd) * sizeof(float),
+                          "df attn ring v") ||
+        !qwen4_bind_tensor(&b[3], kb, kb_bytes, "df attn block k") ||
+        !qwen4_bind_tensor(&b[4], vb, kb_bytes, "df attn block v") ||
+        !qwen4_bind_tensor(&b[5], out, q_bytes, "df attn out"))
+        return 0;
+    return qwen4_dispatch(QWEN4_K_DF_ATTN, &args, sizeof(args), b, 6,
+                         MTLSizeMake(qph, kvh, 1), MTLSizeMake(64, 1, 1), 0) ? 1 : 0;
 }
 
 /* M5 successor to decode2 (see ds4_gpu_qwen35_attn_decode2_tensor above),

@@ -52,7 +52,7 @@
 
 #define DS4_DFLASH_WINDOW_DEFAULT 2048u
 #define DS4_DFLASH_INJ_CAP        256u
-#define DS4_DFL_TSTAT_SLOTS       24u
+#define DS4_DFL_TSTAT_SLOTS       26u
 #define DS4_DFLASH_MAX_DRAFT      15u    /* trained block_size - 1          */
 
 typedef struct ds4_dflash_gpu {
@@ -67,6 +67,7 @@ typedef struct ds4_dflash_gpu {
     bool     probe;                         /* DS4_DFLASH_PROBE                */
     bool     wired;
     bool     tstat;                         /* DS4_DFLASH_TSTAT=1              */
+    bool     dgp;                           /* DS4_DFLASH_DGPU=1: GPU draft    */
     double   tstat_ms[DS4_DFL_TSTAT_SLOTS];          /* cumulative wall ms      */
     uint64_t tstat_n[DS4_DFL_TSTAT_SLOTS];             /* region occurrences     */
 
@@ -97,6 +98,14 @@ typedef struct ds4_dflash_gpu {
     ds4_gpu_tensor *gfc;                    /* inj_cap*E (fc out)              */
     ds4_gpu_tensor *gk_inj, *gv_inj;        /* inj_cap*kv_heads*hd             */
     ds4_gpu_tensor *gtap_ring;              /* n_taps planes * ring_cap*E      */
+    /* W-D4b GPU-draft (DS4_DFLASH_DGPU): the whole drafter block runs on the
+     * GPU as one command batch.  The ctx KV ring moves from host RAM to a GPU
+     * pair (the attention kernel and the inject rope both touch it), and the
+     * residual/block buffers stay on-device between the two host sync points
+     * (the anchor embeddings and the logits readback). */
+    ds4_gpu_tensor *gh, *gcr1, *gcr2;      /* cap_rows*E residual / conv out   */
+    ds4_gpu_tensor *gck, *gcv;             /* n_layer*kv_heads*ring_cap*hd     */
+    ds4_gpu_tensor *gk_view[DS4_DFLASH_MAX_LAYERS], *gv_view[DS4_DFLASH_MAX_LAYERS];
 
     /* drafter ctx KV cache [layer][head][slot][hd] fp32; slot = pos%ring_cap */
     float   *ck, *cv;
@@ -149,7 +158,8 @@ static const char *ds4_dfl_tstat_name[DS4_DFL_TSTAT_SLOTS] = {
     "inj_taps", "inj_w",  "inj_fc",  "inj_rms", "inj_kv",  "inj_kvhost",
     "d_rmsw",   "d_cproj", "d_conv0", "d_qkv",  "d_rope",  "d_attn",
     "d_wo",     "d_hup",   "d_fproj", "d_fconv", "d_gate",  "d_up",
-    "d_silu",   "d_down",  "d_fup2",  "d_final", "d_walk",  "spare22"
+    "d_silu",   "d_down",  "d_fup2",  "d_final", "d_walk",  "spare22",
+    "dg_inject", "dg_draft"
 };
 
 #define DS4_DFL_TEND(df, slot_, t0_) do { \
@@ -379,6 +389,13 @@ static void ds4_dflash_free(struct ds4_dflash_gpu *df) {
     ds4_gpu_tensor_free(df->ginj);     ds4_gpu_tensor_free(df->gfc);
     ds4_gpu_tensor_free(df->gk_inj);   ds4_gpu_tensor_free(df->gv_inj);
     ds4_gpu_tensor_free(df->gtap_ring);
+    for (uint32_t il = 0; il < (uint32_t)DS4_DFLASH_MAX_LAYERS; il++) {
+        ds4_gpu_tensor_free(df->gk_view[il]);
+        ds4_gpu_tensor_free(df->gv_view[il]);
+    }
+    ds4_gpu_tensor_free(df->gh);       ds4_gpu_tensor_free(df->gcr1);
+    ds4_gpu_tensor_free(df->gcr2);     ds4_gpu_tensor_free(df->gck);
+    ds4_gpu_tensor_free(df->gcv);
     free(df->mask_rowf); free(df->fc_w);
     free(df->ck); free(df->cv);
     free(df->h);  free(df->xn); free(df->cr1); free(df->cr2); free(df->q);
@@ -476,6 +493,13 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
       df->gpu_fc = !gv || !gv[0] || gv[0] != '0'; }
     { const char *tv = getenv("DS4_DFLASH_TSTAT");
       df->tstat = tv && tv[0] && tv[0] != '0'; }
+    /* W-D4b stage 2: run the whole drafter block (conv, norm+RoPE, ring
+     * attention) on the GPU inside one command batch.  Off by default until
+     * the receipts land.  It implies the GPU fc path (the enc norm chains
+     * straight off the fc output). */
+    { const char *dv = getenv("DS4_DFLASH_DGPU");
+      df->dgp = dv && dv[0] && dv[0] != '0'; }
+    if (df->dgp) df->gpu_fc = 1;
     df->inj_chunk = DS4_DFLASH_INJ_CAP;
     {
         const char *cv = getenv("DS4_DFLASH_INJ_CHUNK");
@@ -509,11 +533,27 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     DF_ALLOC(gv_inj,   (uint64_t)df->n_layer * DS4_DFLASH_INJ_CAP * df->kv_heads * df->hd);
     DF_ALLOC(gtap_ring,
              (uint64_t)df->n_taps * df->ring_cap * df->E);
+    if (df->dgp) {
+        DF_ALLOC(gh,    (uint64_t)df->cap_rows * df->E);
+        DF_ALLOC(gcr1,  (uint64_t)df->cap_rows * df->E);
+        DF_ALLOC(gcr2,  (uint64_t)df->cap_rows * df->E);
+        DF_ALLOC(gck,   (uint64_t)df->n_layer * df->kv_heads * df->ring_cap * df->hd);
+        DF_ALLOC(gcv,   (uint64_t)df->n_layer * df->kv_heads * df->ring_cap * df->hd);
+        for (uint32_t il = 0; ok && il < df->n_layer; il++) {
+            const uint64_t plane = (uint64_t)il * DS4_DFLASH_INJ_CAP * df->kv_heads * df->hd * sizeof(float);
+            const uint64_t bytes = (uint64_t)DS4_DFLASH_INJ_CAP * df->kv_heads * df->hd * sizeof(float);
+            df->gk_view[il] = ds4_gpu_tensor_view(df->gk_inj, plane, bytes);
+            df->gv_view[il] = ds4_gpu_tensor_view(df->gv_inj, plane, bytes);
+            ok = ok && df->gk_view[il] && df->gv_view[il];
+        }
+    }
 #undef DF_ALLOC
 #define DF_MALLOC(field_, bytes_) do { df->field_ = xmalloc(bytes_); ok = ok && df->field_; } while (0)
     DF_MALLOC(mask_rowf, (size_t)df->E * sizeof(float));
-    DF_MALLOC(ck, (size_t)df->n_layer * df->kv_heads * df->ring_cap * df->hd * sizeof(float));
-    DF_MALLOC(cv, (size_t)df->n_layer * df->kv_heads * df->ring_cap * df->hd * sizeof(float));
+    if (!df->dgp) {
+        DF_MALLOC(ck, (size_t)df->n_layer * df->kv_heads * df->ring_cap * df->hd * sizeof(float));
+        DF_MALLOC(cv, (size_t)df->n_layer * df->kv_heads * df->ring_cap * df->hd * sizeof(float));
+    }
     DF_MALLOC(h,   (size_t)df->cap_rows * df->E * sizeof(float));
     DF_MALLOC(xn,  (size_t)df->cap_rows * df->E * sizeof(float));
     DF_MALLOC(cr1, (size_t)df->cap_rows * df->E * sizeof(float));
@@ -540,9 +580,10 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     DF_MALLOC(uv, sizeof(float) * (size_t)df->cap_rows * df->top_k);
     DF_MALLOC(succ, (size_t)df->top_k * df->rank * sizeof(float));
     DF_MALLOC(pv, (size_t)df->rank * sizeof(float));
-    DF_MALLOC(fc_w, (size_t)df->E * (size_t)df->n_taps * df->E * sizeof(float));
+    if (!df->gpu_fc)
+        DF_MALLOC(fc_w, (size_t)df->E * (size_t)df->n_taps * df->E * sizeof(float));
 #undef DF_MALLOC
-    if (ok) {
+    if (ok && df->fc_w) {
         /* host fc fallback (DS4_DFLASH_GPU_FC=0): the drafter's only tensor
          * with in-dim taps*E = 24576 — W-D4b receipts show the GPU multi-gemv
          * handles that in-dim, so this host dequant + sgemm only runs on
@@ -672,6 +713,43 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
             return;
         }
         DS4_DFL_TEND(df, 1, tw);
+        if (df->dgp) {
+            /* GPU-draft mode: fc, its enc norm, every layer's k/v gemv and
+             * the norm+rope+ring-append all ride ONE command batch.  The
+             * batch stays open and the GPU draft extends it, so nothing
+             * returns to the host until the logits readback.               */
+            const double tdg = df->tstat ? now_sec() : 0.0;         /* TSTAT dg_inject */
+            bool kok = glm_graph_begin_commands_if_needed();
+            kok = kok && qwen4_gemv(df->gfc, df->dm, dw->fc, df->gtap, n);
+            kok = kok && ds4_gpu_rms_norm_weight_rows_tensor(df->ginj, df->gfc,
+                                                            df->dm->map, df->dm->size,
+                                                            dw->enc_output_norm->abs_offset,
+                                                            df->E, n, df->eps);
+            for (uint32_t il = 0; kok && il < df->n_layer; il++) {
+                const uint32_t rbase = (uint32_t)((uint64_t)il * df->kv_heads *
+                                                  df->ring_cap * df->hd);
+                kok = kok &&
+                      qwen4_gemv(df->gk_view[il], df->dm, dw->block[il].attn_k, df->ginj, n) &&
+                      qwen4_gemv(df->gv_view[il], df->dm, dw->block[il].attn_v, df->ginj, n) &&
+                      ds4_gpu_df_rope_tensor(df->gk_view[il], df->gck, df->dm->map, df->dm->size,
+                                            dw->block[il].attn_k_norm->abs_offset, n, df->kv_heads,
+                                            df->hd, from, df->ring_cap, rbase, 1u, 1u, 1u,
+                                            df->eps, df->rope_base) &&
+                      ds4_gpu_df_rope_tensor(df->gv_view[il], df->gcv, df->dm->map, df->dm->size,
+                                            dw->block[il].attn_k_norm->abs_offset, n, df->kv_heads,
+                                            df->hd, from, df->ring_cap, rbase, 0u, 0u, 1u,
+                                            df->eps, df->rope_base);
+            }
+            DS4_DFL_TEND(df, 24, tdg);
+            if (!kok) {
+                ds4_gpu_end_commands();
+                fprintf(stderr, "ds4: dflash: GPU inject batch failed (rows=%u)\n", n);
+                df->wired = false;
+                return;
+            }
+            df->inj_next = from + n;
+            continue;
+        }
         const double tfc = df->tstat ? now_sec() : 0.0;           /* TSTAT inj_fc  */
         if (df->gpu_fc) {
             if (!glm_graph_begin_commands_if_needed()) { df->wired = false; return; }
@@ -783,12 +861,176 @@ static uint32_t ds4_dflash_n_ctx(const ds4_dflash_gpu *df) {
 }
 
 /* ================================================================== */
+/* W-D4b stage 2: the GPU draft.                                        */
+/* ================================================================== */
+/* The whole drafter block — conv, per-head norm+RoPE, the non-causal
+ * ctx-ring attention, swiglu, the residual adds and the final head —
+ * runs as ONE command batch (opened by the inject above and closed here),
+ * with the only host syncs at the anchor-embeddings write and the logits
+ * readback.  Ring caches live on the GPU (gck/gcv); the host ring and the
+ * host draft scratch are not used in this mode.  Same failure contract as
+ * every other GPU path: a failed dispatch turns the drafter off and the
+ * verify cycle falls back to plain rows.                                */
+
+static bool ds4_dfl_read_walk(ds4_dflash_gpu *df, const ds4_dflash_weights *dw,
+                              uint32_t T, int32_t anchor, uint32_t n_draft,
+                              int32_t *drafts, uint32_t *n_out) {
+    if (ds4_gpu_tensor_read(df->glogits, 0, df->logits,
+                            (size_t)T * DS4_N_VOCAB * sizeof(float)) != 1 ||
+        ds4_gpu_tensor_read(df->ggate, 0, df->gate,
+                            (size_t)T * df->rank * sizeof(float)) != 1)
+        return false;
+    /* candidates then the greedy lattice walk                            */
+    const double dwt = df->tstat ? now_sec() : 0.0;              /* TSTAT d_walk  */
+    for (uint32_t i = 1; i <= n_draft; i++)
+        ds4_dfl_topk(df->logits + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB, df->top_k,
+                     df->cand + (size_t)i * df->top_k, df->uv + (size_t)i * df->top_k);
+    int32_t carried = 0;
+    for (uint32_t i = 1; i <= n_draft; i++) {
+        const uint32_t K = df->top_k, R = df->rank;
+        const float *gr = df->gate + (size_t)i * R;
+        const int32_t pred_id = i == 1 ? anchor
+            : df->cand[(size_t)(i - 1) * K + carried];
+        if (pred_id < 0 || pred_id >= (int32_t)DS4_N_VOCAB) {
+            DS4_DFL_TEND(df, 22, dwt);
+            return false;
+        }
+        ds4_dfl_row(df->dm, dw->sel_predecessor, (uint64_t)pred_id, df->pv);
+        for (uint32_t c = 0; c < K; c++)
+            ds4_dfl_row(df->dm, dw->sel_successor,
+                        (uint64_t)df->cand[(size_t)i * K + c],
+                        df->succ + (size_t)c * R);
+        uint32_t best = 0;
+        float best_s = -1e30f;
+        for (uint32_t c = 0; c < K; c++) {
+            float s = df->uv[(size_t)i * K + c];
+            const float *sv = df->succ + (size_t)c * R;
+            for (uint32_t r = 0; r < R; r++)
+                s += sv[r] * (df->pv[r] * gr[r]);
+            if (s > best_s) { best_s = s; best = c; }
+        }
+        carried = (int32_t)best;
+        drafts[i - 1] = df->cand[(size_t)i * K + best];
+    }
+    DS4_DFL_TEND(df, 22, dwt);
+    if (df->dbg) {                             /* row-0 argmax: the drafter's
+                                                * own next-token prediction */
+        int32_t b0 = 0;
+        float bv = -1e30f;
+        const float *r0 = df->logits;
+        for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+            if (r0[v] > bv) { bv = r0[v]; b0 = (int32_t)v; }
+        df->dbg_rc[0] = b0;
+        df->dbg_rc[1] = drafts[0];
+        df->dbg_rc[2] = n_draft > 1 ? drafts[1] : -1;
+        df->dbg_rc[3] = n_draft > 2 ? drafts[2] : -1;
+    }
+    *n_out = n_draft;
+    return true;
+}
+
+static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t pos0,
+                                uint32_t n_draft, int32_t *drafts, uint32_t *n_out) {
+    ds4_dflash_gpu *df = (ds4_dflash_gpu *)g->dflash_gpu;
+    const ds4_dflash_weights *dw = &df->dw;
+    *n_out = 0;
+    if (anchor < 0 || anchor >= (int32_t)DS4_N_VOCAB || !df->wired) return false;
+    if (n_draft > 7u) n_draft = 7u;              /* block kernels tile 8 rows  */
+    const uint32_t T = n_draft + 1u;
+    const uint32_t E = df->E;
+    const uint32_t n_ctx = ds4_dflash_n_ctx(df);
+    const float scale = 1.0f / sqrtf((float)df->hd);
+    const void *dmmap = df->dm->map;
+    const uint64_t dmsize = df->dm->size;
+
+    /* 1. block embeddings (host) into the GPU residual stream.            *
+     * The memcpy lands before the first draft command is encoded, so the   *
+     * GPU sees it even though the inject batch is still open.              */
+    qwen4_ref_row(df->tm, df->tw->token_embd, (uint64_t)anchor, df->h);
+    for (uint32_t i = 1; i < T; i++)
+        memcpy(df->h + (size_t)i * E, df->mask_rowf, (size_t)E * sizeof(float));
+    if (ds4_gpu_tensor_write(df->gh, 0, df->h, (size_t)T * E * sizeof(float)) != 1) {
+        df->wired = false;
+        return false;
+    }
+
+    const double tdg = df->tstat ? now_sec() : 0.0;             /* TSTAT dg_draft */
+    bool ok = glm_graph_begin_commands_if_needed();
+    for (uint32_t il = 0; ok && il < df->n_layer; il++) {
+        const uint32_t rbase = (uint32_t)((uint64_t)il * df->kv_heads * df->ring_cap * df->hd);
+        /* attention half: norm -> conv coefficients -> conv side 0 -> qkv
+         * -> per-head norm+rope in place -> non-causal ring attention ->
+         * out projection -> conv side 1 -> residual add, all chained with
+         * no host step in between.                                       */
+        ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
+                                                      dw->block[il].attn_norm->abs_offset,
+                                                      E, T, df->eps);
+        ok = ok && qwen4_gemv(df->gconv, df->dm, dw->block[il].attn_conv_proj, df->gxn, T);
+        ok = ok && ds4_gpu_df_conv_tensor(df->gcr1, df->gconv, dmmap, dmsize,
+                                         dw->block[il].attn_conv_base->abs_offset, df->gxn,
+                                         T, E, df->n_groups, df->group, df->kernel,
+                                         df->block_size, 0u);
+        ok = ok && qwen4_gemv(df->gq, df->dm, dw->block[il].attn_q, df->gcr1, T) &&
+             qwen4_gemv(df->gk, df->dm, dw->block[il].attn_k, df->gcr1, T) &&
+             qwen4_gemv(df->gv, df->dm, dw->block[il].attn_v, df->gcr1, T);
+        ok = ok && ds4_gpu_df_rope_tensor(df->gq, df->gq, dmmap, dmsize,
+                                         dw->block[il].attn_q_norm->abs_offset, T, df->heads,
+                                         df->hd, pos0, 0u, 0u, 1u, 1u, 0u, df->eps, df->rope_base);
+        ok = ok && ds4_gpu_df_rope_tensor(df->gk, df->gk, dmmap, dmsize,
+                                         dw->block[il].attn_k_norm->abs_offset, T, df->kv_heads,
+                                         df->hd, pos0, 0u, 0u, 1u, 1u, 0u, df->eps, df->rope_base);
+        ok = ok && ds4_gpu_df_attn_tensor(df->gattn, df->gq, df->gck, df->gcv, df->gk, df->gv,
+                                         df->heads, df->kv_heads, df->hd, T, n_ctx,
+                                         df->ring_cap, rbase, rbase, scale);
+        ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].attn_output, df->gattn, T);
+        ok = ok && ds4_gpu_df_conv_tensor(df->gcr2, df->gconv, dmmap, dmsize,
+                                         dw->block[il].attn_conv_base->abs_offset, df->gwo,
+                                         T, E, df->n_groups, df->group, df->kernel,
+                                         df->block_size, 1u);
+        ok = ok && ds4_gpu_add_tensor(df->gh, df->gh, df->gcr2, (uint32_t)((uint64_t)T * E));
+
+        /* ffn half                                                     */
+        ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
+                                                      dw->block[il].ffn_norm->abs_offset,
+                                                      E, T, df->eps);
+        ok = ok && qwen4_gemv(df->gconv2, df->dm, dw->block[il].ffn_conv_proj, df->gxn, T);
+        ok = ok && ds4_gpu_df_conv_tensor(df->gcr1, df->gconv2, dmmap, dmsize,
+                                         dw->block[il].ffn_conv_base->abs_offset, df->gxn,
+                                         T, E, df->n_groups, df->group, df->kernel,
+                                         df->block_size, 0u);
+        ok = ok && qwen4_gemv(df->gffn1, df->dm, dw->block[il].ffn_gate, df->gcr1, T) &&
+             qwen4_gemv(df->gffn2, df->dm, dw->block[il].ffn_up, df->gcr1, T);
+        ok = ok && ds4_gpu_swiglu_tensor(df->gmid, df->gffn1, df->gffn2,
+                                        (uint32_t)((uint64_t)T * df->ff), 0.0f, 1.0f);
+        ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].ffn_down, df->gmid, T);
+        ok = ok && ds4_gpu_df_conv_tensor(df->gcr2, df->gconv2, dmmap, dmsize,
+                                         dw->block[il].ffn_conv_base->abs_offset, df->gwo,
+                                         T, E, df->n_groups, df->group, df->kernel,
+                                         df->block_size, 1u);
+        ok = ok && ds4_gpu_add_tensor(df->gh, df->gh, df->gcr2, (uint32_t)((uint64_t)T * E));
+    }
+    ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
+                                                  dw->output_norm->abs_offset, E, T, df->eps);
+    ok = ok && qwen4_gemv(df->glogits, df->tm, df->tw->output, df->gxn, T) &&
+         qwen4_gemv(df->ggate, df->dm, dw->sel_hidden, df->gxn, T);
+    DS4_DFL_TEND(df, 25, tdg);
+    if (!ok || !ds4_gpu_end_commands()) {
+        fprintf(stderr, "ds4: dflash: GPU draft batch failed (rows=%u)\n", T);
+        df->wired = false;
+        return false;
+    }
+    return ds4_dfl_read_walk(df, dw, T, anchor, n_draft, drafts, n_out);
+}
+
+/* ================================================================== */
 /* draft block cycle: anchor + mask rows through the drafter layers,    *
  * trunk head, selector walk.  Returns n_draft tokens.                  */
 /* ================================================================== */
 static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t pos0,
                              uint32_t n_draft, int32_t *drafts, uint32_t *n_out) {
     ds4_dflash_gpu *df = (ds4_dflash_gpu *)g->dflash_gpu;
+    if (df && df->dgp)
+        return ds4_dflash_draft_gpu(g, anchor, pos0, n_draft, drafts, n_out);
     const ds4_dflash_weights *dw = &df->dw;
     const uint32_t T = n_draft + 1u;
     const uint32_t E = df->E, KV = df->kv_heads * df->hd, QD = df->heads * df->hd;
@@ -971,59 +1213,14 @@ static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t po
         if (!glm_graph_begin_commands_if_needed()) return false;
         if (!qwen4_gemv(df->glogits, df->tm, df->tw->output, df->gxn, T) ||
             !qwen4_gemv(df->ggate, df->dm, dw->sel_hidden, df->gxn, T) ||
-            !ds4_gpu_end_commands() ||
-            ds4_gpu_tensor_read(df->glogits, 0, df->logits,
-                                (size_t)T * DS4_N_VOCAB * sizeof(float)) != 1 ||
-            ds4_gpu_tensor_read(df->ggate, 0, df->gate,
-                                (size_t)T * df->rank * sizeof(float)) != 1)
+            !ds4_gpu_end_commands())
             return false;
         DS4_DFL_TEND(df, 21, t0);
     }
 
-    /* 4. candidates then the greedy lattice walk                           */
-    const double dwt = df->tstat ? now_sec() : 0.0;              /* TSTAT d_walk  */
-    for (uint32_t i = 1; i <= n_draft; i++)
-    ds4_dfl_topk(df->logits + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB, df->top_k,
-                 df->cand + (size_t)i * df->top_k, df->uv + (size_t)i * df->top_k);
-    int32_t carried = 0;
-    for (uint32_t i = 1; i <= n_draft; i++) {
-        const uint32_t K = df->top_k, R = df->rank;
-        const float *gr = df->gate + (size_t)i * R;
-        const int32_t pred_id = i == 1 ? anchor
-            : df->cand[(size_t)(i - 1) * K + carried];
-        if (pred_id < 0 || pred_id >= (int32_t)DS4_N_VOCAB) return false;
-        ds4_dfl_row(df->dm, dw->sel_predecessor, (uint64_t)pred_id, df->pv);
-        for (uint32_t c = 0; c < K; c++)
-            ds4_dfl_row(df->dm, dw->sel_successor,
-                        (uint64_t)df->cand[(size_t)i * K + c],
-                        df->succ + (size_t)c * R);
-        uint32_t best = 0;
-        float best_s = -1e30f;
-        for (uint32_t c = 0; c < K; c++) {
-            float s = df->uv[(size_t)i * K + c];
-            const float *sv = df->succ + (size_t)c * R;
-            for (uint32_t r = 0; r < R; r++)
-                s += sv[r] * (df->pv[r] * gr[r]);
-            if (s > best_s) { best_s = s; best = c; }
-        }
-        carried = (int32_t)best;
-        drafts[i - 1] = df->cand[(size_t)i * K + best];
-    }
-    DS4_DFL_TEND(df, 22, dwt);
-    if (df->dbg) {                             /* row-0 argmax: the drafter's
-                                                * own next-token prediction */
-        int32_t b0 = 0;
-        float bv = -1e30f;
-        const float *r0 = df->logits;
-        for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
-            if (r0[v] > bv) { bv = r0[v]; b0 = (int32_t)v; }
-        df->dbg_rc[0] = b0;
-        df->dbg_rc[1] = drafts[0];
-        df->dbg_rc[2] = n_draft > 1 ? drafts[1] : -1;
-        df->dbg_rc[3] = n_draft > 2 ? drafts[2] : -1;
-    }
-    *n_out = n_draft;
-    return true;
+    /* 4. logits readback, candidates, the greedy lattice walk — shared with
+     *    the GPU draft path.                                           */
+    return ds4_dfl_read_walk(df, dw, T, anchor, n_draft, drafts, n_out);
 }
 
 /* ================================================================== */
