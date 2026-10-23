@@ -2045,6 +2045,11 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.dspark_strict = true;
         } else if (!strcmp(arg, "--mtp-exact-sampling")) {
             c.engine.dspark_exact_sampling = true;
+        } else if (!strcmp(arg, "--dflash")) {
+            c.engine.dflash = true;
+        } else if (!strcmp(arg, "--dflash-mask-row")) {
+            c.engine.dflash = true;
+            c.engine.dflash_mask_row = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "-n") || !strcmp(arg, "--tokens")) {
             c.gen.n_predict = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "-c") || !strcmp(arg, "--ctx")) {

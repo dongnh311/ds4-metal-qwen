@@ -159,6 +159,8 @@ typedef struct {
     bool dspark_strict;
     bool dspark_exact_sampling;
     bool dspark_confidence_threshold_set;
+    bool dflash;                   /* enable DFlash2 block-diffusion drafting */
+    const char *dflash_mask_row;   /* mask-row sidecar override (--dflash-mask-row) */
     bool cuda_tensor_parallel;
     bool ssd_streaming;
     bool ssd_streaming_cold;
