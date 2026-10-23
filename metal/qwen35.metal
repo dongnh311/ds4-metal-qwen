@@ -2429,22 +2429,22 @@ kernel void kernel_df_rope(
     ss = simd_sum(ss);
     if (tid == 0u) tot[0] = ss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float s = 1.0f / sqrtf(tot[0] / (float)hd + args.eps);
+    const float s = 1.0f / sqrt(tot[0] / (float)hd + args.eps);
     if (args.do_norm) {
         for (uint d = tid; d < hd; d += 32u) xh[d] *= s * w[d];
     } else {
         for (uint d = tid; d < hd; d += 32u) xh[d] *= s;
     }
     if (args.do_rope) {
-        const uint half = hd / 2u;
-        const double pos = (double)(args.pos0 + r);
-        for (uint i = tid; i < half; i += 32u) {
-            const float theta = (float)(pos * pow((double)args.rope_base,
-                                                  -(double)(2u * i) / (double)hd));
-            const float c = cosf(theta), sn = sinf(theta);
-            const float a = xh[i], b = xh[i + half];
+        const uint hlf = hd / 2u;                 /* 'half' is a Metal type    */
+        const float pos = (float)(args.pos0 + r);
+        for (uint i = tid; i < hlf; i += 32u) {
+            const float theta = pos * pow(args.rope_base,
+                                        -(float)(2u * i) / (float)hd);
+            const float c = cos(theta), sn = sin(theta);
+            const float a = xh[i], b = xh[i + hlf];
             xh[i]        = a * c - b * sn;
-            xh[i + half] = b * c + a * sn;
+            xh[i + hlf]  = b * c + a * sn;
         }
     }
     for (uint d = tid; d < hd; d += 32u) dst[dbase + d] = xh[d];
@@ -2478,7 +2478,8 @@ kernel void kernel_df_attn(
         ushort tiisg [[thread_index_in_simdgroup]]) {
     const uint qi = tgpig.x, kvh = tgpig.y;
     if (kvh >= args.kvh) return;
-    const uint H = args.heads, Hkv = args.kvh, D = 128u;
+    const uint H = args.heads, Hkv = args.kvh;
+    constexpr uint D = 128u;
     const uint head = kvh * args.qph + qi;
     const uint rows = args.rows, N = args.n_ctx + rows;
     const uint dh = sgitg;                     /* key half of the tile      */
