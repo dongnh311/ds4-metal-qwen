@@ -653,7 +653,13 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
         /* wide + decode2 era: the row loop below dispatches decode3 per row. */
     }
     const uint64_t qrow = (uint64_t)DS4_N_HEAD * DS4_N_HEAD_DIM * sizeof(float);
-    const uint32_t step = per_row ? 1u : n;
+    /* W-D4 stage 2: a batched verify pairs even row counts into the 2-row
+     * decode3 dispatch (the receipted MTP 2-row verify shape; each kernel
+     * pass computes its own head slots, so rows 1 and 2 agree with rows =
+     * 1 calls bit for bit).  Odd widths keep one row per dispatch. */
+    const uint32_t step = (per_row && g->dflash_verify_batched && (n & 1u) == 0u)
+        ? 2u
+        : (per_row ? 1u : n);
     bool ok = true;
     for (uint32_t t = r0; t < r0 + n && ok; t += step) {
         const uint64_t off = (uint64_t)t * qrow, bytes = (uint64_t)step * qrow;
@@ -664,7 +670,7 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
              (wide_decode3
                   ? ds4_gpu_qwen35_attn_decode3_tensor(o, q, gt, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                                        g->attn_part, DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM,
-                                                       pos0 + t, 1u, scale) != 0
+                                                       pos0 + t, step, scale) != 0
                   : ds4_gpu_qwen4_attn_decode_tensor(o, q, gt, qwen4_kcache(g, il), qwen4_vcache(g, il),
                                                      NULL, NULL, step <= 2u ? g->attn_part : NULL, step,
                                                      DS4_N_HEAD, DS4_N_HEAD_KV, DS4_N_HEAD_DIM, pos0 + t, 0u, 0u, scale,
