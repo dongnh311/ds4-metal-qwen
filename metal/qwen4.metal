@@ -4520,6 +4520,116 @@ kernel void kernel_qwen4_moe_down_mxfp4_grouped(
     }
 }
 
+/* Q4_K down rows shared by every pair that chose the same expert (the mid
+ * grouped kernel's structure for the down side).  Per pair the arithmetic is
+ * kernel_qwen4_moe_down_k<12, NR>'s exactly: the block's sub-scale decode and
+ * the eight quad extractions happen once, each pair accumulates in the same
+ * non-reassociating chain. */
+template <uint NR, uint NJ>
+static inline void qwen4_moe_down_q4k_pass(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char *down_base, device const float *mid, device float *part,
+        device const int32_t *list, uint64_t ebase, uint row0, uint nb,
+        uint group, uint l, uint shift, ushort tiisg) {
+    uint pairs[NJ];
+    device const float *ms[NJ];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++) {
+        pairs[j] = (uint)list[j];
+        ms[j] = mid + (uint64_t)pairs[j] * args.in_dim;
+    }
+    float acc[NJ][NR];
+#pragma unroll
+    for (uint j = 0; j < NJ; j++)
+#pragma unroll
+        for (uint r = 0; r < NR; r++) acc[j][r] = 0.0f;
+    for (uint ib = 0; ib < nb; ib++) {
+        const uint e0 = ib * 256u + group * 32u + l;
+        if (e0 >= args.in_dim) continue;
+        float y[NJ][8];
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            const float4 ya = *(device const float4 *)(ms[j] + e0);
+            const float4 yb = *(device const float4 *)(ms[j] + e0 + 4);
+            y[j][0] = ya.x; y[j][1] = ya.y; y[j][2] = ya.z; y[j][3] = ya.w;
+            y[j][4] = yb.x; y[j][5] = yb.y; y[j][6] = yb.z; y[j][7] = yb.w;
+        }
+        for (uint r = 0; r < NR; r++) {
+            if (row0 + r >= args.out_rows) break;
+            device const uchar *blk = (device const uchar *)(down_base + ebase +
+                                                            (uint64_t)(row0 + r) * args.row_bytes + (uint64_t)ib * 144);
+            const half2 dd = *(device const half2 *)blk;
+            const float d = (float)dd.x;
+            const float dmin = (float)dd.y;
+            device const uchar *sc = blk + 4;
+            uint s, mn;
+            if (group < 4) { s = sc[group] & 63u; mn = sc[group + 4] & 63u; }
+            else { s = (sc[group + 4] & 0xFu) | ((sc[group - 4] & 0xC0u) >> 2); mn = (sc[group + 4] >> 4) | ((sc[group] & 0xC0u) >> 2); }
+            const float ds = d * (float)s, dm = dmin * (float)mn;
+            const uint2 qv = *(device const uint2 *)(blk + 16 + (group >> 1) * 32 + l);
+            for (uint i = 0; i < 8; i++) {
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+                const uint qb = ((i < 4 ? qv.x : qv.y) >> (8u * (i & 3u))) & 0xFFu;
+                const float qf = (float)((qb >> shift) & 0xFu);
+                const float w = fma(ds, qf, -dm);
+#pragma unroll
+                for (uint j = 0; j < NJ; j++) acc[j][r] = fma(w, y[j][i], acc[j][r]);
+            }
+        }
+    }
+#pragma unroll
+    for (uint r = 0; r < NR; r++) {
+        if (row0 + r >= args.out_rows) break;
+#pragma unroll
+        for (uint j = 0; j < NJ; j++) {
+            const float v = simd_sum(acc[j][r]);
+            if (tiisg == 0) part[(uint64_t)pairs[j] * args.out_rows + row0 + r] = v;
+        }
+    }
+}
+
+kernel void kernel_qwen4_moe_down_q4k_grouped(
+        constant ds4_metal_args_qwen4_moe & args,
+        device const char    *down_base,
+        device const int32_t *selected,
+        device const float   *mid,
+        device float         *part,
+        device const int32_t *lists,     /* [n_total_expert][list_cap]: pair indices */
+        device const int32_t *counts,    /* [n_total_expert] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint slot = tgpig.y, tok = tgpig.z;
+    const uint row0 = (tgpig.x * (ntg.x / 32u) + (uint)sgitg) * 2u;
+    if (row0 >= args.out_rows || slot >= args.n_slots || tok >= args.n_tokens) return;
+    const uint pair = tok * args.n_slots + slot;
+    const int32_t expert = selected[pair];
+    if (expert < 0 || (uint)expert >= args.n_total_expert) {
+        if (tiisg == 0) {
+            for (uint r = row0; r < row0 + 2u && r < args.out_rows; r++) part[(uint64_t)pair * args.out_rows + r] = 0.0f;
+        }
+        return;
+    }
+    device const int32_t *list = lists + (uint64_t)(uint)expert * args.list_cap;
+    const uint count = min((uint)counts[expert], args.list_cap);
+    if (count == 0 || (uint)list[0] != pair) return;
+    const uint64_t ebase = (uint64_t)(uint)expert * args.expert_bytes;
+    const uint nb = args.in_dim / 256;
+    const uint group = tiisg / 4, l = (tiisg % 4) * 8;
+    const uint shift = (group & 1u) * 4u;
+    for (uint j0 = 0; j0 < count; j0 += 4u) {
+        const uint nj = min(4u, count - j0);
+        switch (nj) {
+        case 1u: qwen4_moe_down_q4k_pass<2, 1>(args, down_base, mid, part, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
+        case 2u: qwen4_moe_down_q4k_pass<2, 2>(args, down_base, mid, part, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
+        case 3u: qwen4_moe_down_q4k_pass<2, 3>(args, down_base, mid, part, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
+        default: qwen4_moe_down_q4k_pass<2, 4>(args, down_base, mid, part, list + j0, ebase, row0, nb, group, l, shift, tiisg); break;
+        }
+    }
+}
+
 struct ds4_metal_args_qwen4_moe_reduce {
     uint32_t n_tokens;
     uint32_t n_slots;

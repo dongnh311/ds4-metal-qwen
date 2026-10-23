@@ -49858,6 +49858,7 @@ enum {
     QWEN4_K_MOE_DOWN_Q2K_ADDR_NR4,
     QWEN4_K_MOE_MID_Q4K_GROUPED,
     QWEN4_K_MOE_DOWN_MXFP4_GROUPED,
+    QWEN4_K_MOE_DOWN_Q4K_GROUPED,
     QWEN4_K_MOE_REDUCE,
     QWEN4_K_HC_COMBINE_NORM,
     QWEN4_K_ARGMAX,
@@ -50031,6 +50032,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_moe_down_q2k_addr_nr4",
     "kernel_qwen4_moe_mid_q4k_grouped",
     "kernel_qwen4_moe_down_mxfp4_grouped",
+    "kernel_qwen4_moe_down_q4k_grouped",
     "kernel_qwen4_moe_reduce",
     "kernel_qwen4_hc_combine_norm_f16",
     "kernel_qwen4_argmax",
@@ -54814,6 +54816,36 @@ int ds4_gpu_qwen4_moe_down_grouped_tensor(
     }
     const uint32_t nsg = 4u, rows_per_tg = 2u * nsg;
     return qwen4_dispatch(QWEN4_K_MOE_DOWN_MXFP4_GROUPED, &args, sizeof(args), b, 6,
+                          MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_slots, n_tokens),
+                          MTLSizeMake(32u * nsg, 1, 1), 0);
+}
+
+/* The Q4_K down rows of the same batch, on the same lists (Ornith verify). */
+int ds4_gpu_qwen4_moe_down_grouped_q4k_tensor(
+        ds4_gpu_tensor *part, const ds4_gpu_tensor *mid, const ds4_gpu_tensor *selected,
+        const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts, uint32_t list_cap,
+        const void *model_map, uint64_t model_size, uint64_t down_offset,
+        uint32_t weight_type, uint32_t n_total_expert, uint32_t n_tokens, uint32_t n_slots,
+        uint32_t ff_dim, uint32_t out_dim) {
+    if (weight_type != 12u || (ff_dim % 256u) != 0) return 0;
+    const uint32_t row_bytes = qwen4_down_row_bytes(weight_type, ff_dim);
+    const uint64_t expert_bytes = (uint64_t)row_bytes * out_dim;
+    qwen4_moe_args args = { n_tokens, n_slots, ff_dim, out_dim, weight_type, row_bytes, expert_bytes,
+                            0u, 0u, 0u, n_total_expert, list_cap, 0u };
+    qwen4_bind b[6];
+    if (n_tokens == 0 || n_slots == 0 || row_bytes == 0 || out_dim == 0 || list_cap == 0 ||
+        !qwen4_bind_weight(&b[0], model_map, model_size, down_offset, expert_bytes * n_total_expert, "moe down experts") ||
+        !qwen4_bind_tensor(&b[1], selected, (uint64_t)n_tokens * n_slots * sizeof(int32_t), "moe selected") ||
+        !qwen4_bind_tensor(&b[2], mid, (uint64_t)n_tokens * n_slots * ff_dim * sizeof(float), "moe mid")) {
+        return 0;
+    }
+    if (!qwen4_bind_tensor(&b[3], part, (uint64_t)n_tokens * n_slots * out_dim * sizeof(float), "moe partial") ||
+        !qwen4_bind_tensor(&b[4], lists, (uint64_t)n_total_expert * list_cap * sizeof(int32_t), "moe lists") ||
+        !qwen4_bind_tensor(&b[5], counts, (uint64_t)n_total_expert * sizeof(int32_t), "moe counts")) {
+        return 0;
+    }
+    const uint32_t nsg = 2u, rows_per_tg = 2u * nsg;
+    return qwen4_dispatch(QWEN4_K_MOE_DOWN_Q4K_GROUPED, &args, sizeof(args), b, 6,
                           MTLSizeMake((out_dim + rows_per_tg - 1) / rows_per_tg, n_slots, n_tokens),
                           MTLSizeMake(32u * nsg, 1, 1), 0);
 }

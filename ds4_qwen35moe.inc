@@ -730,6 +730,16 @@ static bool qwen35_spec_overlap_note(ds4_qwen4_gpu_graph *g) {
  * expert GEMMs above one tile of tokens; single rows and verifies keep the
  * per-token row kernels.  Batches above 8 rows run the shared expert as
  * dense projections, single rows and verifies keep it as an extra slot. */
+/* W-D5: the verify batch's rows often pick the same experts; the grouped
+ * kernels read each expert's Q4_K rows once for all pairs that chose it, with
+ * every pair's arithmetic unchanged (bit-identical to the per-pair kernels).
+ * Off by default until the receipts land. */
+static bool qwen35_moe_grouped_enabled(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_QWEN35_MOE_GROUPED"); v = e && e[0] && e[0] != '0'; }
+    return v;
+}
+
 static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                              uint32_t T) {
     const uint32_t E = DS4_N_EMBD, F = DS4_N_FF_EXP, NE = DS4_N_EXPERT, K = DS4_N_EXPERT_USED;
@@ -740,7 +750,10 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
                                          E, g->sh_gate_logit, T, NE, K) != 0;
     if (ok && T == 2u && g->verify_rows_exact && qwen35_spec_overlap_enabled()) ok = qwen35_spec_overlap_note(g);
     const bool mm = T > 64u && xt == dt && (xt == DS4_TENSOR_Q4_K || xt == DS4_TENSOR_Q5_K);
-    const bool shared_dense = mm || T > 8u;
+    const bool grouped = !mm && qwen35_moe_grouped_enabled() && T > 1u && T <= 8u &&
+        xt == DS4_TENSOR_Q4_K && dt == DS4_TENSOR_Q4_K && l->ffn_up_exps->type == DS4_TENSOR_Q4_K &&
+        !ds4_gpu_ssd_streaming_enabled();
+    const bool shared_dense = mm || T > 8u || grouped;
     if (ok && shared_dense) {
         ok = qwen35_gemv(g, g->sh_gate, m, l->ffn_gate_shexp, g->mixed, T) &&
              qwen35_gemv(g, g->sh_up, m, l->ffn_up_shexp, g->mixed, T) &&
@@ -766,6 +779,15 @@ static bool qwen35_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const d
                  : ds4_gpu_qwen4_moe_mm_down_tensor(g->part, g->mid, g->moe_lists, g->moe_counts, m->map, m->size,
                                                     l->ffn_down_exps->abs_offset, dt, NE, T, K, K, F, E, g->cap_tokens);
         }
+    } else if (ok && grouped) {
+        ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, K, NE,
+                                                 g->cap_tokens) &&
+             ds4_gpu_qwen4_moe_mid_grouped_tensor(g->mid, g->mixed, g->selected, g->moe_lists, g->moe_counts,
+                                                  g->cap_tokens, m->map, m->size, l->ffn_gate_exps->abs_offset,
+                                                  l->ffn_up_exps->abs_offset, xt, NE, T, K, E, F) &&
+             ds4_gpu_qwen4_moe_down_grouped_q4k_tensor(g->part, g->mid, g->selected, g->moe_lists, g->moe_counts,
+                                                       g->cap_tokens, m->map, m->size, l->ffn_down_exps->abs_offset,
+                                                       dt, NE, T, K, F, E);
     } else if (ok) {
         const uint64_t sg = shared_dense ? 0u : l->ffn_gate_shexp->abs_offset;
         const uint64_t su = shared_dense ? 0u : l->ffn_up_shexp->abs_offset;
@@ -1030,6 +1052,13 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     memset(g_qwen35_prof_p, 0, sizeof(g_qwen35_prof_p));
     g_qwen35_prof_last = prof ? now_sec() : 0.0;
     g_qwen35_prof_split = prof && prof_level >= 3;
+    /* W-D4b: the GDN sub-stage GPU-timestamp profiler (DS4_QWEN4_SUB_TS_PROFILE)
+     * also arms the Ornith verify forward — qwen4_graph_linear's sub_seal calls
+     * are the only ones inside this path, so the split is GDN-only. */
+    if (!prof) {
+        g_sub_armed = qwen4_sub_ts_enabled() && T <= 8u;
+        if (g_sub_armed) { (void)ds4_gpu_qsa_prof_seal(-1); g_sub_steps++; }
+    }
 #define QWEN35_PROF(idx_) do { if (prof) { ds4_gpu_end_commands(); const double n_ = now_sec(); \
         g_qwen35_prof_p[idx_] += n_ - g_qwen35_prof_last; g_qwen35_prof_last = n_; \
         glm_graph_begin_commands_if_needed(); } } while (0)
@@ -1119,6 +1148,7 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
         }
     }
     g_qwen35_prof_split = false;
+    g_sub_armed = 0;
 #undef QWEN35_PROF
 #undef DS4_QWEN35_PROF_DECODE_N
     if (!ds4_gpu_end_commands()) ok = false;
