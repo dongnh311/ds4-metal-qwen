@@ -60452,6 +60452,18 @@ typedef struct ds4_qwen4_gpu_graph {
     /* DFlash2 drafter state (ds4_dflash.inc); attached per session when
      * --dflash is set.  Defined later, after the dflash include. */
     struct ds4_dflash_gpu *dflash_gpu;
+    /* W-D4: DFlash2 T-row verify (DS4_DFLASH_VERIFY).  dflash_verify_rows is
+     * the verify row count (the anchor plus rows-1 drafts); 0 keeps every
+     * decode step plain.  dflash_snap_{s,h}[r][il] are the per-row GDN
+     * snapshot sets (set r holds the state after verify row r, r =
+     * 0..rows-2), and verify_row_snap_{s,h} are the per-row injection
+     * pointers qwen4_graph_linear consults in preference to the MTP
+     * after-first-row set while the row loop runs. */
+    ds4_gpu_tensor *dflash_snap_s[8][DS4_MAX_LAYER];
+    ds4_gpu_tensor *dflash_snap_h[8][DS4_MAX_LAYER];
+    ds4_gpu_tensor *verify_row_snap_s;
+    ds4_gpu_tensor *verify_row_snap_h;
+    uint32_t dflash_verify_rows;
 } ds4_qwen4_gpu_graph;
 
 /* W-D3: DFlash2 drafter lifecycle hook; defined in ds4_dflash.inc. */
@@ -60638,6 +60650,10 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         ds4_gpu_tensor_free(g->snap2_lin_hist[il]);
         ds4_gpu_tensor_free(g->snap0_lin_state[il]);
         ds4_gpu_tensor_free(g->snap0_lin_hist[il]);
+        for (uint32_t r = 0; r < 8; r++) {           /* W-D4 DFlash2 verify */
+            ds4_gpu_tensor_free(g->dflash_snap_s[r][il]);
+            ds4_gpu_tensor_free(g->dflash_snap_h[r][il]);
+        }
     }
     free(g->host_logits);
     memset(g, 0, sizeof(*g));
@@ -61509,11 +61525,17 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     sub_seal(SUB_GDN_Z);
     bool ok;
     if (qwen4_graph_fused(g, T)) {
+        /* W-D4: a DFlash2 per-row verify injects this row's snapshot dest in
+         * preference to the MTP after-first-row set (per-row calls are T=1,
+         * so pair 0's row index is 0 either way). */
+        ds4_gpu_tensor *row_snap_h = g->verify_row_snap_h
+            ? g->verify_row_snap_h
+            : (g->snap_after_first ? g->snap_lin_hist[il] : NULL);
         ok = ds4_gpu_qwen4_gdn_front_tensor(g->qkv, g->layer_lin_hist[il], g->mixed, g->ga, g->gb, m->map, m->size,
                                             l->lin_conv->abs_offset, l->lin_alpha->abs_offset, l->lin_beta->abs_offset,
                                             l->lin_a->abs_offset, l->lin_dt_bias->abs_offset, l->lin_alpha->type, T,
                                             DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV,
-                                            DS4_N_EMBD, g->snap_after_first ? g->snap_lin_hist[il] : NULL, 0u,
+                                            DS4_N_EMBD, row_snap_h, 0u,
                                             g->snap_after_second ? g->snap2_lin_hist[il] : NULL, 1u) != 0;
     } else {
         ok = qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) &&
@@ -61528,7 +61550,8 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
     if (ok) {
         ok = ds4_gpu_qwen4_gdn_scan_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->ga, g->gb, T,
                                            DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
-                                           g->snap_after_first ? g->snap_lin_state[il] : NULL, 0u,
+                                           g->verify_row_snap_s ? g->verify_row_snap_s
+                                               : (g->snap_after_first ? g->snap_lin_state[il] : NULL), 0u,
                                            g->snap_after_second ? g->snap2_lin_state[il] : NULL, 1u) != 0;
     }
     sub_seal(SUB_GDN_SCAN);
@@ -63863,6 +63886,7 @@ struct ds4_session {
     bool qwen35_graph_ready;
     bool qwen4_rewound;
     float *qwen4_verify_logits;
+    float *dflash_verify_logits;   /* W-D4: DFlash2 per-row verify logit rows */
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
 #endif
@@ -65846,7 +65870,11 @@ int ds4_engine_mtp_draft_tokens(ds4_engine *e) {
         return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 ? 2 : 0;
     }
     if (e && ds4_model_is_qwen35moe()) {
-        return e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend == DS4_BACKEND_METAL ? 2 : 0;
+        if (e->glm_mtp && DS4_N_NEXTN_PREDICT != 0 && e->backend == DS4_BACKEND_METAL) return 2;
+        /* W-D4: DFlash2 verify cycles are a draft path of their own; the
+         * callers use this only as a "> 1 speculative decode" gate */
+        if (e->dflash && e->backend == DS4_BACKEND_METAL) return 2;
+        return 0;
     }
     if (ds4_engine_has_mtp(e)) return e->mtp_draft_tokens;
 #ifndef DS4_NO_GPU
@@ -77277,7 +77305,7 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
         const uint32_t cap_tokens = e->prefill_chunk && e->prefill_chunk < (uint32_t)ctx_size ?
             e->prefill_chunk : qwen35_prefill_chunk_tokens((uint32_t)ctx_size);
         s->qwen4_slot = -1;
-        if (!qwen35_graph_alloc(&s->qwen4_graph, (uint32_t)ctx_size, cap_tokens, e->glm_mtp)) {
+        if (!qwen35_graph_alloc(&s->qwen4_graph, (uint32_t)ctx_size, cap_tokens, e->glm_mtp, e->dflash)) {
             free(s);
             return 1;
         }
@@ -77748,6 +77776,9 @@ void ds4_session_free(ds4_session *s) {
                         100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
             }
             free(s->qwen4_verify_logits);
+            free(s->dflash_verify_logits);
+            s->qwen4_verify_logits = NULL;
+            s->dflash_verify_logits = NULL;
             qwen4_graph_free(&s->qwen4_graph);
         } else
 #endif
@@ -79231,6 +79262,128 @@ static int ds4_session_qwen35_spec_cycle(ds4_session *s, int first_token, float 
     return 1;
 }
 #endif
+
+/* W-D4: one DFlash2 verify cycle (DS4_DFLASH_VERIFY, --dflash sessions).
+ *
+ * The caller has sampled first_token from s->logits; at this point
+ * g->pos is that token's position and the token itself is NOT forwarded
+ * yet.  The cycle injects any pending drafter ctx rows, drafts a fresh
+ * block of dflash_verify_rows-1 tokens anchored at first_token, then
+ * verifies the anchor plus drafts in one all-rows trunk forward whose
+ * attention, dense projections and GDN layers run one row per dispatch
+ * (bit-exact with plain decoding), with a GDN snapshot set taken after
+ * every row except the last.
+ *
+ * The commit is the longest chain whose row argmax equals the next row's
+ * token: argmax(rows[k]) == toks[k+1].  The last row's argmax is never
+ * checked -- it becomes the caller's next first_token, so the bonus token
+ * commits for free as the next cycle's anchor row.  On a partial chain the
+ * state swaps back to the snapshot of the last matched row and g->pos ends
+ * at pos0 + matched + 1; a full chain keeps the live state.  s->logits ends
+ * at rows[matched] either way.  A failed or disengaged cycle falls back to
+ * one plain decode step (returns 1); the temperate/sampled entry shares the
+ * same opportunistic semantics the Qwen35 MTP cycle uses.  Returns the
+ * committed count (1..rows), or -1. */
+static bool ds4_dflash_trace(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_DFLASH_TRACE"); v = e && e[0] && e[0] != '0'; }
+    return v != 0;
+}
+
+static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, float temperature, int top_k,
+                                           float top_p, float min_p, uint64_t *rng, bool exact_sampling,
+                                           int *accepted, int accepted_cap, char *err, size_t errlen) {
+    (void)temperature; (void)top_k; (void)top_p; (void)min_p; (void)rng; (void)exact_sampling;
+    ds4_engine *e = s->engine;
+    ds4_qwen4_gpu_graph *g = &s->qwen4_graph;
+    const ds4_model *m = &e->model;
+    const ds4_weights *w = &e->weights;
+    ds4_dflash_gpu *df = (ds4_dflash_gpu *)g->dflash_gpu;
+    const uint32_t V = DS4_N_VOCAB;
+    const uint32_t T = g->dflash_verify_rows;
+    /* the plain decode fallback covers the context/window edges, a caller
+     * buffer too small, a missing or failed drafter, and desync (it runs one
+     * ordinary 1-token step and the caller keeps generating) */
+    const bool engage = accepted_cap >= (int)T && df && df->wired && T > 1u &&
+        g->pos >= 1u && s->checkpoint_valid && g->pos == (uint32_t)s->checkpoint.len &&
+        g->pos + T <= g->ctx_cap && g->cap_tokens >= T;
+    if (!engage) {
+        const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
+        if (rc != 0) return -1;
+        if (df) df->verify_fallbacks++;
+        accepted[0] = first_token;
+        return 1;
+    }
+    const bool trace = ds4_dflash_trace();
+    const uint32_t pos = g->pos, nd = T - 1u;
+    int32_t drafts[DS4_DFLASH_MAX_DRAFT];
+    uint32_t got = 0;
+    double tinject = 0.0, tverify = 0.0;
+    if (trace) {
+        fprintf(stderr, "ds4: dfl verify: pos %u anchor %d rows %u\n", pos, first_token, T);
+        tinject = now_sec();
+    }
+    ds4_dflash_inject(g, pos - 1u);
+    if (!df->wired) {
+        const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
+        if (rc != 0) return -1;
+        df->verify_fallbacks++;
+        accepted[0] = first_token;
+        return 1;
+    }
+    if (!ds4_dflash_draft(g, first_token, pos, nd, drafts, &got) || got != nd) {
+        const int rc = ds4_session_eval_internal(s, first_token, false, err, errlen);
+        if (rc != 0) return -1;
+        df->verify_fallbacks++;
+        if (trace) fprintf(stderr, "ds4: dfl verify: draft cycle failed at pos %u (got %u/%u), plain step\n",
+                           pos, got, nd);
+        accepted[0] = first_token;
+        return 1;
+    }
+    if (trace) tinject = now_sec() - tinject;
+    int toks[DS4_DFLASH_MAX_DRAFT + 1];
+    toks[0] = first_token;
+    for (uint32_t i = 0; i < nd; i++) toks[i + 1] = drafts[i];
+    if (!s->dflash_verify_logits)
+        s->dflash_verify_logits = xmalloc((size_t)T * (size_t)V * sizeof(float));
+    float *rows = s->dflash_verify_logits;
+    g->verify_rows_exact = true;
+    if (trace) tverify = now_sec();
+    const bool ok = qwen35_graph_forward_tokens(g, m, w, toks, T, rows, true);
+    if (trace) tverify = now_sec() - tverify;
+    g->verify_rows_exact = false;
+    if (!ok) {
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "Ornith dflash: verify failed");
+        return -1;
+    }
+    uint32_t matched = 0;
+    while (matched + 1u < T && sample_argmax(rows + (size_t)matched * V, V) == toks[matched + 1u])
+        matched++;
+    if (matched + 1u < T &&
+        !qwen35_graph_dflash_state_swap(g, matched, pos + matched + 1u)) {
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "Ornith dflash: partial commit restore failed");
+        return -1;
+    }
+    token_vec_push(&s->checkpoint, first_token);
+    for (uint32_t k = 1; k <= matched; k++) token_vec_push(&s->checkpoint, toks[k]);
+    s->checkpoint_valid = true;
+    s->mtp_draft_valid = false;
+    memcpy(s->logits, rows + (size_t)matched * V, (size_t)V * sizeof(float));
+    accepted[0] = first_token;
+    for (uint32_t k = 1; k <= matched; k++) accepted[k] = toks[k];
+    df->verify_cycles++;
+    df->verify_tokens += matched + 1u;
+    df->verify_hist[matched + 1u]++;
+    if (matched + 1u < T) df->verify_swaps++;
+    if ((df->verify_cycles % 64u) == 0u) ds4_dflash_verify_flush(df);
+    if (trace)
+        fprintf(stderr, "ds4: dfl verify: pos %u..%u matched %u/%u (%s) inject %.1f ms verify %.1f ms\n",
+                pos, pos + matched, matched, T - 1u,
+                matched + 1u == T ? "full" : "partial", 1000.0 * tinject, 1000.0 * tverify);
+    return (int)(matched + 1u);
+}
 
 int ds4_session_glm_tp_spec_cycle(ds4_session *s, int token, int limit,
                                  char *err, size_t errlen) {
@@ -89272,6 +89425,13 @@ static int ds4_session_eval_speculative_argmax_impl(
 #ifdef DS4_HAS_QWEN4_METAL
     if (ds4_session_is_qwen35(s)) {
         if (!accepted || accepted_cap <= 0) return 0;
+        /* W-D4: the DFlash2 verify cycle takes precedence over the MTP one
+         * (the two drafters are mutually exclusive at open) */
+        if (s->engine->dflash && s->qwen35_graph_ready &&
+            s->qwen4_graph.dflash_verify_rows > 1u) {
+            return ds4_session_qwen35_dflash_cycle(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
+                                                   accepted, accepted_cap, err, errlen);
+        }
         if (s->engine->glm_mtp && s->qwen35_graph_ready && s->qwen4_graph.mtp_h) {
             return ds4_session_qwen35_spec_cycle(s, first_token, 0.0f, 0, 0.0f, 0.0f, NULL, false,
                                                  accepted, accepted_cap, err, errlen);
@@ -90152,6 +90312,12 @@ int ds4_session_eval_speculative(ds4_session *s, int first_token,
     }
 #ifdef DS4_HAS_QWEN4_METAL
     if (ds4_session_is_qwen35(s)) {
+        /* W-D4: same opportunistic verify semantics as the MTP cycle */
+        if (s->engine->dflash && s->qwen35_graph_ready &&
+            s->qwen4_graph.dflash_verify_rows > 1u) {
+            return ds4_session_qwen35_dflash_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, false,
+                                                   accepted, accepted_cap, err, errlen);
+        }
         if (s->engine->glm_mtp && s->qwen35_graph_ready && s->qwen4_graph.mtp_h) {
             return ds4_session_qwen35_spec_cycle(s, first_token, temperature, top_k, top_p, min_p, rng, false,
                                                  accepted, accepted_cap, err, errlen);

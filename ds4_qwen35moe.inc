@@ -26,7 +26,8 @@
  * row equals plain decoding bit for bit.  The session cycle is
  * ds4_session_qwen35_spec_cycle in ds4.c. */
 
-static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens, bool mtp) {
+static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_t cap_tokens, bool mtp,
+                               bool dflash) {
     memset(g, 0, sizeof(*g));
     if (!ds4_qwen35_context_ok((uint32_t)DS4_ROPE_ORIG_CTX, ctx_cap, (double)g_qwen4_rope_factor)) {
         char why[256];
@@ -46,6 +47,20 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
     g->cap_tokens = cap_tokens;
     /* a verify reads both of its rows' logits */
     g->n_logit_rows = mtp ? 2u : 1u;
+    /* W-D4: DS4_DFLASH_VERIFY=N (2..8) turns on the DFlash2 T-row verify for
+     * a --dflash session (the anchor plus N-1 drafted rows); absent, empty,
+     * or N < 2 keeps decode plain.  Each per-row GDN snapshot set is
+     * state+conv hist (~4.3 MiB per GDN layer here), so N-1 sets at N=8 is
+     * about 1.1 GiB on the 122B -- the budget is printed once at alloc. */
+    if (dflash) {
+        const char *dv = getenv("DS4_DFLASH_VERIFY");
+        if (dv && dv[0]) {
+            const long n = strtol(dv, NULL, 10);
+            if (n >= 2) g->dflash_verify_rows = n > 8 ? 8u : (uint32_t)n;
+        }
+    }
+    if (g->dflash_verify_rows > 1u && g->dflash_verify_rows > g->n_logit_rows)
+        g->n_logit_rows = g->dflash_verify_rows;
     g->owns_scratch = true;
     g->gdn_silu = true;
     qwen35_kv_mode_env(&g->kv_fp8, &g->kv_q4);
@@ -114,6 +129,11 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
         QWEN35_ALLOC(mtp_R, T * E);
         QWEN35_ALLOC(mtp_argmax, 1u);
         QWEN35_ALLOC(mtp_argmax_tmp, ((DS4_N_VOCAB + 4095u) / 4096u) * 2u);
+    } else if (g->dflash_verify_rows > 1u) {
+        /* W-D4: the all-rows head path reads/writes the post-norm h rows
+         * through g->mtp_h, so a DFlash2 verify allocates it even though the
+         * nextn block itself stays unbound. */
+        QWEN35_ALLOC(mtp_h, (T + 1u) * E);
     }
 #undef QWEN35_ALLOC
     /* F16 K/V per full-attention layer (with MTP, the MTP block's too);
@@ -148,6 +168,13 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
                 g->snap_lin_hist[il] = qwen4_graph_alloc_f32(hist_n);
                 ok = g->snap_lin_state[il] && g->snap_lin_hist[il];
             }
+            if (ok && g->dflash_verify_rows > 1u) {
+                for (uint32_t r = 0; ok && r + 1u < g->dflash_verify_rows; r++) {
+                    g->dflash_snap_s[r][il] = qwen4_graph_alloc_f32(state_n);
+                    g->dflash_snap_h[r][il] = qwen4_graph_alloc_f32(hist_n);
+                    ok = g->dflash_snap_s[r][il] && g->dflash_snap_h[r][il];
+                }
+            }
         }
     }
     g->host_row = xmalloc(T * E * sizeof(float));
@@ -157,6 +184,15 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
         fprintf(stderr, "ds4: Ornith graph allocation failed (ctx %u)\n", ctx_cap);
         qwen4_graph_free(g);
         return false;
+    }
+    if (g->dflash_verify_rows > 1u) {
+        uint32_t gdn = 0;
+        for (uint32_t il = 0; il < n_layers; il++)
+            if (!ds4_qwen35_layer_is_attention(il)) gdn++;
+        const double mb = (double)gdn * (double)(g->dflash_verify_rows - 1u)
+            * (double)(state_n + hist_n) * 4.0 / (1024.0 * 1024.0);
+        fprintf(stderr, "ds4: dflash verify: rows=%u snapshot sets=%u (%.0f MiB)\n",
+                g->dflash_verify_rows, g->dflash_verify_rows - 1u, mb);
     }
     /* once per process, outside any command batch; both the session and the
      * one-shot greedy path allocate here, and the fold waits for this check */
@@ -804,7 +840,10 @@ static bool qwen35_graph_linear_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         fprintf(stderr, "ds4: Ornith per-row verify supports only the after-first-row snapshot\n");
         return false;
     }
-    if (T == 2u && qwen35_verify_batch_env()) return qwen35_graph_linear_verify(g, m, l, il);
+    /* W-D4: a DFlash2 verify needs its per-row snapshot sets; the 2-row
+     * batch helper snaps into the MTP set instead, so keep the row loop. */
+    if (T == 2u && !g->dflash_verify_rows && qwen35_verify_batch_env())
+        return qwen35_graph_linear_verify(g, m, l, il);
     ds4_gpu_tensor *const mixed0 = g->mixed, *const blk0 = g->blk;
     const bool snap0 = g->snap_after_first;
     const uint64_t row = (uint64_t)DS4_N_EMBD * sizeof(float);
@@ -815,7 +854,19 @@ static bool qwen35_graph_linear_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m,
         g->mixed = mv;
         g->blk = bv;
         g->snap_after_first = snap0 && t == 0u;
+        /* W-D4: a DFlash2 per-row verify snapshots every row except the last
+         * (the last row's state stays live for an all-accepted block) into
+         * set t, so a partial commit can resume after any row. */
+        if (g->dflash_verify_rows && t + 1u < g->dflash_verify_rows) {
+            g->verify_row_snap_s = g->dflash_snap_s[t][il];
+            g->verify_row_snap_h = g->dflash_snap_h[t][il];
+        } else {
+            g->verify_row_snap_s = NULL;
+            g->verify_row_snap_h = NULL;
+        }
         ok = mv && bv && qwen4_graph_linear(g, m, l, il, 1u);
+        g->verify_row_snap_s = NULL;
+        g->verify_row_snap_h = NULL;
         ds4_gpu_tensor_free(mv);
         ds4_gpu_tensor_free(bv);
     }
@@ -889,7 +940,11 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     const bool snap = g->snap_after_first;
     g->snap_after_first = false;
     if (T == 0 || T > g->cap_tokens || g->pos + T > g->ctx_cap) return false;
-    if (all_rows && (!logits_out || !g->mtp_h || T > g->n_logit_rows)) return false;
+    /* W-D4: a DFlash2 verify lists all T rows' logits without the nextn
+     * block; mtp_h is allocated for it at graph alloc, so the head path
+     * below runs unchanged. */
+    if (all_rows && (!logits_out || (!g->mtp_h && !g->dflash_verify_rows) || T > g->n_logit_rows))
+        return false;
     for (uint32_t t = 0; t < T; t++) {
         if (tokens[t] < 0 || tokens[t] >= (int)DS4_N_VOCAB) {
             fprintf(stderr, "ds4: Ornith token id %d is outside the vocabulary\n", tokens[t]);
@@ -1242,6 +1297,31 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_mtp_chain(ds4_qwen4_gpu_graph *g, cons
     return true;
 }
 
+/* W-D4: a DFlash2 verify that matched only its first r+1 rows resumes from
+ * the state after row r: swap the live GDN buffers with verify-row snapshot
+ * set r (filled by qwen35_graph_linear_rows during the verify) and put the
+ * position back to the caller's new_pos (= pos0 + r + 1).  K/V rows beyond
+ * the restored position are overwritten by the next forward, exactly like
+ * qwen35_graph_state_swap; the exchanged set keeps working as the next
+ * verify's fresh snapshot dest. */
+static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_state_swap(ds4_qwen4_gpu_graph *g, uint32_t r, uint32_t new_pos) {
+    if (!g->dflash_verify_rows || r + 1u >= g->dflash_verify_rows) return false;
+    bool any = false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->dflash_snap_s[r][il]) continue;
+        ds4_gpu_tensor *t = g->layer_lin_state[il];
+        g->layer_lin_state[il] = g->dflash_snap_s[r][il];
+        g->dflash_snap_s[r][il] = t;
+        t = g->layer_lin_hist[il];
+        g->layer_lin_hist[il] = g->dflash_snap_h[r][il];
+        g->dflash_snap_h[r][il] = t;
+        any = true;
+    }
+    if (!any) return false;
+    g->pos = new_pos;
+    return true;
+}
+
 /* h_{g->pos - 1}: the post-output_norm trunk row the next MTP row pairs
  * with, held in mtp_h row (g->pos - g->mtp_h_pos0).  The disk payload saves
  * it so a restored session drafts exactly like the uninterrupted one. */
@@ -1323,7 +1403,7 @@ static int generate_qwen35_metal_argmax(
     const uint32_t cap = prefill_chunk && prefill_chunk < (uint32_t)ctx_size ?
         prefill_chunk : qwen35_prefill_chunk_tokens((uint32_t)ctx_size);
     ds4_qwen4_gpu_graph *g = xcalloc(1, sizeof(*g));
-    if (!qwen35_graph_alloc(g, (uint32_t)ctx_size, cap, false)) {
+    if (!qwen35_graph_alloc(g, (uint32_t)ctx_size, cap, false, dflash_w != NULL)) {
         free(g);
         return 1;
     }

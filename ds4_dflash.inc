@@ -126,6 +126,10 @@ typedef struct ds4_dflash_gpu {
     int32_t  pd_drafts[DS4_DFLASH_MAX_DRAFT];
     uint32_t pd_pos0, pd_len, pd_matched;
     bool     pd_valid;
+    /* W-D4 verify receipts (cycles committing matched+1 tokens each)       */
+    uint64_t verify_cycles, verify_tokens;
+    uint64_t verify_swaps, verify_fallbacks;
+    uint32_t verify_hist[DS4_DFLASH_MAX_DRAFT + 2];
 } ds4_dflash_gpu;
 
 /* ------------------------------------------------------------------ */
@@ -299,6 +303,19 @@ static void ds4_dflash_probe_flush(ds4_dflash_gpu *df) {
     fflush(stderr);
 }
 
+/* W-D4 verify receipt line (final print is the authoritative run receipt) */
+static void ds4_dflash_verify_flush(ds4_dflash_gpu *df) {
+    if (!df || !df->verify_cycles) return;
+    const double mean = (double)df->verify_tokens / (double)df->verify_cycles;
+    fprintf(stderr, "ds4: dflash verify: %llu cycles, mean %.3f tok/cycle, hist",
+            (unsigned long long)df->verify_cycles, mean);
+    for (uint32_t i = 1; i <= df->block_size && i <= DS4_DFLASH_MAX_DRAFT + 1u; i++)
+        fprintf(stderr, " %u", df->verify_hist[i]);
+    fprintf(stderr, " | swaps %llu fallbacks %llu\n",
+            (unsigned long long)df->verify_swaps, (unsigned long long)df->verify_fallbacks);
+    fflush(stderr);
+}
+
 static void ds4_dflash_free(struct ds4_dflash_gpu *df) {
     if (!df) return;
     if (df->dbg)
@@ -308,6 +325,7 @@ static void ds4_dflash_free(struct ds4_dflash_gpu *df) {
                 (unsigned long long)df->probe_tokens,
                 df->probe_hist[0], df->pd_valid, df->wired);
     ds4_dflash_probe_flush(df);
+    ds4_dflash_verify_flush(df);
     ds4_gpu_tensor_free(df->gxn);      ds4_gpu_tensor_free(df->gq);
     ds4_gpu_tensor_free(df->gattn);    ds4_gpu_tensor_free(df->gk);
     ds4_gpu_tensor_free(df->gv);       ds4_gpu_tensor_free(df->gwo);
@@ -397,6 +415,12 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
 
     { const char *pv = getenv("DS4_DFLASH_PROBE");
       df->probe = pv && pv[0] && pv[0] != '0'; }
+    /* W-D4: the verify cycle replaces the probe's stream-comparison decode;
+     * both envs together would double-draft, so verify wins. */
+    if (g->dflash_verify_rows > 1u && df->probe) {
+        df->probe = false;
+        fprintf(stderr, "ds4: dflash: DS4_DFLASH_VERIFY is set, probe stays off\n");
+    }
     { const char *dv = getenv("DS4_DFLASH_DEBUG");
       df->dbg = dv && dv[0] && dv[0] != '0'; }
     { const char *gv = getenv("DS4_DFLASH_GPU_FC");
