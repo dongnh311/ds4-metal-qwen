@@ -51670,12 +51670,12 @@ int ds4_gpu_df_conv_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *dyn,
                            uint64_t base_offset, const ds4_gpu_tensor *in,
                            uint32_t T, uint32_t E, uint32_t ngroup,
                            uint32_t group, uint32_t kernel, uint32_t bs,
-                           uint32_t side) {
+                           uint32_t side, uint32_t add) {
     if (T == 0u || E == 0u || group == 0u || kernel == 0u || ngroup == 0u ||
         bs == 0u || side > 1u)
         return 0;
-    struct { uint32_t T, E, ngroup, group, kernel, bs, side; } args =
-        { T, E, ngroup, group, kernel, bs, side };
+    struct { uint32_t T, E, ngroup, group, kernel, bs, side, add; } args =
+        { T, E, ngroup, group, kernel, bs, side, add };
     const uint64_t dyn_bytes = (uint64_t)T * 2u * kernel * ngroup * sizeof(float);
     const uint64_t act_bytes = (uint64_t)T * E * sizeof(float);
     qwen4_bind b[4];

@@ -3653,7 +3653,7 @@ int ds4_gpu_df_conv_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *dyn,
                            uint64_t base_offset, const ds4_gpu_tensor *in,
                            uint32_t T, uint32_t E, uint32_t ngroup,
                            uint32_t group, uint32_t kernel, uint32_t bs,
-                           uint32_t side);
+                           uint32_t side, uint32_t add);
 int ds4_gpu_df_rope_tensor(const ds4_gpu_tensor *src, ds4_gpu_tensor *dst,
                            const void *model_map, uint64_t model_size,
                            uint64_t weight_offset, uint32_t rows, uint32_t heads,

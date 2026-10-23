@@ -2357,6 +2357,7 @@ kernel void kernel_qwen35_mv_q8_0_rows2(
  * (dyn[t][side,k,g(e)] + base[k][side][e]) * in[t-k][e]. */
 struct ds4_metal_args_df_conv {
     uint32_t rows, edim, ngroups, grpsz, tapk, bs, side;
+    uint32_t add;      /* 1: out is the residual stream; accumulate in place */
 };
 
 kernel void kernel_df_conv(
@@ -2383,7 +2384,8 @@ kernel void kernel_df_conv(
                          (uint64_t)args.side * ((uint64_t)args.edim * args.tapk)])
                  * inr[(uint64_t)(t - k) * args.edim + e];
         }
-        out[(uint64_t)t * args.edim + e] = acc;
+        if (args.add) out[(uint64_t)t * args.edim + e] += acc;
+        else          out[(uint64_t)t * args.edim + e] = acc;
     }
 }
 

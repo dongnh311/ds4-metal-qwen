@@ -981,7 +981,7 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
         ok = ok && ds4_gpu_df_conv_tensor(df->gcr1, df->gconv, dmmap, dmsize,
                                          dw->block[il].attn_conv_base->abs_offset, df->gxn,
                                          T, E, df->n_groups, df->group, df->kernel,
-                                         df->block_size, 0u);
+                                         df->block_size, 0u, 0u);
         ok = ok && qwen4_gemv(df->gq, df->dm, dw->block[il].attn_q, df->gcr1, T) &&
              qwen4_gemv(df->gk, df->dm, dw->block[il].attn_k, df->gcr1, T) &&
              qwen4_gemv(df->gv, df->dm, dw->block[il].attn_v, df->gcr1, T);
@@ -995,11 +995,10 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
                                          df->heads, df->kv_heads, df->hd, T, n_ctx,
                                          df->ring_cap, rbase, rbase, scale);
         ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].attn_output, df->gattn, T);
-        ok = ok && ds4_gpu_df_conv_tensor(df->gcr2, df->gconv, dmmap, dmsize,
+        ok = ok && ds4_gpu_df_conv_tensor(df->gh, df->gconv, dmmap, dmsize,
                                          dw->block[il].attn_conv_base->abs_offset, df->gwo,
                                          T, E, df->n_groups, df->group, df->kernel,
-                                         df->block_size, 1u);
-        ok = ok && ds4_gpu_add_tensor(df->gh, df->gh, df->gcr2, (uint32_t)((uint64_t)T * E));
+                                         df->block_size, 1u, 1u);
 
         /* ffn half                                                     */
         ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
@@ -1009,17 +1008,16 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
         ok = ok && ds4_gpu_df_conv_tensor(df->gcr1, df->gconv2, dmmap, dmsize,
                                          dw->block[il].ffn_conv_base->abs_offset, df->gxn,
                                          T, E, df->n_groups, df->group, df->kernel,
-                                         df->block_size, 0u);
+                                         df->block_size, 0u, 0u);
         ok = ok && qwen4_gemv(df->gffn1, df->dm, dw->block[il].ffn_gate, df->gcr1, T) &&
              qwen4_gemv(df->gffn2, df->dm, dw->block[il].ffn_up, df->gcr1, T);
         ok = ok && ds4_gpu_swiglu_tensor(df->gmid, df->gffn1, df->gffn2,
                                         (uint32_t)((uint64_t)T * df->ff), 0.0f, 1.0f);
         ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].ffn_down, df->gmid, T);
-        ok = ok && ds4_gpu_df_conv_tensor(df->gcr2, df->gconv2, dmmap, dmsize,
+        ok = ok && ds4_gpu_df_conv_tensor(df->gh, df->gconv2, dmmap, dmsize,
                                          dw->block[il].ffn_conv_base->abs_offset, df->gwo,
                                          T, E, df->n_groups, df->group, df->kernel,
-                                         df->block_size, 1u);
-        ok = ok && ds4_gpu_add_tensor(df->gh, df->gh, df->gcr2, (uint32_t)((uint64_t)T * E));
+                                         df->block_size, 1u, 1u);
     }
     ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
                                                   dw->output_norm->abs_offset, E, T, df->eps);
