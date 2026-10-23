@@ -72,6 +72,11 @@ typedef struct ds4_dflash_gpu {
     const ds4_weights *tw;
     ds4_dflash_weights dw;                  /* by-value bind copy              */
     float   *mask_rowf;                     /* trained mask embedding, E       */
+    int      dbg;                           /* DS4_DFLASH_DEBUG: per-call dump */
+    int      gpu_fc;                        /* DS4_DFLASH_GPU_FC=1: try GPU fc */
+    uint32_t inj_chunk;                     /* rows per inject gemv batch      */
+    float   *fc_w;                          /* host fp32 fc [E][taps*E]        */
+    int32_t  dbg_rc[4];                     /* dbg: prev cycle row0 top1+drafts */
 
     /* GPU arena                                                            */
     ds4_gpu_tensor *gxn;                    /* gemv input, cap_rows*E          */
@@ -172,9 +177,10 @@ static void ds4_dfl_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, f
 }
 
 /* raw conv (llama.cpp build_dflash2_conv, one block, side split):        *
- * out[t][e] = sum_k (dyn[t][side,g,k] + base[k][side][e]) *              *
+ * out[t][e] = sum_k (dyn[t][side,k,g] + base[k][side][e]) *              *
  *             in[t - k (block rows only, zero left pad)][e]              *
- * dyn layout  = [t][side*(kernel*ng) + g*kernel + k]                      *
+ * dyn layout (conv_proj rows, ggml ne [g][k][side] per token) =          *
+ *              [t][side*(kernel*ng) + k*ng + g]                          *
  * base layout = [side][kernel][E] as (e + k*E + side*E*kernel)            */
 static void ds4_dfl_conv(uint32_t T, uint32_t bs, uint32_t E, uint32_t group, uint32_t kernel,
                          const float *dyn, int side, const float *base,
@@ -190,7 +196,7 @@ static void ds4_dfl_conv(uint32_t T, uint32_t bs, uint32_t E, uint32_t group, ui
             for (uint32_t k = 0; k < kernel; k++) {
                 if (b - (int32_t)k < 0) break;   /* taps read left padding */
                 const float inrow  = in[(size_t)(t - (uint32_t)k) * E + e];
-                const float coeff  = drow[(size_t)g * kernel + k];
+                const float coeff  = drow[(size_t)k * ng + g];
                 const float basew  = base[(size_t)e + (size_t)k * E + (size_t)side * ((size_t)E * kernel)];
                 acc += (coeff + basew) * inrow;
             }
@@ -295,6 +301,12 @@ static void ds4_dflash_probe_flush(ds4_dflash_gpu *df) {
 
 static void ds4_dflash_free(struct ds4_dflash_gpu *df) {
     if (!df) return;
+    if (df->dbg)
+        fprintf(stderr, "ds4: dfl dbg free: cycles=%llu tokens=%llu "
+                "hist[0]=%u pd_valid=%d wired=%d\n",
+                (unsigned long long)df->probe_cycles,
+                (unsigned long long)df->probe_tokens,
+                df->probe_hist[0], df->pd_valid, df->wired);
     ds4_dflash_probe_flush(df);
     ds4_gpu_tensor_free(df->gxn);      ds4_gpu_tensor_free(df->gq);
     ds4_gpu_tensor_free(df->gattn);    ds4_gpu_tensor_free(df->gk);
@@ -306,7 +318,7 @@ static void ds4_dflash_free(struct ds4_dflash_gpu *df) {
     ds4_gpu_tensor_free(df->ginj);     ds4_gpu_tensor_free(df->gfc);
     ds4_gpu_tensor_free(df->gk_inj);   ds4_gpu_tensor_free(df->gv_inj);
     ds4_gpu_tensor_free(df->gtap_ring);
-    free(df->mask_rowf);
+    free(df->mask_rowf); free(df->fc_w);
     free(df->ck); free(df->cv);
     free(df->h);  free(df->xn); free(df->cr1); free(df->cr2); free(df->q);
     free(df->kb); free(df->vb); free(df->o);  free(df->ho); free(df->dyn);
@@ -385,6 +397,19 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
 
     { const char *pv = getenv("DS4_DFLASH_PROBE");
       df->probe = pv && pv[0] && pv[0] != '0'; }
+    { const char *dv = getenv("DS4_DFLASH_DEBUG");
+      df->dbg = dv && dv[0] && dv[0] != '0'; }
+    { const char *gv = getenv("DS4_DFLASH_GPU_FC");
+      df->gpu_fc = gv && gv[0] && gv[0] != '0'; }
+    df->inj_chunk = DS4_DFLASH_INJ_CAP;
+    {
+        const char *cv = getenv("DS4_DFLASH_INJ_CHUNK");
+        if (cv && cv[0]) {
+            const long v = strtol(cv, NULL, 10);
+            if (v >= 1 && (unsigned long)v <= (unsigned long)DS4_DFLASH_INJ_CAP)
+                df->inj_chunk = (uint32_t)v;
+        }
+    }
 
     bool ok = true;
 #define DF_ALLOC(field_, floats_) do { df->field_ = qwen4_graph_alloc_f32(floats_); \
@@ -440,7 +465,17 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     DF_MALLOC(uv, sizeof(float) * (size_t)df->cap_rows * df->top_k);
     DF_MALLOC(succ, (size_t)df->top_k * df->rank * sizeof(float));
     DF_MALLOC(pv, (size_t)df->rank * sizeof(float));
+    DF_MALLOC(fc_w, (size_t)df->E * (size_t)df->n_taps * df->E * sizeof(float));
 #undef DF_MALLOC
+    if (ok) {
+        /* host fc: the drafter's only tensor whose in-dim (taps*E = 24576)
+         * has no GPU kernel path (both mul_mv_ext and the NAX/plain tensor
+         * matmuls reject that shape) — dequantize once at attach, then
+         * sgemm per inject chunk.  DS4_DFLASH_GPU_FC=1 forces the GPU path
+         * for empirical bisection. */
+        for (uint32_t e = 0; ok && e < df->E; e++)
+            ds4_dfl_row(df->dm, dw->fc, e, df->fc_w + (size_t)e * df->n_taps * df->E);
+    }
     if (ok) {
         memcpy(df->mask_rowf, mask_row, (size_t)df->E * sizeof(float));
         df->wired = true;
@@ -448,6 +483,15 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
         fprintf(stderr, "ds4: dflash: drafter attached (%u layers, window %u, block %u, "
                         "taps %u, probe=%d)\n",
                 df->n_layer, df->window, df->block_size, df->n_taps, df->probe);
+        if (df->dbg)
+            fprintf(stderr, "ds4: dfl dbg offsets: sizeof=%zu gtap_ring+%zu gxn+%zu "
+                    "gfc+%zu stage+%zu ck+%zu\n",
+                    sizeof(*df),
+                    (size_t)((char *)&df->gtap_ring - (char *)df),
+                    (size_t)((char *)&df->gxn - (char *)df),
+                    (size_t)((char *)&df->gfc - (char *)df),
+                    (size_t)((char *)&df->stage - (char *)df),
+                    (size_t)((char *)&df->ck - (char *)df));
         return true;
     }
     fprintf(stderr, "ds4: dflash: attach failed (allocation)\n");
@@ -517,31 +561,58 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
             from = df->ring_base;                     /* tap window trim */
         if (from > last) { df->inj_next = last + 1u; break; }
         uint32_t n = last - from + 1u;
-        if (n > DS4_DFLASH_INJ_CAP) n = DS4_DFLASH_INJ_CAP;
+        if (n > df->inj_chunk) n = df->inj_chunk;
 
         /* 1. fc input: tap planes -> fused rows (row = n_taps concat)      */
+        if (df->dbg && df->probe_seq == 0)
+            fprintf(stderr, "ds4: dfl dbg inject: last=%u from=%u n=%u chunk=%u ring(base=%u valid=%u "
+                    "ringb=%llu gfc=%llu gk=%llu gv=%llu stage=%p)\n",
+                    last, from, n, df->inj_chunk, df->ring_base, df->ring_valid,
+                    (unsigned long long)ds4_gpu_tensor_bytes(df->gtap_ring),
+                    (unsigned long long)ds4_gpu_tensor_bytes(df->gfc),
+                    (unsigned long long)ds4_gpu_tensor_bytes(df->gk_inj),
+                    (unsigned long long)ds4_gpu_tensor_bytes(df->gv_inj),
+                    (void *)df->stage);
         for (uint32_t j = 0; j < n; j++) {
             const uint32_t pos = from + j;
             const uint32_t slot = pos % df->ring_cap;
             for (uint32_t tp = 0; tp < df->n_taps; tp++) {
                 const uint64_t off = ((uint64_t)tp * df->ring_cap + slot) * erow;
+                /* stage rows are float-indexed: row j starts at j*(n_taps*E) */
                 if (ds4_gpu_tensor_read(df->gtap_ring, off,
-                                        df->stage + (size_t)j * row_bytes + (size_t)tp * df->E,
+                                        df->stage + ((size_t)j * df->n_taps + tp) * df->E,
                                         erow) != 1) {
+                    fprintf(stderr, "ds4: dflash: inject ring read failed (tp=%u slot=%u j=%u n=%u)\n",
+                            tp, slot, j, n);
                     df->wired = false;
                     return;
                 }
             }
         }
         if (ds4_gpu_tensor_write(df->gtap, 0, df->stage, (size_t)n * row_bytes) != 1) {
+            fprintf(stderr, "ds4: dflash: inject gtap write failed (n=%u)\n", n);
             df->wired = false;
             return;
         }
-        if (!qwen4_gemv(df->gfc, df->dm, dw->fc, df->gtap, n)) { df->wired = false; return; }
-        if (!ds4_gpu_end_commands()) { df->wired = false; return; }
-        if (ds4_gpu_tensor_read(df->gfc, 0, df->enc, (size_t)n * erow) != 1) {
-            df->wired = false;
-            return;
+        if (df->gpu_fc) {
+            if (!glm_graph_begin_commands_if_needed()) { df->wired = false; return; }
+            if (!qwen4_gemv(df->gfc, df->dm, dw->fc, df->gtap, n)) {
+                df->wired = false;
+                return;
+            }
+            if (!ds4_gpu_end_commands()) { df->wired = false; return; }
+            if (ds4_gpu_tensor_read(df->gfc, 0, df->enc, (size_t)n * erow) != 1) {
+                fprintf(stderr, "ds4: dflash: inject enc read failed\n");
+                df->wired = false;
+                return;
+            }
+        } else {
+            /* C[n][E] = stage[n][taps*E] * fc_w[E][taps*E]^T (row-major host) */
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                        (int)n, (int)df->E, (int)(df->n_taps * df->E),
+                        1.0f, df->stage, (int)(df->n_taps * df->E),
+                        df->fc_w, (int)(df->n_taps * df->E),
+                        0.0f, df->enc, (int)df->E);
         }
         {
             const float *ew = ds4_dfl_f32(df->dm, dw->enc_output_norm);
@@ -554,17 +625,28 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
         /* 2. per layer: k/v projections, k_norm + rope, cache append       */
         for (uint32_t il = 0; il < df->n_layer && df->wired; il++) {
             if (ds4_gpu_tensor_write(df->ginj, 0, df->enc, (size_t)n * erow) != 1) {
+                fprintf(stderr, "ds4: dflash: inject ginj write failed\n");
+                df->wired = false;
+                return;
+            }
+            /* the probe runs outside forwards: open the batch ourselves so
+             * gemv dispatch + end_commands pair up (a bare end_commands
+             * fails when no batch is open, and the raw gemvs would run
+             * owned-synchronous and leave the readbacks racing)          */
+            if (!glm_graph_begin_commands_if_needed()) {
                 df->wired = false;
                 return;
             }
             if (!qwen4_gemv(df->gk_inj, df->dm, dw->block[il].attn_k, df->ginj, n) ||
                 !qwen4_gemv(df->gv_inj, df->dm, dw->block[il].attn_v, df->ginj, n)) {
+                fprintf(stderr, "ds4: dflash: inject k/v gemv failed (layer %u n=%u)\n", il, n);
                 df->wired = false;
                 return;
             }
             if (!ds4_gpu_end_commands()) { df->wired = false; return; }
             if (ds4_gpu_tensor_read(df->gk_inj, 0, df->ik, (size_t)n * KV * sizeof(float)) != 1 ||
                 ds4_gpu_tensor_read(df->gv_inj, 0, df->iv, (size_t)n * KV * sizeof(float)) != 1) {
+                fprintf(stderr, "ds4: dflash: inject kv read failed (layer %u)\n", il);
                 df->wired = false;
                 return;
             }
@@ -781,6 +863,18 @@ static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t po
         carried = (int32_t)best;
         drafts[i - 1] = df->cand[(size_t)i * K + best];
     }
+    if (df->dbg) {                             /* row-0 argmax: the drafter's
+                                                * own next-token prediction */
+        int32_t b0 = 0;
+        float bv = -1e30f;
+        const float *r0 = df->logits;
+        for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+            if (r0[v] > bv) { bv = r0[v]; b0 = (int32_t)v; }
+        df->dbg_rc[0] = b0;
+        df->dbg_rc[1] = drafts[0];
+        df->dbg_rc[2] = n_draft > 1 ? drafts[1] : -1;
+        df->dbg_rc[3] = n_draft > 2 ? drafts[2] : -1;
+    }
     *n_out = n_draft;
     return true;
 }
@@ -790,7 +884,20 @@ static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t po
 /* ================================================================== */
 static void ds4_dflash_probe_step(ds4_qwen4_gpu_graph *g, int32_t token) {
     ds4_dflash_gpu *df = (ds4_dflash_gpu *)g->dflash_gpu;
-    if (!df || !df->wired || !df->probe) return;
+    if (!df || !df->wired || !df->probe) {
+        if (df && df->dbg && df->probe_seq < 2u)
+            fprintf(stderr, "ds4: dfl dbg step skip: wired=%d probe=%d\n",
+                    df ? df->wired : 0, df ? df->probe : 0);
+        return;
+    }
+    if (df->dbg && df->probe_seq < 3u)
+        fprintf(stderr, "ds4: dfl dbg step pos0=%u tok=%d seq=%llu\n",
+                g->pos, token, (unsigned long long)df->probe_seq);
+    if (df->dbg && df->probe_seq < 17u)
+        fprintf(stderr, "ds4: dfl dbg t: pos0=%u tok=%d prev(row0=%d d0=%d d1=%d d2=%d) "
+                "want0=%d\n",
+                g->pos, token, df->dbg_rc[0], df->dbg_rc[1], df->dbg_rc[2], df->dbg_rc[3],
+                df->pd_valid ? (int32_t)df->pd_drafts[0] : -1);
     const uint32_t pos0 = g->pos;                 /* the anchor's position  */
     ds4_dflash_inject(g, pos0 - 1u);
     if (!df->wired) return;
@@ -819,30 +926,36 @@ static void ds4_dflash_probe_step(ds4_qwen4_gpu_graph *g, int32_t token) {
         }
     }
 
-    uint32_t nd = df->block_size - 1u;
-    {
-        const char *e = getenv("DS4_DFLASH_NDRAFT");
-        if (e && e[0]) {
-            const long v = strtol(e, NULL, 10);
-            if (v >= 1 && v <= (long)(df->block_size - 1u)) nd = (uint32_t)v;
+    /* a fresh block is drafted only when no cycle is pending: a pending    *
+     * cycle extends across steps as its drafts verify one-by-one, closed   *
+     * by the scorer above on mismatch or full-block consumption.           *
+     * (Redrafting every step resets the streak before it can grow.)        */
+    if (!df->pd_valid) {
+        uint32_t nd = df->block_size - 1u;
+        {
+            const char *e = getenv("DS4_DFLASH_NDRAFT");
+            if (e && e[0]) {
+                const long v = strtol(e, NULL, 10);
+                if (v >= 1 && v <= (long)(df->block_size - 1u)) nd = (uint32_t)v;
+            }
         }
+        int32_t *drafts = xmalloc(sizeof(int32_t) * nd);
+        if (!drafts) return;
+        uint32_t got = 0;
+        const bool ok = ds4_dflash_draft(g, token, pos0, nd, drafts, &got);
+        if (ok && got == nd) {
+            memcpy(df->pd_drafts, drafts, sizeof(int32_t) * nd);
+            df->pd_pos0 = pos0;
+            df->pd_len = nd;
+            df->pd_matched = 0;
+            df->pd_valid = true;
+        } else {
+            /* a failed cycle disables further probing; decode is never touched */
+            df->probe = false;
+            fprintf(stderr, "ds4: dflash probe: draft cycle failed/probe off at pos %u\n", pos0);
+        }
+        free(drafts);
     }
-    int32_t *drafts = xmalloc(sizeof(int32_t) * nd);
-    if (!drafts) return;
-    uint32_t got = 0;
-    const bool ok = ds4_dflash_draft(g, token, pos0, nd, drafts, &got);
-    if (ok && got == nd) {
-        memcpy(df->pd_drafts, drafts, sizeof(int32_t) * nd);
-        df->pd_pos0 = pos0;
-        df->pd_len = nd;
-        df->pd_matched = 0;
-        df->pd_valid = true;
-    } else {
-        /* a failed cycle disables further probing; decode is never touched */
-        df->probe = false;
-        fprintf(stderr, "ds4: dflash probe: draft cycle failed/probe off at pos %u\n", pos0);
-    }
-    free(drafts);
     df->probe_seq++;
     if ((df->probe_seq % 256u) == 0u) ds4_dflash_probe_flush(df);
 }
