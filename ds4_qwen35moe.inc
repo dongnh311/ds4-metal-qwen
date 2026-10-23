@@ -57,6 +57,22 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
         if (dv && dv[0]) {
             const long n = strtol(dv, NULL, 10);
             if (n >= 2) g->dflash_verify_rows = n > 8 ? 8u : (uint32_t)n;
+            /* W-D4 stage 2: DS4_DFLASH_VERIFY_MODE=batch swaps the exact
+             * per-row dispatch for the prefill kernel shapes; the restore
+             * is a state blit + replay instead of per-row sets.  2 rows
+             * would take the fused front (alpha/beta computed inside the
+             * front kernel), which the replay cannot re-run, so 2 is
+             * promoted to 3. */
+            if (n >= 2) {
+                const char *vm = getenv("DS4_DFLASH_VERIFY_MODE");
+                if (vm && vm[0] && !strcmp(vm, "batch")) {
+                    g->dflash_verify_batched = true;
+                    if (g->dflash_verify_rows == 2u) {
+                        g->dflash_verify_rows = 3u;
+                        fprintf(stderr, "ds4: dflash verify: batch mode needs >= 3 rows; rows=2 promoted to 3\n");
+                    }
+                }
+            }
         }
     }
     if (g->dflash_verify_rows > 1u && g->dflash_verify_rows > g->n_logit_rows)
@@ -169,10 +185,26 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
                 ok = g->snap_lin_state[il] && g->snap_lin_hist[il];
             }
             if (ok && g->dflash_verify_rows > 1u) {
-                for (uint32_t r = 0; ok && r + 1u < g->dflash_verify_rows; r++) {
+                /* exact mode: one set per row except the last (after-row-r
+                 * states); batch mode: a single set holding the pre-verify
+                 * block-start state, restored + replayed on a partial. */
+                const uint32_t n_sets = g->dflash_verify_batched ? 1u : g->dflash_verify_rows - 1u;
+                for (uint32_t r = 0; ok && r < n_sets; r++) {
                     g->dflash_snap_s[r][il] = qwen4_graph_alloc_f32(state_n);
                     g->dflash_snap_h[r][il] = qwen4_graph_alloc_f32(hist_n);
                     ok = g->dflash_snap_s[r][il] && g->dflash_snap_h[r][il];
+                }
+                if (ok && g->dflash_verify_batched) {
+                    /* the verify's per-layer inputs: the raw qkv projection
+                     * (before the conv walk) and the alpha/beta projections
+                     * (after their gemvs, before prep) of rows 0..rows-1; a
+                     * partial-commit replay re-runs conv stream, prep and
+                     * scan over their committed prefix. */
+                    const uint64_t crows = g->dflash_verify_rows;
+                    g->dflash_cap_qkv[il] = qwen4_graph_alloc_f32(crows * conv_dim);
+                    g->dflash_cap_ga[il] = qwen4_graph_alloc_f32(crows * DS4_N_LIN_V_HEAD);
+                    g->dflash_cap_gb[il] = qwen4_graph_alloc_f32(crows * DS4_N_LIN_V_HEAD);
+                    ok = g->dflash_cap_qkv[il] && g->dflash_cap_ga[il] && g->dflash_cap_gb[il];
                 }
             }
         }
@@ -189,10 +221,17 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
         uint32_t gdn = 0;
         for (uint32_t il = 0; il < n_layers; il++)
             if (!ds4_qwen35_layer_is_attention(il)) gdn++;
-        const double mb = (double)gdn * (double)(g->dflash_verify_rows - 1u)
-            * (double)(state_n + hist_n) * 4.0 / (1024.0 * 1024.0);
-        fprintf(stderr, "ds4: dflash verify: rows=%u snapshot sets=%u (%.0f MiB)\n",
-                g->dflash_verify_rows, g->dflash_verify_rows - 1u, mb);
+        const uint32_t n_sets = g->dflash_verify_batched ? 1u : g->dflash_verify_rows - 1u;
+        const double mb = (double)gdn * (double)n_sets * (double)(state_n + hist_n) * 4.0 / (1024.0 * 1024.0);
+        if (g->dflash_verify_batched) {
+            const double cbytes = (double)gdn * (double)g->dflash_verify_rows
+                * ((double)conv_dim + 2.0 * (double)DS4_N_LIN_V_HEAD) * 4.0;
+            fprintf(stderr, "ds4: dflash verify: rows=%u batch mode: state set 1 (%.0f MiB) + captures %.0f MiB\n",
+                    g->dflash_verify_rows, mb, cbytes / (1024.0 * 1024.0));
+        } else {
+            fprintf(stderr, "ds4: dflash verify: rows=%u snapshot sets=%u (%.0f MiB)\n",
+                    g->dflash_verify_rows, g->dflash_verify_rows - 1u, mb);
+        }
     }
     /* once per process, outside any command batch; both the session and the
      * one-shot greedy path allocate here, and the fold waits for this check */
@@ -642,8 +681,16 @@ static bool qwen35_graph_attend(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
  * dense attention, output projection into blk. */
 static bool qwen35_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                    uint32_t il, uint32_t pos0, uint32_t T) {
+    /* W-D4 stage 2: a batched verify keeps per-row attention dispatches
+     * (the wide multi-row chunk shape is not wired for N-head-ratio-16
+     * rows > 2 yet), so each row's key split matches a plain decode.  The
+     * gate is verify-width only: a prefill chunk must keep the flash path
+     * that the r0==0 && !per_row branch owns. */
+    const bool per_row = T > 1u &&
+        ((g->verify_rows_exact && T > 1u) ||
+         (g->dflash_verify_batched && T <= g->dflash_verify_rows));
     return qwen35_graph_attention_prep(g, m, l, il, pos0, T) &&
-           qwen35_graph_attend(g, il, pos0, 0u, T, g->verify_rows_exact && T > 1u) &&
+           qwen35_graph_attend(g, il, pos0, 0u, T, per_row) &&
            qwen35_gemv(g, g->blk, m, l->attn_output, g->attn_o, T);
 }
 
@@ -1320,6 +1367,89 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_state_swap(ds4_qwen4_gpu_graph 
     if (!any) return false;
     g->pos = new_pos;
     return true;
+}
+
+/* W-D4 stage 2 (DS4_DFLASH_VERIFY_MODE=batch): blit the live GDN state and
+ * conv history into snapshot set 0 right before a batched T-row verify, so
+ * a partial commit has a block-start state to restore.  Set 0's exact-mode
+ * meaning (the state after row 0) is never used in batch mode, which runs
+ * no per-row sets at all. */
+static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_batched_baseline(ds4_qwen4_gpu_graph *g) {
+    if (!g->dflash_verify_batched || g->dflash_verify_rows <= 1u) return true;
+    const uint64_t state_bytes = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM
+        * sizeof(float);
+    const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM * sizeof(float);
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->dflash_cap_qkv[il] || !g->layer_lin_state[il]) continue;
+        if (!ds4_gpu_tensor_copy(g->dflash_snap_s[0][il], 0, g->layer_lin_state[il], 0, state_bytes) ||
+            !ds4_gpu_tensor_copy(g->dflash_snap_h[0][il], 0, g->layer_lin_hist[il], 0, hist_bytes))
+            return false;
+    }
+    return ds4_gpu_end_commands();
+}
+
+/* W-D4 stage 2: a batched verify that matched only its first r+1 rows
+ * rebuilds the recurrence for the committed prefix.  The batched forward
+ * runs the prefill kernel shapes, which leave only the live recurrent
+ * state, so the restore is: blit the block-start state/hist back into the
+ * live buffers (from set 0, taken by qwen35_graph_dflash_batched_baseline),
+ * then re-run conv stream, prep and scan over rows 0..r of the captured
+ * qkv/alpha/beta projections in layer order, which advances every GDN
+ * layer exactly past the committed rows.  Attention layers need nothing:
+ * a verify's K/V rows beyond a partial commit are overwritten by the next
+ * forward, the same invariant qwen35_graph_dflash_state_swap leans on.
+ * Note the replay drives the captured tensors through conv (in place) and
+ * prep, so a replayed commit consumes them once; the next verify fills the
+ * captures again.  The committed rows' totals also stay out of the
+ * residual: the caller only continues from the recurrence state. */
+static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_batched_restore_replay(ds4_qwen4_gpu_graph *g,
+                                                                        const ds4_model *m,
+                                                                        const ds4_weights *w,
+                                                                        uint32_t committed,
+                                                                        uint32_t new_pos) {
+    if (!g->dflash_verify_batched || g->dflash_verify_rows <= 1u) return false;
+    if (committed == 0u || committed > g->dflash_verify_rows) return false;
+    const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t state_bytes = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * DS4_N_LIN_HEAD_DIM
+        * sizeof(float);
+    const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * DS4_N_LIN_CONV_DIM * sizeof(float);
+    const uint64_t qrow = (uint64_t)committed * conv_dim * sizeof(float);
+    const uint64_t arow = (uint64_t)committed * DS4_N_LIN_V_HEAD * sizeof(float);
+    const uint64_t lrow = (uint64_t)committed * DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * sizeof(float);
+    /* the batch the verify forward opened ended at its tail; open our own */
+    if (!glm_graph_begin_commands_if_needed()) return false;
+    for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+        if (!g->dflash_cap_qkv[il] || !g->layer_lin_state[il]) continue;
+        if (!ds4_gpu_tensor_copy(g->layer_lin_state[il], 0, g->dflash_snap_s[0][il], 0, state_bytes) ||
+            !ds4_gpu_tensor_copy(g->layer_lin_hist[il], 0, g->dflash_snap_h[0][il], 0, hist_bytes))
+            return false;
+    }
+    for (uint32_t il = 0; il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
+        if (!g->dflash_cap_qkv[il] || !g->dflash_cap_ga[il] || !g->dflash_cap_gb[il]) continue;
+        const ds4_layer_weights *l = &w->layer[il];
+        ds4_gpu_tensor *qkv = ds4_gpu_tensor_view(g->dflash_cap_qkv[il], 0, qrow);
+        ds4_gpu_tensor *ga = ds4_gpu_tensor_view(g->dflash_cap_ga[il], 0, arow);
+        ds4_gpu_tensor *gb = ds4_gpu_tensor_view(g->dflash_cap_gb[il], 0, arow);
+        ds4_gpu_tensor *lo = ds4_gpu_tensor_view(g->lin_o, 0, lrow);
+        bool ok = qkv && ga && gb && lo &&
+            ds4_gpu_qwen4_conv_stream_tensor(qkv, g->layer_lin_hist[il], m->map, m->size,
+                                             l->lin_conv->abs_offset, committed, conv_dim, DS4_N_LIN_CONV,
+                                             true) &&
+            ds4_gpu_qwen4_gdn_prep_tensor(qkv, ga, gb, m->map, m->size, l->lin_a->abs_offset,
+                                          l->lin_dt_bias->abs_offset, committed, DS4_N_LIN_K_HEAD,
+                                          DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM) &&
+            ds4_gpu_qwen4_gdn_scan_tensor(lo, g->layer_lin_state[il], qkv, ga, gb, committed,
+                                          DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
+                                          NULL, 0u, NULL, 1u) != 0;
+        ds4_gpu_tensor_free(lo);
+        ds4_gpu_tensor_free(gb);
+        ds4_gpu_tensor_free(ga);
+        ds4_gpu_tensor_free(qkv);
+        if (!ok) return false;
+    }
+    g->pos = new_pos;
+    return ds4_gpu_end_commands();
 }
 
 /* h_{g->pos - 1}: the post-output_norm trunk row the next MTP row pairs

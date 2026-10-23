@@ -60464,6 +60464,17 @@ typedef struct ds4_qwen4_gpu_graph {
     ds4_gpu_tensor *verify_row_snap_s;
     ds4_gpu_tensor *verify_row_snap_h;
     uint32_t dflash_verify_rows;
+    /* W-D4 stage 2: DS4_DFLASH_VERIFY_MODE=batch runs the T-row verify in
+     * the prefill kernel shapes (batched projections, one T-row conv/prep/
+     * scan call per GDN layer) instead of the exact per-row dispatch.  A
+     * partial commit then rebuilds the recurrence from a pre-verify state
+     * blit (snapshot set 0) plus an in-order front/scan replay over the
+     * committed rows of dflash_cap_*, the per-GDN-layer capture of the qkv
+     * and alpha/beta projections the verify used. */
+    bool dflash_verify_batched;
+    ds4_gpu_tensor *dflash_cap_qkv[DS4_MAX_LAYER];
+    ds4_gpu_tensor *dflash_cap_ga[DS4_MAX_LAYER];
+    ds4_gpu_tensor *dflash_cap_gb[DS4_MAX_LAYER];
 } ds4_qwen4_gpu_graph;
 
 /* W-D3: DFlash2 drafter lifecycle hook; defined in ds4_dflash.inc. */
@@ -60654,6 +60665,9 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
             ds4_gpu_tensor_free(g->dflash_snap_s[r][il]);
             ds4_gpu_tensor_free(g->dflash_snap_h[r][il]);
         }
+        ds4_gpu_tensor_free(g->dflash_cap_qkv[il]);   /* W-D4 stage 2 */
+        ds4_gpu_tensor_free(g->dflash_cap_ga[il]);
+        ds4_gpu_tensor_free(g->dflash_cap_gb[il]);
     }
     free(g->host_logits);
     memset(g, 0, sizeof(*g));
@@ -61510,6 +61524,13 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                uint32_t il, uint32_t T) {
     const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
+    /* W-D4 stage 2: a batched verify captures each GDN layer's inputs (the
+     * raw qkv projection and the alpha/beta projections) so a partial
+     * commit can replay conv stream + prep + scan over the committed rows
+     * from the block-start state. */
+    const bool cap = g->dflash_verify_batched && T == g->dflash_verify_rows &&
+        g->dflash_cap_qkv[il] != NULL;
+    bool cap_ok = true;
     bool paired = false;
     if (T == 1u && !g->mtp_R && ds4_gpu_qwen4_decode_fusions_enabled() &&
         l->lin_qkv->type == DS4_TENSOR_Q8_0 && l->lin_gate->type == DS4_TENSOR_Q8_0) {
@@ -61521,6 +61542,10 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
         const bool qok = qwen4_gemv(g->qkv, m, l->lin_qkv, g->mixed, T);
         sub_seal(SUB_GDN_QKV);
         if (!qok || !qwen4_gemv(g->z, m, l->lin_gate, g->mixed, T)) return false;
+        /* the capture must land before the conv walk consumes qkv in place */
+        if (cap)
+            cap_ok = ds4_gpu_tensor_copy(g->dflash_cap_qkv[il], 0, g->qkv, 0,
+                                         T * conv_dim * sizeof(float)) != 0;
     }
     sub_seal(SUB_GDN_Z);
     bool ok;
@@ -61539,7 +61564,14 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                             g->snap_after_second ? g->snap2_lin_hist[il] : NULL, 1u) != 0;
     } else {
         ok = qwen4_gemv(g->ga, m, l->lin_alpha, g->mixed, T) &&
-             qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T) &&
+             qwen4_gemv(g->gb, m, l->lin_beta, g->mixed, T);
+        if (ok && cap)
+            cap_ok = cap_ok &&
+                ds4_gpu_tensor_copy(g->dflash_cap_ga[il], 0, g->ga, 0,
+                                    T * DS4_N_LIN_V_HEAD * sizeof(float)) != 0 &&
+                ds4_gpu_tensor_copy(g->dflash_cap_gb[il], 0, g->gb, 0,
+                                    T * DS4_N_LIN_V_HEAD * sizeof(float)) != 0;
+        ok = ok && cap_ok &&
              ds4_gpu_qwen4_conv_stream_tensor(g->qkv, g->layer_lin_hist[il], m->map, m->size, l->lin_conv->abs_offset,
                                               T, conv_dim, DS4_N_LIN_CONV, true) &&
              ds4_gpu_qwen4_gdn_prep_tensor(g->qkv, g->ga, g->gb, m->map, m->size, l->lin_a->abs_offset,
@@ -61547,7 +61579,7 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                            DS4_N_LIN_HEAD_DIM);
     }
     sub_seal(SUB_GDN_FRONT);
-    if (ok) {
+    if (ok && cap_ok) {
         ok = ds4_gpu_qwen4_gdn_scan_tensor(g->lin_o, g->layer_lin_state[il], g->qkv, g->ga, g->gb, T,
                                            DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD, DS4_N_LIN_HEAD_DIM,
                                            g->verify_row_snap_s ? g->verify_row_snap_s
@@ -79347,7 +79379,16 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
     if (!s->dflash_verify_logits)
         s->dflash_verify_logits = xmalloc((size_t)T * (size_t)V * sizeof(float));
     float *rows = s->dflash_verify_logits;
-    g->verify_rows_exact = true;
+    /* W-D4 stage 2: batch mode blits the block-start GDN state into
+     * snapshot set 0 before the forward and rebuilds the committed prefix
+     * by replay after it; exact mode (the default) keeps per-row sets. */
+    const bool batched = g->dflash_verify_batched;
+    if (batched && !qwen35_graph_dflash_batched_baseline(g)) {
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "Ornith dflash: verify block-start snapshot failed");
+        return -1;
+    }
+    g->verify_rows_exact = !batched;
     if (trace) tverify = now_sec();
     const bool ok = qwen35_graph_forward_tokens(g, m, w, toks, T, rows, true);
     if (trace) tverify = now_sec() - tverify;
@@ -79360,11 +79401,18 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
     uint32_t matched = 0;
     while (matched + 1u < T && sample_argmax(rows + (size_t)matched * V, V) == toks[matched + 1u])
         matched++;
-    if (matched + 1u < T &&
-        !qwen35_graph_dflash_state_swap(g, matched, pos + matched + 1u)) {
-        s->checkpoint_valid = false;
-        if (errlen) snprintf(err, errlen, "Ornith dflash: partial commit restore failed");
-        return -1;
+    if (matched + 1u < T) {
+        bool restored;
+        if (batched)
+            restored = qwen35_graph_dflash_batched_restore_replay(g, m, w, matched + 1u,
+                                                                  pos + matched + 1u);
+        else
+            restored = qwen35_graph_dflash_state_swap(g, matched, pos + matched + 1u);
+        if (!restored) {
+            s->checkpoint_valid = false;
+            if (errlen) snprintf(err, errlen, "Ornith dflash: partial commit restore failed");
+            return -1;
+        }
     }
     token_vec_push(&s->checkpoint, first_token);
     for (uint32_t k = 1; k <= matched; k++) token_vec_push(&s->checkpoint, toks[k]);
