@@ -1313,6 +1313,7 @@ static bool qwen35_graph_rw_copy(ds4_qwen4_gpu_graph *g, bool save) {
 static int generate_qwen35_metal_argmax(
         const ds4_model *model, const ds4_vocab *vocab, const ds4_weights *weights,
         const token_vec *prompt, int n_predict, int ctx_size, uint32_t prefill_chunk,
+        const ds4_dflash_weights *dflash_w, const float *dflash_mask, ds4_model *dflash_m,
         ds4_token_emit_fn emit, ds4_generation_done_fn done, void *emit_ud,
         ds4_session_progress_fn progress, void *progress_ud) {
     if (!prompt || prompt->len <= 0 || prompt->len >= ctx_size) {
@@ -1327,6 +1328,12 @@ static int generate_qwen35_metal_argmax(
         return 1;
     }
     qwen35_graph_reset(g);
+    if (dflash_w && !ds4_dflash_attach(dflash_w, dflash_mask, dflash_m,
+                                       (ds4_model *)model, weights, g)) {
+        qwen4_graph_free(g);
+        free(g);
+        return 1;
+    }
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     const double t_prefill0 = now_sec();
     bool ok = true;

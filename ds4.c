@@ -62920,6 +62920,7 @@ static int generate_metal_graph_raw_swa(
         uint64_t            ssd_streaming_prefill_headroom_bytes,
         int                 power_percent,
         uint32_t            prefill_chunk,
+        const ds4_dflash_weights *dflash_w, const float *dflash_mask, ds4_model *dflash_m,
         const char        * directional_steering_file,
         float               directional_steering_attn,
         float               directional_steering_ffn,
@@ -62945,6 +62946,7 @@ static int generate_metal_graph_raw_swa(
 #ifdef DS4_HAS_QWEN4_METAL
     if (ds4_model_is_qwen35moe()) {
         return generate_qwen35_metal_argmax(model, vocab, weights, prompt, n_predict, ctx_size, prefill_chunk,
+                                            dflash_w, dflash_mask, dflash_m,
                                             emit, done, emit_ud, progress, progress_ud);
     }
 #endif
@@ -69127,6 +69129,9 @@ int ds4_engine_generate_argmax(
                                             e->ssd_streaming_prefill_headroom_bytes,
                                             e->power_percent,
                                             e->prefill_chunk,
+                                            e->dflash ? &e->dflash_weights : NULL,
+                                            e->dflash ? e->dflash_mask_vals : NULL,
+                                            e->dflash ? &e->mtp_model : NULL,
                                             e->directional_steering_file,
                                             e->directional_steering_attn_scale,
                                             e->directional_steering_ffn_scale,
