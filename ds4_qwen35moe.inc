@@ -1346,6 +1346,10 @@ static int generate_qwen35_metal_argmax(
         if (vocab_token_is_generation_stop(vocab, token)) break;
         if (emit) emit(emit_ud, token);
         n_generated++;
+        /* W-D3 probe: same anchor semantics as the session decode hook —
+         * score pending drafts at this commit position, then draft one
+         * block anchored at (token, g->pos) before the trunk forward. */
+        if (g->dflash_gpu) ds4_dflash_probe_step(g, token);
         if (i == n_predict - 1 || g->pos + 1u >= g->ctx_cap) break;
         ok = qwen35_graph_forward_tokens(g, model, weights, &token, 1, logits, false);
     }
