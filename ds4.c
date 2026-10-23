@@ -80399,9 +80399,12 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
                 snprintf(err, errlen, "Ornith prefill failed at token %d", i);
                 return 1;
             }
-            /* MTP catch-up: the block's K/V rows for this chunk's positions */
-            if (g->mtp_h && !qwen35_graph_mtp(g, &e->model, &e->weights, prompt->v + i, chunk, (uint32_t)i,
-                                              false, NULL)) {
+            /* MTP catch-up: the block's K/V rows for this chunk's positions.
+             * DFlash2 sessions allocate mtp_h for the verify head path but
+             * keep the nextn block unbound, so gate on the MTP engine. */
+            if (e->glm_mtp && g->mtp_h &&
+                !qwen35_graph_mtp(g, &e->model, &e->weights, prompt->v + i, chunk, (uint32_t)i,
+                                  false, NULL)) {
                 snprintf(err, errlen, "Ornith MTP catch-up failed at token %d", i);
                 return 1;
             }
@@ -82518,8 +82521,10 @@ static int ds4_session_eval_internal(ds4_session *s, int token, bool probe_mtp,
         }
         /* A token that did not come through the speculative cycle (plain
          * decode, server-forced tokens) still gets its MTP row, so later
-         * drafts attend a complete cache; the cycle writes its own rows. */
-        if (!s->glm_spec_inside && g->mtp_h &&
+         * drafts attend a complete cache; the cycle writes its own rows.
+         * DFlash2 keeps the nextn block unbound; its verify never needs a
+         * nextn row, so gate the catch-up on the MTP engine. */
+        if (!s->glm_spec_inside && e->glm_mtp && g->mtp_h &&
             !qwen35_graph_mtp(g, &e->model, &e->weights, &token, 1u, g->pos - 1u, false, NULL)) {
             if (errlen) snprintf(err, errlen, "Ornith MTP catch-up failed at position %u", g->pos - 1u);
             s->checkpoint_valid = false;
