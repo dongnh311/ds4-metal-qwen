@@ -3677,6 +3677,29 @@ int ds4_gpu_df_attn_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *q,
                            uint32_t heads, uint32_t kvh, uint32_t hd, uint32_t rows,
                            uint32_t n_ctx, uint32_t cap, uint32_t rbase_k,
                            uint32_t rbase_v, float scale);
+/* W-D9 fused drafter stages (df_pre / df_rope2 / df_gateup / df_gemvconv). */
+int ds4_gpu_df_pre_tensor(const ds4_gpu_tensor *gh, const void *model_map, uint64_t model_size,
+                          uint64_t norm_offset, uint64_t coeff_offset, uint32_t coeff_type,
+                          uint64_t base_offset, const ds4_gpu_tensor *dyn,
+                          ds4_gpu_tensor *xn, ds4_gpu_tensor *out,
+                          uint32_t T, uint32_t E, uint32_t ngroup, uint32_t group,
+                          uint32_t kernel, uint32_t bs, float eps);
+int ds4_gpu_df_rope2_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor *k,
+                            const void *model_map, uint64_t model_size,
+                            uint64_t q_norm_offset, uint64_t k_norm_offset,
+                            uint32_t rows, uint32_t qh, uint32_t kvh, uint32_t hd,
+                            uint32_t pos0, float eps, float rope_base);
+int ds4_gpu_df_gateup_tensor(const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+                             uint64_t gate_offset, uint32_t gate_type,
+                             uint64_t up_offset, uint32_t up_type,
+                             ds4_gpu_tensor *mid, uint32_t T, uint32_t ff, uint32_t in_dim);
+int ds4_gpu_df_gemvconv_tensor(const ds4_gpu_tensor *in, const void *model_map, uint64_t model_size,
+                               uint64_t weight_offset, uint32_t weight_type,
+                               const ds4_gpu_tensor *dyn, uint64_t base_offset,
+                               ds4_gpu_tensor *res, uint32_t T, uint32_t E,
+                               uint32_t ngroup, uint32_t group, uint32_t kernel,
+                               uint32_t bs, uint32_t in_dim);
+
 /* Scratch floats for `rows` rows at decode3's split cap (256). */
 uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32_t head_dim);
 /* Round 2 Plan B: number of kernel_qwen35_attn_merge3_fold dispatches so far

@@ -712,6 +712,19 @@ static inline bool ds4_dfl_multi_gemv(void) {
     }
     return v;
 }
+/* W-D9 receipts: folding the draft gemvs into scalar row_dot kernels
+ * (df_pre / df_gateup / df_gemvconv) is strongly negative at drafter
+ * shapes - layers ran 4.6 vs 0.79 ms/cycle - so those chains stay split
+ * and only DS4_DFL_FUSE_GEMV=1 re-enables them for probing.  The rope
+ * pair fold (df_rope2) costs no extra work and stays on. */
+static inline bool ds4_dfl_fuse_gemv(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_DFL_FUSE_GEMV");
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return v;
+}
 
 /* ================================================================== */
 /* inject: append committed rows' features to the drafter ctx cache      */
@@ -1046,20 +1059,34 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
 
     const double tdg = df->tstat ? now_sec() : 0.0;             /* TSTAT dg_draft */
     bool ok = glm_graph_begin_commands_if_needed();
+    const bool fuse_gemv = ds4_dfl_fuse_gemv();
     for (uint32_t il = 0; ok && il < df->n_layer; il++) {
         const uint32_t rbase = (uint32_t)((uint64_t)il * df->kv_heads * df->ring_cap * df->hd);
         /* attention half: norm -> conv coefficients -> conv side 0 -> qkv
          * -> per-head norm+rope in place -> non-causal ring attention ->
          * out projection -> conv side 1 -> residual add, all chained with
-         * no host step in between.                                       */
-        ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
-                                                      dw->block[il].attn_norm->abs_offset,
-                                                      E, T, df->eps);
-        ok = ok && qwen4_gemv(df->gconv, df->dm, dw->block[il].attn_conv_proj, df->gxn, T);
-        ok = ok && ds4_gpu_df_conv_tensor(df->gcr1, df->gconv, dmmap, dmsize,
-                                         dw->block[il].attn_conv_base->abs_offset, df->gxn,
-                                         T, E, df->n_groups, df->group, df->kernel,
-                                         df->block_size, 0u, 0u);
+         * no host step in between.  W-D9 folds norm+coefficients+side-0 into
+         * df_pre and the out gemv + side-1 add into df_gemvconv.           */
+        bool fused_pre = false;
+        if (fuse_gemv)
+            fused_pre = ds4_gpu_df_pre_tensor(df->gh, dmmap, dmsize,
+                                             dw->block[il].attn_norm->abs_offset,
+                                             dw->block[il].attn_conv_proj->abs_offset,
+                                             dw->block[il].attn_conv_proj->type,
+                                             dw->block[il].attn_conv_base->abs_offset,
+                                             df->gconv, df->gxn, df->gcr1,
+                                             T, E, df->n_groups, df->group, df->kernel,
+                                             df->block_size, df->eps) != 0;
+        if (!fused_pre) {
+            ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
+                                                          dw->block[il].attn_norm->abs_offset,
+                                                          E, T, df->eps);
+            ok = ok && qwen4_gemv(df->gconv, df->dm, dw->block[il].attn_conv_proj, df->gxn, T);
+            ok = ok && ds4_gpu_df_conv_tensor(df->gcr1, df->gconv, dmmap, dmsize,
+                                             dw->block[il].attn_conv_base->abs_offset, df->gxn,
+                                             T, E, df->n_groups, df->group, df->kernel,
+                                             df->block_size, 0u, 0u);
+        }
         /* q, k and v share the same input rows: one dispatch instead of three */
         if (ds4_dfl_multi_gemv()) {
             ds4_gpu_tensor *qkv_outs[3] = {df->gq, df->gk, df->gv};
@@ -1079,32 +1106,62 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
                  qwen4_gemv(df->gk, df->dm, dw->block[il].attn_k, df->gcr1, T) &&
                  qwen4_gemv(df->gv, df->dm, dw->block[il].attn_v, df->gcr1, T);
         }
-        ok = ok && ds4_gpu_df_rope_tensor(df->gq, df->gq, dmmap, dmsize,
-                                         dw->block[il].attn_q_norm->abs_offset, T, df->heads,
-                                         df->hd, pos0, 0u, 0u, 1u, 1u, 0u, df->eps, df->rope_base);
-        ok = ok && ds4_gpu_df_rope_tensor(df->gk, df->gk, dmmap, dmsize,
-                                         dw->block[il].attn_k_norm->abs_offset, T, df->kv_heads,
-                                         df->hd, pos0, 0u, 0u, 1u, 1u, 0u, df->eps, df->rope_base);
+        bool fused_rope = ds4_gpu_df_rope2_tensor(df->gq, df->gk, dmmap, dmsize,
+                                                dw->block[il].attn_q_norm->abs_offset,
+                                                dw->block[il].attn_k_norm->abs_offset,
+                                                T, df->heads, df->kv_heads, df->hd,
+                                                pos0, df->eps, df->rope_base) != 0;
+        if (!fused_rope) {
+            ok = ok && ds4_gpu_df_rope_tensor(df->gq, df->gq, dmmap, dmsize,
+                                            dw->block[il].attn_q_norm->abs_offset, T, df->heads,
+                                            df->hd, pos0, 0u, 0u, 1u, 1u, 0u, df->eps, df->rope_base);
+            ok = ok && ds4_gpu_df_rope_tensor(df->gk, df->gk, dmmap, dmsize,
+                                            dw->block[il].attn_k_norm->abs_offset, T, df->kv_heads,
+                                            df->hd, pos0, 0u, 0u, 1u, 1u, 0u, df->eps, df->rope_base);
+        }
         ok = ok && ds4_gpu_df_attn_tensor(df->gattn, df->gq, df->gck, df->gcv, df->gk, df->gv,
                                          df->heads, df->kv_heads, df->hd, T, n_ctx,
                                          df->ring_cap, rbase, rbase, scale);
         if (ds4_dfl_qsa_on() && ok && il == 0u) (void)ds4_gpu_qsa_prof_seal(DFQ_L0ATTN);
-        ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].attn_output, df->gattn, T);
-        ok = ok && ds4_gpu_df_conv_tensor(df->gh, df->gconv, dmmap, dmsize,
-                                         dw->block[il].attn_conv_base->abs_offset, df->gwo,
-                                         T, E, df->n_groups, df->group, df->kernel,
-                                         df->block_size, 1u, 1u);
+        bool fused_out = false;
+        if (fuse_gemv)
+            fused_out = ds4_gpu_df_gemvconv_tensor(df->gattn, dmmap, dmsize,
+                                                  dw->block[il].attn_output->abs_offset,
+                                                  dw->block[il].attn_output->type,
+                                                  df->gconv, dw->block[il].attn_conv_base->abs_offset,
+                                                  df->gh, T, E, df->n_groups, df->group,
+                                                  df->kernel, df->block_size,
+                                                  df->heads * df->hd) != 0;
+        if (!fused_out) {
+            ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].attn_output, df->gattn, T);
+            ok = ok && ds4_gpu_df_conv_tensor(df->gh, df->gconv, dmmap, dmsize,
+                                             dw->block[il].attn_conv_base->abs_offset, df->gwo,
+                                             T, E, df->n_groups, df->group, df->kernel,
+                                             df->block_size, 1u, 1u);
+        }
         if (ds4_dfl_qsa_on() && ok && il == 0u) (void)ds4_gpu_qsa_prof_seal(DFQ_L0OUT);
 
         /* ffn half                                                     */
-        ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
-                                                      dw->block[il].ffn_norm->abs_offset,
-                                                      E, T, df->eps);
-        ok = ok && qwen4_gemv(df->gconv2, df->dm, dw->block[il].ffn_conv_proj, df->gxn, T);
-        ok = ok && ds4_gpu_df_conv_tensor(df->gcr1, df->gconv2, dmmap, dmsize,
-                                         dw->block[il].ffn_conv_base->abs_offset, df->gxn,
-                                         T, E, df->n_groups, df->group, df->kernel,
-                                         df->block_size, 0u, 0u);
+        fused_pre = false;
+        if (fuse_gemv)
+            fused_pre = ds4_gpu_df_pre_tensor(df->gh, dmmap, dmsize,
+                                             dw->block[il].ffn_norm->abs_offset,
+                                             dw->block[il].ffn_conv_proj->abs_offset,
+                                             dw->block[il].ffn_conv_proj->type,
+                                             dw->block[il].ffn_conv_base->abs_offset,
+                                             df->gconv2, df->gxn, df->gcr1,
+                                             T, E, df->n_groups, df->group, df->kernel,
+                                             df->block_size, df->eps) != 0;
+        if (!fused_pre) {
+            ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
+                                                          dw->block[il].ffn_norm->abs_offset,
+                                                          E, T, df->eps);
+            ok = ok && qwen4_gemv(df->gconv2, df->dm, dw->block[il].ffn_conv_proj, df->gxn, T);
+            ok = ok && ds4_gpu_df_conv_tensor(df->gcr1, df->gconv2, dmmap, dmsize,
+                                             dw->block[il].ffn_conv_base->abs_offset, df->gxn,
+                                             T, E, df->n_groups, df->group, df->kernel,
+                                             df->block_size, 0u, 0u);
+        }
         if (ds4_dfl_qsa_on() && ok && il == 0u) (void)ds4_gpu_qsa_prof_seal(DFQ_L0PRE);
         /* gate and up share the input rows too (swiglu stays its own pass) */
         if (ds4_dfl_multi_gemv()) {
@@ -1121,13 +1178,32 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
             ok = ok && qwen4_gemv(df->gffn1, df->dm, dw->block[il].ffn_gate, df->gcr1, T) &&
                  qwen4_gemv(df->gffn2, df->dm, dw->block[il].ffn_up, df->gcr1, T);
         }
-        ok = ok && ds4_gpu_swiglu_tensor(df->gmid, df->gffn1, df->gffn2,
-                                        (uint32_t)((uint64_t)T * df->ff), 0.0f, 1.0f);
-        ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].ffn_down, df->gmid, T);
-        ok = ok && ds4_gpu_df_conv_tensor(df->gh, df->gconv2, dmmap, dmsize,
-                                         dw->block[il].ffn_conv_base->abs_offset, df->gwo,
-                                         T, E, df->n_groups, df->group, df->kernel,
-                                         df->block_size, 1u, 1u);
+        bool fused_gateup = false, fused_down = false;
+        if (fuse_gemv && !ds4_dfl_multi_gemv())
+            fused_gateup = ds4_gpu_df_gateup_tensor(df->gcr1, dmmap, dmsize,
+                                                   dw->block[il].ffn_gate->abs_offset,
+                                                   dw->block[il].ffn_gate->type,
+                                                   dw->block[il].ffn_up->abs_offset,
+                                                   dw->block[il].ffn_up->type,
+                                                   df->gmid, T, df->ff, E) != 0;
+        if (!fused_gateup) {
+            ok = ok && ds4_gpu_swiglu_tensor(df->gmid, df->gffn1, df->gffn2,
+                                            (uint32_t)((uint64_t)T * df->ff), 0.0f, 1.0f);
+        }
+        if (fuse_gemv)
+            fused_down = ds4_gpu_df_gemvconv_tensor(df->gmid, dmmap, dmsize,
+                                                   dw->block[il].ffn_down->abs_offset,
+                                                   dw->block[il].ffn_down->type,
+                                                   df->gconv2, dw->block[il].ffn_conv_base->abs_offset,
+                                                   df->gh, T, E, df->n_groups, df->group,
+                                                   df->kernel, df->block_size, df->ff) != 0;
+        if (!fused_down) {
+            ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].ffn_down, df->gmid, T);
+            ok = ok && ds4_gpu_df_conv_tensor(df->gh, df->gconv2, dmmap, dmsize,
+                                             dw->block[il].ffn_conv_base->abs_offset, df->gwo,
+                                             T, E, df->n_groups, df->group, df->kernel,
+                                             df->block_size, 1u, 1u);
+        }
         if (ds4_dfl_qsa_on() && ok)
             (void)ds4_gpu_qsa_prof_seal(il == 0u ? DFQ_L0FFN : DFQ_L0 + il);
     }

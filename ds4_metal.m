@@ -49948,6 +49948,10 @@ enum {
     QWEN4_K_DF_CONV,
     QWEN4_K_DF_ROPE,
     QWEN4_K_DF_ATTN,
+    QWEN4_K_DF_PRE,
+    QWEN4_K_DF_ROPE2,
+    QWEN4_K_DF_GATEUP,
+    QWEN4_K_DF_GEMVCONV,
     QWEN4_K_COUNT,
 };
 
@@ -50123,6 +50127,10 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_df_conv",
     "kernel_df_rope",
     "kernel_df_attn",
+    "kernel_df_pre",
+    "kernel_df_rope2",
+    "kernel_df_gateup",
+    "kernel_df_gemvconv",
 };
 
 typedef struct {
@@ -51724,6 +51732,108 @@ int ds4_gpu_df_conv_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *dyn,
         return 0;
     return qwen4_dispatch(QWEN4_K_DF_CONV, &args, sizeof(args), b, 4,
                          MTLSizeMake(T, 1, 1), MTLSizeMake(256, 1, 1), 0) ? 1 : 0;
+}
+
+/* W-D9 fused drafter stages: rms + conv coefficients + conv side 0 in one
+ * dispatch; q/k rope pair in one dispatch; gate+up+silu in one dispatch; and
+ * output/down gemv with the side-1 conv residual add in one dispatch. */
+int ds4_gpu_df_pre_tensor(const ds4_gpu_tensor *gh, const void *model_map, uint64_t model_size,
+                          uint64_t norm_offset, uint64_t coeff_offset, uint32_t coeff_type,
+                          uint64_t base_offset, const ds4_gpu_tensor *dyn,
+                          ds4_gpu_tensor *xn, ds4_gpu_tensor *out,
+                          uint32_t T, uint32_t E, uint32_t ngroup, uint32_t group,
+                          uint32_t kernel, uint32_t bs, float eps) {
+    if (T == 0u || T > 8u || E == 0u || group == 0u || ngroup == 0u ||
+        kernel < 2u || kernel > 4u || bs == 0u)
+        return 0;
+    const uint32_t rb = qwen4_expert_row_bytes(coeff_type, E);
+    if (rb == 0u) return 0;
+    struct { uint32_t rows, edim, ngroups, grp, tapk, bs, rbytes, wtype; float eps; } args =
+        { T, E, ngroup, group, kernel, bs, rb, coeff_type, eps };
+    qwen4_bind b[7];
+    if (!qwen4_bind_tensor(&b[0], gh, (uint64_t)T * E * sizeof(float), "df pre residual") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, norm_offset,
+                          (uint64_t)E * sizeof(float), "df pre norm") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, coeff_offset,
+                          (uint64_t)rb * 2ull * kernel * ngroup, "df pre coeff") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, base_offset,
+                          2ull * kernel * E * sizeof(float), "df pre base") ||
+        !qwen4_bind_tensor(&b[4], dyn, (uint64_t)T * 2u * kernel * ngroup * sizeof(float), "df pre dyn") ||
+        !qwen4_bind_tensor(&b[5], xn, (uint64_t)T * E * sizeof(float), "df pre xn") ||
+        !qwen4_bind_tensor(&b[6], out, (uint64_t)T * E * sizeof(float), "df pre out"))
+        return 0;
+    return qwen4_dispatch(QWEN4_K_DF_PRE, &args, sizeof(args), b, 7,
+                          MTLSizeMake(T, 1, 1), MTLSizeMake(256, 1, 1), 0) ? 1 : 0;
+}
+
+int ds4_gpu_df_rope2_tensor(ds4_gpu_tensor *q, ds4_gpu_tensor *k,
+                            const void *model_map, uint64_t model_size,
+                            uint64_t q_norm_offset, uint64_t k_norm_offset,
+                            uint32_t rows, uint32_t qh, uint32_t kvh, uint32_t hd,
+                            uint32_t pos0, float eps, float rope_base) {
+    if (rows == 0u || rows > 8u || qh == 0u || kvh == 0u || hd != 128u)
+        return 0;
+    struct { uint32_t qh, kvh, rows, hd, pos0, pad0, pad1, pad2; float eps, rope_base; } args =
+        { qh, kvh, rows, hd, pos0, 0u, 0u, 0u, eps, rope_base };
+    qwen4_bind b[4];
+    if (!qwen4_bind_tensor(&b[0], q, (uint64_t)rows * qh * hd * sizeof(float), "df rope2 q") ||
+        !qwen4_bind_tensor(&b[1], k, (uint64_t)rows * kvh * hd * sizeof(float), "df rope2 k") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, q_norm_offset,
+                          (uint64_t)hd * sizeof(float), "df rope2 q norm") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, k_norm_offset,
+                          (uint64_t)hd * sizeof(float), "df rope2 k norm"))
+        return 0;
+    return qwen4_dispatch(QWEN4_K_DF_ROPE2, &args, sizeof(args), b, 4,
+                          MTLSizeMake(qh + kvh, rows, 1), MTLSizeMake(32, 1, 1), 0) ? 1 : 0;
+}
+
+int ds4_gpu_df_gateup_tensor(const ds4_gpu_tensor *x, const void *model_map, uint64_t model_size,
+                             uint64_t gate_offset, uint32_t gate_type,
+                             uint64_t up_offset, uint32_t up_type,
+                             ds4_gpu_tensor *mid, uint32_t T, uint32_t ff, uint32_t in_dim) {
+    if (T == 0u || T > 8u || ff == 0u || in_dim == 0u)
+        return 0;
+    const uint32_t gb = qwen4_expert_row_bytes(gate_type, in_dim);
+    const uint32_t ub = qwen4_expert_row_bytes(up_type, in_dim);
+    if (gb == 0u || ub == 0u) return 0;
+    struct { uint32_t ff, in_dim, rows, gbytes, ubytes, gtype, utype; } args =
+        { ff, in_dim, T, gb, ub, gate_type, up_type };
+    qwen4_bind b[4];
+    if (!qwen4_bind_tensor(&b[0], x, (uint64_t)T * in_dim * sizeof(float), "df gateup input") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, gate_offset,
+                          (uint64_t)gb * ff, "df gateup gate") ||
+        !qwen4_bind_weight(&b[2], model_map, model_size, up_offset,
+                          (uint64_t)ub * ff, "df gateup up") ||
+        !qwen4_bind_tensor(&b[3], mid, (uint64_t)T * ff * sizeof(float), "df gateup mid"))
+        return 0;
+    return qwen4_dispatch(QWEN4_K_DF_GATEUP, &args, sizeof(args), b, 4,
+                          MTLSizeMake((ff + 3u) / 4u, T, 1), MTLSizeMake(128, 1, 1), 0) ? 1 : 0;
+}
+
+int ds4_gpu_df_gemvconv_tensor(const ds4_gpu_tensor *in, const void *model_map, uint64_t model_size,
+                               uint64_t weight_offset, uint32_t weight_type,
+                               const ds4_gpu_tensor *dyn, uint64_t base_offset,
+                               ds4_gpu_tensor *res, uint32_t T, uint32_t E,
+                               uint32_t ngroup, uint32_t group, uint32_t kernel,
+                               uint32_t bs, uint32_t in_dim) {
+    if (T == 0u || T > 8u || E == 0u || group == 0u || ngroup == 0u ||
+        kernel < 2u || kernel > 4u || bs == 0u || in_dim == 0u)
+        return 0;
+    const uint32_t rb = qwen4_expert_row_bytes(weight_type, in_dim);
+    if (rb == 0u) return 0;
+    struct { uint32_t edim, in_dim, rows, ngroups, grp, tapk, bs, rbytes, wtype; } args =
+        { E, in_dim, T, ngroup, group, kernel, bs, rb, weight_type };
+    qwen4_bind b[5];
+    if (!qwen4_bind_tensor(&b[0], in, (uint64_t)T * in_dim * sizeof(float), "df gemvconv input") ||
+        !qwen4_bind_weight(&b[1], model_map, model_size, weight_offset,
+                          (uint64_t)rb * E, "df gemvconv weight") ||
+        !qwen4_bind_tensor(&b[2], dyn, (uint64_t)T * 2u * kernel * ngroup * sizeof(float), "df gemvconv dyn") ||
+        !qwen4_bind_weight(&b[3], model_map, model_size, base_offset,
+                          2ull * kernel * E * sizeof(float), "df gemvconv base") ||
+        !qwen4_bind_tensor(&b[4], res, (uint64_t)T * E * sizeof(float), "df gemvconv residual"))
+        return 0;
+    return qwen4_dispatch(QWEN4_K_DF_GEMVCONV, &args, sizeof(args), b, 5,
+                          MTLSizeMake((E + 3u) / 4u, T, 1), MTLSizeMake(128, 1, 1), 0) ? 1 : 0;
 }
 
 /* Per-head RMS + NeoX RoPE for rows x heads.  dst == src (in place) for the

@@ -2624,3 +2624,192 @@ kernel void kernel_df_attn(
             ((threadgroup float *)KV)[r * D + d];   /* both halves staged */
     }
 }
+
+/* --- W-D9: fused drafter stages --------------------------------------- */
+
+/* rms norm + conv coefficients + conv side 0 in one dispatch per half.
+ * One threadgroup (256 threads) per block row t; the normalized row lands
+ * in xn[t] as the standalone rms kernel leaves it, the 768 conv-coefficient
+ * dots reuse qwen4_row_dot, and the side-0 conv is applied inline.  Tap
+ * rows t-k are recomputed from the raw residual instead of read from xn,
+ * so threadgroups stay independent. */
+struct ds4_metal_args_df_pre {
+    uint32_t rows, edim, ngroups, grp, tapk, bs;
+    uint32_t rbytes, wtype;
+    float    eps;
+};
+
+kernel void kernel_df_pre(
+        constant ds4_metal_args_df_pre & args,
+        device const float *gh,       /* [T][E] residual                */
+        device const float *normw,    /* [E]                            */
+        device const char  *coeff,    /* [2*tapk*ngroups][E] quantized */
+        device const float *base,     /* [E][tapk][2]                   */
+        device float       *dyn,      /* [T][2*tapk*ngroups]           */
+        device float       *xn,       /* [T][E] normalized              */
+        device float       *out,      /* [T][E] conv side 0            */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint t = tgpig.x;
+    if (t >= args.rows) return;
+    const uint E = args.edim, K = args.tapk, NG = args.ngroups, G = args.grp;
+    const uint b = t % args.bs;
+    const uint nth = 256u;
+    float sq[4];
+    for (uint k = 0; k < 4u; k++) sq[k] = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        if (k > b || t < k) break;
+        device const float *row = gh + (uint64_t)(t - k) * E;
+        float acc = 0.0f;
+        for (uint e = tid; e < E; e += nth) { const float v = row[e]; acc += v * v; }
+        sq[k] = simd_sum(acc);
+    }
+    threadgroup float p[4][8];
+    threadgroup float sc[4];
+    if ((tid & 31u) == 0u) {
+        for (uint k = 0; k < K; k++) p[k][sgitg] = sq[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        for (uint k = 0; k < K; k++) {
+            float s = 0.0f;
+            for (uint u = 0; u < 8u; u++) s += p[k][u];
+            sc[k] = 1.0f / sqrt(s / (float)E + args.eps);
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device float *xrow = xn + (uint64_t)t * E;
+    for (uint e = tid; e < E; e += nth)
+        xrow[e] = gh[(uint64_t)t * E + e] * normw[e] * sc[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const ushort lane = (ushort)(tid & 31u);
+    for (uint o = sgitg; o < 2u * K * NG; o += 8u)
+        dyn[(uint64_t)t * 2u * K * NG + o] =
+            qwen4_row_dot(coeff + (uint64_t)o * args.rbytes, xrow, args.wtype, E, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < E; e += nth) {
+        const uint g = e / G;
+        float acc = 0.0f;
+        for (uint k = 0; k < K; k++) {
+            if (k > b || t < k) break;
+            const float xv = (k == 0u) ? xrow[e]
+                                       : gh[(uint64_t)(t - k) * E + e] * normw[e] * sc[k];
+            acc += (dyn[(uint64_t)t * 2u * K * NG + k * NG + g] +
+                    base[e + (uint64_t)k * E]) * xv;
+        }
+        out[(uint64_t)t * E + e] = acc;
+    }
+}
+
+/* Per-head RMS + NeoX RoPE for the q and k rows in one dispatch.
+ * Grid (qh + kvh, rows), 32 threads per threadgroup. */
+struct ds4_metal_args_df_rope2 {
+    uint32_t qh, kvh, rows, hd, pos0, pad0, pad1, pad2;
+    float    eps, rope_base;
+};
+
+kernel void kernel_df_rope2(
+        constant ds4_metal_args_df_rope2 & args,
+        device float       *q,
+        device float       *k,
+        device const float *qw,
+        device const float *kw,
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]]) {
+    const uint r = tgpig.y, x = tgpig.x;
+    const uint hd = args.hd;
+    device float *dst;
+    device const float *w;
+    uint64_t dbase;
+    if (x < args.qh) {
+        dst = q; dbase = ((uint64_t)r * args.qh + x) * hd; w = qw;
+    } else if (x < args.qh + args.kvh) {
+        dst = k; dbase = ((uint64_t)r * args.kvh + (x - args.qh)) * hd; w = kw;
+    } else {
+        return;
+    }
+    threadgroup float xh[128];
+    threadgroup float tot[1];
+    float ss = 0.0f;
+    for (uint d = tid; d < hd; d += 32u) { const float v = dst[dbase + d]; ss += v * v; xh[d] = v; }
+    ss = simd_sum(ss);
+    if (tid == 0u) tot[0] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float s = 1.0f / sqrt(tot[0] / (float)hd + args.eps);
+    for (uint d = tid; d < hd; d += 32u) xh[d] *= s * w[d];
+    const uint hlf = hd / 2u;
+    const float pos = (float)(args.pos0 + r);
+    for (uint i = tid; i < hlf; i += 32u) {
+        const float theta = pos * pow(args.rope_base, -(float)(2u * i) / (float)hd);
+        const float c = cos(theta), sn = sin(theta);
+        const float a = xh[i], bb = xh[i + hlf];
+        xh[i]       = a * c - bb * sn;
+        xh[i + hlf] = bb * c + a * sn;
+    }
+    for (uint d = tid; d < hd; d += 32u) dst[dbase + d] = xh[d];
+}
+
+/* gate and up projections share the input row and silu folds into the same
+ * dispatch: mid[t][f] = silu(gate_f . x_t) * (up_f . x_t).
+ * Grid (ceil(ff/4), rows), 128 threads (4 simdgroups, one output each). */
+struct ds4_metal_args_df_gateup {
+    uint32_t ff, in_dim, rows;
+    uint32_t gbytes, ubytes, gtype, utype;
+};
+
+kernel void kernel_df_gateup(
+        constant ds4_metal_args_df_gateup & args,
+        device const float *x,        /* [T][in_dim] */
+        device const char  *gate,
+        device const char  *up,
+        device float       *mid,      /* [T][ff] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint r = tgpig.y;
+    const uint f = tgpig.x * 4u + sgitg;
+    if (f >= args.ff) return;
+    const ushort lane = (ushort)(tid & 31u);
+    device const float *xr = x + (uint64_t)r * args.in_dim;
+    const float g = qwen4_row_dot(gate + (uint64_t)f * args.gbytes, xr, args.gtype, args.in_dim, lane);
+    const float u = qwen4_row_dot(up  + (uint64_t)f * args.ubytes, xr, args.utype, args.in_dim, lane);
+    mid[(uint64_t)r * args.ff + f] = qwen4_silu(g) * u;
+}
+
+/* Output/down gemv plus conv side 1 residual add in one dispatch: the gemv
+ * dot products for the tap rows t-k are taken straight from the gemv input
+ * rows, so the gemv output buffer is never materialized.
+ * Grid (ceil(edim/4), rows), 128 threads. */
+struct ds4_metal_args_df_gemvconv {
+    uint32_t edim, in_dim, rows, ngroups, grp, tapk, bs;
+    uint32_t rbytes, wtype;
+};
+
+kernel void kernel_df_gemvconv(
+        constant ds4_metal_args_df_gemvconv & args,
+        device const float *in,       /* [T][in_dim] gemv input rows */
+        device const char  *w,        /* [edim][in_dim] quantized     */
+        device const float *dyn,
+        device const float *base,
+        device float       *res,      /* [T][E] residual, added into  */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid  [[thread_index_in_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    const uint t = tgpig.y;
+    const uint e = tgpig.x * 4u + sgitg;
+    if (e >= args.edim) return;
+    const uint E = args.edim, K = args.tapk, NG = args.ngroups, G = args.grp;
+    const uint b = t % args.bs, g = e / G;
+    const ushort lane = (ushort)(tid & 31u);
+    float acc = 0.0f;
+    for (uint k = 0; k < K; k++) {
+        if (k > b || t < k) break;
+        const float dotv = qwen4_row_dot(w + (uint64_t)e * args.rbytes,
+                                        in + (uint64_t)(t - k) * args.in_dim,
+                                        args.wtype, args.in_dim, lane);
+        acc += (dyn[(uint64_t)t * 2u * K * NG + K * NG + k * NG + g] +
+                base[e + (uint64_t)k * E + (uint64_t)E * K]) * dotv;
+    }
+    res[(uint64_t)t * E + e] += acc;
+}
