@@ -3541,6 +3541,16 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
         uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
         ds4_gpu_tensor *snap_state, uint32_t snap_tok,
         ds4_gpu_tensor *snap2_state, uint32_t snap2_tok);
+/* W-D8: fused restore-replay for DFlash partial matches (Metal only);
+ * callers fall back to conv stream + prep + scan when it is unavailable. */
+int ds4_gpu_qwen4_gdn_replay_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *snap_state,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *hist,
+        const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const void *model_map, uint64_t model_size,
+        uint64_t conv_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
+        uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t conv_kernel);
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,

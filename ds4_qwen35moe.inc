@@ -1462,6 +1462,18 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_batched_baseline(ds4_qwen4_gpu_
  * prep, so a replayed commit consumes them once; the next verify fills the
  * captures again.  The committed rows' totals also stay out of the
  * residual: the caller only continues from the recurrence state. */
+/* W-D8 probe knob (DS4_DFL_REPLAY_FUSED): restore the committed prefix of a
+ * partial batched verify in one fused dispatch per GDN layer instead of the
+ * snapshot blits plus conv/prep/scan trio.  Off until the receipts land. */
+static int qwen35_dflash_replay_fused(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("DS4_DFL_REPLAY_FUSED");
+        c = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return c;
+}
+
 static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_batched_restore_replay(ds4_qwen4_gpu_graph *g,
                                                                         const ds4_model *m,
                                                                         const ds4_weights *w,
@@ -1478,6 +1490,34 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_batched_restore_replay(ds4_qwen
     const uint64_t lrow = (uint64_t)committed * DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * sizeof(float);
     /* the batch the verify forward opened ended at its tail; open our own */
     if (!glm_graph_begin_commands_if_needed()) return false;
+    const bool fused = committed <= 3u && qwen35_dflash_replay_fused();
+    if (fused) {
+        bool ok = true;
+        for (uint32_t il = 0; ok && il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
+            if (!g->dflash_cap_qkv[il] || !g->layer_lin_state[il]) continue;
+            if (!g->dflash_snap_s[0][il] || !g->dflash_snap_h[0][il] ||
+                !g->dflash_cap_ga[il] || !g->dflash_cap_gb[il]) { ok = false; break; }
+            const ds4_layer_weights *l = &w->layer[il];
+            ds4_gpu_tensor *qkv = ds4_gpu_tensor_view(g->dflash_cap_qkv[il], 0, qrow);
+            ds4_gpu_tensor *ga = ds4_gpu_tensor_view(g->dflash_cap_ga[il], 0, arow);
+            ds4_gpu_tensor *gb = ds4_gpu_tensor_view(g->dflash_cap_gb[il], 0, arow);
+            ds4_gpu_tensor *lo = ds4_gpu_tensor_view(g->lin_o, 0, lrow);
+            ok = qkv && ga && gb && lo &&
+                ds4_gpu_qwen4_gdn_replay_tensor(lo, g->layer_lin_state[il], g->dflash_snap_s[0][il],
+                                               qkv, g->dflash_snap_h[0][il], ga, gb,
+                                               m->map, m->size, l->lin_conv->abs_offset,
+                                               l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
+                                               committed, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
+                                               DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV) != 0;
+            ds4_gpu_tensor_free(lo);
+            ds4_gpu_tensor_free(gb);
+            ds4_gpu_tensor_free(ga);
+            ds4_gpu_tensor_free(qkv);
+        }
+        if (!ok) return false;
+        g->pos = new_pos;
+        return ds4_gpu_end_commands();
+    }
     for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
         if (!g->dflash_cap_qkv[il] || !g->layer_lin_state[il]) continue;
         if (!ds4_gpu_tensor_copy(g->layer_lin_state[il], 0, g->dflash_snap_s[0][il], 0, state_bytes) ||

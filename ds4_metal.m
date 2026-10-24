@@ -49813,6 +49813,7 @@ enum {
     QWEN4_K_GDN_PREP,
     QWEN4_K_GDN_SCAN,
     QWEN4_K_GDN_SCAN_R4,
+    QWEN4_K_GDN_REPLAY,
     QWEN4_K_GDN_OUT,
     QWEN4_K_PLE_GATE,
     QWEN4_K_PLE_CONV,
@@ -49987,6 +49988,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_gdn_prep",
     "kernel_qwen4_gdn_scan",
     "kernel_qwen4_gdn_scan_r4",
+    "kernel_qwen4_gdn_replay",
     "kernel_qwen4_gdn_out",
     "kernel_qwen4_ple_gate",
     "kernel_qwen4_ple_conv",
@@ -50638,6 +50640,41 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
     }
     return qwen4_dispatch(QWEN4_K_GDN_SCAN, &args, sizeof(args), bd, 7,
                           MTLSizeMake(head_dim, n_v_head, 1), MTLSizeMake(32, 1, 1), 0);
+}
+
+/* W-D8: one dispatch per layer restores the GDN recurrence over the committed
+ * DFlash verify rows.  Same arithmetic as conv stream + prep + scan, but it
+ * reads the captured raw rows and the block-start history/state snapshot
+ * instead of blitting into the live buffers and rewriting the captures. */
+int ds4_gpu_qwen4_gdn_replay_tensor(
+        ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *snap_state,
+        const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *hist,
+        const ds4_gpu_tensor *ga, const ds4_gpu_tensor *gb,
+        const void *model_map, uint64_t model_size,
+        uint64_t conv_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
+        uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
+        uint32_t conv_kernel) {
+    if (n_tokens == 0u || n_tokens > 3u || head_dim != 128u ||
+        conv_kernel < 2u || conv_kernel > 4u) return 0;
+    const uint64_t conv_dim = (uint64_t)(2u * n_k_head + n_v_head) * head_dim;
+    const uint64_t state_bytes = (uint64_t)n_v_head * head_dim * head_dim * sizeof(float);
+    struct { uint32_t n_tokens, n_k_head, n_v_head, head_dim, conv_kernel, pad0, pad1, pad2; } args =
+        { n_tokens, n_k_head, n_v_head, head_dim, conv_kernel, 0u, 0u, 0u };
+    qwen4_bind bd[10];
+    if (!qwen4_bind_tensor(&bd[0], qkv, n_tokens * conv_dim * sizeof(float), "gdn replay qkv") ||
+        !qwen4_bind_tensor(&bd[1], hist, (uint64_t)(conv_kernel - 1u) * conv_dim * sizeof(float), "gdn replay hist") ||
+        !qwen4_bind_weight(&bd[2], model_map, model_size, conv_offset,
+                           conv_dim * conv_kernel * sizeof(float), "gdn replay conv weight") ||
+        !qwen4_bind_tensor(&bd[3], ga, (uint64_t)n_tokens * n_v_head * sizeof(float), "gdn replay alpha") ||
+        !qwen4_bind_tensor(&bd[4], gb, (uint64_t)n_tokens * n_v_head * sizeof(float), "gdn replay beta") ||
+        !qwen4_bind_weight(&bd[5], model_map, model_size, ssm_a_offset, (uint64_t)n_v_head * sizeof(float), "gdn replay ssm_a") ||
+        !qwen4_bind_weight(&bd[6], model_map, model_size, dt_bias_offset, (uint64_t)n_v_head * sizeof(float), "gdn replay dt_bias") ||
+        !qwen4_bind_tensor(&bd[7], snap_state, state_bytes, "gdn replay snapshot") ||
+        !qwen4_bind_tensor(&bd[8], state, state_bytes, "gdn replay state") ||
+        !qwen4_bind_tensor(&bd[9], out, (uint64_t)n_tokens * n_v_head * head_dim * sizeof(float), "gdn replay out"))
+        return 0;
+    return qwen4_dispatch(QWEN4_K_GDN_REPLAY, &args, sizeof(args), bd, 10,
+                          MTLSizeMake(head_dim / 4u, n_v_head, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
 static ds4_gpu_tensor *g_qwen4_gdn_slots;

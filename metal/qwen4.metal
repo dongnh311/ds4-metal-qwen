@@ -931,6 +931,141 @@ kernel void kernel_qwen4_gdn_scan_r4(
     for (uint r = 0; r < 4; r++) *(device float4 *)(srow + r * D) = s[r];
 }
 
+struct ds4_metal_args_qwen4_gdn_replay {
+    uint32_t n_tokens;      /* committed verify rows to replay (1..3) */
+    uint32_t n_k_head;
+    uint32_t n_v_head;
+    uint32_t head_dim;      /* 128 */
+    uint32_t conv_kernel;   /* taps, 2..4 */
+    uint32_t pad0;
+    uint32_t pad1;
+    uint32_t pad2;
+};
+
+/* W-D8: the whole partial-match restore of one GDN layer in a single
+ * dispatch.  The conv+silu, q/k head normalization and decay preparation
+ * of the committed verify rows run in registers against the block-start
+ * history snapshot, and the r4 delta scan seeds its state straight from
+ * the snapshot blitted before the verify instead of from a copy into the
+ * live buffers, so the live state and history are never touched until
+ * the final state write.  The tap accumulation follows
+ * kernel_qwen4_conv_stream term by term, the silu/normalization matches
+ * kernel_qwen4_gdn_prep, and the scan matches kernel_qwen4_gdn_scan_r4. */
+kernel void kernel_qwen4_gdn_replay(
+        constant ds4_metal_args_qwen4_gdn_replay & args,
+        device const float *qkv,        /* [T][conv_dim] captured rows, pre-conv */
+        device const float *hist,       /* [K-1][conv_dim] block-start window */
+        device const float *weight,     /* [conv_dim][K] tap weights */
+        device const float *ga,         /* [T][Hv] captured raw alpha */
+        device const float *gb,         /* [T][Hv] captured raw beta */
+        device const float *ssm_a,      /* [Hv] = -exp(A_log) */
+        device const float *dt_bias,    /* [Hv] */
+        device const float *snap,       /* [Hv][D][D] block-start state */
+        device float       *state,      /* [Hv][D][D] live state */
+        device float       *out,        /* [T][Hv*D] */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort3 ntg [[threads_per_threadgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]],
+        ushort tiisg [[thread_index_in_simdgroup]]) {
+    const uint dv0 = (tgpig.x * (ntg.x / 32u) + sgitg) * 4u;
+    const uint h = tgpig.y;
+    if (dv0 >= args.head_dim || h >= args.n_v_head) return;
+    const uint D = 128u;
+    const uint K = args.conv_kernel;
+    const uint T = args.n_tokens;
+    const uint kh = h % args.n_k_head;
+    const uint dk0 = tiisg * 4u;
+    const uint conv_dim = 2u * args.n_k_head * D + args.n_v_head * D;
+
+    float qacc[3][4], kacc[3][4], vacc[3][4];
+    float sq[3], sk[3];
+    for (uint tok = 0; tok < 3u; tok++) {
+        sq[tok] = 0.0f;
+        sk[tok] = 0.0f;
+        for (uint i = 0; i < 4u; i++) {
+            qacc[tok][i] = 0.0f;
+            kacc[tok][i] = 0.0f;
+            vacc[tok][i] = 0.0f;
+        }
+    }
+
+    for (uint i = 0; i < 4u; i++) {
+        const uint qpos = kh * D + dk0 + i;
+        const uint kpos = (args.n_k_head + kh) * D + dk0 + i;
+        const uint vpos = 2u * args.n_k_head * D + h * D + dv0 + i;
+        for (uint tok = 0; tok < T; tok++) {
+            const uint64_t row = (uint64_t)tok * conv_dim;
+            /* the leading tap is the current raw row, exactly as the
+             * streaming conv seeds its accumulator */
+            qacc[tok][i] = weight[qpos * K + K - 1u] * qkv[row + qpos];
+            kacc[tok][i] = weight[kpos * K + K - 1u] * qkv[row + kpos];
+            vacc[tok][i] = weight[vpos * K + K - 1u] * qkv[row + vpos];
+        }
+        for (uint s = 0; s + 1u < K; s++) {
+            const uint lag = K - 1u - s;
+            for (uint tok = 0; tok < T; tok++) {
+                float rq, rk, rv;
+                if (tok >= lag) {
+                    const uint64_t row = (uint64_t)(tok - lag) * conv_dim;
+                    rq = qkv[row + qpos];
+                    rk = qkv[row + kpos];
+                    rv = qkv[row + vpos];
+                } else {
+                    const uint64_t row = (uint64_t)(tok + s) * conv_dim;
+                    rq = hist[row + qpos];
+                    rk = hist[row + kpos];
+                    rv = hist[row + vpos];
+                }
+                qacc[tok][i] += weight[qpos * K + s] * rq;
+                kacc[tok][i] += weight[kpos * K + s] * rk;
+                vacc[tok][i] += weight[vpos * K + s] * rv;
+            }
+        }
+        for (uint tok = 0; tok < T; tok++) {
+            qacc[tok][i] = qwen4_silu(qacc[tok][i]);
+            kacc[tok][i] = qwen4_silu(kacc[tok][i]);
+            vacc[tok][i] = qwen4_silu(vacc[tok][i]);
+            sq[tok] += qacc[tok][i] * qacc[tok][i];
+            sk[tok] += kacc[tok][i] * kacc[tok][i];
+        }
+    }
+
+    float qs[3], ks[3];
+    for (uint tok = 0; tok < T; tok++) {
+        sq[tok] = simd_sum(sq[tok]);
+        sk[tok] = simd_sum(sk[tok]);
+        qs[tok] = rsqrt(sq[tok] + 1e-6f) * rsqrt(128.0f);
+        ks[tok] = rsqrt(sk[tok] + 1e-6f);
+    }
+
+    float4 s[4];
+    device const float *snaprow = snap + ((uint64_t)h * D + dv0) * D + dk0;
+    for (uint r = 0; r < 4u; r++) s[r] = *(device const float4 *)(snaprow + r * D);
+    const float sa = ssm_a[h], db = dt_bias[h];
+    for (uint tok = 0; tok < T; tok++) {
+        const float4 q = float4(qacc[tok][0] * qs[tok], qacc[tok][1] * qs[tok],
+                                qacc[tok][2] * qs[tok], qacc[tok][3] * qs[tok]);
+        const float4 k = float4(kacc[tok][0] * ks[tok], kacc[tok][1] * ks[tok],
+                                kacc[tok][2] * ks[tok], kacc[tok][3] * ks[tok]);
+        const float4 v = float4(vacc[tok][0], vacc[tok][1], vacc[tok][2], vacc[tok][3]);
+        const float g = exp(sa * qwen4_softplus(ga[(uint64_t)tok * args.n_v_head + h] + db));
+        const float beta = qwen4_sigmoid(gb[(uint64_t)tok * args.n_v_head + h]);
+        float u[4], o[4];
+        for (uint r = 0; r < 4u; r++) { s[r] *= g; u[r] = dot(s[r], k); }
+        for (uint r = 0; r < 4u; r++) u[r] = simd_sum(u[r]);
+        for (uint r = 0; r < 4u; r++) {
+            s[r] += k * ((v[r] - u[r]) * beta);
+            o[r] = dot(s[r], q);
+        }
+        for (uint r = 0; r < 4u; r++) o[r] = simd_sum(o[r]);
+        if (tiisg == 0)
+            *(device float4 *)(out + ((uint64_t)tok * args.n_v_head + h) * D + dv0) =
+                float4(o[0], o[1], o[2], o[3]);
+    }
+    device float *srow = state + ((uint64_t)h * D + dv0) * D + dk0;
+    for (uint r = 0; r < 4u; r++) *(device float4 *)(srow + r * D) = s[r];
+}
+
 struct ds4_metal_args_qwen4_gdn_out {
     uint32_t n_tokens;
     uint32_t n_head;
