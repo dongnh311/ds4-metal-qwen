@@ -660,6 +660,60 @@ static void ds4_dflash_tap_hook(ds4_qwen4_gpu_graph *g, uint32_t il, uint32_t po
 }
 
 /* ================================================================== */
+/* W-D7 diagnostic: per-stage GPU spans of the draft batch.            */
+/* DS4_DFL_QSA=1 seals the open batch at inject/layer/head boundaries   */
+/* and dumps the GPU-timestamped spans at exit (one CB per stage; the   */
+/* GPU still runs them back-to-back, no host syncs are added). Slots 0- */
+/* 7 of the shared QSA accumulator: do not combine with the QSA/STAGE   */
+/* decoders (they share the table).                                      */
+/* ================================================================== */
+extern int ds4_gpu_qsa_prof_seal(int slot);
+extern void ds4_gpu_qsa_prof_get(double *out, int n);
+enum { DFQ_INJ = 0, DFQ_L0 = 1, DFQ_HEAD = 7, DFQ_L0ATTN = 8, DFQ_L0OUT = 9,
+       DFQ_L0PRE = 10, DFQ_L0FFN = 11, DFQ_N = 12 };
+static const char *g_dfq_names[DFQ_N] = {
+    "inject", "layer0", "layer1", "layer2", "layer3", "layer4", "layer5", "head",
+    "L0:attn", "L0:outcv", "L0:ffnpr", "L0:ffn"};
+static double g_dfq_gpu[DFQ_N];
+static uint64_t g_dfq_cycles;
+static void ds4_dfl_qsa_dump(void) {
+    if (!g_dfq_cycles) return;
+    ds4_gpu_qsa_prof_get(g_dfq_gpu, DFQ_N);
+    double tot = 0.0;
+    for (int i = 0; i < DFQ_N; i++) tot += g_dfq_gpu[i];
+    fprintf(stderr, "ds4: === dflash draft GPU profile (%llu cycles) ===\n",
+            (unsigned long long)g_dfq_cycles);
+    for (int i = 0; i < DFQ_N; i++)
+        fprintf(stderr, "ds4:   %-8s %9.2f ms  %5.1f%%  %.3f ms/cycle\n",
+                g_dfq_names[i], g_dfq_gpu[i],
+                tot > 0.0 ? 100.0 * g_dfq_gpu[i] / tot : 0.0,
+                g_dfq_gpu[i] / (double)g_dfq_cycles);
+    fprintf(stderr, "ds4:   %-8s %9.2f ms  %.3f ms/cycle\n", "TOTAL", tot,
+            tot / (double)g_dfq_cycles);
+}
+static inline int ds4_dfl_qsa_on(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("DS4_DFL_QSA");
+        c = (e && e[0] && e[0] != '0') ? 1 : 0;
+        if (c) atexit(ds4_dfl_qsa_dump);
+    }
+    return c;
+}
+/* W-D7 A/B knob: DS4_DFL_MULTI_GEMV=0 reverts the shared-input gemv folds
+ * (qkv / gate-up / inject kv) to individual dispatches. */
+static inline bool ds4_dfl_multi_gemv(void) {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = getenv("DS4_DFL_MULTI_GEMV");
+        /* the scalar multi-gemv kernel loses to the tuned per-projection
+         * dense kernels at these shapes; keep the fold off unless probing */
+        v = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    return v;
+}
+
+/* ================================================================== */
 /* inject: append committed rows' features to the drafter ctx cache      */
 /* ================================================================== */
 static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
@@ -728,9 +782,18 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
             for (uint32_t il = 0; kok && il < df->n_layer; il++) {
                 const uint32_t rbase = (uint32_t)((uint64_t)il * df->kv_heads *
                                                   df->ring_cap * df->hd);
-                kok = kok &&
-                      qwen4_gemv(df->gk_view[il], df->dm, dw->block[il].attn_k, df->ginj, n) &&
-                      qwen4_gemv(df->gv_view[il], df->dm, dw->block[il].attn_v, df->ginj, n) &&
+                ds4_gpu_tensor *ikv[2] = {df->gk_view[il], df->gv_view[il]};
+                uint64_t ikv_offs[2] = {dw->block[il].attn_k->abs_offset,
+                                        dw->block[il].attn_v->abs_offset};
+                uint32_t ikv_types[2] = {dw->block[il].attn_k->type,
+                                         dw->block[il].attn_v->type};
+                uint32_t ikv_rows[2] = {df->kv_heads * df->hd, df->kv_heads * df->hd};
+                kok = kok && (ds4_dfl_multi_gemv()
+                    ? ds4_gpu_qwen4_multi_gemv_tensor(df->ginj, n, df->E, 2, ikv,
+                                                     df->dm->map, df->dm->size, ikv_offs,
+                                                     ikv_types, ikv_rows)
+                    : (qwen4_gemv(df->gk_view[il], df->dm, dw->block[il].attn_k, df->ginj, n) &&
+                       qwen4_gemv(df->gv_view[il], df->dm, dw->block[il].attn_v, df->ginj, n))) &&
                       ds4_gpu_df_rope_tensor(df->gk_view[il], df->gck, df->dm->map, df->dm->size,
                                             dw->block[il].attn_k_norm->abs_offset, n, df->kv_heads,
                                             df->hd, from, df->ring_cap, rbase, 1u, 1u, 1u,
@@ -741,6 +804,7 @@ static void ds4_dflash_inject(ds4_qwen4_gpu_graph *g, uint32_t last) {
                                             df->eps, df->rope_base);
             }
             DS4_DFL_TEND(df, 24, tdg);
+            if (ds4_dfl_qsa_on() && kok) (void)ds4_gpu_qsa_prof_seal(DFQ_INJ);
             if (!kok) {
                 ds4_gpu_end_commands();
                 fprintf(stderr, "ds4: dflash: GPU inject batch failed (rows=%u)\n", n);
@@ -872,6 +936,14 @@ static uint32_t ds4_dflash_n_ctx(const ds4_dflash_gpu *df) {
  * every other GPU path: a failed dispatch turns the drafter off and the
  * verify cycle falls back to plain rows.                                */
 
+/* Raw per-position top-1 drafting (no lattice refinement) — an A/B knob for
+ * the walk policy while the drafter is being evaluated. */
+static bool ds4_dfl_raw_walk(void) {
+    static int v = -1;
+    if (v < 0) { const char *e = getenv("DS4_DFL_RAW_WALK"); v = e && e[0] && e[0] != '0'; }
+    return v;
+}
+
 static bool ds4_dfl_read_walk(ds4_dflash_gpu *df, const ds4_dflash_weights *dw,
                               uint32_t T, int32_t anchor, uint32_t n_draft,
                               int32_t *drafts, uint32_t *n_out) {
@@ -886,9 +958,15 @@ static bool ds4_dfl_read_walk(ds4_dflash_gpu *df, const ds4_dflash_weights *dw,
         ds4_dfl_topk(df->logits + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB, df->top_k,
                      df->cand + (size_t)i * df->top_k, df->uv + (size_t)i * df->top_k);
     int32_t carried = 0;
+    const bool raw = ds4_dfl_raw_walk();
     for (uint32_t i = 1; i <= n_draft; i++) {
         const uint32_t K = df->top_k, R = df->rank;
         const float *gr = df->gate + (size_t)i * R;
+        if (raw) {                          /* per-position top-1 as-is     */
+            carried = 0;
+            drafts[i - 1] = df->cand[(size_t)i * K + 0];
+            continue;
+        }
         const int32_t pred_id = i == 1 ? anchor
             : df->cand[(size_t)(i - 1) * K + carried];
         if (pred_id < 0 || pred_id >= (int32_t)DS4_N_VOCAB) {
@@ -982,9 +1060,25 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
                                          dw->block[il].attn_conv_base->abs_offset, df->gxn,
                                          T, E, df->n_groups, df->group, df->kernel,
                                          df->block_size, 0u, 0u);
-        ok = ok && qwen4_gemv(df->gq, df->dm, dw->block[il].attn_q, df->gcr1, T) &&
-             qwen4_gemv(df->gk, df->dm, dw->block[il].attn_k, df->gcr1, T) &&
-             qwen4_gemv(df->gv, df->dm, dw->block[il].attn_v, df->gcr1, T);
+        /* q, k and v share the same input rows: one dispatch instead of three */
+        if (ds4_dfl_multi_gemv()) {
+            ds4_gpu_tensor *qkv_outs[3] = {df->gq, df->gk, df->gv};
+            uint64_t qkv_offs[3] = {dw->block[il].attn_q->abs_offset,
+                                    dw->block[il].attn_k->abs_offset,
+                                    dw->block[il].attn_v->abs_offset};
+            uint32_t qkv_types[3] = {dw->block[il].attn_q->type,
+                                     dw->block[il].attn_k->type,
+                                     dw->block[il].attn_v->type};
+            uint32_t qkv_rows[3] = {df->heads * df->hd, df->kv_heads * df->hd,
+                                    df->kv_heads * df->hd};
+            ok = ok && ds4_gpu_qwen4_multi_gemv_tensor(df->gcr1, T, E, 3, qkv_outs,
+                                                       dmmap, dmsize, qkv_offs, qkv_types,
+                                                       qkv_rows);
+        } else {
+            ok = ok && qwen4_gemv(df->gq, df->dm, dw->block[il].attn_q, df->gcr1, T) &&
+                 qwen4_gemv(df->gk, df->dm, dw->block[il].attn_k, df->gcr1, T) &&
+                 qwen4_gemv(df->gv, df->dm, dw->block[il].attn_v, df->gcr1, T);
+        }
         ok = ok && ds4_gpu_df_rope_tensor(df->gq, df->gq, dmmap, dmsize,
                                          dw->block[il].attn_q_norm->abs_offset, T, df->heads,
                                          df->hd, pos0, 0u, 0u, 1u, 1u, 0u, df->eps, df->rope_base);
@@ -994,11 +1088,13 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
         ok = ok && ds4_gpu_df_attn_tensor(df->gattn, df->gq, df->gck, df->gcv, df->gk, df->gv,
                                          df->heads, df->kv_heads, df->hd, T, n_ctx,
                                          df->ring_cap, rbase, rbase, scale);
+        if (ds4_dfl_qsa_on() && ok && il == 0u) (void)ds4_gpu_qsa_prof_seal(DFQ_L0ATTN);
         ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].attn_output, df->gattn, T);
         ok = ok && ds4_gpu_df_conv_tensor(df->gh, df->gconv, dmmap, dmsize,
                                          dw->block[il].attn_conv_base->abs_offset, df->gwo,
                                          T, E, df->n_groups, df->group, df->kernel,
                                          df->block_size, 1u, 1u);
+        if (ds4_dfl_qsa_on() && ok && il == 0u) (void)ds4_gpu_qsa_prof_seal(DFQ_L0OUT);
 
         /* ffn half                                                     */
         ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
@@ -1009,8 +1105,22 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
                                          dw->block[il].ffn_conv_base->abs_offset, df->gxn,
                                          T, E, df->n_groups, df->group, df->kernel,
                                          df->block_size, 0u, 0u);
-        ok = ok && qwen4_gemv(df->gffn1, df->dm, dw->block[il].ffn_gate, df->gcr1, T) &&
-             qwen4_gemv(df->gffn2, df->dm, dw->block[il].ffn_up, df->gcr1, T);
+        if (ds4_dfl_qsa_on() && ok && il == 0u) (void)ds4_gpu_qsa_prof_seal(DFQ_L0PRE);
+        /* gate and up share the input rows too (swiglu stays its own pass) */
+        if (ds4_dfl_multi_gemv()) {
+            ds4_gpu_tensor *gu_outs[2] = {df->gffn1, df->gffn2};
+            uint64_t gu_offs[2] = {dw->block[il].ffn_gate->abs_offset,
+                                   dw->block[il].ffn_up->abs_offset};
+            uint32_t gu_types[2] = {dw->block[il].ffn_gate->type,
+                                    dw->block[il].ffn_up->type};
+            uint32_t gu_rows[2] = {df->ff, df->ff};
+            ok = ok && ds4_gpu_qwen4_multi_gemv_tensor(df->gcr1, T, E, 2, gu_outs,
+                                                       dmmap, dmsize, gu_offs, gu_types,
+                                                       gu_rows);
+        } else {
+            ok = ok && qwen4_gemv(df->gffn1, df->dm, dw->block[il].ffn_gate, df->gcr1, T) &&
+                 qwen4_gemv(df->gffn2, df->dm, dw->block[il].ffn_up, df->gcr1, T);
+        }
         ok = ok && ds4_gpu_swiglu_tensor(df->gmid, df->gffn1, df->gffn2,
                                         (uint32_t)((uint64_t)T * df->ff), 0.0f, 1.0f);
         ok = ok && qwen4_gemv(df->gwo, df->dm, dw->block[il].ffn_down, df->gmid, T);
@@ -1018,12 +1128,34 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
                                          dw->block[il].ffn_conv_base->abs_offset, df->gwo,
                                          T, E, df->n_groups, df->group, df->kernel,
                                          df->block_size, 1u, 1u);
+        if (ds4_dfl_qsa_on() && ok)
+            (void)ds4_gpu_qsa_prof_seal(il == 0u ? DFQ_L0FFN : DFQ_L0 + il);
     }
     ok = ok && ds4_gpu_rms_norm_weight_rows_tensor(df->gxn, df->gh, dmmap, dmsize,
                                                   dw->output_norm->abs_offset, E, T, df->eps);
-    ok = ok && qwen4_gemv(df->glogits, df->tm, df->tw->output, df->gxn, T) &&
-         qwen4_gemv(df->ggate, df->dm, dw->sel_hidden, df->gxn, T);
+    /* Head + selector: only draft rows 1..T-1 feed the walk — the anchor row's
+     * own logits are never read — so both gemvs start at row 1. */
+    if (T > 1u) {
+        ds4_gpu_tensor *hn = ds4_gpu_tensor_view(df->gxn, (uint64_t)E * sizeof(float),
+                                                 (uint64_t)(T - 1u) * E * sizeof(float));
+        ds4_gpu_tensor *lg = ds4_gpu_tensor_view(df->glogits,
+                                                 (uint64_t)DS4_N_VOCAB * sizeof(float),
+                                                 (uint64_t)(T - 1u) * DS4_N_VOCAB * sizeof(float));
+        ds4_gpu_tensor *gt = ds4_gpu_tensor_view(df->ggate,
+                                                 (uint64_t)df->rank * sizeof(float),
+                                                 (uint64_t)(T - 1u) * df->rank * sizeof(float));
+        ok = ok && hn && lg && gt &&
+             qwen4_gemv(lg, df->tm, df->tw->output, hn, T - 1u) &&
+             qwen4_gemv(gt, df->dm, dw->sel_hidden, hn, T - 1u);
+        ds4_gpu_tensor_free(hn);
+        ds4_gpu_tensor_free(lg);
+        ds4_gpu_tensor_free(gt);
+    }
     DS4_DFL_TEND(df, 25, tdg);
+    if (ds4_dfl_qsa_on()) {
+        (void)ds4_gpu_qsa_prof_seal(ok ? DFQ_HEAD : -1);
+        g_dfq_cycles++;
+    }
     if (!ok || !ds4_gpu_end_commands()) {
         fprintf(stderr, "ds4: dflash: GPU draft batch failed (rows=%u)\n", T);
         df->wired = false;

@@ -60377,6 +60377,12 @@ typedef struct ds4_qwen4_gpu_graph {
     int32_t *draft_ids;
     uint32_t draft_rows;
     bool draft_head_tried;
+    /* dflash verify accept: GPU-side per-row argmax so the cycle reads one id
+     * per verify row instead of the whole logits block (W-D7) */
+    ds4_gpu_tensor *dflash_ids_gpu;
+    ds4_gpu_tensor *dflash_ids_scratch;
+    int dflash_gpu_argmax;
+    int32_t dflash_ids_host[16];
     ds4_gpu_tensor *snap_lin_state[DS4_MAX_LAYER];
     ds4_gpu_tensor *snap_lin_hist[DS4_MAX_LAYER];
     /* Rewind point (qwen35): GDN states and conv histories at the point,
@@ -60613,6 +60619,7 @@ static void qwen4_graph_free(ds4_qwen4_gpu_graph *g) {
         &g->mtp_e, &g->mtp_cat, &g->mtp_proj, &g->mtp_R, &g->mtp_argmax, &g->mtp_argmax_tmp,
         &g->snap_ple_hist, &g->snap2_ple_hist, &g->snap0_ple_hist, &g->pos3,
         &g->draft_head, &g->steer_dirs, &g->mtp_h,
+        &g->dflash_ids_gpu, &g->dflash_ids_scratch,
     };
     if (g->owns_scratch) {
         ds4_gpu_tensor **scratch[] = {
@@ -79350,7 +79357,7 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
     const uint32_t pos = g->pos, nd = T - 1u;
     int32_t drafts[DS4_DFLASH_MAX_DRAFT];
     uint32_t got = 0;
-    double tinject = 0.0, tverify = 0.0;
+    double tinject = 0.0, tverify = 0.0, tstart = trace ? now_sec() : 0.0;
     if (trace) {
         fprintf(stderr, "ds4: dfl verify: pos %u anchor %d rows %u\n", pos, first_token, T);
         tinject = now_sec();
@@ -79379,6 +79386,11 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
     if (!s->dflash_verify_logits)
         s->dflash_verify_logits = xmalloc((size_t)T * (size_t)V * sizeof(float));
     float *rows = s->dflash_verify_logits;
+    if (!g->dflash_ids_gpu) {
+        g->dflash_ids_gpu = ds4_gpu_tensor_alloc(16u * sizeof(int32_t));
+        g->dflash_ids_scratch = ds4_gpu_tensor_alloc(
+            (uint64_t)((V + 4095u) / 4096u) * 8u);
+    }
     /* W-D4 stage 2: batch mode blits the block-start GDN state into
      * snapshot set 0 before the forward and rebuilds the committed prefix
      * by replay after it; exact mode (the default) keeps per-row sets. */
@@ -79394,10 +79406,21 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
      * MTP verify sets it); batched mode leaves it false on purpose - the
      * prefill shapes own that width. */
     ds4_gpu_qwen4_set_verify_rows_exact(!batched);
+    static int gpu_argmax_gate = -1;
+    if (gpu_argmax_gate < 0) {
+        /* GPU-side verify argmax measured cycle-neutral (the 3 MB logits
+         * readback is a ~0.2 ms unified-memory memcpy); keep it as a probe
+         * knob, off by default. DS4_DFL_GPU_ARGMAX=1 enables it. */
+        const char *e = getenv("DS4_DFL_GPU_ARGMAX");
+        gpu_argmax_gate = (e && e[0] && e[0] != '0') ? 1 : 0;
+    }
+    const bool gpu_accept = gpu_argmax_gate && g->dflash_ids_gpu && g->dflash_ids_scratch;
+    g->dflash_gpu_argmax = gpu_accept ? 1 : 0;
     if (trace) tverify = now_sec();
     const bool ok = qwen35_graph_forward_tokens(g, m, w, toks, T, rows, true);
     if (trace) tverify = now_sec() - tverify;
     g->verify_rows_exact = false;
+    g->dflash_gpu_argmax = 0;
     ds4_gpu_qwen4_set_verify_rows_exact(false);
     if (!ok) {
         s->checkpoint_valid = false;
@@ -79405,8 +79428,13 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
         return -1;
     }
     uint32_t matched = 0;
-    while (matched + 1u < T && sample_argmax(rows + (size_t)matched * V, V) == toks[matched + 1u])
-        matched++;
+    if (gpu_accept) {
+        while (matched + 1u < T && g->dflash_ids_host[matched] == toks[matched + 1u])
+            matched++;
+    } else {
+        while (matched + 1u < T && sample_argmax(rows + (size_t)matched * V, V) == toks[matched + 1u])
+            matched++;
+    }
     if (matched + 1u < T) {
         bool restored;
         if (batched)
@@ -79433,9 +79461,10 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
     if (matched + 1u < T) df->verify_swaps++;
     if ((df->verify_cycles % 64u) == 0u) ds4_dflash_verify_flush(df);
     if (trace)
-        fprintf(stderr, "ds4: dfl verify: pos %u..%u matched %u/%u (%s) inject %.1f ms verify %.1f ms\n",
+        fprintf(stderr, "ds4: dfl verify: pos %u..%u matched %u/%u (%s) inject %.1f ms verify %.1f ms cycle total %.1f ms\n",
                 pos, pos + matched, matched, T - 1u,
-                matched + 1u == T ? "full" : "partial", 1000.0 * tinject, 1000.0 * tverify);
+                matched + 1u == T ? "full" : "partial", 1000.0 * tinject, 1000.0 * tverify,
+                1000.0 * (now_sec() - tstart));
     return (int)(matched + 1u);
 }
 

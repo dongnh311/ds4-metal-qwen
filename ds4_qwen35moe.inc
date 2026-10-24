@@ -1151,10 +1151,33 @@ static bool qwen35_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model 
     g_sub_armed = 0;
 #undef QWEN35_PROF
 #undef DS4_QWEN35_PROF_DECODE_N
+    /* dflash verify: GPU-side per-row argmax for the accept decision, riding
+     * the same open batch as the head; the cycle then reads one int32 per row
+     * instead of the whole logits block. */
+    if (ok && logits_out && g->dflash_gpu_argmax && all_rows && g->dflash_ids_gpu &&
+        g->dflash_ids_scratch) {
+        for (uint32_t i = 0; ok && i < T; i++) {
+            ds4_gpu_tensor *r = ds4_gpu_tensor_view(g->logits,
+                                                    (uint64_t)i * DS4_N_VOCAB * sizeof(float),
+                                                    (uint64_t)DS4_N_VOCAB * sizeof(float));
+            ds4_gpu_tensor *oid = ds4_gpu_tensor_view(g->dflash_ids_gpu,
+                                                      (uint64_t)i * sizeof(int32_t),
+                                                      sizeof(int32_t));
+            ok = r && oid &&
+                 ds4_gpu_qwen4_argmax_tensor(oid, g->dflash_ids_scratch, r, DS4_N_VOCAB) != 0;
+            ds4_gpu_tensor_free(oid);
+            ds4_gpu_tensor_free(r);
+        }
+    }
     if (!ds4_gpu_end_commands()) ok = false;
     const uint32_t n_rows = all_rows ? T : 1u;
     if (ok && logits_out) {
-        ok = ds4_gpu_tensor_read(g->logits, 0, logits_out, (uint64_t)n_rows * DS4_N_VOCAB * sizeof(float)) != 0;
+        if (g->dflash_gpu_argmax && all_rows)
+            ok = ds4_gpu_tensor_read(g->dflash_ids_gpu, 0, g->dflash_ids_host,
+                                     (uint64_t)n_rows * sizeof(int32_t)) != 0;
+        else
+            ok = ds4_gpu_tensor_read(g->logits, 0, logits_out,
+                                     (uint64_t)n_rows * DS4_N_VOCAB * sizeof(float)) != 0;
     }
     if (ok) {
         g->pos += T;
