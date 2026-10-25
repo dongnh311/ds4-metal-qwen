@@ -92,7 +92,15 @@ typedef struct ds4_dflash_gpu {
     ds4_gpu_tensor *gffn1, *gffn2;          /* cap_rows*ff (gate / up out)     */
     ds4_gpu_tensor *gmid;                   /* cap_rows*ff (silu*up in)        */
     ds4_gpu_tensor *ggate;                  /* cap_rows*rank                   */
-    ds4_gpu_tensor *glogits;                /* cap_rows*trunk vocab            */
+    ds4_gpu_tensor *glogits;                /* cap_rows*trunk vocab (or the
+                                             * gathered draft-head rows)       */
+    /* W-D10 FR-Spec draft head (DS4_DFLASH_DRAFT_VOCAB=<ids file>): the draft
+     * gemv runs against a GPU-resident gather of the trunk output-head rows
+     * for a ranked vocabulary subset; the walk remaps compact slots back to
+     * true ids and the verify rows still score the full head. */
+    ds4_gpu_tensor *ghead;                  /* ghead_rows rows, head type    */
+    int32_t        *ghead_ids;              /* slot -> true trunk vocab id   */
+    uint32_t        ghead_rows;             /* gathered rows (0 = full head) */
     ds4_gpu_tensor *gtap;                   /* inj_cap rows of n_taps*E        */
     ds4_gpu_tensor *ginj;                   /* inj_cap*E (k/v gemv input)      */
     ds4_gpu_tensor *gfc;                    /* inj_cap*E (fc out)              */
@@ -386,6 +394,10 @@ static void ds4_dflash_free(struct ds4_dflash_gpu *df) {
     ds4_gpu_tensor_free(df->gffn1);    ds4_gpu_tensor_free(df->gffn2);
     ds4_gpu_tensor_free(df->gmid);     ds4_gpu_tensor_free(df->ggate);
     ds4_gpu_tensor_free(df->glogits);  ds4_gpu_tensor_free(df->gtap);
+    ds4_gpu_tensor_free(df->ghead);
+    free(df->ghead_ids);
+    df->ghead_ids = NULL;
+    df->ghead_rows = 0;
     ds4_gpu_tensor_free(df->ginj);     ds4_gpu_tensor_free(df->gfc);
     ds4_gpu_tensor_free(df->gk_inj);   ds4_gpu_tensor_free(df->gv_inj);
     ds4_gpu_tensor_free(df->gtap_ring);
@@ -423,6 +435,70 @@ static void ds4_dflash_reset(ds4_qwen4_gpu_graph *g) {
  * graph right after qwen35_graph_alloc when e->dflash; the drafter was
  * already bound and validated at engine open (W-D2), and the trained mask
  * row sidecar is mandatory there. */
+/* W-D10 FR-Spec draft head: DS4_DFLASH_DRAFT_VOCAB=<file> (token ids, one
+ * per line, most frequent first).  The draft gemv then streams a gathered
+ * GPU copy of the trunk output head's rows for that subset instead of the
+ * full 248320-row head; ds4_dfl_read_walk maps the compact slots back to
+ * true ids.  Any failure leaves the full head in place. */
+static void ds4_dfl_head_gather(ds4_dflash_gpu *df) {
+    const char *path = getenv("DS4_DFLASH_DRAFT_VOCAB");
+    if (!path || !path[0]) return;
+    const ds4_tensor *ho = df->tw->output;
+    uint32_t block_elems = 0, block_bytes = 0;
+    if (ds4_gguf_type_block(ho->type, &block_elems, &block_bytes) != 0 ||
+        ho->ndim < 2 || ho->dim[0] == 0 || (ho->dim[0] % block_elems) != 0) {
+        fprintf(stderr, "ds4: DS4_DFLASH_DRAFT_VOCAB ignored (head type %u has no row gather)\n",
+                ho->type);
+        return;
+    }
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "ds4: dflash draft vocab %s: %s\n", path, strerror(errno));
+        return;
+    }
+    const uint64_t V = ho->dim[1];
+    int32_t *ids = malloc((size_t)V * sizeof(int32_t));
+    uint8_t *seen = V ? calloc((size_t)V, 1) : NULL;
+    uint32_t n = 0;
+    long long v;
+    while (ids && seen && n < V && fscanf(fp, "%lld", &v) == 1) {
+        if (v < 0 || v >= (long long)V || seen[v]) continue;
+        seen[v] = 1;
+        ids[n++] = (int32_t)v;
+    }
+    fclose(fp);
+    free(seen);
+    if (!ids || n == 0 || n >= V) {
+        fprintf(stderr, "ds4: dflash draft vocab %s: need 1..%" PRIu64 " distinct ids (got %u)\n",
+                path, V, n);
+        free(ids);
+        return;
+    }
+    const uint64_t row_bytes = (ho->dim[0] / block_elems) * (uint64_t)block_bytes;
+    const uint64_t bytes = (uint64_t)n * row_bytes;
+    uint8_t *rows = malloc(bytes);
+    ds4_gpu_tensor *head = rows ? ds4_gpu_tensor_alloc(bytes) : NULL;
+    bool ok = rows && head;
+    if (ok) {
+        const uint8_t *src = (const uint8_t *)df->tm->map + ho->abs_offset;
+        for (uint32_t i = 0; ok && i < n; i++)
+            memcpy(rows + (uint64_t)i * row_bytes, src + (uint64_t)ids[i] * row_bytes, row_bytes);
+        ok = ds4_gpu_tensor_write(head, 0, rows, bytes) == 1;
+    }
+    free(rows);
+    if (!ok) {
+        fprintf(stderr, "ds4: dflash draft head gather failed (vocab %s)\n", path);
+        if (head) ds4_gpu_tensor_free(head);
+        free(ids);
+        return;
+    }
+    df->ghead = head;
+    df->ghead_ids = ids;
+    df->ghead_rows = n;
+    fprintf(stderr, "ds4: dflash draft head: gathered %u of %" PRIu64 " rows (%.1f MiB, type %u)\n",
+            n, V, (double)bytes / (1024.0 * 1024.0), ho->type);
+}
+
 static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_row,
                               ds4_model *dm, ds4_model *tm, const ds4_weights *tw,
                               ds4_qwen4_gpu_graph *g) {
@@ -512,6 +588,8 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     }
 
     bool ok = true;
+    ds4_dfl_head_gather(df);
+    const uint32_t head_rows = df->ghead_rows ? df->ghead_rows : DS4_N_VOCAB;
 #define DF_ALLOC(field_, floats_) do { df->field_ = qwen4_graph_alloc_f32(floats_); \
         ok = ok && df->field_; } while (0)
     DF_ALLOC(gxn,      (uint64_t)df->cap_rows * df->E);
@@ -526,7 +604,7 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     DF_ALLOC(gffn2,    (uint64_t)df->cap_rows * df->ff);
     DF_ALLOC(gmid,     (uint64_t)df->cap_rows * df->ff);
     DF_ALLOC(ggate,    (uint64_t)df->cap_rows * df->rank);
-    DF_ALLOC(glogits,  (uint64_t)df->cap_rows * DS4_N_VOCAB);
+    DF_ALLOC(glogits,  (uint64_t)df->cap_rows * head_rows);
     DF_ALLOC(gtap,     (uint64_t)DS4_DFLASH_INJ_CAP * df->n_taps * df->E);
     DF_ALLOC(ginj,     (uint64_t)DS4_DFLASH_INJ_CAP * df->E);
     DF_ALLOC(gfc,      (uint64_t)DS4_DFLASH_INJ_CAP * df->E);
@@ -574,7 +652,7 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     DF_MALLOC(ik, (size_t)DS4_DFLASH_INJ_CAP * df->kv_heads * df->hd * sizeof(float));
     DF_MALLOC(iv, (size_t)DS4_DFLASH_INJ_CAP * df->kv_heads * df->hd * sizeof(float));
     DF_MALLOC(gate, (size_t)df->cap_rows * df->rank * sizeof(float));
-    DF_MALLOC(logits, (size_t)df->cap_rows * DS4_N_VOCAB * sizeof(float));
+    DF_MALLOC(logits, (size_t)df->cap_rows * head_rows * sizeof(float));
     DF_MALLOC(score, (size_t)df->cap_rows * (df->ring_cap + 1u) * sizeof(float));
     DF_MALLOC(score_f, (size_t)df->cap_rows * df->cap_rows * sizeof(float));
     DF_MALLOC(cand, sizeof(int32_t) * (size_t)df->cap_rows * df->top_k);
@@ -961,16 +1039,23 @@ static bool ds4_dfl_raw_walk(void) {
 static bool ds4_dfl_read_walk(ds4_dflash_gpu *df, const ds4_dflash_weights *dw,
                               uint32_t T, int32_t anchor, uint32_t n_draft,
                               int32_t *drafts, uint32_t *n_out) {
+    const uint32_t HR = df->ghead_rows ? df->ghead_rows : DS4_N_VOCAB;
     if (ds4_gpu_tensor_read(df->glogits, 0, df->logits,
-                            (size_t)T * DS4_N_VOCAB * sizeof(float)) != 1 ||
+                            (size_t)T * HR * sizeof(float)) != 1 ||
         ds4_gpu_tensor_read(df->ggate, 0, df->gate,
                             (size_t)T * df->rank * sizeof(float)) != 1)
         return false;
     /* candidates then the greedy lattice walk                            */
     const double dwt = df->tstat ? now_sec() : 0.0;              /* TSTAT d_walk  */
     for (uint32_t i = 1; i <= n_draft; i++)
-        ds4_dfl_topk(df->logits + (size_t)i * DS4_N_VOCAB, DS4_N_VOCAB, df->top_k,
+        ds4_dfl_topk(df->logits + (size_t)i * HR, HR, df->top_k,
                      df->cand + (size_t)i * df->top_k, df->uv + (size_t)i * df->top_k);
+    if (df->ghead) {                        /* compact slots -> true ids     */
+        for (uint32_t i = 1; i <= n_draft; i++)
+            for (uint32_t c = 0; c < df->top_k; c++)
+                df->cand[(size_t)i * df->top_k + c] =
+                    df->ghead_ids[df->cand[(size_t)i * df->top_k + c]];
+    }
     int32_t carried = 0;
     const bool raw = ds4_dfl_raw_walk();
     for (uint32_t i = 1; i <= n_draft; i++) {
@@ -1022,8 +1107,9 @@ static bool ds4_dfl_read_walk(ds4_dflash_gpu *df, const ds4_dflash_weights *dw,
         int32_t b0 = 0;
         float bv = -1e30f;
         const float *r0 = df->logits;
-        for (uint32_t v = 0; v < DS4_N_VOCAB; v++)
+        for (uint32_t v = 0; v < HR; v++)
             if (r0[v] > bv) { bv = r0[v]; b0 = (int32_t)v; }
+        if (df->ghead) b0 = df->ghead_ids[b0];
         df->dbg_rc[0] = b0;
         df->dbg_rc[1] = drafts[0];
         df->dbg_rc[2] = n_draft > 1 ? drafts[1] : -1;
@@ -1213,16 +1299,20 @@ static bool ds4_dflash_draft_gpu(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_
     /* Head + selector: only draft rows 1..T-1 feed the walk — the anchor row's
      * own logits are never read — so both gemvs start at row 1. */
     if (T > 1u) {
+        const uint32_t HR = df->ghead_rows ? df->ghead_rows : DS4_N_VOCAB;
         ds4_gpu_tensor *hn = ds4_gpu_tensor_view(df->gxn, (uint64_t)E * sizeof(float),
                                                  (uint64_t)(T - 1u) * E * sizeof(float));
         ds4_gpu_tensor *lg = ds4_gpu_tensor_view(df->glogits,
-                                                 (uint64_t)DS4_N_VOCAB * sizeof(float),
-                                                 (uint64_t)(T - 1u) * DS4_N_VOCAB * sizeof(float));
+                                                 (uint64_t)HR * sizeof(float),
+                                                 (uint64_t)(T - 1u) * HR * sizeof(float));
         ds4_gpu_tensor *gt = ds4_gpu_tensor_view(df->ggate,
                                                  (uint64_t)df->rank * sizeof(float),
                                                  (uint64_t)(T - 1u) * df->rank * sizeof(float));
         ok = ok && hn && lg && gt &&
-             qwen4_gemv(lg, df->tm, df->tw->output, hn, T - 1u) &&
+             (df->ghead ? ds4_gpu_qwen4_gemv_rows_tensor(lg, df->ghead,
+                                                         df->tw->output->type, E,
+                                                         df->ghead_rows, hn, T - 1u)
+                        : qwen4_gemv(lg, df->tm, df->tw->output, hn, T - 1u)) &&
              qwen4_gemv(gt, df->dm, dw->sel_hidden, hn, T - 1u);
         ds4_gpu_tensor_free(hn);
         ds4_gpu_tensor_free(lg);
@@ -1430,7 +1520,10 @@ static bool ds4_dflash_draft(ds4_qwen4_gpu_graph *g, int32_t anchor, uint32_t po
             ds4_dfl_rms(df->h + (size_t)t * E, ow, E, df->eps, df->xn + (size_t)t * E);
         if (ds4_gpu_tensor_write(df->gxn, 0, df->xn, (size_t)T * erow) != 1) return false;
         if (!glm_graph_begin_commands_if_needed()) return false;
-        if (!qwen4_gemv(df->glogits, df->tm, df->tw->output, df->gxn, T) ||
+        if (!(df->ghead ? ds4_gpu_qwen4_gemv_rows_tensor(df->glogits, df->ghead,
+                                                        df->tw->output->type, df->E,
+                                                        df->ghead_rows, df->gxn, T)
+                        : qwen4_gemv(df->glogits, df->tm, df->tw->output, df->gxn, T)) ||
             !qwen4_gemv(df->ggate, df->dm, dw->sel_hidden, df->gxn, T) ||
             !ds4_gpu_end_commands())
             return false;

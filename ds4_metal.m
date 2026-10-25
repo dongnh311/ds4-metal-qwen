@@ -55718,6 +55718,52 @@ int ds4_gpu_qwen4_multi_gemv_tensor(
                           MTLSizeMake((total + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
 }
 
+/* W-D10 FR-Spec draft head: the same GSQ/multi-gemv dispatch as
+ * ds4_gpu_qwen4_multi_gemv_tensor for a single output, but the weight is a
+ * GPU-resident tensor (the gathered draft-head rows) rather than a mapped
+ * model range. */
+int ds4_gpu_qwen4_gemv_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *w,
+                                   uint32_t weight_type, uint32_t in_dim,
+                                   uint32_t out_rows, const ds4_gpu_tensor *x,
+                                   uint32_t n_tokens) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    struct { uint32_t n_tokens, in_dim, n_out, zero, rows[4], types[4], row_bytes[4]; } args = {0};
+    qwen4_bind b[9];
+    if (!x || !w || !out || n_tokens == 0 || in_dim == 0 || (in_dim % 32) != 0 ||
+        out_rows == 0 ||
+        !qwen4_bind_tensor(&b[0], x, (uint64_t)n_tokens * in_dim * sizeof(float), "gemv rows input"))
+        return 0;
+    const uint32_t rb = qwen4_expert_row_bytes(weight_type, in_dim);
+    if (rb == 0 ||
+        !qwen4_bind_tensor(&b[1], w, (uint64_t)rb * out_rows, "gemv rows weight") ||
+        !qwen4_bind_tensor(&b[5], out, (uint64_t)n_tokens * out_rows * sizeof(float), "gemv rows output"))
+        return 0;
+    args.n_tokens = n_tokens;
+    args.in_dim = in_dim;
+    args.n_out = 1u;
+    args.rows[0] = out_rows;
+    args.types[0] = weight_type;
+    args.row_bytes[0] = rb;
+    for (uint32_t i = 1; i < 4; i++) {
+        b[1 + i] = b[1];
+        b[5 + i] = b[5];
+    }
+    if (qwen4_gsq_mv2_ok(n_tokens, in_dim, 1u, args.types)) {
+        const uint32_t r1 = n_tokens < 4u ? n_tokens : 4u;
+        return qwen4_dispatch(QWEN4_K_GSQ_MV2_R1 + (int)r1 - 1, &args, sizeof(args), b, 9,
+                              MTLSizeMake((out_rows + 7) / 8, (n_tokens + r1 - 1) / r1, 1),
+                              MTLSizeMake(128, 1, 1), 2048);
+    }
+    if (qwen4_gsq_mv_ok(n_tokens, in_dim, 1u, args.types)) {
+        const uint32_t r1 = n_tokens < 4u ? n_tokens : 4u;
+        return qwen4_dispatch(QWEN4_K_GSQ_MV_R1 + (int)r1 - 1, &args, sizeof(args), b, 9,
+                              MTLSizeMake((out_rows + 3) / 4, (n_tokens + r1 - 1) / r1, 1),
+                              MTLSizeMake(128, 1, 1), 0);
+    }
+    return qwen4_dispatch(QWEN4_K_MULTI_GEMV, &args, sizeof(args), b, 9,
+                          MTLSizeMake((out_rows + 7) / 8, n_tokens, 1), MTLSizeMake(128, 1, 1), 0);
+}
+
 static ds4_gpu_tensor *g_qwen4_dense_mm_partials;
 static uint64_t g_qwen4_dense_mm_partials_bytes;
 

@@ -3699,6 +3699,10 @@ int ds4_gpu_df_gemvconv_tensor(const ds4_gpu_tensor *in, const void *model_map, 
                                ds4_gpu_tensor *res, uint32_t T, uint32_t E,
                                uint32_t ngroup, uint32_t group, uint32_t kernel,
                                uint32_t bs, uint32_t in_dim);
+int ds4_gpu_qwen4_gemv_rows_tensor(ds4_gpu_tensor *out, const ds4_gpu_tensor *w,
+                                   uint32_t weight_type, uint32_t in_dim,
+                                   uint32_t out_rows, const ds4_gpu_tensor *x,
+                                   uint32_t n_tokens);
 
 /* Scratch floats for `rows` rows at decode3's split cap (256). */
 uint64_t ds4_gpu_qwen35_attn_part3_floats(uint32_t rows, uint32_t n_head, uint32_t head_dim);
