@@ -1479,6 +1479,69 @@ static int qwen35_dflash_replay_fused(void) {
     return c;
 }
 
+/* W-D11 restore-replay overlay (on by default after the 2026-10-25 receipts:
+ * partial cycles 71.3-71.6 vs 72.5-73.1 ms in 8/8 alternating pairs;
+ * DS4_DFL_OVERLAY=0 reverts to the blocking restore). */
+static int qwen35_dflash_overlay(void) {
+    static int c = -1;
+    if (c < 0) {
+        const char *e = getenv("DS4_DFL_OVERLAY");
+        c = (e && e[0] && e[0] == '0') ? 0 : 1;
+    }
+    return c;
+}
+
+/* Same restore as qwen35_graph_dflash_batched_restore_replay but encoded on
+ * the overlay queue and committed without waiting.  Returns false (with the
+ * overlay drained) when the fused path is not eligible, so the caller can
+ * fall back to the blocking restore. */
+static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_restore_replay_overlay(ds4_qwen4_gpu_graph *g,
+                                                                        const ds4_model *m,
+                                                                        const ds4_weights *w,
+                                                                        uint32_t committed,
+                                                                        uint32_t new_pos) {
+    if (!qwen35_dflash_overlay() || !qwen35_dflash_replay_fused()) return false;
+    if (!g->dflash_verify_batched || g->dflash_verify_rows <= 1u) return false;
+    if (committed == 0u || committed > 3u) return false;
+    if (!ds4_gpu_overlay_begin()) return false;
+    const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
+    const uint64_t qrow = (uint64_t)committed * conv_dim * sizeof(float);
+    const uint64_t arow = (uint64_t)committed * DS4_N_LIN_V_HEAD * sizeof(float);
+    const uint64_t lrow = (uint64_t)committed * DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM * sizeof(float);
+    bool ok = true;
+    for (uint32_t il = 0; ok && il + DS4_N_NEXTN_PREDICT < DS4_N_LAYER; il++) {
+        if (!g->dflash_cap_qkv[il] || !g->layer_lin_state[il]) continue;
+        if (!g->dflash_snap_s[0][il] || !g->dflash_snap_h[0][il] ||
+            !g->dflash_cap_ga[il] || !g->dflash_cap_gb[il]) { ok = false; break; }
+        const ds4_layer_weights *l = &w->layer[il];
+        ds4_gpu_tensor *qkv = ds4_gpu_tensor_view(g->dflash_cap_qkv[il], 0, qrow);
+        ds4_gpu_tensor *ga = ds4_gpu_tensor_view(g->dflash_cap_ga[il], 0, arow);
+        ds4_gpu_tensor *gb = ds4_gpu_tensor_view(g->dflash_cap_gb[il], 0, arow);
+        ds4_gpu_tensor *lo = ds4_gpu_tensor_view(g->lin_o, 0, lrow);
+        ok = qkv && ga && gb && lo &&
+            ds4_gpu_qwen4_gdn_replay_tensor(lo, g->layer_lin_state[il], g->dflash_snap_s[0][il],
+                                           qkv, g->dflash_snap_h[0][il], ga, gb,
+                                           m->map, m->size, l->lin_conv->abs_offset,
+                                           l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
+                                           committed, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
+                                           DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV, 1) != 0;
+        ds4_gpu_tensor_free(lo);
+        ds4_gpu_tensor_free(gb);
+        ds4_gpu_tensor_free(ga);
+        ds4_gpu_tensor_free(qkv);
+    }
+    if (!ok) {
+        (void)ds4_gpu_overlay_wait();
+        return false;
+    }
+    if (!ds4_gpu_overlay_commit()) {
+        (void)ds4_gpu_overlay_wait();
+        return false;
+    }
+    g->pos = new_pos;
+    return true;
+}
+
 static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_batched_restore_replay(ds4_qwen4_gpu_graph *g,
                                                                         const ds4_model *m,
                                                                         const ds4_weights *w,
@@ -1513,7 +1576,7 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_batched_restore_replay(ds4_qwen
                                                m->map, m->size, l->lin_conv->abs_offset,
                                                l->lin_a->abs_offset, l->lin_dt_bias->abs_offset,
                                                committed, DS4_N_LIN_K_HEAD, DS4_N_LIN_V_HEAD,
-                                               DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV) != 0;
+                                               DS4_N_LIN_HEAD_DIM, DS4_N_LIN_CONV, 0) != 0;
             ds4_gpu_tensor_free(lo);
             ds4_gpu_tensor_free(gb);
             ds4_gpu_tensor_free(ga);

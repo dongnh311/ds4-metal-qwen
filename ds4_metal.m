@@ -12008,6 +12008,7 @@ int ds4_gpu_wait_committed_commands(void) {
 
 int ds4_gpu_synchronize(void) {
     if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (ds4_gpu_overlay_pending() && !ds4_gpu_overlay_wait()) return 0;
     if (g_batch_cb) return ds4_gpu_end_commands();
     ds4_gpu_parallel_ffn_reset_state(YES);
     if ([g_pending_cbs count] != 0) {
@@ -50654,6 +50655,83 @@ int ds4_gpu_qwen4_gdn_scan_tensor(
  * DFlash verify rows.  Same arithmetic as conv stream + prep + scan, but it
  * reads the captured raw rows and the block-start history/state snapshot
  * instead of blitting into the live buffers and rewriting the captures. */
+/* ---------------------------------------------------------------------- */
+/* W-D11 restore-replay overlay: the partial-commit restore dispatches run
+ * on a dedicated command queue so they overlap with the next cycle's draft
+ * batch on the main queue.  The overlap window closes with
+ * ds4_gpu_overlay_wait() before the verify forward reads the restored GDN
+ * state; queue ordering is safe because the host already waited on the
+ * verify batch (the logits readback) before encoding the restore, so the
+ * captured qkv/snapshot buffers the restore reads are final. */
+static id<MTLCommandQueue> g_overlay_queue;
+static id<MTLCommandBuffer> g_overlay_cb;          /* open, not yet committed   */
+static id<MTLCommandBuffer> g_overlay_committed;   /* committed, not yet waited */
+
+int ds4_gpu_overlay_begin(void) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    @autoreleasepool {
+        if (!g_overlay_queue)
+            g_overlay_queue = [g_device newCommandQueue];
+        if (!g_overlay_queue) return 0;
+        if (g_overlay_committed) {
+            /* one outstanding overlay at a time: drain before re-opening */
+            [g_overlay_committed waitUntilCompleted];
+            g_overlay_committed = nil;
+        }
+        if (!g_overlay_cb)
+            g_overlay_cb = [g_overlay_queue commandBuffer];
+        return g_overlay_cb != nil;
+    }
+}
+
+int ds4_gpu_overlay_commit(void) {
+    if (!g_overlay_cb) return 1;
+    g_overlay_committed = g_overlay_cb;
+    g_overlay_cb = nil;
+    [g_overlay_committed commit];
+    return 1;
+}
+
+int ds4_gpu_overlay_pending(void) {
+    return g_overlay_cb != nil || g_overlay_committed != nil;
+}
+
+int ds4_gpu_overlay_wait(void) {
+    if (!g_overlay_cb && !g_overlay_committed) return 1;
+    @autoreleasepool {
+        if (g_overlay_cb) {
+            [g_overlay_cb commit];
+            g_overlay_committed = g_overlay_cb;
+            g_overlay_cb = nil;
+        }
+        [g_overlay_committed waitUntilCompleted];
+    }
+    g_overlay_committed = nil;
+    return 1;
+}
+
+static int qwen4_overlay_dispatch(int kernel, const void *args, size_t args_len,
+                                  const qwen4_bind *binds, int n_binds,
+                                  MTLSize grid, MTLSize tg, NSUInteger tg_mem) {
+    if (!g_initialized || !g_overlay_cb) return 0;
+    @autoreleasepool {
+        if (!g_qwen4_pipelines[kernel]) {
+            g_qwen4_pipelines[kernel] = ds4_gpu_get_pipeline(qwen4_kernel_names[kernel]);
+            if (!g_qwen4_pipelines[kernel]) return 0;
+        }
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(g_overlay_cb);
+        if (!enc) return 0;
+        [enc setComputePipelineState:g_qwen4_pipelines[kernel]];
+        [enc setBytes:args length:args_len atIndex:0];
+        for (int i = 0; i < n_binds; i++)
+            [enc setBuffer:binds[i].buf offset:binds[i].off atIndex:(NSUInteger)(i + 1)];
+        if (tg_mem) [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+        [enc dispatchThreadgroups:grid threadsPerThreadgroup:tg];
+        ds4_gpu_end_compute_encoder(g_overlay_cb, enc);
+    }
+    return 1;
+}
+
 int ds4_gpu_qwen4_gdn_replay_tensor(
         ds4_gpu_tensor *out, ds4_gpu_tensor *state, const ds4_gpu_tensor *snap_state,
         const ds4_gpu_tensor *qkv, const ds4_gpu_tensor *hist,
@@ -50661,7 +50739,7 @@ int ds4_gpu_qwen4_gdn_replay_tensor(
         const void *model_map, uint64_t model_size,
         uint64_t conv_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
         uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
-        uint32_t conv_kernel) {
+        uint32_t conv_kernel, int overlay) {
     if (n_tokens == 0u || n_tokens > 3u || head_dim != 128u ||
         conv_kernel < 2u || conv_kernel > 4u) return 0;
     const uint64_t conv_dim = (uint64_t)(2u * n_k_head + n_v_head) * head_dim;
@@ -50681,8 +50759,11 @@ int ds4_gpu_qwen4_gdn_replay_tensor(
         !qwen4_bind_tensor(&bd[8], state, state_bytes, "gdn replay state") ||
         !qwen4_bind_tensor(&bd[9], out, (uint64_t)n_tokens * n_v_head * head_dim * sizeof(float), "gdn replay out"))
         return 0;
-    return qwen4_dispatch(QWEN4_K_GDN_REPLAY, &args, sizeof(args), bd, 10,
-                          MTLSizeMake(head_dim / 4u, n_v_head, 1), MTLSizeMake(32, 1, 1), 0);
+    return overlay ? qwen4_overlay_dispatch(QWEN4_K_GDN_REPLAY, &args, sizeof(args), bd, 10,
+                                           MTLSizeMake(head_dim / 4u, n_v_head, 1),
+                                           MTLSizeMake(32, 1, 1), 0)
+                   : qwen4_dispatch(QWEN4_K_GDN_REPLAY, &args, sizeof(args), bd, 10,
+                                   MTLSizeMake(head_dim / 4u, n_v_head, 1), MTLSizeMake(32, 1, 1), 0);
 }
 
 static ds4_gpu_tensor *g_qwen4_gdn_slots;

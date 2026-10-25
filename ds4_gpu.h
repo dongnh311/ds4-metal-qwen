@@ -3550,7 +3550,12 @@ int ds4_gpu_qwen4_gdn_replay_tensor(
         const void *model_map, uint64_t model_size,
         uint64_t conv_offset, uint64_t ssm_a_offset, uint64_t dt_bias_offset,
         uint32_t n_tokens, uint32_t n_k_head, uint32_t n_v_head, uint32_t head_dim,
-        uint32_t conv_kernel);
+        uint32_t conv_kernel, int overlay);
+/* W-D11 restore-replay overlay queue (see ds4_metal.m). */
+int ds4_gpu_overlay_begin(void);
+int ds4_gpu_overlay_commit(void);
+int ds4_gpu_overlay_pending(void);
+int ds4_gpu_overlay_wait(void);
 int ds4_gpu_qwen4_gdn_out_tensor(
         ds4_gpu_tensor *o, const ds4_gpu_tensor *z,
         const void *model_map, uint64_t model_size, uint64_t weight_offset,

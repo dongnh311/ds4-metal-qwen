@@ -79395,6 +79395,12 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
      * snapshot set 0 before the forward and rebuilds the committed prefix
      * by replay after it; exact mode (the default) keeps per-row sets. */
     const bool batched = g->dflash_verify_batched;
+    /* W-D11: close the overlay window before the forward reads GDN state. */
+    if (ds4_gpu_overlay_pending() && !ds4_gpu_overlay_wait()) {
+        s->checkpoint_valid = false;
+        if (errlen) snprintf(err, errlen, "Ornith dflash: restore overlay wait failed");
+        return -1;
+    }
     if (batched && !qwen35_graph_dflash_batched_baseline(g)) {
         s->checkpoint_valid = false;
         if (errlen) snprintf(err, errlen, "Ornith dflash: verify block-start snapshot failed");
@@ -79436,12 +79442,18 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
             matched++;
     }
     if (matched + 1u < T) {
-        bool restored;
-        if (batched)
-            restored = qwen35_graph_dflash_batched_restore_replay(g, m, w, matched + 1u,
+        bool restored = false;
+        if (batched) {
+            /* W-D11: try the overlaid restore first; when ineligible the
+             * blocking restore (which also drains the overlay) follows. */
+            restored = qwen35_graph_dflash_restore_replay_overlay(g, m, w, matched + 1u,
                                                                   pos + matched + 1u);
-        else
+            if (!restored)
+                restored = qwen35_graph_dflash_batched_restore_replay(g, m, w, matched + 1u,
+                                                                      pos + matched + 1u);
+        } else {
             restored = qwen35_graph_dflash_state_swap(g, matched, pos + matched + 1u);
+        }
         if (!restored) {
             s->checkpoint_valid = false;
             if (errlen) snprintf(err, errlen, "Ornith dflash: partial commit restore failed");
