@@ -494,11 +494,12 @@ static bool ds4_dflash_attach(const ds4_dflash_weights *dw, const float *mask_ro
     { const char *tv = getenv("DS4_DFLASH_TSTAT");
       df->tstat = tv && tv[0] && tv[0] != '0'; }
     /* W-D4b stage 2: run the whole drafter block (conv, norm+RoPE, ring
-     * attention) on the GPU inside one command batch.  Off by default until
-     * the receipts land.  It implies the GPU fc path (the enc norm chains
+     * attention) on the GPU inside one command batch.  On by default since
+     * the 2026-10-25 T=4 receipts (DS4_DFLASH_DGPU=0 reverts to the host
+     * draft for A/B).  It implies the GPU fc path (the enc norm chains
      * straight off the fc output). */
     { const char *dv = getenv("DS4_DFLASH_DGPU");
-      df->dgp = dv && dv[0] && dv[0] != '0'; }
+      df->dgp = !(dv && dv[0] && dv[0] == '0'); }
     if (df->dgp) df->gpu_fc = 1;
     df->inj_chunk = DS4_DFLASH_INJ_CAP;
     {

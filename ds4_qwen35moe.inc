@@ -51,10 +51,14 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
      * a --dflash session (the anchor plus N-1 drafted rows); absent, empty,
      * or N < 2 keeps decode plain.  Each per-row GDN snapshot set is
      * state+conv hist (~4.3 MiB per GDN layer here), so N-1 sets at N=8 is
-     * about 1.1 GiB on the 122B -- the budget is printed once at alloc. */
+     * about 1.1 GiB on the 122B -- the budget is printed once at alloc.
+     * W-D9 receipts (4 alternating T=3/T=4 pairs): T=4 wins every pair
+     * (e.g. 47.07/30.13 vs 27.94/26.77 t/s at n=250), so an unset DS4_DFLASH_VERIFY
+     * on a --dflash session now defaults to 4. */
     if (dflash) {
         const char *dv = getenv("DS4_DFLASH_VERIFY");
-        if (dv && dv[0]) {
+        if (!dv || !dv[0]) dv = "4";
+        {
             const long n = strtol(dv, NULL, 10);
             if (n >= 2) g->dflash_verify_rows = n > 8 ? 8u : (uint32_t)n;
             /* W-D4 stage 2: DS4_DFLASH_VERIFY_MODE=batch swaps the exact
@@ -65,7 +69,8 @@ static bool qwen35_graph_alloc(ds4_qwen4_gpu_graph *g, uint32_t ctx_cap, uint32_
              * promoted to 3. */
             if (n >= 2) {
                 const char *vm = getenv("DS4_DFLASH_VERIFY_MODE");
-                if (vm && vm[0] && !strcmp(vm, "batch")) {
+                if (!vm || !vm[0]) vm = "batch";   /* receipts: batched stage-2 is the accepted baseline */
+                if (!strcmp(vm, "batch")) {
                     g->dflash_verify_batched = true;
                     if (g->dflash_verify_rows == 2u) {
                         g->dflash_verify_rows = 3u;
@@ -1462,14 +1467,14 @@ static DS4_MAYBE_UNUSED bool qwen35_graph_dflash_batched_baseline(ds4_qwen4_gpu_
  * prep, so a replayed commit consumes them once; the next verify fills the
  * captures again.  The committed rows' totals also stay out of the
  * residual: the caller only continues from the recurrence state. */
-/* W-D8 probe knob (DS4_DFL_REPLAY_FUSED): restore the committed prefix of a
- * partial batched verify in one fused dispatch per GDN layer instead of the
- * snapshot blits plus conv/prep/scan trio.  Off until the receipts land. */
+/* W-D8 fused restore-replay (DS4_DFL_REPLAY_FUSED, on by default after the
+ * 2026-10-25 receipts: partial gap 3.9-4.6 vs 4.4-4.8 ms, 5 dispatches+302 MB
+ * per partial cycle collapsed to 1). DS4_DFL_REPLAY_FUSED=0 reverts per chain. */
 static int qwen35_dflash_replay_fused(void) {
     static int c = -1;
     if (c < 0) {
         const char *e = getenv("DS4_DFL_REPLAY_FUSED");
-        c = (e && e[0] && e[0] != '0') ? 1 : 0;
+        c = (e && e[0] && e[0] == '0') ? 0 : 1;
     }
     return c;
 }
