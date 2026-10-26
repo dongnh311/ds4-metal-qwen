@@ -715,6 +715,7 @@ def merge(dirpath, out_path, delete_engram=True, delete_shards=True):
             src.piece_len = rec["piece_len"]
             src.kv_bytes_off = rec["hdr_off"]
             src.hdrlen = rec["hdr_len"]
+            src.file_size = rec["llama_ds"] + rec["piece_len"]
             src.fd = os.open(raw_path, os.O_RDONLY)  # only for KV reads
         sources.append(src)
 
@@ -733,6 +734,7 @@ def merge(dirpath, out_path, delete_engram=True, delete_shards=True):
         en.piece_len = rec["piece_len"]
         en.kv_bytes_off = rec["hdr_off"]
         en.hdrlen = rec["hdr_len"]
+        en.file_size = rec["llama_ds"] + rec["piece_len"]
         en.fd = os.open(raw_path, os.O_RDONLY)
 
     rows = [kv_value_int(sources[0], "deepseek41.engram.num_embeddings", 0),
