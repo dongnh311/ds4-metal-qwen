@@ -557,14 +557,18 @@ def copy_piece(p, s, out_fd, t0):
     src = p["shards"][s]
     base, blen = p["base"][s], p["piece_len"][s]
     cur = os.fstat(out_fd).st_size
-    progressed = max(0, cur - base)
-    if progressed > blen:
-        die(f"output extends past piece {s + 1}'s span")
-    at = progressed - (progressed % CHUNK_BYTES)
+    # Progress = how much contiguous output extends from this piece's
+    # base. A piece is DONE when the frontier covers base + span (the
+    # writer never leaves holes: earlier runs wrote contiguously).
+    covered = cur - base
+    if covered >= blen:
+        return
+    at = max(0, covered)
+    at -= at % CHUNK_BYTES
     if src.reconstructed and at < blen:
         die(f"{src.path} was already merged+removed in an earlier run, "
-            f"but only {progressed} of {blen} B of its data exists in the "
-            "output; this resume cannot proceed from here")
+            f"but only {max(0, covered)} of {blen} B of its data exists "
+            "in the output; this resume cannot proceed from here")
     if at == 0:
         ensure_free(p, blen)
         tag = " (RECONSTRUCTED, data already merged)" if src.reconstructed else ""
