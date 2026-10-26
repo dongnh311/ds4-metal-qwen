@@ -151,6 +151,7 @@ typedef struct ds4_dflash_gpu {
     uint64_t verify_cycles, verify_tokens;
     uint64_t verify_swaps, verify_fallbacks;
     uint32_t verify_hist[DS4_DFLASH_MAX_DRAFT + 2];
+    uint64_t accept_pos[DS4_DFLASH_MAX_DRAFT + 1]; /* W-D11b: attempted/accepted per draft position */
 } ds4_dflash_gpu;
 
 /* ------------------------------------------------------------------ */
@@ -363,8 +364,15 @@ static void ds4_dflash_verify_flush(ds4_dflash_gpu *df) {
             (unsigned long long)df->verify_cycles, mean);
     for (uint32_t i = 1; i <= df->block_size && i <= DS4_DFLASH_MAX_DRAFT + 1u; i++)
         fprintf(stderr, " %u", df->verify_hist[i]);
-    fprintf(stderr, " | swaps %llu fallbacks %llu\n",
+    fprintf(stderr, " | swaps %llu fallbacks %llu",
             (unsigned long long)df->verify_swaps, (unsigned long long)df->verify_fallbacks);
+    if (df->accept_pos[0]) {
+        fprintf(stderr, " | accept");
+        for (uint32_t i = 1; i <= df->block_size - 1u && i <= DS4_DFLASH_MAX_DRAFT; i++)
+            fprintf(stderr, " p%u:%.0f%%", i,
+                    100.0 * (double)df->accept_pos[i] / (double)df->accept_pos[0]);
+    }
+    fprintf(stderr, "\n");
     fflush(stderr);
     if (df->tstat) {
         fprintf(stderr, "ds4: dfl tstat ms/call:");
@@ -441,8 +449,22 @@ static void ds4_dflash_reset(ds4_qwen4_gpu_graph *g) {
  * full 248320-row head; ds4_dfl_read_walk maps the compact slots back to
  * true ids.  Any failure leaves the full head in place. */
 static void ds4_dfl_head_gather(ds4_dflash_gpu *df) {
+    char buf[512];
     const char *path = getenv("DS4_DFLASH_DRAFT_VOCAB");
-    if (!path || !path[0]) return;
+    if (path && !path[0]) return;           /* explicitly disabled */
+    if (!path) {
+        /* W-D11b default-on: auto-detect the gateway draft-vocab sidecar
+         * (gather head receipts: QSA head 3.32 -> 0.88 ms/cycle, no accept
+         * cliff in the alternating pairs).  Missing file = full head. */
+        const char *home = getenv("HOME");
+        if (!home) return;
+        snprintf(buf, sizeof(buf), "%s/.local/share/ai-gateway/ds4-models/"
+                 "Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt", home);
+        path = buf;
+        FILE *tp = fopen(path, "r");
+        if (!tp) return;
+        fclose(tp);
+    }
     const ds4_tensor *ho = df->tw->output;
     uint32_t block_elems = 0, block_bytes = 0;
     if (ds4_gguf_type_block(ho->type, &block_elems, &block_bytes) != 0 ||

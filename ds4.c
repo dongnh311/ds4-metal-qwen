@@ -79468,6 +79468,12 @@ static int ds4_session_qwen35_dflash_cycle(ds4_session *s, int first_token, floa
     accepted[0] = first_token;
     for (uint32_t k = 1; k <= matched; k++) accepted[k] = toks[k];
     df->verify_cycles++;
+    /* W-D11b acceptance study: per-position tally over every engaged cycle.
+     * Slot 0 counts attempted drafts (one per position per cycle), slots
+     * 1..T-1 += the positions that were accepted, so pos-accept = n[i]/n[0]. */
+    df->accept_pos[0]++;
+    for (uint32_t k = 1; k <= matched && k <= DS4_DFLASH_MAX_DRAFT; k++)
+        df->accept_pos[k]++;
     df->verify_tokens += matched + 1u;
     df->verify_hist[matched + 1u]++;
     if (matched + 1u < T) df->verify_swaps++;
