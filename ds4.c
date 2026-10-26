@@ -43545,7 +43545,6 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         }
     }
 #endif
-    bool shared_here = !shared_owner || g->tp_rank == (il & 1u);
 #ifdef DS4_ROCM_BUILD
     if (g->streaming) {
         const ds4_gpu_stream_expert_table table = {
@@ -92652,6 +92651,8 @@ static void ds4_session_trim_vision_identities(ds4_session *s, int pos) {
            (uint64_t)s->checkpoint_images[keep].token_start +
            s->checkpoint_images[keep].token_count <= (uint64_t)pos) keep++;
     s->checkpoint_image_count = keep;
+}
+
 /* Internal state-only restore. The coordinator must replay from this prefix
  * before sampling; the TP worker acknowledges it before any gated eval. */
 int ds4_session_restore_speculative_prefix(ds4_session *s, int pos) {

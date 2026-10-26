@@ -456,6 +456,8 @@ static void test_encoder(void) {
     errno = 0;
     assert(!ds4_engram_encode_row136(src, row) && errno == EDOM);
     close(fd);
+}
+
 static void test_reader(void) {
     char path[] = "/tmp/ds4-engram-reader-XXXXXX";
     const int fd = mkstemp(path);
