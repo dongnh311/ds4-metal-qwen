@@ -98,7 +98,7 @@ static void dq_iq1_m(const uint8_t *p, uint64_t n, float *y) {
 
 /* ggml type codes (must match the merged GGUF's tensor types). */
 enum {
-    K_F32 = 0, K_F16 = 1, K_Q8_0 = 8, K_Q5K = 13, K_IQ2XXS = 16,
+    K_F32 = 0, K_F16 = 1, K_Q2K = 10, K_Q8_0 = 8, K_Q5K = 13, K_IQ2XXS = 16,
     K_IQ2XS = 17, K_IQ1M = 29, K_BF16 = 30,
 };
 
@@ -107,6 +107,7 @@ int64_t ds41_type_size(int kind, int64_t ne) {
     case K_F32:    return ne * 4;
     case K_F16:    return ne * 2;
     case K_BF16:   return ne * 2;
+    case K_Q2K:    return (ne / 256) * 84;
     case K_Q8_0:   return (ne / 32) * 34;
     case K_Q5K:    return (ne / 256) * 176;
     case K_IQ2XXS: return (ne / 256) * 66;
@@ -157,6 +158,12 @@ int ds41_retype(const uint8_t *src, int src_kind, uint8_t *dst, int dst_kind,
         return 0;
     case K_BF16:
         ds4q_f32_to_bf16_row(scratch, (uint16_t *)dst, ne);
+        return 0;
+    case K_Q2K:
+        if (ncols % 256) return -2;
+        ds4q_quantize_init(DS4Q_TYPE_Q2_K);
+        ds4q_quantize_chunk(DS4Q_TYPE_Q2_K, scratch, dst, 0,
+                            ne / ncols, ncols, NULL);
         return 0;
     case K_Q8_0:
         if (ncols % 32) return -2;

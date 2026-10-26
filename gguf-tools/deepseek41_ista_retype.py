@@ -28,12 +28,12 @@ CHUNK = 64 << 20
 PLAN_MAGIC = b"DS4RTYP\x01"
 
 F32, F16, BF16 = 0, 1, 2
-Q4_0, Q8_0, Q4_K, Q5_K, Q6_K = 2, 8, 12, 13, 14
+Q4_0, Q8_0, Q2_K, Q4_K, Q5_K, Q6_K = 2, 8, 10, 12, 13, 14
 IQ2_XXS, IQ2_XS, MXFP4, IQ1_M = 16, 17, 39, 29
 
 # Fork-legal sets per role.
 DENSE = {Q8_0, Q4_K, Q4_0}
-ROUTED = {Q8_0, IQ2_XXS, Q2_K := 5, Q4_K, Q5_K, Q6_K, MXFP4}
+ROUTED = {Q8_0, IQ2_XXS, Q2_K, Q4_K, Q5_K, Q6_K, MXFP4}
 QWEN4_DENSE = {Q8_0, Q4_0, F16, BF16, F32}
 
 GLOBALS = {
@@ -91,6 +91,9 @@ def lib():
     return l
 
 
+DOWN_Q2K = os.environ.get("DS41_DOWN_Q2K") == "1"
+
+
 def target_type(name, ty):
     if name in GLOBALS:
         return GLOBALS[name]
@@ -102,6 +105,8 @@ def target_type(name, ty):
     if base in DENSE_ROLE:
         return ty if ty in DENSE else Q8_0
     if base in ROUTED_ROLE:
+        if DOWN_Q2K and base == "ffn_down_exps.weight" and ty != Q2_K:
+            return Q2_K          # fork's streaming batch path needs Q2_K down
         return ty if ty in ROUTED else IQ2_XXS
     return ty       # norms / engram / unknown stay
 
@@ -421,7 +426,13 @@ def header_is_new(fd, p):
         n_tensors, n_kv, kv_end, hdr_end, names, ents = parse(fd)
     except SystemExit:
         return False
-    return ents.get("token_embd.weight", (None, None, None))[1] == F16
+    for item in p["plan"]:
+        dims, ty, rel = ents.get(item["name"], (None, None, None))
+        if ty != item["dst_ty"]:
+            return False
+        if rel != item["dst_pos"] - p["data_start"]:
+            return False
+    return True
 
 
 def run(out_path, dry=False, worker=None, jobs=8):
