@@ -131,6 +131,8 @@ static void dequant_any(const uint8_t *src, int kind, int64_t ne, float *y) {
                  return;
     case K_IQ2XS: dq_iq2_xs(src, (uint64_t)ne, y);
                  return;
+    case K_IQ2XXS: dq_iq2_xxs(src, (uint64_t)ne, y);
+                 return;
     case K_IQ1M: dq_iq1_m(src, (uint64_t)ne, y);
                  return;
     default:     break;
