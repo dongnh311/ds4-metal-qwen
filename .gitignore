@@ -33,6 +33,7 @@ __pycache__/
 *.pyc
 /gguf-tools/libds4quants.dylib
 /gguf-tools/libds4quants.so
+/gguf-tools/libds41ista.dylib
 /misc/
 .*.swp
 .DS_Store
