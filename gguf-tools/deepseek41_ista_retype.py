@@ -92,17 +92,23 @@ def lib():
 
 
 DOWN_Q2K = os.environ.get("DS41_DOWN_Q2K") == "1"
+DENSE_Q4K = os.environ.get("DS41_DENSE_Q4K") == "1"
 
 
 def target_type(name, ty):
     if name in GLOBALS:
-        return GLOBALS[name]
+        want = GLOBALS[name]
+        if DENSE_Q4K and want == Q8_0:
+            return Q4_K
+        return want
     base = name
     if name.startswith("blk."):
         base = name.split(".", 2)[2]
     if base in PER_LAYER:
         return PER_LAYER[base]
     if base in DENSE_ROLE:
+        if DENSE_Q4K and ty != Q4_K:
+            return Q4_K
         return ty if ty in DENSE else Q8_0
     if base in ROUTED_ROLE:
         if DOWN_Q2K and base == "ffn_down_exps.weight" and ty != Q2_K:
@@ -438,6 +444,7 @@ def header_is_new(fd, p):
 def run(out_path, dry=False, worker=None, jobs=8):
     plan_path = out_path + ".retype-plan"
     journal_path = out_path + ".retype-journal"
+    fresh = not os.path.exists(plan_path)
     if os.path.exists(plan_path):
         p = read_plan(plan_path)
         print("resume: reusing the existing retype-plan")
@@ -464,9 +471,10 @@ def run(out_path, dry=False, worker=None, jobs=8):
         else:
             if os.path.exists(journal_path):
                 shift_tables(fd, out_path, p)
-            else:
-                if os.fstat(fd).st_size != p["eof_old"] + p["d2"]:
-                    die("file size does not match the completed shift state")
+            elif fresh:
+                shift_tables(fd, out_path, p)
+            elif os.fstat(fd).st_size != p["eof_old"] + p["d2"]:
+                die("file size does not match the completed shift state")
             idxs = list(range(len(p["plan"])))
             convert_indices(fd, p, out_path, idxs)
             os.pwrite(fd, p["hdr"], 0)

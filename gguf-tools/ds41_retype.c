@@ -98,7 +98,7 @@ static void dq_iq1_m(const uint8_t *p, uint64_t n, float *y) {
 
 /* ggml type codes (must match the merged GGUF's tensor types). */
 enum {
-    K_F32 = 0, K_F16 = 1, K_Q2K = 10, K_Q8_0 = 8, K_Q5K = 13, K_IQ2XXS = 16,
+    K_F32 = 0, K_F16 = 1, K_Q8_0 = 8, K_Q2K = 10, K_Q4K = 12, K_Q5K = 13, K_IQ2XXS = 16,
     K_IQ2XS = 17, K_IQ1M = 29, K_BF16 = 30,
 };
 
@@ -108,6 +108,7 @@ int64_t ds41_type_size(int kind, int64_t ne) {
     case K_F16:    return ne * 2;
     case K_BF16:   return ne * 2;
     case K_Q2K:    return (ne / 256) * 84;
+    case K_Q4K:    return (ne / 256) * 144;
     case K_Q8_0:   return (ne / 32) * 34;
     case K_Q5K:    return (ne / 256) * 176;
     case K_IQ2XXS: return (ne / 256) * 66;
@@ -133,6 +134,15 @@ static void dequant_any(const uint8_t *src, int kind, int64_t ne, float *y) {
                  return;
     case K_IQ2XXS: dq_iq2_xxs(src, (uint64_t)ne, y);
                  return;
+    case K_Q8_0: {
+        const uint8_t *p = src;
+        for (int64_t b = 0; b < ne / 32; b++, p += 34) {
+            const float d = f16_to_f32((uint16_t)(p[0] | (p[1] << 8)));
+            for (int j = 0; j < 32; j++)
+                *y++ = d * (float)(int8_t)p[2 + j];
+        }
+        return;
+    }
     case K_IQ1M: dq_iq1_m(src, (uint64_t)ne, y);
                  return;
     default:     break;
@@ -165,6 +175,12 @@ int ds41_retype(const uint8_t *src, int src_kind, uint8_t *dst, int dst_kind,
         if (ncols % 256) return -2;
         ds4q_quantize_init(DS4Q_TYPE_Q2_K);
         ds4q_quantize_chunk(DS4Q_TYPE_Q2_K, scratch, dst, 0,
+                            ne / ncols, ncols, NULL);
+        return 0;
+    case K_Q4K:
+        if (ncols % 256) return -2;
+        ds4q_quantize_init(DS4Q_TYPE_Q4_K);
+        ds4q_quantize_chunk(DS4Q_TYPE_Q4_K, scratch, dst, 0,
                             ne / ncols, ncols, NULL);
         return 0;
     case K_Q8_0:
