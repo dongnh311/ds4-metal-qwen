@@ -781,6 +781,8 @@ def merge(dirpath, out_path, delete_engram=True, delete_shards=True):
             copy_piece(p, s, out_fd, t0)
             if delete_shards and not sources[s].reconstructed \
                     and os.path.exists(sources[s].path):
+                os.close(sources[s].fd)   # APFS: an open fd on an unlinked
+                sources[s].fd = None      # file keeps its blocks on disk
                 os.unlink(sources[s].path)
                 print(f"  ({os.path.basename(sources[s].path)} removed)")
         for e in range(2):
