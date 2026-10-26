@@ -769,7 +769,7 @@ def merge(dirpath, out_path, delete_engram=True, delete_shards=True):
     selftest()                # deterministic cross-check; aborts on mismatch
 
     if man is None:
-        raws = [read_header_bytes(s) for s in sources]
+        raws = [read_header_bytes(s) for s in [*sources, en]]
         write_manifest(p, raws)
     else:
         print(f"manifest exists: {out_path}.merge-manifest.json")
