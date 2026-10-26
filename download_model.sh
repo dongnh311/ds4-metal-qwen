@@ -9,11 +9,10 @@ QWEN38_REPO="antirez/qwen3.8-flash-next-gguf"
 QWEN38_MMPROJ_REPO="ggml-org/Qwen3.8-Flash-Next-GGUF"
 REPO="antirez/deepseek-v4-gguf"
 DS41_REPO="antirez/deepseek-v4.1-flash-gguf"
-DS41_Q2_FILE="DeepSeek-V4.1-Flash-Q2.gguf"
+DS41_Q2_FILE="DeepSeek-V4.1-Flash-1017-IQ2_XXS-Q2_K-imatrix.gguf"
 DS41_Q4_FILE="DeepSeek-V4.1-Flash-Q4.gguf"
+DS41_MXFP4_BASE="DeepSeek-V4.1-Flash-1017-MXFP4-experts"
 DS41_VISION_FILE="DeepSeek-V4.1-Flash-Vision.gguf"
-DS41_EQ4_REPO="dongnhdev/DeepSeek-V4.1-Flash-Q2-EngramQ4-GGUF"
-DS41_EQ4_FILE="DeepSeek-V4.1-Flash-Q2-EngramQ4.gguf"
 DS4F_Q2_FILE="DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf"
 DS4F_Q4_FILE="DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf"
 DS4F_MXFP4_FILE="DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf"
@@ -66,8 +65,8 @@ Usage:
   ./download_model.sh ds4f-vision-encoder [--token TOKEN]
   ./download_model.sh ds4f-vision-dspark [--token TOKEN]
   ./download_model.sh ds41f-q2 [--token TOKEN]
-  ./download_model.sh ds41f-q2-eq4 [--token TOKEN]
   ./download_model.sh ds41f-q4 [--token TOKEN]
+  ./download_model.sh ds41f-mxfp4 [--token TOKEN]
   ./download_model.sh ds41f-vision [--token TOKEN]
   ./download_model.sh pro-q2-imatrix [--token TOKEN]
   ./download_model.sh pro-q4-layers00-30 [--token TOKEN]
@@ -136,13 +135,6 @@ Targets:
        occupy 152 GiB; Engram tables stay on disk. Metal only: use SSD streaming
        on one 128 GB Mac, tensor parallelism on two, or a larger resident Mac.
 
-  ds41f-q2-eq4
-       The same Q2 with its Engram tables re-encoded to 4 bits (Lloyd codebook,
-       lloyd4_e5m3_32_r136), about 249 GiB on disk; no measurable quality loss.
-       Made with gguf-tools/deepseek41_engram_q4 from ds41f-q2. Only this fork
-       reads it. Downloads six parts and joins them automatically; allow
-       another 43 GiB of free disk space.
-
   ds41f-vision
        Matching V4.1 Flash vision encoder, about 0.9 GiB. Add --vision FILE
        to the language-model command. Does not update ./ds4flash.gguf.
@@ -152,6 +144,12 @@ Targets:
        occupy 294 GiB; Engram tables stay on disk. Metal only: use SSD streaming
        on smaller Macs or full residency on a 512 GB Mac. Downloads two parts
        and joins them automatically; allow another 37 GiB of free disk space.
+
+  ds41f-mxfp4
+       DeepSeek V4.1 Flash 1017 MXFP4 routed experts, about 467 GiB on disk.
+       Downloads and verifies all nine GGUF shards, then restores the original
+       page-aligned GGUF for DwarfStar. Retains the shards: allow about 935 GiB
+       of disk space for shards plus output. Downloads and merging can resume.
 
   pro-q2-imatrix
        DeepSeek V4 PRO 0813 q2 imatrix quant, as a single GGUF file. About
@@ -301,14 +299,17 @@ case "$MODEL" in
         MODEL_FILE=$DS41_Q2_FILE
         FORCE_HF_DOWNLOAD=1
         ;;
-    ds41f-q2-eq4)
-        REPO=$DS41_EQ4_REPO
-        MODEL_FILE=$DS41_EQ4_FILE
-        FORCE_HF_DOWNLOAD=1
-        ;;
     ds41f-q4)
         REPO=$DS41_REPO
         MODEL_FILE=$DS41_Q4_FILE
+        FORCE_HF_DOWNLOAD=1
+        ;;
+    ds41f-mxfp4)
+        REPO=$DS41_REPO
+        MODEL_FILE="$DS41_MXFP4_BASE.gguf"
+        for part in 00001 00002 00003 00004 00005 00006 00007 00008 00009; do
+            MODEL_FILES="$MODEL_FILES $DS41_MXFP4_BASE-${part}-of-00009.gguf"
+        done
         FORCE_HF_DOWNLOAD=1
         ;;
     ds41f-vision)
@@ -474,35 +475,7 @@ artifact_identity() {
             ;;
         "$DS41_Q2_FILE")
             expected_bytes=365713686528
-            expected_sha=1ce6a8f8806205c13330d7ca287bd198331dc5ca35ccc5d8a9a92a188a6f6f42
-            ;;
-        "$DS41_EQ4_FILE")
-            expected_bytes=267406761552
-            expected_sha=311f35981bf14ef8e49968ef942e13263bf9011ffdc28c7b6d00a1de45d2f719
-            ;;
-        "$DS41_EQ4_FILE.part1")
-            expected_bytes=45097156608
-            expected_sha=e3a25ed2c0498eea95f4a7b5605f41eeeac9855486414f647b7ddc002e8fa635
-            ;;
-        "$DS41_EQ4_FILE.part2")
-            expected_bytes=45097156608
-            expected_sha=19673581014fb8ee8f0f9f466107a0168fd97859346474c00b05f7e45e5d8dcc
-            ;;
-        "$DS41_EQ4_FILE.part3")
-            expected_bytes=45097156608
-            expected_sha=1512b3d02258b979c8a5a5fec8fca473ae37c134c832daf71ef4546a1b6c5929
-            ;;
-        "$DS41_EQ4_FILE.part4")
-            expected_bytes=45097156608
-            expected_sha=3125d0fae3a2a79ee79c0bdda59e1fb9bdcb0067f49d201549a1a9affbe7d227
-            ;;
-        "$DS41_EQ4_FILE.part5")
-            expected_bytes=45097156608
-            expected_sha=936b8b67e7be53cb09e60d6ca969ef53c494d83b03cb7d84cd4325a4886aeec8
-            ;;
-        "$DS41_EQ4_FILE.part6")
-            expected_bytes=41920978512
-            expected_sha=d485a71b28ea3e9795f1849c06fb8101f60da26de50b58f222678e4b045d3c73
+            expected_sha=5296e85ff64b42ecb62c8d0c0c54e1caa07e3df8e93112f2365ebbaed62ce93a
             ;;
         "$DS41_Q4_FILE")
             expected_bytes=518596067328
@@ -515,6 +488,46 @@ artifact_identity() {
         "$DS41_Q4_FILE.part2")
             expected_bytes=38596067328
             expected_sha=7c3e10646c918eeaffbc39305a75ec96117450262c61454ff194cef00d7617f0
+            ;;
+        "$DS41_MXFP4_BASE.gguf")
+            expected_bytes=501609136128
+            expected_sha=79608a69cd5bb919d8140c37105edc3a33419692d4e6caf4e68c901e4b359141
+            ;;
+        "$DS41_MXFP4_BASE-00001-of-00009.gguf")
+            expected_bytes=49353784544
+            expected_sha=636918b09de6253bf41af29f06aac3ceeda220e46379d8a2058ef92c4e433ed8
+            ;;
+        "$DS41_MXFP4_BASE-00002-of-00009.gguf")
+            expected_bytes=49412635712
+            expected_sha=b26d3fc1e6ae1be6c52665542f3c1fee6a33791478f26e6cd90b5a75940a9f96
+            ;;
+        "$DS41_MXFP4_BASE-00003-of-00009.gguf")
+            expected_bytes=49582960352
+            expected_sha=20c7fe7adb0578336d8a5e5f9eed521aeb88e8c119ba46e0916cdaab28931c80
+            ;;
+        "$DS41_MXFP4_BASE-00004-of-00009.gguf")
+            expected_bytes=49418206432
+            expected_sha=67592ba15870c4292a615666adcc2736b53cc345b2cccb1c36710a0a6caf15b4
+            ;;
+        "$DS41_MXFP4_BASE-00005-of-00009.gguf")
+            expected_bytes=49412829632
+            expected_sha=ecd04e0aa71bfab8cfe79ea7fef7f35b6be0b6772455139e2081d6ce1dcc18ed
+            ;;
+        "$DS41_MXFP4_BASE-00006-of-00009.gguf")
+            expected_bytes=49257603776
+            expected_sha=88214e0cc80fbae578b80c114527e6ce725199684e0b6849475c7d00b3d0f54c
+            ;;
+        "$DS41_MXFP4_BASE-00007-of-00009.gguf")
+            expected_bytes=2406482112
+            expected_sha=38939faf3e4258f3ae333f0fa1954ce89515b75ceee90d37bf4ebe5fafe285e6
+            ;;
+        "$DS41_MXFP4_BASE-00008-of-00009.gguf")
+            expected_bytes=101377628544
+            expected_sha=a9d1634da2ac57459a64b10b69ddedfadda7dcde0e71ca6e55bea7c293c4a9f0
+            ;;
+        "$DS41_MXFP4_BASE-00009-of-00009.gguf")
+            expected_bytes=101380404256
+            expected_sha=b9832b355288c005da6ef444d02424464dd27f6ebdefeadbec2244264eb65285
             ;;
         "$DS41_VISION_FILE")
             expected_bytes=970555552
@@ -635,48 +648,26 @@ download_one() {
     mv "$part" "$out"
 }
 
-# Downloads FILE as COUNT parts, FILE.part1 .. FILE.partCOUNT, and joins them.
-# Each part is SHA-checked when it is downloaded and removed once it has been
-# appended, so joining needs free space for one more part plus 1 GiB.
-download_joined_hf() {
-    joined=$1
-    count=$2
-    joined_out="$OUT_DIR/$joined"
-    if [ -e "$joined_out" ]; then
-        verify_download "$joined" "$joined_out"
-        # Parts an overlapping run downloaded again are no longer needed.
-        i=1
-        while [ "$i" -le "$count" ]; do
-            rm -f "$joined_out.part$i"
-            i=$((i + 1))
-        done
-        echo "Already downloaded: $joined_out"
+download_ds41_q4() {
+    q4_out="$OUT_DIR/$DS41_Q4_FILE"
+    if [ -e "$q4_out" ]; then
+        verify_download "$DS41_Q4_FILE" "$q4_out"
+        echo "Already downloaded: $q4_out"
         return
     fi
     if ! command -v python3 >/dev/null 2>&1; then
-        echo "Joining the $joined download requires Python 3." >&2
+        echo "Joining the Q4 download requires Python 3." >&2
         exit 1
     fi
-    # Parts already appended to an interrupted join are not downloaded again.
-    joined_bytes=-1
-    if [ -e "$joined_out.assembling" ]; then
-        joined_bytes=$(wc -c < "$joined_out.assembling")
+    if [ ! -e "$q4_out.assembling" ]; then
+        download_one_hf "$DS41_Q4_FILE.part1"
     fi
-    part_sizes=
-    part_end=0
-    i=1
-    while [ "$i" -le "$count" ]; do
-        artifact_identity "$joined.part$i"
-        part_sizes="$part_sizes $expected_bytes"
-        part_end=$((part_end + expected_bytes))
-        if [ "$joined_bytes" -lt "$part_end" ]; then
-            download_one_hf "$joined.part$i"
-        fi
-        i=$((i + 1))
-    done
-    artifact_identity "$joined"
-    # shellcheck disable=SC2086
-    python3 - "$joined_out" "$expected_bytes" "$expected_sha" $part_sizes <<'PY'
+    download_one_hf "$DS41_Q4_FILE.part2"
+    artifact_identity "$DS41_Q4_FILE"
+    q4_bytes=$expected_bytes
+    q4_sha=$expected_sha
+    artifact_identity "$DS41_Q4_FILE.part1"
+    python3 - "$q4_out" "$expected_bytes" "$q4_bytes" "$q4_sha" <<'PY'
 import fcntl
 import hashlib
 import os
@@ -685,14 +676,10 @@ import shutil
 import sys
 
 out = Path(sys.argv[1])
-total = int(sys.argv[2])
-expected = sys.argv[3]
-sizes = [int(size) for size in sys.argv[4:]]
-parts = [Path(str(out) + ".part" + str(i)) for i in range(1, len(sizes) + 1)]
-starts = [sum(sizes[:i]) for i in range(len(sizes))]
-pending = Path(str(out) + ".assembling")
-if sum(sizes) != total:
-    sys.exit("Part sizes do not add up to " + str(out))
+boundary, total = map(int, sys.argv[2:4])
+expected = sys.argv[4]
+first, second, pending = (Path(str(out) + suffix)
+                          for suffix in (".part1", ".part2", ".assembling"))
 
 def verify(path):
     if path.stat().st_size != total:
@@ -706,69 +693,91 @@ def verify(path):
         sys.exit("Checksum mismatch: " + str(path) +
                  ". Move this file aside before retrying; it was not accepted.")
 
-def invalid():
-    sys.exit("Invalid partial assembly: " + str(pending) +
-             ". Move it aside before retrying.")
-
-def drop_leftover_parts():
-    for part in parts:
-        try:
-            part.unlink()
-        except FileNotFoundError:
-            pass
-
 # Keep this lock file: unlinking it could allow two different locks for the
 # same download. The first part becomes the output without a second full copy.
 with Path(str(pending) + ".lock").open("a") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     if out.exists():
         verify(out)
-        drop_leftover_parts()
         sys.exit(0)
     if not pending.exists():
-        if parts[0].stat().st_size != sizes[0]:
-            sys.exit("Incorrect file size: " + str(parts[0]))
-        parts[0].rename(pending)
+        if first.stat().st_size != boundary:
+            sys.exit("Incorrect file size: " + str(first))
+        first.rename(pending)
     size = pending.stat().st_size
-    if not sizes[0] <= size <= total:
-        invalid()
-    # A part is removed only after its append was fsynced, and the next part
-    # is appended only after that. So a part that is still present is appended
-    # again from its start, unless the assembly already runs past it (a copy
-    # left by an overlapping run): then it is dropped. A removed part must
-    # already be in the assembly.
+    if not boundary <= size <= total:
+        sys.exit("Invalid partial assembly: " + str(pending) +
+                 ". Move it aside before retrying.")
+    if second.stat().st_size != total - boundary:
+        sys.exit("Incorrect file size: " + str(second))
+    # An interrupted append restarts only the smaller tail, never the prefix.
     with pending.open("r+b") as dst:
-        for part, start, length in zip(parts[1:], starts[1:], sizes[1:]):
-            if not part.exists():
-                if size < start + length:
-                    invalid()
-                continue
-            if size > start + length:
-                part.unlink()
-                continue
-            if part.stat().st_size != length:
-                sys.exit("Incorrect file size: " + str(part))
-            if size < start:
-                invalid()
-            dst.truncate(start)
-            dst.seek(start)
-            if shutil.disk_usage(out.parent).free < length + (1 << 30):
-                sys.exit("Not enough disk space to join " + out.name +
-                         "; keep the parts and retry.")
-            print("Joining " + part.name, flush=True)
-            with part.open("rb") as src:
-                shutil.copyfileobj(src, dst, 16 << 20)
-            dst.flush()
-            os.fsync(dst.fileno())
-            part.unlink()
-            size = start + length
+        dst.truncate(boundary)
+        dst.seek(boundary)
+        if shutil.disk_usage(out.parent).free < total - boundary + (1 << 30):
+            sys.exit("Not enough disk space to join Q4; keep the parts and retry.")
+        print("Joining Q4 download parts", flush=True)
+        with second.open("rb") as src:
+            shutil.copyfileobj(src, dst, 16 << 20)
+        dst.flush()
+        os.fsync(dst.fileno())
     verify(pending)
     pending.rename(out)
-    drop_leftover_parts()
+    second.unlink()
 PY
 }
 
-if [ "$MODEL" = "ds41f-q4" ]; then
+download_ds41_mxfp4() {
+    mx_out="$OUT_DIR/$MODEL_FILE"
+    if [ -e "$mx_out" ]; then
+        verify_download "$MODEL_FILE" "$mx_out"
+        echo "Already downloaded: $mx_out"
+        return
+    fi
+    if ! command -v python3 >/dev/null 2>&1; then
+        echo "Merging the MXFP4 shards requires Python 3." >&2
+        exit 1
+    fi
+    if [ ! -f "$ROOT/gguf-tools/merge_deepseek41_shards.py" ]; then
+        echo "Missing gguf-tools/merge_deepseek41_shards.py; use a complete checkout." >&2
+        exit 1
+    fi
+    mkdir -p "$OUT_DIR"
+    artifact_identity "$MODEL_FILE"
+    mx_bytes=$expected_bytes
+    mx_sha=$expected_sha
+    set -- "$mx_out.assembling" "$mx_bytes"
+    for shard in $MODEL_FILES; do
+        artifact_identity "$shard"
+        set -- "$@" "$OUT_DIR/$shard" "$expected_bytes"
+    done
+    # Check peak storage before downloading hundreds of GB. Retain the input
+    # shards and account for a resumable output; HF partial caches are extra.
+    python3 - "$OUT_DIR" "$@" <<'PY'
+from pathlib import Path
+import shutil
+import sys
+
+needed = 1 << 30
+for name, size in zip(sys.argv[2::2], sys.argv[3::2]):
+    path = Path(name)
+    needed += max(0, int(size) - (path.stat().st_size if path.exists() else 0))
+if shutil.disk_usage(sys.argv[1]).free < needed:
+    sys.exit("Not enough disk space for MXFP4 shards and merged GGUF: "
+             f"need {needed / (1 << 30):.1f} GiB free. Existing files were kept.")
+PY
+    set --
+    for shard in $MODEL_FILES; do
+        download_one_hf "$shard"
+        set -- "$@" "$OUT_DIR/$shard"
+    done
+    python3 "$ROOT/gguf-tools/merge_deepseek41_shards.py" \
+        --output "$mx_out" --expected-bytes "$mx_bytes" --sha256 "$mx_sha" "$@"
+}
+
+if [ "$MODEL" = "ds41f-mxfp4" ]; then
+    download_ds41_mxfp4
+elif [ "$MODEL" = "ds41f-q4" ]; then
     download_joined_hf "$DS41_Q4_FILE" 2
 elif [ "$MODEL" = "ds41f-q2-eq4" ]; then
     download_joined_hf "$DS41_EQ4_FILE" 6

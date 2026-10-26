@@ -27200,6 +27200,9 @@ static int ds4_gpu_attention_output_q8_batch_impl(
                     low, (uint64_t)matrix_rows * low_dim, rows);
                 ds4_gpu_tensor_free(tail);
             }
+        } else if (ok && round_low_bf16 && n_tokens <= 8u) {
+            ok = ds4_gpu_matmul_q8_0_decode_rows_exact_tensor(out, model_map, model_size,
+                out_b_offset, low_dim, out_dim, low, n_tokens) != 0;
         } else if (ok) {
             ok = ds4_gpu_matmul_q8_0_tensor(out, model_map, model_size,
                                               out_b_offset,
