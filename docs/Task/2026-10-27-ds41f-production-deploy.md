@@ -1,0 +1,110 @@
+# DeepSeek-V4.1-Flash-1017 (ds41f) — deployment lên production (gateway), 512k
+
+Status: **serving** on the ai-gateway as `local--DeepSeek-V4.1-Flash-1017-ds41f`
+(gateway `:8090` → ds4 `:18090`), since 2026-10-27.
+
+## 1. What is deployed
+
+| Item | Value |
+| --- | --- |
+| GGUF | `~/.local/share/ai-gateway/ds4-models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-ds41.gguf` |
+| Size / shape | 405,224,791,632 B (377 GiB), 1010 tensors, **130 KV** (merged 5-file ISTA GSQ-RCO package, engram tables grown in) |
+| Quantization | gate/up `IQ2_XXS`, down `Q2_K`, dense `Q4_K`/`Q8_0`, `token_embd` F16, engram `lloyd4_e5m3_32_r136`, `hc_*_fn` F16, `ffn_gate_inp` F32 |
+| Binary | `~/.local/share/ai-gateway/ds4-metal/ds4-server-ds41f` (built 2026-10-27 from the ds4-metal worktree; kept separate from the Ornith `ds4-server`) |
+| Port | `127.0.0.1:18090` |
+| Context | `-c 524288` (model metadata says 1,048,576; KV is compressed to 3.13 GiB at 512k) |
+| Expert cache | `--ssd-streaming --ssd-streaming-cache-experts 4300` (the fork auto-fits to 3595 → 2827 dynamic experts at 512k) |
+| KV disk | **disabled** — see §4 |
+| Gateway id | `local--DeepSeek-V4.1-Flash-1017-ds41f` (models.json + runtime-registry.json) |
+
+Launch command (exactly what `runtime-registry.json` declares):
+
+```sh
+~/.local/share/ai-gateway/ds4-metal/ds4-server-ds41f \
+  --metal -m ~/.local/share/ai-gateway/ds4-models/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF/DeepSeek-V4.1-Flash-1017-GSQ-RCO-IQ2_XXS-ds41.gguf \
+  -c 524288 --ssd-streaming --ssd-streaming-cache-experts 4300 \
+  --host 127.0.0.1 --port 18090
+```
+
+Startup memory plan (printed by the backend):
+
+```
+memory: KV 3.13 GiB (raw 0.01 + compressed 3.13) + buffers 10.08 GiB
+        + resident model 7.45 GiB + expert cache 26.21 GiB
+        + prefill expert reserve 7.12 GiB = 53.99 GiB planned
+V4.1 SSD cache fitted from 4300 to 3595 experts for context/runtime headroom
+→ dynamic cache 2827 experts (9.49 MiB/expert)
+```
+
+## 2. Measured performance (M5 Pro 64 GB)
+
+Standalone CLI (no gateway, machine otherwise idle):
+
+| Prompt tokens | Prefill | TTFT | Decode |
+| --- | --- | --- | --- |
+| 1,978 | 114 t/s | 17.3 s | 8.60 t/s |
+| 7,522 | 275 t/s | 27.3 s | 8.47 t/s |
+| 30,118 | 333 t/s | 90.4 s | 7.37 t/s |
+| 60,190 | 401 t/s | 150 s | 7.01 t/s |
+| 120,334 | 436 t/s | 276 s | 6.19 t/s |
+
+Through the gateway with the full stack running (Orca/opencode/sidecars present):
+
+| Request | Prefill | Decode |
+| --- | --- | --- |
+| 4,549-token prompt | **207 t/s** (22 s) | **4.77 t/s** |
+| 454-token append | ~25 t/s when KV-disk was on, ~200 t/s without | 4.75 t/s |
+
+The TTFT floor is ~12–15 s even for a short prompt: the first pass faults the
+expert pages in and seeds the cache. The gateway adds ~0.3 s plus its own system
+prompt (~193 tokens for a one-liner).
+
+## 3. Switching / rollback
+
+Only one ds4 model fits at a time (ds41f plans 53.99 GiB; Ornith plans 22.4 GiB).
+
+```sh
+# back to the Ornith prod slot (22.4 GiB, prefill ~1.4–2.1k t/s, decode ~70 t/s)
+bash ~/.local/bin/server-power.sh on
+
+# or explicitly
+bash ~/.local/bin/proxy-stack.sh ensure Shiftedx--ornith-1.5-35b-a3b-abliterated-attention8-bf16recurrence-vision-mtplx
+
+# stop ds41f by itself (ONE SIGTERM; the server persists its KV on the first signal)
+kill -TERM "$(cat ~/.local/share/ai-gateway/ds4-ds41f.pid 2>/dev/null || pgrep -f ds4-server-ds41f)"
+```
+
+`proxy-stack.sh ensure <ds41f-id>` will not launch a ds4 backend by itself (the
+launcher only owns MLX runtimes). Either start the backend with the command in
+§1 first, or let `ai-watchdog.sh` `heal_runtime` start it from the registry
+`process_command` — that path is exercised once the model is the active one.
+
+## 4. Why KV-disk was removed (the 8× prefill finding)
+
+The first deployment carried the Ornith-style KV persistence flags
+(`--kv-disk-dir … --kv-disk-space-mb 32768 --kv-cache-cold-max-tokens 524288
+--kv-cache-min-tokens 4096 --rewind-point-min-tokens 16384`). Measured on the
+same 4,549-token prompt through the gateway:
+
+| Config | Prefill | TTFT |
+| --- | --- | --- |
+| with `--kv-disk-*` | **24.5 t/s** (18.4 s for 453 tokens) | 49.3 s |
+| without `--kv-disk-*` | **207 t/s** (21.9 s for 4,549 tokens) | 24.4 s |
+
+The 512k `--kv-cache-cold-max-tokens` makes every new prefix pay a large KV
+persist/restore cost; ds41f gains no useful prefix reuse from it (its prompt
+prefix is short relative to the model), so the flags are excluded.
+
+The remaining gap to standalone (decode 4.77 vs 8.6 t/s) is **memory pressure**:
+the full stack leaves ~44 % RAM free, swap in use, and the expert cache cannot
+stay fully wired. Stopping the vision/image sidecars or dropping `-c` to 262144
+(frees ~6 GiB of context buffers and lets the cache grow) recovers most of it.
+
+## 5. Known limits
+
+- First token after a start is slow (12–15 s cold start) — send one warmup
+  request after launch if the slot is user-facing.
+- 512k context costs 13.22 GiB of context buffers and shrinks the expert cache
+  4900 → 2827 experts; for interactive use prefer `-c 262144` (future slot).
+- Prefill is the product of the streaming expert cache, not the gateway: the
+  same model does 275–436 t/s in the CLI, so the server path is within ~1.3×.
