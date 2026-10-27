@@ -135,3 +135,38 @@ Chất lượng B2-b: output mạch lạc (half chỉ ở tích, tổng vẫn fp
 - Kỳ vọng: sector utilization ~70% → ~100%, tức 1.4×; cộng giảm latency ⇒ MoE 25 ms → 15–17 ms ⇒ step 51–53 ms ⇒ **19–19.6 t/s**, và mức 20 cần thêm ~1 ms từ host (Pha E).
 
 **Trước khi làm repack phải đo bằng GPU counter** (`MTLCounterSampleBuffer`, L2 hit + sector utilization) để xác nhận giả thuyết lãng phí sector, tránh lặp lại vòng "đoán rồi thử" vừa qua.
+
+## 10. Probe layout (2026-10-27) — bác bỏ giả thuyết lãng phí sector
+
+Nguồn: `docs/Task/2026-10-27-moe-layout-probe.m` (đọc thẳng file model, mmap + shared buffer).
+So sánh 2 pattern với **cùng số byte hữu ích** (20×64 B mỗi hàng):
+
+| Pattern | TG | GB/s hữu ích |
+|---|---|---|
+| **blocked66** (layout hiện tại: 8 B/lane, block stride 66 B) | 1728 | **258.3** |
+| blocked66 | 3456 | 268.1 |
+| planar128 (1 lane = 8 B, warp = 256 B liền mạch) | 1728 | 267.3 |
+| planar128 | 288 | 272.3 |
+
+⇒ Layout hiện tại **đạt 258 GB/s**, gần bằng planar. **Không cần repack 150 GB tensor** (tiết kiệm rủi ro lớn), và nút thắt không nằm ở pattern đọc.
+
+## 11. Tổng kết: 8 giả thuyết đã kiểm, tất cả bị bác bỏ
+
+| # | Giả thuyết | Kiểm bằng | Kết quả |
+|---|---|---|---|
+| 1 | Thiếu băng thông DRAM | bench streaming | trần 240–262 GB/s, không phải nút thắt |
+| 2 | Đường mmap/expert cache chậm | bench mmap file | 258–262 GB/s |
+| 3 | Quá nhiều lệnh ALU | vector load + grid + prefetch | trung tính |
+| 4 | ALU thừa (byte extract) | bảng grid float | trung tính |
+| 5 | ALU fp32 chậm | half2 packed | +0.8% |
+| 6 | `y` bị đọc lặp | nr0 8; stage smem 20 KB; 64 hàng/TG + half 10 KB | trung tính / chậm hơn |
+| 7 | Layout block 66 B lãng phí sector | layout probe | 258 GB/s ⇒ bác bỏ |
+| 8 | Ít threadgroup | 288/1728/3456 TG | đã đủ ở 1728 |
+
+**Kết luận:** kernel MoE không còn dư địa qua các đòn hiện có. Chênh lệch giữa "258 GB/s khả dụng" và "~107 GB/s weights thực tế" nằm ở **cấu trúc engine**: mỗi layer phải chờ host đọc router id → cập nhật bảng expert → pread expert thiếu → encode, và GPU bị ngắt bởi các điểm đồng bộ này (step 60.5 ms trong khi GPU busy 45.5 ms; ~15 ms host + các khoảng trống giữa layer).
+
+**Đường còn lại để tới 20 t/s = tái cấu trúc pipeline decode của engine** (không phải kernel):
+1. Bỏ đồng bộ router per-layer: đọc selected id của layer L **trong lúc** GPU đang chạy FFN của layer L-1 (double-buffer router buffer).
+2. Prefetch expert của layer L+1 ngay khi có router id (đã có lookahead K=1; mở rộng K=2 với hàng đợi pread riêng).
+3. Gom command buffer: 1 CB cho nhiều layer thay vì commit/wait từng layer.
+Mục tiêu: step 60.5 → ~50 ms (host 15 → 5, GPU vẫn 45.5).
