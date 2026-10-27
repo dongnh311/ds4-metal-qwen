@@ -170,3 +170,34 @@ So sánh 2 pattern với **cùng số byte hữu ích** (20×64 B mỗi hàng):
 2. Prefetch expert của layer L+1 ngay khi có router id (đã có lookahead K=1; mở rộng K=2 với hàng đợi pread riêng).
 3. Gom command buffer: 1 CB cho nhiều layer thay vì commit/wait từng layer.
 Mục tiêu: step 60.5 → ~50 ms (host 15 → 5, GPU vẫn 45.5).
+
+## 12. Pha E — đo tầng engine (2026-10-27): 15 ms "host" thực chất là gì
+
+### 12.1 Readback per-layer: KHÔNG phải nút thắt
+`DS4_METAL_SELECTED_PROFILE=1` (mode `stream-addr-mask`, `ids=override`):
+```
+read=0.000 ms   bind=0.002 ms (hit) … bind=0.3–0.7 ms (có miss)
+```
+⇒ Router readback đã được thay bằng lookahead override, **không có đồng bộ đọc id** ⇒ việc "double-buffer router" trong kế hoạch **không cần thiết**.
+
+### 12.2 `bind` = copy expert vào cache
+- Trung bình **0.31–0.39 ms/layer** ⇒ **12.5–16 ms/token** (đúng phần chênh `step 60.5 − GPU 45.5`).
+- ~1 miss/layer (5/6 expert hit), mỗi miss copy **6.6 MB** (gate+up 2.9 + down 3.7) ở ~17–21 GB/s.
+- `DS4_METAL_STREAMING_EXPERT_PREAD_THREADS` 9 → 18: **không đổi** (15.68 vs 15.64).
+- Chính sách thay slot: `EVICT_LRU=1`, `HOTNESS_DECAY=4/64` → **misses y nguyên 5567**, bind 2136–2315 ms ⇒ cache đã chạm trần, policy không giúp.
+
+### 12.3 Zero-copy từ mmap: KHÔNG dùng được
+`DS4_METAL_ENABLE_STREAMING_FULL_EXPERT_ADDR_TABLE=1`: không hoàn thành nổi 4 token trong 240 s (và timeout 30 phút với n=512) ⇒ page cache của OS không giữ nổi working set ⇒ **cache mlock là bắt buộc**.
+
+### 12.4 Kết luận cuối cùng
+| Thành phần | ms/token | Bản chất |
+|---|---|---|
+| GPU busy | 45.5 | resident 21.5 (đỉnh băng thông) + MoE 24 (kernel đã hết dư địa) |
+| **Expert refill** | **12.5–16** | copy ~1 expert/layer vào cache (264 MB/token @ ~17–21 GB/s) |
+| pread/engram/host khác | ~4 | |
+
+Working set thật: 40 layer × 384 expert × 6.6 MB ≈ **100 GB**; cache khả dụng 41.6 GB (trần mlock 52.48 GiB) ⇒ **không thể khử refill** trên máy 64 GB này.
+
+**Trần thực tế: ~15.6–15.7 t/s.** Để 20 t/s cần ~100 GB cache (máy 128 GB) hoặc giảm byte/expert:
+- down Q2_K → IQ2_XXS: expert 6.6 → 5.7 MB (−14%) ⇒ refill ~−2 ms + MoE down ~−2.5 ms ⇒ ước **16.5–17 t/s**, nhưng mất đường mask/split (+1.5%) và cần requant 59 GB (nhiều giờ).
+- Không có tổ hợp nào đạt 20 t/s trên cấu hình hiện tại.
