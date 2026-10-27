@@ -107,3 +107,27 @@ Kết luận: 20 t/s cần **pipeline hoá host path** (overlap load expert vớ
 - Kết luận: **split overlap không phải lever tới 20 t/s**. Decode vẫn bị chặn bởi host/encode/latency (GPU busy ~31%) với ~20 ms/token chưa giải thích được (command encoding + per-layer sync + engram). Muốn 20 t/s cần tái cấu trúc pipeline decode (gộp command buffer, bỏ sync per-layer) — việc lớn hơn một buổi.
 - Chốt cấu hình cuối (giữ theo thiết kế fork): down=**Q2_K**, gate/up=IQ2_XXS, dense Q4_K/Q8_0, token F16, cache 4900 slot (`--ssd-streaming-cache-experts 4900`), kernel fast pair opt-in `DS4_V41_MOE_FAST=1` (+~3%, md5-identical trên bộ oracle 3 prompt). Best đo được: 15.5-15.8 t/s ổn định (đỉnh 16.3).
 - ⚠ Vận hành: convert in-place chạy 8 worker × ~2.5-3 GB RSS có thể gây áp lực bộ nhớ; dùng 4 worker cho an toàn.
+
+## 10. Chẩn đoán cuối (2026-10-27) — vì sao dừng ở ~15.6 t/s
+
+Đo bằng `DS4_V41_DECODE_PROFILE=1 DS4_METAL_GPU_BUSY_PROFILE=1` (Q2_K down, cache 4900, ctx 2048, greedy):
+
+```
+tokens=256 step_ms=60.757 engram_ms=0.874 gpu_busy_ms=45.687
+             pread_ms=7.780 pread_mib=169.6 hits=222.1 misses=17.9
+```
+
+Phân rã (ms/token):
+| Thành phần | ms | Ghi chú |
+|---|---|---|
+| GPU busy | **45.5** | MoE ~24 (2.39 GB expert @ ~100 GB/s) + resident ~21.5 (6.2 GiB @ ~295 GB/s) |
+| pread miss | 7.8 | ~170 MB, đã song song 9 thread |
+| engram | 0.9 | 48 hàng đọc đĩa |
+| host/encode/sync còn lại | ~6 | encoder + sync per-layer |
+
+Kết luận định lượng:
+- **Resident term đã ở đỉnh băng thông** (~295 GB/s): không thể nhanh hơn nếu không giảm byte — mà `attn_output_a/b` (Q8_0, 3.2 GiB) bị kernel grouped-output/prefill bắt buộc Q8_0.
+- **MoE ở ~100 GB/s** (≈1/3 đỉnh) — đây là headroom duy nhất, nhưng cần viết lại kernel Metal (`iq2_xxs pair-swiglu` + `q2_k sum6`) với profiling Xcode GPU. Đã thử: nr0 2/8/16 (không đổi), fast pair +3% (opt-in, md5-identical), float-grid threadgroup (không compile được trong khung thời gian).
+- Việc cần cho 20 t/s: MoE 24→14 ms + host 15→11 ms (step 50 ms). Đây là dự án kernel nhiều ngày, không phải tuning.
+
+**Tốc độ chốt: 15.6 t/s ổn định** (đỉnh 16.3), từ 12.7 (+23%), so bản shipped của fork 12.1 (+30%).
