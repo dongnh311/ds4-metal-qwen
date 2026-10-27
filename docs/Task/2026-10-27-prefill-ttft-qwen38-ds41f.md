@@ -85,3 +85,29 @@ Việc nên làm:
 2. **ds41f**: nếu dùng tương tác, chạy 1 warmup request lúc khởi động để trả 12–15 s warmup trước.
 3. **Prod**: giữ nguyên; nếu prompt thường >30k token và cần TTFT thấp hơn, có thể thử `--prefill-chunk 8192/16384`
    (chưa đo vì cần dừng prod).
+
+## 5. Qwen3.8 @ long context — đo 2026-10-27 17:05 (M5 Pro 64 GB, config prod)
+
+Server log: `context buffers 10012.08 MiB (ctx=262144, prefill_chunk=2048,
+raw_kv_rows=262144, compressed_kv_rows=65537)`, 4-bit KV in-kernel.
+
+| Prompt | Prefill | TTFT | Decode 64 token | Decode t/s |
+|---|---|---|---|---|
+| 27,662 tok | 733 t/s (chunk 2048) | 37.7 s | — | — |
+| 85,826 tok | **684 t/s** | **125.9 s** | 1.46 s | **43.7** |
+| (128k suy ra) | ~690 t/s | **~190 s** | — | ~44 |
+
+Chi tiết quan trọng:
+- Tốc độ **mỗi chunk gần như không đổi** (733→685 t/s) từ 0→86k ⇒ prefill **không**
+  bị attention/KV làm chậm; nút thắt là compute per chunk (~2.9 s/chunk 2048 token,
+  tức ~11 TFLOPS hiệu dụng cho 136B/~8B active).
+- **Decode ở 86k vẫn 43.7–46.8 t/s**, bằng hệt lúc context ngắn ⇒ 128k **không làm
+  decode chậm đi**. Cảm giác "128k chậm" là **TTFT**.
+- Prefix cache hoạt động: request thứ 2 dùng lại 26,624 token đầu
+  (`ctx=26624..112450`), warm TTFT 3.3–4.1 s như tài liệu cũ.
+- `think-budget 4096` + decode 44 t/s ⇒ thêm tới **~93 s** suy luận mỗi lượt.
+- Tổng worst-case 128k: **190 s prefill + 93 s think ≈ 4.7 phút** trước chữ đầu tiên
+  của câu trả lời thật.
+
+Đã đổi registry: `--prefill-chunk 2048 → 8192` (+12% prefill theo §3, 802 vs 713 t/s).
+Backup: `runtime-registry.json.bak-pre-chunk8192-20261027-171154`.
