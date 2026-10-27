@@ -159,3 +159,27 @@ only 849 B, so they must come from a sidecar/flag rather than a header edit, or
 one large KV must be freed), then re-test with the same PNG.
 
 Also note: an image request costs 24–37 s on this slot (8–10 t/s decode).
+
+### 7.1 End-to-end vision test (2026-10-27, still not answering)
+
+With the encoder biases in place the server loads and encodes the image:
+
+```
+ds4-server: request images=1 prompt=238
+ds4-server: vision embedding encoded; cache=3833597 bytes
+ds4-server: live kv cache miss live=358 prompt=242 common=28 vision=mismatch reason=token-mismatch
+```
+
+Prompt tokens 238 for a 640x384 PNG (text ~30 + ~208 image tokens) show the image
+tokens *are* placed in the prompt, but the model answers that no image was sent,
+and long answers are consumed by reasoning first (empty `content` at small
+`max_tokens`). The `vision=mismatch` line comes from the KV-cache validity check
+and indicates the prompt's image-token count and the embedding's `token_count`
+disagree, so the embedding is not attached at those positions.
+
+Next debugging steps:
+1. Compare the prompt's image-token count with `embedding->token_count` from
+   `ds4_engine_encode_image` (the span is registered with `token_start`).
+2. Use the CLI reference path (`/read image.png` in `ds4` with `--vision`) to see
+   whether the engine-level path substitutes embeddings; if it does, the bug is in
+   the server's prompt assembly for V4.1 (template/marker placement).
