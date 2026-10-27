@@ -1,4 +1,4 @@
-# DeepSeek-V4.1-Flash-1017 (ds41f) — production slot, 512k context
+# DeepSeek-V4.1-Flash-1017 (ds41f) — production slot, 256k context
 
 Status: **serving** on the ai-gateway as `local--DeepSeek-V4.1-Flash-1017-ds41f`
 (gateway `:8090` → ds4 `:18090`), since 2026-10-27.
@@ -12,7 +12,7 @@ Status: **serving** on the ai-gateway as `local--DeepSeek-V4.1-Flash-1017-ds41f`
 | Quantization | gate/up `IQ2_XXS`, down `Q2_K`, dense `Q4_K`/`Q8_0`, `token_embd` F16, engram `lloyd4_e5m3_32_r136`, `hc_*_fn` F16, `ffn_gate_inp` F32 |
 | Binary | `~/.local/share/ai-gateway/ds4-metal/ds4-server-ds41f` (built 2026-10-27 from the ds4-metal worktree; kept separate from the Ornith `ds4-server`) |
 | Port | `127.0.0.1:18090` |
-| Context | **`-c 262144`** in the final prod config (512k variant: `-c 524288`, KV 3.13 GiB, plans 53.99 GiB) |
+| Context | **`-c 262144`** (policy for all three local models; the 512k entry is disabled — it plans 53.99 GiB and starves the box) |
 | Expert cache | **`--ssd-streaming-cache-experts 2600`** (24.10 GiB) in the final config — 41.92 GiB planned total. With 512k/4300 the fork plans 53.99 GiB and starves the rest of the stack |
 | KV disk | **disabled** — see §4 |
 | Gateway id | `local--DeepSeek-V4.1-Flash-1017-ds41f` (models.json + runtime-registry.json) |
