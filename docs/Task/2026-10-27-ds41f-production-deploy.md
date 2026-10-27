@@ -1,4 +1,4 @@
-# DeepSeek-V4.1-Flash-1017 (ds41f) — deployment lên production (gateway), 512k
+# DeepSeek-V4.1-Flash-1017 (ds41f) — production slot, 512k context
 
 Status: **serving** on the ai-gateway as `local--DeepSeek-V4.1-Flash-1017-ds41f`
 (gateway `:8090` → ds4 `:18090`), since 2026-10-27.
@@ -12,8 +12,8 @@ Status: **serving** on the ai-gateway as `local--DeepSeek-V4.1-Flash-1017-ds41f`
 | Quantization | gate/up `IQ2_XXS`, down `Q2_K`, dense `Q4_K`/`Q8_0`, `token_embd` F16, engram `lloyd4_e5m3_32_r136`, `hc_*_fn` F16, `ffn_gate_inp` F32 |
 | Binary | `~/.local/share/ai-gateway/ds4-metal/ds4-server-ds41f` (built 2026-10-27 from the ds4-metal worktree; kept separate from the Ornith `ds4-server`) |
 | Port | `127.0.0.1:18090` |
-| Context | `-c 524288` (model metadata says 1,048,576; KV is compressed to 3.13 GiB at 512k) |
-| Expert cache | `--ssd-streaming --ssd-streaming-cache-experts 4300` (the fork auto-fits to 3595 → 2827 dynamic experts at 512k) |
+| Context | **`-c 262144`** in the final prod config (512k variant: `-c 524288`, KV 3.13 GiB, plans 53.99 GiB) |
+| Expert cache | **`--ssd-streaming-cache-experts 2600`** (24.10 GiB) in the final config — 41.92 GiB planned total. With 512k/4300 the fork plans 53.99 GiB and starves the rest of the stack |
 | KV disk | **disabled** — see §4 |
 | Gateway id | `local--DeepSeek-V4.1-Flash-1017-ds41f` (models.json + runtime-registry.json) |
 
@@ -108,3 +108,24 @@ stay fully wired. Stopping the vision/image sidecars or dropping `-c` to 262144
   4900 → 2827 experts; for interactive use prefer `-c 262144` (future slot).
 - Prefill is the product of the streaming expert cache, not the gateway: the
   same model does 275–436 t/s in the CLI, so the server path is within ~1.3×.
+
+## 6. Final prod config and the memory-pressure finding
+
+The 512k/4300-slot plan (53.99 GiB) cannot coexist with the rest of the stack on
+64 GB: free RAM dropped to 25 %, swap grew, and prefill for the same 4,549-token
+prompt degraded from 22 s to 35 s while decode fell to 4.7 t/s.
+
+Final deployed config — `-c 262144 --ssd-streaming-cache-experts 2600`:
+
+| Metric | Value |
+| --- | --- |
+| Planned memory | KV 1.57 + buffers 8.80 + resident 7.45 + cache 24.10 = **41.92 GiB** |
+| Free RAM after start | ~35 % (vs 25 % with the 512k plan) |
+| Decode | **9.8 t/s** (as good as the standalone CLI 8.6–9.8) |
+| Prefill, 4,549-token prompt | 22–40 s through the gateway → **115–207 t/s** (CLI: 275 t/s) |
+| TTFT | ~24 s first request; repeat requests vary with expert locality |
+
+Rule of thumb for this box: **ds41f gets the machine, or it gets a small cache.**
+With a full stack (gateway + sidecars + browser/other apps) keep the cache at
+~2600 and ctx at 262144; for long-context work stop the sidecars first and use
+the 512k config. Never enable KV-disk persistence for this slot.
