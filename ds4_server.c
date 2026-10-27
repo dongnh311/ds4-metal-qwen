@@ -11072,6 +11072,13 @@ static bool server_encode_image(server *s, const server_image_input *input,
     if (!ds4_engine_vision_encode_memory(s->engine, input->encoded,
                                          input->encoded_len, out, err, errlen))
         return false;
+    if (getenv("DS4_VISION_DEBUG") && out->data && out->token_count) {
+        const float *f = (const float *)out->data;
+        double sum = 0.0, mx = 0.0;
+        for (size_t i = 0; i < 64; i++) { double v = f[i] < 0 ? -f[i] : f[i]; sum += v; if (v > mx) mx = v; }
+        fprintf(stderr, "ds4-server: vision debug tokens=%u |x|[0..64]=%.6f max=%.6f\n",
+                out->token_count, sum, mx);
+    }
     /* Row width must match the encoder's allocation: the mmproj projection
      * dim is validated to equal the model's n_embd at load (Qwen3.8 is
      * 2560-wide, not 4096; a wrong width over-reads the source in put). */
