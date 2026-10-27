@@ -8403,7 +8403,9 @@ static void deepseek4_vision_weights_bind(
         ds4_die("DeepSeek vision sidecar does not match the language checkpoint");
     }
     const uint32_t expected_tensors = v41 ? 266u : 316u;
-    if (m->n_tensors != expected_tensors) {
+    /* Extra trailing tensors are allowed: blk.N.exp_probs_b_vl.bias may ride
+     * in the encoder when the language GGUF carries none. */
+    if (m->n_tensors < expected_tensors) {
         fprintf(stderr,
                 "ds4: DeepSeek vision GGUF has %" PRIu64
                 " tensors, expected %u\n", m->n_tensors, expected_tensors);
@@ -43488,6 +43490,11 @@ static bool ds41_balance_shared(const ds41_gpu_graph *g, const ds4_layer_weights
         l->ffn_down_shexp->type == DS4_TENSOR_Q8_0 && ds41_shared_balance_enabled();
 }
 
+/* V4.1 visual router biases may live in the --vision encoder GGUF instead of the
+ * language GGUF.  The router-select reads them through this map. */
+static const char *g_ds41_vl_bias_map = NULL;
+static uint64_t    g_ds41_vl_bias_size = 0;
+
 static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
                      const ds4_layer_weights *l, uint32_t il, uint32_t token) {
     uint64_t gate_row = 0, down_row = 0;
@@ -43500,9 +43507,14 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
         g->tp_out[il * DS4_TP_GATES_PER_LAYER + DS4_TP_GATE_FFN] : sum;
     const ds4_tensor *bias = ds41_image_at(g, g->pos) ? l->ffn_exp_probs_vl : l->ffn_exp_probs_b;
     if (!bias) return false;
+    /* Biases sourced from the --vision encoder need that model's map; the fused
+     * router-select variant takes a single map for gate and bias, so skip it. */
+    const bool bias_external = ds41_image_at(g, g->pos) && g_ds41_vl_bias_map != NULL;
+    const char    *bias_map  = bias_external ? g_ds41_vl_bias_map  : m->map;
+    const uint64_t bias_size = bias_external ? g_ds41_vl_bias_size : m->size;
 #if defined(__APPLE__)
     const bool fused = ds41_moe_fused(g, l);
-    if (ds41_router_fused(g, l)) {
+    if (!bias_external && ds41_router_fused(g, l)) {
         if (!ds4_gpu_dsv41_router_select(g->selected, g->route_weights, g->route_probs,
                 g->route_logits, g->norm, m->map, m->size, l->ffn_gate_inp->abs_offset,
                 bias->abs_offset, true, DS4_N_EMBD, DS4_N_EXPERT, DS4_N_EXPERT_USED,
@@ -43511,7 +43523,7 @@ static bool ds41_moe_partial(ds41_gpu_graph *g, const ds4_model *m,
 #endif
     if (!ds41_matmul(g->route_logits, m, l->ffn_gate_inp, g->norm, false) ||
         !ds4_gpu_router_select_tensor(g->selected, g->route_weights, g->route_probs,
-            m->map, m->size, bias->abs_offset, 0, 0, token,
+            bias_map, bias_size, bias->abs_offset, 0, 0, token,
             DS4_N_EXPERT, DS4_N_EXPERT_USED, DS4_EXPERT_WEIGHT_SCALE, 0, 0, true, false,
             g->route_logits)) return false;
     if (!ds41_stage(il, g->pos, "moe_route")) return false;
@@ -76304,13 +76316,27 @@ static int ds4_engine_open_internal(ds4_engine **out,
                 (double)e->model.ngram_tensor->bytes / (1024.0 * 1024.0 * 1024.0));
     }
     if (e->vision_ready && DS4_MODEL_FAMILY == DS4_MODEL_FAMILY_DEEPSEEK41) {
+        bool need_encoder_bias = false;
         for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
-            if (!e->weights.layer[il].ffn_exp_probs_vl) {
-                fprintf(stderr, "ds4: V4.1 vision requires visual router biases in the language GGUF\n");
+            if (!e->weights.layer[il].ffn_exp_probs_vl) { need_encoder_bias = true; break; }
+        }
+        if (need_encoder_bias) {
+            bool all_found = true;
+            for (uint32_t il = 0; il < DS4_N_LAYER; il++) {
+                ds4_tensor *bt = tensor_by_namef(&e->vision_model, "blk.%u.exp_probs_b_vl.bias", il);
+                if (!bt) { all_found = false; break; }
+                e->weights.layer[il].ffn_exp_probs_vl = bt;
+            }
+            if (!all_found) {
+                fprintf(stderr, "ds4: V4.1 vision requires visual router biases in the language GGUF "
+                                "or blk.N.exp_probs_b_vl.bias in the --vision encoder\n");
                 ds4_engine_close(e);
                 *out = NULL;
                 return 1;
             }
+            g_ds41_vl_bias_map = e->vision_model.map;
+            g_ds41_vl_bias_size = e->vision_model.size;
+            fprintf(stderr, "ds4: V4.1 visual router biases read from the vision encoder\n");
         }
     }
 

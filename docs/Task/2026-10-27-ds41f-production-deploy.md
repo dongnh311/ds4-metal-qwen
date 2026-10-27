@@ -129,3 +129,33 @@ Rule of thumb for this box: **ds41f gets the machine, or it gets a small cache.*
 With a full stack (gateway + sidecars + browser/other apps) keep the cache at
 ~2600 and ctx at 262144; for long-context work stop the sidecars first and use
 the 512k config. Never enable KV-disk persistence for this slot.
+
+## 7. Vision for ds41f — encoder + router biases wired (2026-10-27)
+
+What was done:
+
+1. Downloaded the official V4.1 vision encoder (926 MB) via
+   `./download_model.sh ds41f-vision` → `ds4-models/DeepSeek-V4.1-Flash-Vision.gguf`.
+2. Fetched the 40 **visual router biases** (`layers.N.ffn.gate.bias_vl`, F32[384])
+   from `deepseek-ai/DeepSeek-V4.1-Flash-1017` with HTTP range requests (only KBs;
+   the safetensors index names the shard, then the header + tensor bytes).
+3. Injected them into the **encoder** GGUF as `blk.N.exp_probs_b_vl.bias`
+   (encoder header had 14 KB slack, so no data moved).
+4. Patched `ds4.c` so the language model falls back to the encoder for those
+   biases (they need the encoder's map; the fused router path is skipped when
+   they come from the encoder), and so the encoder may carry extra trailing
+   tensors (266 → 306).
+5. Wired `--vision` into the ds41f registry entry, `capabilities.vision: true`.
+
+Verified: the server logs `V4.1 visual router biases read from the vision encoder`
+and an image request produces `vision embedding encoded; cache=3833597 bytes` +
+`request images=1 prompt=259`.
+
+**Still blocking end-to-end vision:** the language GGUF carries **no vision token
+metadata** (no `deepseek41.vision.*` image-token ids), so the server cannot put
+image placeholders into the prompt — the model then answers "no image". Next
+step: add the image marker KVs/template (header slack in the language GGUF is
+only 849 B, so they must come from a sidecar/flag rather than a header edit, or
+one large KV must be freed), then re-test with the same PNG.
+
+Also note: an image request costs 24–37 s on this slot (8–10 t/s decode).
