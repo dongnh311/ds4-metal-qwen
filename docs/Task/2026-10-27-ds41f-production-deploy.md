@@ -183,3 +183,29 @@ Next debugging steps:
 2. Use the CLI reference path (`/read image.png` in `ds4` with `--vision`) to see
    whether the engine-level path substitutes embeddings; if it does, the bug is in
    the server's prompt assembly for V4.1 (template/marker placement).
+
+### 7.2 Vision pipeline verified down to the embedding (2026-10-27, late)
+
+With `DS4_VISION_DEBUG=1` the prefill trace is unambiguous:
+
+```
+vision embedding encoded; cache=3833597 bytes          (187 patches from the tower)
+vision embed pos=0   token=0      image=no  spans=1 first=28 len=200
+vision embed pos=34  token=129264 image=yes spans=1 first=28 len=200
+vision embed pos=51  token=129264 image=yes spans=1 first=28 len=200
+...
+vision embed pos=255 token=1999   image=no  spans=0      (decode: spans cleared)
+```
+
+So: the encoder produces 187 patch embeddings, the layout expands them to 200
+language positions (patches + 13 `image_newline` rows), the prompt carries 200
+copies of token 129264 at positions 28..227, and `ds41_embed()` **takes the image
+branch for every one of them** during prefill. The router bias also comes from the
+encoder (log confirms).
+
+The model still answers "no image is attached", so the remaining defect is
+**downstream of the embedding** — the prime suspect is how image positions are
+masked/attended: `ds41_text_mask()` sets text rows to 1 and image rows to 0 and
+the graph consumes `g->image_text_mask`; if that mask also gates attention, the
+image rows are invisible to the model. Next: trace `image_text_mask` consumers and
+try a run with the mask inverted (or the gate relaxed) to confirm.

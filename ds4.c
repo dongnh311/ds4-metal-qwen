@@ -42745,6 +42745,11 @@ static bool ds41_hash_tokens(ds41_gpu_graph *g, ds4_engram_history *history,
 static bool ds41_embed(ds41_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                         ds4_gpu_tensor *out, ds4_gpu_tensor *scratch, int token, uint32_t pos) {
     const ds4_vision_span *image = ds41_image_at(g, pos);
+    if (getenv("DS4_VISION_DEBUG") && (pos % 17u == 0u))
+        fprintf(stderr, "ds4: vision embed pos=%u token=%d image=%s spans=%zu first=%u len=%llu\n",
+                pos, token, image ? "yes" : "no", g->image_count,
+                g->image_count ? g->images[0].token_start : 0u,
+                g->image_count ? (unsigned long long)g->images[0].embedding.token_count : 0ull);
     if (!image) return ds4_gpu_embed_token_hc_tensor(out, m->map, m->size,
         w->token_embd->abs_offset, DS4_N_VOCAB, (uint32_t)token, DS4_N_EMBD, DS4_N_HC);
     const float *data = image->embedding.data + (uint64_t)(pos - image->token_start) * DS4_N_EMBD;
