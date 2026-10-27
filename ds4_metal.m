@@ -8188,7 +8188,10 @@ int ds4_gpu_init(void) {
         }
 
         error = nil;
-        fn = [library newFunctionWithName:@"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32"
+        fn = [library newFunctionWithName:
+                (getenv("DS4_V41_MOE_FAST") != NULL ?
+                 @"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_fast_f32" :
+                 @"kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_f32")
                            constantValues:moe_mv_id_constants
                                     error:&error];
         if (!fn) {

@@ -81,3 +81,17 @@ Số đo từ timing summary của fork (256 token, cache 4900):
 - Model file: 1010 tensor / 130 KV, mọi dtype hợp lệ với validator V4.1, bảng Engram page-aligned, `resident_end == tbl1`.
 - Commit chuỗi tool: `9ba11be6`, `835a7593`, `3a685a04`, `e3e107a2` (+ các commit merge/grow/fix trước đó).
 - Dữ liệu phụ: `ds41f-dspark-support.gguf` (8.6 GB), `ds41f-dspark-src/` (3 shard MTP 7.9 GB) — có thể xoá nếu cần chỗ (tải lại từ HF).
+## 8. Kernel work (đêm 2026-10-27) — kết quả & kết luận
+
+Đo chính xác hơn bằng `DS4_METAL_GPU_BUSY_PROFILE` (decode-only, `-n 128`):
+- Wall ~82 ms/token, **GPU busy chỉ 25.5 ms (31%)** ⇒ decode **bị chặn bởi host/latency**, không phải GPU.
+- Host path (timing summary, cache 4900): pread 12.9 ms + readahead 6.1 ms + "selected" bind wrapper 10.4 ms + prepare 3.1 ms ≈ 32 ms/token, phần lớn **serial** với GPU vì mỗi layer phải chờ router→load expert.
+- Preads ĐÃ song song (tối đa 9 thread). Lookahead K=1 là tối ưu (K≥2 tệ hơn). Đường **split-deferred** (submit resident stage trước, load missing expert bằng CPU trong lúc GPU chạy) chỉ bật khi `g_batch_cb != nil` và không ở chế độ profile — không kích hoạt trong decode CLI/server single-stream ⇒ đây là chỗ còn ~30-50 ms/token tiềm năng (việc lớn tiếp theo: mở overlap cho decode thường).
+
+Kernel MoE (thử nghiệm):
+- Viết `kernel_mul_mv_iq2_xxs_pair_f32_impl_fast` + `kernel_mul_mv_addr_iq2_xxs_pair_swiglu_masked_fast_f32` (grid load 1× uint64, sign gộp vào thanh ghi y, FMA) — bật bằng `DS4_V41_MOE_FAST=1`.
+- Kết quả: **+3% (15.3 → 15.8 t/s)**, output **byte-identical** trên 3 prompt oracle (md5 trùng). Mặc định vẫn dùng kernel gốc.
+- Bản fast cho kernel **down** làm lệch bit (thứ tự cộng bị tái kết hợp) → đã bỏ; đây là lý do chỉ giữ fast cho gate/up.
+- Lưu ý: fast pair là opt-in; nếu dùng cho production cần chạy bộ quality 112 prompt của fork để xác nhận byte-identical.
+
+Kết luận: 20 t/s cần **pipeline hoá host path** (overlap load expert với GPU giữa các layer), không phải micro-opt kernel. Ước tính: nếu overlap được toàn bộ host (32ms) với GPU (25ms) → ~35-40 ms/token ≈ 25-28 t/s (trần mới), trong khi micro-opt kernel chỉ cho +3%.
