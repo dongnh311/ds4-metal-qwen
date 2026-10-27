@@ -42960,6 +42960,18 @@ int ds4_gpu_routed_moe_one_tensor(
                     ds4_gpu_stream_expert_masked_addr_requested() &&
                     g_moe_mul_mv_addr_iq2_xxs_pair_swiglu_masked_pipeline != nil &&
                     g_moe_mul_mv_addr_q2_k_sum6_masked_pipeline != nil;
+                if (getenv("DS4_V41_SPLIT_DEBUG") != NULL && layer_index < 3) {
+                    fprintf(stderr,
+                            "ds4: split-debug layer=%u candidate=%d masked=%d res=%u miss=%u worthwhile=%d batch_cb=%d prof=%d iq2slots=%d cache=%d\n",
+                            layer_index, (int)use_stream_expert_split_candidate,
+                            (int)use_stream_expert_masked_addr_table,
+                            stream_expert_resident_mask, stream_expert_missing_mask,
+                            ds4_gpu_stream_expert_split_worthwhile(stream_expert_resident_mask,
+                                                                   stream_expert_missing_mask),
+                            (int)(g_batch_cb != nil),
+                            (int)(getenv("DS4_METAL_MOE_ONE_STAGE_PROFILE") != NULL),
+                            (int)use_iq2_selected_slots, (int)use_stream_expert_cache);
+                }
                 use_stream_expert_split_deferred =
                     use_stream_expert_split_candidate &&
                     use_stream_expert_masked_addr_table &&
