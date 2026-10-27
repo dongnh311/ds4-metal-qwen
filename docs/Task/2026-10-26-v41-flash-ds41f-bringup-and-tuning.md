@@ -95,3 +95,15 @@ Kernel MoE (thử nghiệm):
 - Lưu ý: fast pair là opt-in; nếu dùng cho production cần chạy bộ quality 112 prompt của fork để xác nhận byte-identical.
 
 Kết luận: 20 t/s cần **pipeline hoá host path** (overlap load expert với GPU giữa các layer), không phải micro-opt kernel. Ước tính: nếu overlap được toàn bộ host (32ms) với GPU (25ms) → ~35-40 ms/token ≈ 25-28 t/s (trần mới), trong khi micro-opt kernel chỉ cho +3%.
+
+## 9. Split-deferred overlap (2026-10-27 sáng) — kết quả
+
+- Khôi phục sau crash giữa cuộc convert in-place: re-chạy `fix_down.py` (deterministic, 4 worker thay vì 8 để giảm áp lực RAM — nghi nguyên nhân crash), patch header down 16→10. File 405,224,791,632 B, 1010 tensor/130 KV, structure OK.
+- Với **down = Q2_K** (công thức chuẩn của fork), đường **masked + split-deferred** bật đúng: `DS4_V41_SPLIT_DEBUG` cho thấy `candidate=1, masked=1, batch_cb=1, worthwhile=1` ở layer có ≥3 expert missing.
+- Đo A/B cùng file (env `DS4_METAL_DISABLE_STREAMING_EXPERT_MASKED_ADDR=1` để tắt masked/split):
+  - split ON: 15.55 / 15.66 t/s
+  - split OFF: 15.36 / 15.21 t/s
+  → **+1.5%**. Nguyên nhân: `split_layers=417` trên 5120 lượt (chỉ ~10% layer có ≥3 missing) vì cache 4900 slot đã phủ gần hết expert; resident-stage GPU chỉ ~0.2-0.4 ms/layer nên overlap cứu được rất ít.
+- Kết luận: **split overlap không phải lever tới 20 t/s**. Decode vẫn bị chặn bởi host/encode/latency (GPU busy ~31%) với ~20 ms/token chưa giải thích được (command encoding + per-layer sync + engram). Muốn 20 t/s cần tái cấu trúc pipeline decode (gộp command buffer, bỏ sync per-layer) — việc lớn hơn một buổi.
+- Chốt cấu hình cuối (giữ theo thiết kế fork): down=**Q2_K**, gate/up=IQ2_XXS, dense Q4_K/Q8_0, token F16, cache 4900 slot (`--ssd-streaming-cache-experts 4900`), kernel fast pair opt-in `DS4_V41_MOE_FAST=1` (+~3%, md5-identical trên bộ oracle 3 prompt). Best đo được: 15.5-15.8 t/s ổn định (đỉnh 16.3).
+- ⚠ Vận hành: convert in-place chạy 8 worker × ~2.5-3 GB RSS có thể gây áp lực bộ nhớ; dùng 4 worker cho an toàn.
