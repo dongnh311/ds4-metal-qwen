@@ -112,3 +112,26 @@ Mục tiêu: `y` chỉ đọc **một lần cho 32 hàng** thay vì một lần 
 ### 7.5 Qwen3.8-flash-next (prod 35B)
 
 Model prod `Ornith-1.5-35B-A3B-…gguf` (41 layer, hidden 2048) có expert routed **Q5_K (45 tensor) + Q4_K (78)**, shared expert Q8_0, không có IQ2_XXS ⇒ **không đi qua kernel vừa sửa**. Muốn "cả hai cùng hưởng lợi" thì thiết kế 7.4 phải áp cho họ kernel `kernel_mul_mv_*_q4_K/q5_K_sum6` và `_pair_swiglu` của nó, kèm **xác nhận md5 bit-exact trên đúng lệnh prod** (KV cache đĩa `ds4-kv-cache-ornith` không được đổi).
+
+## 8. Pha B2 (32/64 hàng mỗi TG + stage `y`) — kết quả
+
+Đã dựng 2 cấu hình (opt-in `DS4_V41_MOE_B2`), cả hai **không thắng**:
+
+| Cấu hình | `gate_up`/layer | generation | Ghi chú |
+|---|---|---|---|
+| B2-a: 4 simdgroup × nr0=8 = 32 hàng/TG, stage `y` **float** 20 KB | — | 13.95 | 1 TG/core, mất occupancy |
+| B2-b: 8 simdgroup × nr0=8 = 64 hàng/TG, stage `y` **half** 10 KB + half2 | 0.344 ms (không đổi) | 15.21–15.32 | traffic/2.5× nhưng thời gian y nguyên |
+| Mặc định | 0.344 ms | 15.65 | |
+
+Chất lượng B2-b: output mạch lạc (half chỉ ở tích, tổng vẫn fp32) ⇒ về mặt số học dùng được, nhưng **không có lợi tốc độ** nên đã revert.
+
+**Kết luận quan trọng:** giảm 2.5× traffic activation vẫn **không đổi thời gian** ⇒ nút thắt không phải tổng byte, mà là **hiệu suất đọc weight theo pattern 8 B × stride 66 B** (mỗi warp đọc 4 khối 64 B nằm trong 3 dòng 128 B ⇒ ~30% lãng phí sector + latency L2). Đây là giới hạn của **layout tensor**, không phải của vòng lặp.
+
+## 9. Hướng còn lại (cần một phiên riêng): repack tensor expert sang dạng phẳng
+
+Ý tưởng: tách mỗi expert tensor thành 2 mặt phẳng (SoA) — mảng `d`/scale và mảng **các chunk 8 B liền mạch** — sao cho 32 lane đọc đúng **256 B liên tục** (100% sector) thay vì 8 B × stride 66 B.
+- Kích thước tensor **không đổi** (chỉ hoán vị byte trong từng tensor) ⇒ có thể ghi in-place theo từng expert, không cần thêm đĩa.
+- Áp dụng cho: IQ2_XXS gate/up (V4.1) và Q4_K/Q5_K gate/up + Q2_K down (35B prod) ⇒ cả hai model cùng hưởng.
+- Kỳ vọng: sector utilization ~70% → ~100%, tức 1.4×; cộng giảm latency ⇒ MoE 25 ms → 15–17 ms ⇒ step 51–53 ms ⇒ **19–19.6 t/s**, và mức 20 cần thêm ~1 ms từ host (Pha E).
+
+**Trước khi làm repack phải đo bằng GPU counter** (`MTLCounterSampleBuffer`, L2 hit + sector utilization) để xác nhận giả thuyết lãng phí sector, tránh lặp lại vòng "đoán rồi thử" vừa qua.
