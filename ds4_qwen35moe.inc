@@ -910,7 +910,7 @@ static bool qwen35_graph_linear_verify(ds4_qwen4_gpu_graph *g, const ds4_model *
  * batched, the recurrence still one row at a time). */
 static bool qwen35_graph_linear_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
                                      uint32_t il, uint32_t T) {
-    if (!g->verify_rows_exact || T <= 1u) return qwen4_graph_linear(g, m, l, il, T);
+    if (!g->verify_rows_exact || T <= 1u) return qwen4_graph_linear(g, m, l, il, T, false);
     if (g->snap_after_second) {
         /* Each per-row call below is T=1, so it can only take the
          * after-first-row snapshot; a 3-row verify (a deeper draft) needs
@@ -944,7 +944,7 @@ static bool qwen35_graph_linear_rows(ds4_qwen4_gpu_graph *g, const ds4_model *m,
             g->verify_row_snap_s = NULL;
             g->verify_row_snap_h = NULL;
         }
-        ok = mv && bv && qwen4_graph_linear(g, m, l, il, 1u);
+        ok = mv && bv && qwen4_graph_linear(g, m, l, il, 1u, false);
         g->verify_row_snap_s = NULL;
         g->verify_row_snap_h = NULL;
         ds4_gpu_tensor_free(mv);

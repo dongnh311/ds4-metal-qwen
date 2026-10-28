@@ -61297,6 +61297,10 @@ typedef struct ds4_qwen4_gpu_graph {
     uint32_t kv_reserve;   /* rows reserved past the prompt on sync */
     uint32_t pos;
     uint32_t cap_tokens;
+    /* KVA: prefill chunks ending at or before this absolute position only
+     * build state (KV pages, GDN recurrence, indexer keys) in layers >=
+     * kva_split; 0 disables the approximation.  Set once per prompt. */
+    uint32_t kva_until;
     uint32_t k_blocks;
     uint32_t n_block_cap;
     uint32_t sel_stride;
@@ -62501,7 +62505,7 @@ static bool qwen4_graph_hc_mix(ds4_qwen4_gpu_graph *g, const ds4_model *m,
 }
 
 static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
-                               uint32_t il, uint32_t T) {
+                               uint32_t il, uint32_t T, bool state_only) {
     const uint32_t conv_dim = DS4_N_LIN_CONV_DIM;
     /* W-D4 stage 2: a batched verify captures each GDN layer's inputs (the
      * raw qkv projection and the alpha/beta projections) so a partial
@@ -62566,6 +62570,9 @@ static bool qwen4_graph_linear(ds4_qwen4_gpu_graph *g, const ds4_model *m, const
                                            g->snap_after_second ? g->snap2_lin_state[il] : NULL, 1u) != 0;
     }
     sub_seal(SUB_GDN_SCAN);
+    /* KVA: the recurrence state is now advanced; the output half only feeds
+     * the residual stream, which the approximation intentionally skips. */
+    if (state_only) return ok;
     if (ok) {
 #ifdef DS4_HAS_QWEN4_METAL
         if (g->gdn_silu)
@@ -62901,7 +62908,7 @@ static bool qwen4_graph_attention_core(ds4_qwen4_gpu_graph *g, uint32_t il,
  * appends, pooled block keys and the attention core; the projections before
  * it and the output projection after it are row-agnostic. */
 static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
-                                       uint32_t il, uint32_t pos0, uint32_t T) {
+                                       uint32_t il, uint32_t pos0, uint32_t T, bool state_only) {
     const uint32_t ratio = 4u;
     const uint32_t last = pos0 + T - 1u;
     const uint32_t q_dim = DS4_N_HEAD * DS4_N_HEAD_DIM;
@@ -62938,6 +62945,9 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
         qsa_pf_end(QSA_PF_BLOCK_KEY);
         if (!bk_ok) return false;
     }
+    /* KVA: KV pages and pooled indexer keys are written; the attention read
+     * and the output projection only feed the residual, which is skipped. */
+    if (state_only) return true;
     if (T > 2u && g->verify_rows_exact) {
         /* speculative verify: run the attention core as <=2-row sub-batches so
          * every dispatch keeps the exact T <= 2 kernel paths (prefill tails keep
@@ -62974,7 +62984,7 @@ static bool qwen4_graph_attention_tail(ds4_qwen4_gpu_graph *g, const ds4_model *
 }
 
 static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_layer_weights *l,
-                                  uint32_t il, uint32_t pos0, uint32_t T) {
+                                  uint32_t il, uint32_t pos0, uint32_t T, bool state_only) {
     {
         bool ok = qwen4_gemv(g->qg, m, l->attn_q, g->mixed, T);
         if (ok && qwen4_graph_fused(g, T)) {
@@ -62993,8 +63003,8 @@ static bool qwen4_graph_attention(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
         }
         if (!ok) return false;
     }
-    return qwen4_graph_attention_tail(g, m, l, il, pos0, T) &&
-           qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T);
+    return qwen4_graph_attention_tail(g, m, l, il, pos0, T, state_only) &&
+           (state_only || qwen4_gemv(g->blk, m, l->attn_output, g->attn_o, T));
 }
 
 /* router GEMV, top-k (+ shared gate logit), experts with the shared expert as
@@ -63303,6 +63313,57 @@ static bool qwen4_graph_stage_inputs(ds4_qwen4_gpu_graph *g, const ds4_model *m,
  * everything is causal by construction because the recurrent kernels walk
  * tokens in order and attention reads the caches written for the same
  * chunk.  g->R keeps the pre-mixer streams of every row afterwards. */
+/* ---- KVA: late-layer approximate prefill (opt-in, DS4_QWEN4_KVA_SPLIT) ----
+ * Strata's kernel-VA trick: a long prompt is read exactly through the early
+ * layers; in the late layers only their recurrent state is built (KV pages,
+ * indexer block keys, GDN convolution history and scan state) from the last
+ * exact hidden state, and the attention output, output projection, residual
+ * combine and MoE are skipped.  The final DS4_QWEN4_KVA_TAIL tokens are read
+ * exactly through every layer, so decode starts from an exact tail.  With
+ * both knobs unset the path below is byte-identical to the plain prefill. */
+static int qwen4_kva_split(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("DS4_QWEN4_KVA_SPLIT");
+        char *end = NULL;
+        long n = 0;
+        if (v && *v) n = strtol(v, &end, 10);
+        if (!v || !*v || !end || *end || n < 0 || n > (long)DS4_N_LAYER) n = 0;
+        cached = (int)n;
+    }
+    return cached;
+}
+
+static uint32_t qwen4_kva_tail(void) {
+    static uint32_t cached = 0;
+    static bool init = false;
+    if (!init) {
+        init = true;
+        const char *v = getenv("DS4_QWEN4_KVA_TAIL");
+        char *end = NULL;
+        long n = 2048;
+        if (v && *v) n = strtol(v, &end, 10);
+        if (!v || !*v || !end || *end) n = 2048;
+        if (n < 512) n = 512;
+        if (n > 8192) n = 8192;
+        cached = (uint32_t)n;
+    }
+    return cached;
+}
+
+/* Marks the prompt's approximate boundary.  Call once per prompt, before the
+ * chunk loop; chunks that end at or before g->kva_until approximate layers
+ * >= split, every chunk after it runs the exact path. */
+static void qwen4_graph_kva_begin(ds4_qwen4_gpu_graph *g, uint32_t n_tokens) {
+    const int split = qwen4_kva_split();
+    const uint32_t tail = qwen4_kva_tail();
+    if (!g) return;
+    g->kva_until = 0;
+    if (split <= 0 || n_tokens <= tail + tail / 2u) return;
+    g->kva_until = n_tokens - tail;
+    fprintf(stderr, "ds4: KVA approx prefill: split=%d tail=%u until=%u\n",
+            split, tail, g->kva_until);
+}
 static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds4_weights *w,
                                        const int *tokens, uint32_t T, float *logits_out, bool all_rows) {
     if (!g || T == 0 || T > g->cap_tokens || g->pos + T > g->alloc_cap) return false;
@@ -63315,6 +63376,8 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
     }
     const uint32_t pos0 = g->pos;
     const uint32_t n_trunk = DS4_N_LAYER - DS4_N_NEXTN_PREDICT;
+    const int kva_split = qwen4_kva_split();
+    const bool kva_chunk = kva_split > 0 && g->kva_until != 0u && pos0 + T <= g->kva_until;
     const uint32_t hc_dim = DS4_N_EMBD * DS4_N_HC;
     static int timing = -1;
     if (timing < 0) {
@@ -63389,11 +63452,12 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
         QWEN4_PROF(1);
         stg_seal(STG_HCATTN);
+        const bool kva_state_only = kva_chunk && il >= (uint32_t)kva_split;
         if (ok) {
-            ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T)
-                                               : qwen4_graph_attention(g, m, l, il, pos0, T);
+            ok = ds4_qwen4_layer_is_linear(il) ? qwen4_graph_linear(g, m, l, il, T, kva_state_only)
+                                               : qwen4_graph_attention(g, m, l, il, pos0, T, kva_state_only);
         }
-        if (ok) {
+        if (ok && !kva_state_only) {
             /* GDN and full attention both project into the same E-wide blk
              * stream before the hyper-connection residual combine. */
             if (g->dump_prompt_rows) qwen4_graph_dump_last_attn(g, il, T);
@@ -63402,6 +63466,7 @@ static bool qwen4_graph_forward_tokens(ds4_qwen4_gpu_graph *g, const ds4_model *
         QWEN4_PROF(ds4_qwen4_layer_is_linear(il) ? 2 : 3);
         stg_seal(ds4_qwen4_layer_is_linear(il) ? STG_GDN : STG_ATTN);
         sub_seal(SUB_REST);
+        if (kva_state_only) continue;   /* no combine, no FFN: R keeps the last exact hidden */
         if (T == 1u && !g->mtp_R && DS4_N_HC == 4u && ds4_gpu_qwen4_decode_fusions_enabled() &&
             l->hc_ffn_inject->type == DS4_TENSOR_F16) {
             if (ok) ok = ds4_gpu_qwen4_hc_combine_norm_tensor(g->hc_u, g->blk, g->inj,
@@ -63717,7 +63782,7 @@ static bool qwen4_graph_mtp_steps(ds4_qwen4_gpu_graph *g, const ds4_model *m, co
     }
     g->R = g->mtp_R;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, T);
-    if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T);
+    if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, T, false);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, T, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, T);
     if (ok) ok = qwen4_graph_moe(g, m, w, l, il, T);
@@ -63809,7 +63874,7 @@ static bool qwen4_graph_mtp_chain_step(ds4_qwen4_gpu_graph *g, const ds4_model *
     }
     g->R = g->mtp_R;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_attn_norm, l->hc_attn_down, l->hc_attn_up, l->hc_attn_inject, 1);
-    if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, 1);
+    if (ok) ok = qwen4_graph_attention(g, m, l, il, idx, 1, false);
     if (ok) ok = ds4_gpu_qwen4_hc_combine_tensor(g->R, g->blk, g->inj, 1, E, hc) != 0;
     if (ok) ok = qwen4_graph_hc_mix(g, m, l->hc_ffn_norm, l->hc_ffn_down, l->hc_ffn_up, l->hc_ffn_inject, 1);
     if (ok) ok = qwen4_graph_moe(g, m, w, l, il, 1);
@@ -63879,6 +63944,7 @@ static int generate_qwen4_metal_argmax(
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
     const double t_prefill0 = now_sec();
     bool ok = true;
+    qwen4_graph_kva_begin(g, (uint32_t)prompt->len);
     for (int i = 0; i < prompt->len && ok;) {
         uint32_t chunk = (uint32_t)(prompt->len - i);
         if (chunk > g->cap_tokens) chunk = g->cap_tokens;
@@ -82053,6 +82119,7 @@ static int ds4_session_sync_internal(ds4_session *s, const ds4_tokens *prompt, c
         /* A one-token prefill tail is still a prompt row. Speculative verify
          * batches, despite having multiple rows, must never overwrite dumps. */
         s->qwen4_graph.dump_prompt_rows = true;
+        qwen4_graph_kva_begin(&s->qwen4_graph, (uint32_t)prompt->len);
         int prefill_rc = 0;
         for (int i = start; i < prompt->len;) {
             if (ds4_session_cancelled(s)) {
