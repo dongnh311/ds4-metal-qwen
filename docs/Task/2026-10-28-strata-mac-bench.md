@@ -42,6 +42,26 @@ ref: unknown type 29
 Metal engine không có kernel cho tensor type của IQ2_XS ⇒ không chạy được trên
 Mac. Đã xoá 68 GB sau khi thử.
 
+## Thử lần 3 — Q2_0 tinh chỉnh cho context cao (số cuối)
+
+Cấu hình chạy được: `--kv q4_0 --kv-grow --max-context 131072`, bỏ `--vision`,
+`STRATA_METAL_PROMPT_CHUNK=1024`.
+
+| prompt | Strata Q2_0 | ds4 IQ2_XXS + KVA |
+|---|---|---|
+| 24k (30.980 tok) | 31,6 s → **981 t/s** | 871 t/s |
+| 52k (52.400 tok) | 52,9 s → **990 t/s** | 897 t/s (58,3 s) |
+| 60k (60.764 tok) | 351,8 s → **172 t/s** (sụp) | ~860 t/s |
+| 100k | **OOM** ở ~53k token (exit 5) | 863 t/s @128k |
+| 200k | — | 804 t/s, 12/12 fact |
+| decode | không đo được | 50,1 t/s |
+
+Kết luận: **≤52k Strata nhanh hơn 10–13%**; qua ~53k thì sụp còn 172 t/s rồi chết,
+trong khi ds4 giữ 800–900 t/s tới 200k.
+
+Phụ chú: sau khi engine chết, macOS giữ ~44 GB "wired" và Strata không khởi động
+lại được (OOM ngay cả ở ctx 32k) cho tới khi reboot; ds4 không bị ảnh hưởng.
+
 ## Vì sao
 
 - Strata tải cả 37,6 GB model "wrap" vào Metal + PLE 28,8 GB; prompt buffer cộng
