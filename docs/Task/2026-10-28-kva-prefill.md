@@ -57,16 +57,24 @@ cần bộ extraction đầy đủ trước khi dùng.
 Rollback: bỏ 2 env, restart backend (không cần đổi code). Khi tắt, đường chạy
 byte-identical với build trước (đã đo 745,9 vs 745,3 t/s).
 
-## P2 — ds41f lookahead: kết quả audit
+## P2 — ds41f lookahead: audit + sweep
 
 `ds41_la_post_layer` chỉ được gọi từ nhánh **decode** (MoE một token,
-`ds4.c` ≈43695); đường prefill batch (T>1) **không** post job nào. Job hiện tại
-mang 1 vector `x` + `pos` nên không dùng lại trực tiếp cho batch được — muốn
-prefetch cho prefill phải đọc selected ids của cả chunk và warm theo union.
+`ds4.c` ≈43695); đường prefill batch (T>1) không post job nào. Job mang 1 vector
+`x` + `pos` nên không dùng lại trực tiếp cho batch.
 
-Vì vậy: sweep `DS4_METAL_V41_LOOKAHEAD_K` hiện chỉ tác động decode. Cần cửa sổ
-dừng Qwen ~30–40 phút để nạp ds41f và đo k=0/1/3/6 (prefill 8k/30k, decode
-4k/30k). Chưa làm để không hạ prod khi chưa có số.
+Sweep trên ds41f (bất hoạt Qwen trong lúc đo), prompt 45k token lạnh:
+
+| k | prefill 45k | decode @45k |
+|---|---|---|
+| 0 (tắt) | 409,3 t/s | 9,1 → median 9,3 t/s |
+| **1 (mặc định)** | 402,9 t/s | **10,8 → median 10,7 t/s (+15%)** |
+| 3 | 394,8 t/s | 8,6 t/s |
+| 6 | 389,2 t/s | 6,2 t/s (−31%) |
+
+⇒ k=1 đang đặt sẵn là điểm tối ưu; k≥3 làm SSD tranh chấp, decode tệ đi.
+Không đổi registry. Prefill không post lookahead nhưng đạt 409 t/s (nhanh hơn
+con số 115–207 t/s cũ), nên chưa đáng làm prefetch batch.
 
 ## Tái lập
 
