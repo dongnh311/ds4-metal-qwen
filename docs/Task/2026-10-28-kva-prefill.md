@@ -47,12 +47,20 @@ chậm đi. Chốt base = `ornith-122b`.
 |---|---|---|
 | needle 52k (3 mã ở 15/50/85%) | **3/3**, 58 s | 3/3, 57 s |
 | needle 128k | **3/3**, 151 s | chưa đo |
+| lưới 12 fact @128k (`scripts/needle-grid.py`) | **12/12**, 149,7 s | 12/12, 145,1 s |
+| lưới 12 fact @200k (ctx 262144) | **12/12**, 253,2 s (804 t/s), 53,19 GiB | — |
 
 ## Quyết định
 
 Bật `DS4_QWEN4_KVA_SPLIT=36`, `DS4_QWEN4_KVA_TAIL=2048` cho Qwen3.8; split 32
-nhanh hơn ~7% ở 24k nhưng chưa có bằng chứng chất lượng ngoài needle ⇒ để dành,
-cần bộ extraction đầy đủ trước khi dùng.
+nhanh hơn ~3% ở 128k và ~7% ở 24k, recall 12/12 bằng 36 nhưng chưa có bằng chứng
+về câu hỏi suy luận/tổng hợp trên tài liệu dài ⇒ giữ 36 (an toàn hơn), để 32 làm
+ứng viên khi cần thêm tốc độ.
+
+Lưu ý harness: sau khi deploy, `process_command` trong registry có sẵn
+`DS4_QWEN4_KVA_SPLIT=36` nên biến môi trường của Popen **bị ghi đè** — các script
+`scripts/needle*.py`, `scripts/phase0-parity.py` đã được sửa để chèn override
+ngay sau `/usr/bin/env`, đảm bảo A/B đúng cấu hình.
 
 Rollback: bỏ 2 env, restart backend (không cần đổi code). Khi tắt, đường chạy
 byte-identical với build trước (đã đo 745,9 vs 745,3 t/s).

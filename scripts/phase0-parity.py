@@ -30,6 +30,10 @@ def start(tag, binary, extra_env=None):
     cmd = list(cfg["process_command"])
     idx = next(i for i, a in enumerate(cmd) if a.endswith("/ds4-server") or a == "ds4-server")
     cmd[idx] = binary
+    if extra_env and cmd and cmd[0].endswith("/env"):
+        cmd = [cmd[0]] + [x for x in cmd[1:]
+                          if not ("=" in x and x.split("=", 1)[0] in extra_env)]
+        cmd[1:1] = ["%s=%s" % (k, v) for k, v in extra_env.items()]
     env = dict(os.environ)
     env.update(cfg.get("env") or {})
     env.update(extra_env or {})

@@ -60,6 +60,11 @@ def start(tag, binary, extra, ctx):
         idx = next(i for i, a in enumerate(cmd) if a.endswith("/ds4-server") or a == "ds4-server")
         cmd[idx] = binary
     cmd[cmd.index("-c") + 1] = str(ctx)
+    if extra and cmd and cmd[0].endswith("/env"):
+        # our overrides must beat the registry's inline /usr/bin/env assignments
+        cmd = [cmd[0]] + [a for a in cmd[1:]
+                          if not ("=" in a and a.split("=", 1)[0] in extra)]
+        cmd[1:1] = ["%s=%s" % (k, v) for k, v in extra.items()]
     env = dict(os.environ)
     env.update(cfg.get("env") or {})
     env.update(extra)
