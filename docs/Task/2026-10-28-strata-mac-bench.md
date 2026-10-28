@@ -30,6 +30,18 @@ Strata trên PC Windows (RTX 3060 12 GB, qua Tailscale) — chỉ để tham chi
 máy: Qwen q2_0 prefill 16,7k token / 35,2 s = **474 t/s**, decode ngắn 16,8 t/s;
 DeepSeek V4.1 prefill 16,7k / 144,4 s ≈ **116 t/s**.
 
+## Thử lần 2 — IQ2_XS (cùng hạng quant với ds4)
+
+Tải `IQ2_XS` (39,23 GB + PLE 28,80 GB = 68 GB), patch `mac_fit.py` để thêm pack
+này (setup Mac không liệt kê dù bảng model có). Kết quả: engine **từ chối nạp**:
+
+```
+ref: unknown type 29
+```
+
+Metal engine không có kernel cho tensor type của IQ2_XS ⇒ không chạy được trên
+Mac. Đã xoá 68 GB sau khi thử.
+
 ## Vì sao
 
 - Strata tải cả 37,6 GB model "wrap" vào Metal + PLE 28,8 GB; prompt buffer cộng
