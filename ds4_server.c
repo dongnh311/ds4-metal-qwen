@@ -904,6 +904,9 @@ typedef struct {
     int logit_bias_ban_len;
     int logit_bias_bans_n;
     float *logit_bias_scratch;
+    /* OpenAI-style anti-loop sampling: penalty > 1 applies over the last rep_window tokens. */
+    float rep_penalty;
+    int rep_window;
 } request;
 
 static void tool_call_free(tool_call *tc) {
@@ -1039,6 +1042,8 @@ static void request_init(request *r, req_kind kind, int max_tokens) {
     r->top_k = 0;
     r->temperature = DS4_DEFAULT_TEMPERATURE;
     r->top_p = DS4_DEFAULT_TOP_P;
+    r->rep_penalty = 1.0f;
+    r->rep_window = 128;
     r->min_p = DS4_DEFAULT_MIN_P;
     r->think_mode = DS4_THINK_HIGH;
     r->tmpl = CHAT_TEMPLATE_DEFAULTS;
@@ -4950,6 +4955,21 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
             }
             r->top_p = (float)v;
             r->top_p_set = true;
+        } else if (!strcmp(key, "repetition_penalty")) {
+            double v = 1.0;
+            if (!json_number(&p, &v)) {
+                free(key);
+                goto bad;
+            }
+            if (v < 1.0) v = 1.0;
+            if (v > 4.0) v = 4.0;
+            r->rep_penalty = (float)v;
+        } else if (!strcmp(key, "repetition_context_size") || !strcmp(key, "repeat_last_n")) {
+            if (!json_int(&p, &r->rep_window)) {
+                free(key);
+                goto bad;
+            }
+            if (r->rep_window < 0) r->rep_window = 0;
         } else if (!strcmp(key, "min_p")) {
             double v = 0.0;
             if (!json_number(&p, &v)) {
@@ -14805,7 +14825,10 @@ static int server_select_token(server *s, server_slot *slot, request *r,
     if (r->logit_bias_n == 0) {
         return r->ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session, r->think_mode) :
-            ds4_session_sample(slot->session, temperature, top_k, top_p, min_p, rng);
+            (r->rep_penalty > 1.0f
+                 ? ds4_session_sample_penalized(slot->session, temperature, top_k, top_p, min_p,
+                                                r->rep_penalty, r->rep_window, rng)
+                 : ds4_session_sample(slot->session, temperature, top_k, top_p, min_p, rng));
     }
     const int n_vocab = ds4_engine_vocab_size(s->engine);
     if (n_vocab <= 0) return -1;
@@ -14824,7 +14847,10 @@ static int server_select_token(server *s, server_slot *slot, request *r,
         r->logit_bias_ban_len = 0;
         return r->ignore_eos ?
             ds4_session_argmax_ignoring_eos(slot->session, r->think_mode) :
-            ds4_session_sample(slot->session, temperature, top_k, top_p, min_p, rng);
+            (r->rep_penalty > 1.0f
+                 ? ds4_session_sample_penalized(slot->session, temperature, top_k, top_p, min_p,
+                                                r->rep_penalty, r->rep_window, rng)
+                 : ds4_session_sample(slot->session, temperature, top_k, top_p, min_p, rng));
     }
     logit_bias_apply(r, r->logit_bias_scratch, n_vocab);
     if (r->ignore_eos)

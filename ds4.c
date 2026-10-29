@@ -83331,6 +83331,28 @@ int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p
                               top_p, min_p, rng, s->sample_probs);
 }
 
+/* Repetition penalty (llama.cpp's rule: positive logits divide, negative multiply) over the
+ * last `rep_window` tokens of the session's own checkpoint.  Qwen3.8/ds41f degenerate into
+ * short mantras at low temperature and ds4 had no penalty knob at all, so the gateway's
+ * anti-loop retry (which raises repetition_penalty) could never take effect.  The logits are
+ * recomputed every step, so the in-place edit does not leak into the next token. */
+int ds4_session_sample_penalized(ds4_session *s, float temperature, int top_k, float top_p, float min_p,
+                                 float rep_penalty, int rep_window, uint64_t *rng) {
+    if (!s || !s->checkpoint_valid || !s->logits) return -1;
+    if (rep_penalty > 1.0f && rep_window > 0 && s->checkpoint.v && s->checkpoint.len > 0) {
+        int start = s->checkpoint.len - rep_window;
+        if (start < 0) start = 0;
+        for (int i = start; i < s->checkpoint.len; i++) {
+            const int t = s->checkpoint.v[i];
+            if (t < 0 || t >= (int)DS4_N_VOCAB) continue;
+            float *v = &s->logits[t];
+            *v = (*v > 0.0f) ? *v / rep_penalty : *v * rep_penalty;
+        }
+    }
+    return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
+                              top_p, min_p, rng, s->sample_probs);
+}
+
 int ds4_session_top_logprobs(ds4_session *s, ds4_token_score *out, int k) {
     if (!s || !out || k <= 0) return 0;
     if (k > (int)DS4_N_VOCAB) k = (int)DS4_N_VOCAB;
