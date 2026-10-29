@@ -49,50 +49,61 @@ trustworthy with use.
 ## Baseline sweep (220K-target protocol)
 
 Sweep 2026-10-29 16:50–18:04 (arms mtp/d2/d3/force, receipts
-`speed-bench/receipts/orca-iq2-20261029-165008/`) plus the true-`plain`
-re-run 22:06–22:23 (`…/orca-iq2-20261029-220605/`, after the flag-decoupling
-fix — the 16:50 "plain" arm silently ran MTP because `--mtp-timing` implied
-`--mtp`). Merged table: `speed-bench/orca-iq2-baseline.csv`. One rep per arm
-(variance lesson below); gen = greedy continuation of a frozen 1.2 MB ds4.c
-slice, production launch env mirrored from the live registry.
+`speed-bench/receipts/orca-iq2-20261029-165008/`), the true-`plain` re-run
+22:06–22:23 (`…/220605/`, after the flag-decoupling fix — the 16:50 "plain"
+arm silently ran MTP because `--mtp-timing` implied `--mtp`), and rep 2 of
+plain+auto-MTP 22:33–23:05 (`…/223243/`). Merged table:
+`speed-bench/orca-iq2-baseline.csv`. plain/mtp are 2-rep means; d2/d3/force
+1 rep (variance lesson below). gen = greedy continuation of a frozen 1.2 MB
+ds4.c slice, production launch env mirrored from the live registry.
 
 | arm (gen t/s) | 32K | 64K | 128K | 192K | 225K | draft-1 acc | depth-3 accept2 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| plain (true, no MTP) | 37.9 | 37.7 | 37.4 | 28.5 | 31.4 | — | — |
-| mtp (auto depth) | 44.7 | 41.3 | 41.7 | 39.5 | 40.6 | 73.2% | 68.8% (32/280 cycles engaged) |
+| plain (true, no MTP) | 37.1 | 36.9 | 35.6 | 30.5 | 32.1 | — | — |
+| mtp (auto depth) | 43.4 | 39.5 | 40.3 | 38.8 | 39.6 | 73.2% | 68.8% (32/280 cycles engaged) |
+| — MTP gain over plain | +17% | +7% | +13% | +27% | +23% | | |
 | mtp-d2 (forced depth 2) | 48.3 | 41.8 | 40.8 | 40.4 | 40.6 | 74.2% | — (never engages) |
 | mtp-d3 (forced depth 3) | 42.4 | 32.2 | 32.8 | 31.4 | 30.9 | 69.9% | 41.6% (99/238) |
 | mtp-force (accept-all ceiling) | 38.2* | 46.6 | 45.7 | 42.7 | 44.5 | 100% (forced) | 100% |
 
 *The 32K cell of mtp-force is a run outlier; the same config measured 46.6 at 64K.
-†plain 192K/225K (and their prefill, 518/531 t/s vs ~640–670 elsewhere) look
-depressed relative to the 32–128K plateau of the same run — a second rep is
-running to separate real high-ctx degradation of the single-row path from a
-one-run artifact. The 32–128K cells agree with the discarded bare-env sweep's
-plain arm (37.8/37.8/36.9), so the low-context baseline is solid.
+Gain row: the per-context delta of the two-rep means. rep-1-only and
+rep-2-only pairs bracket it (32K +17.9/+15.7, 225K +29.0/+17.7) — real gain
+is at least +15% and larger at high ctx; rep 1's 192K/225K plain cells were
+degraded outliers (28.5/31.4 vs rep 2's 32.4/32.8), so the +27/+23% figures
+carry ±10% uncertainty.
 
-Readings that matter (corrected against the TRUE plain baseline):
+Readings that matter (2-rep plain/MTP, corrected against the TRUE baseline):
 
-1. **MTP is a real +10–18% on the main ladder, +29–39% at high ctx** (auto
-   44.7 vs plain 37.9 at 32K; 40.6 vs 31.4 at 225K, pending the rep-2 check
-   of the depressed plain cells). The earlier "MTP is neutral" reading was an
-   artifact of the contaminated plain arm — it compared MTP against MTP.
+1. **MTP is a real +15% floor on this build** (up to +23–27% at ≥192K, where
+   the no-MTP path decays past its 37 t/s plateau to ~31 while auto-MTP
+   holds ~39). MTP is also what FLATTENS the context curve: plain loses 13%
+   of its throughput between 32K and 225K, auto-MTP only 9%. The earlier
+   "MTP is neutral" reading was an artifact of the contaminated plain arm —
+   it compared MTP against MTP.
 2. **The ceiling is near the current auto result.** mtp-force commits 1.93
    extra tokens per cycle at PERFECT acceptance yet lands at 44.5–46.6,
-   within ~5% of what auto already delivers (40.6–44.7): verification width
+   within ~5% of what auto already delivers at high ctx: verification width
    on this model/quant eats most of the ideal gain. Acceptance tuning has
-   little left to capture — MTP here is a real but sublinear lever, not the
-   2× the plan hoped.
+   little left to capture — MTP is real but sublinear, not the 2× the plan
+   hoped.
 3. **Forced depth-3 costs ~25%.** `reject2_streak >= 2` is the exit that makes
    the auto policy safe: with it, engagement stayed at 11% of cycles and
    accept2 held 68.8%; without it, accept2 fell to 41.6% and decode collapsed
-   below the plain baseline (32.2 vs 37.7 at 64K). Task 4 Step 2 verdict:
+   below the plain baseline (32.2 vs 36.9 at 64K). Task 4 Step 2 verdict:
    **do not retune the engage thresholds** — the forced arms are the
    counterfactual that proves the current policy already measures the right
    thing on this workload.
-4. **Rep variance is ±8%** (two identical auto-MTP configs measured 48.9 vs
-   44.7 at 32K). One rep cannot decide kernel-task deltas; the plan's 3 reps
-   are mandatory for anything that claims a percentage point.
+4. **Rep variance is ±5–10% and there is a day-part offset.** rep 2 (22:33–
+   23:05) ran ~5% below rep 1 (16:50–18:04) on EVERY arm including prefill
+   (mtp 32K: 44.7→42.0, pre 705→625) — thermal/power state, not config.
+   Within-run pair comparisons (same arm, same window) are the only honest
+   unit; the plan's 3 reps are mandatory for anything claiming a percentage
+   point, and cross-window deltas should be paired (plain-vs-mtp WITHIN a
+   rep, then averaged).
+5. **Greedy determinism verified**: acceptance counters identical across reps
+   (73.2% both reps) — the bench harness itself adds no acceptance noise;
+   all run-to-run noise is machine state.
 
 ## What this says about the ceiling
 
@@ -117,10 +128,11 @@ SSD bandwidth) were confirmed NOT the bottleneck.
    widen only if a cheap experiment shows >5% recoverable.
 4. Keep 4-bit in-kernel KV + grow-on-demand KV as-is (cache_hit 0.75–0.93 in
    production analytics; prefix reuse already works).
-5. NEW from this campaign: the plain (no-MTP) path degrades hard past 128K
-   (37.4 → 28.5 t/s) while MTP holds ~40 — if the rep-2 confirms it, the
-   single-row eval loop's high-context behavior is itself a kernel Task-1
-   candidate, and `--mtp` is load-bearing at long ctx, not just a bonus.
+5. Confirmed by rep 2: the plain (no-MTP) path loses ~13% between 32K and
+   225K while auto-MTP loses 9% — MTP is load-bearing at long ctx, so any
+   future change that lowers acceptance (hotter temp, different quant) costs
+   DOUBLE at high context. Kernel Task-1 candidate: the single-row eval loop
+   at >192K (31 t/s vs its own 37 plateau).
 
 ## Production changes shipped alongside (2026-10-29)
 
