@@ -91,7 +91,7 @@ if [ -f "$MODEL_SHA_FILE" ]; then MODEL_SHA="$(cat "$MODEL_SHA_FILE")"; else
     MODEL_SHA="$(shasum -a 256 "$MODEL" | cut -d' ' -f1)"; printf '%s' "$MODEL_SHA" > "$MODEL_SHA_FILE"
 fi
 
-[ -f "$CSV" ] || echo "ts,arm,rep,ladder,git,model_tag,ctx,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tps,kvcache_bytes,mtp_cycles,mtp_accepted,mtp_pct,depth3_cycles,depth3_accept2,swap_peak_mb" >> "$CSV"
+[ -f "$CSV" ] || echo "ts,arm,rep,ladder,git,model_tag,ctx,prefill_tokens,prefill_tps,gen_tokens,gen_tps,gen_first_ms,gen_steady_tokens,gen_steady_tps,kvcache_bytes,mtp_cycles,mtp_accepted,mtp_pct,depth3_cycles,depth3_accept2,swap_peak_mb" >> "$CSV"
 
 swap_used_mb() {
     # vm.swapusage: "total = 2048.00M used = 1062.00M free = ..."; also byte form
@@ -109,23 +109,23 @@ run_ladder() {
     # the engine takes DS4_LOCK_FILE (default /tmp/ds4.lock); the deploy window
     # holds that lock to keep the gateway's slot down, so benches need their own
     local -a envs=("${PROD_ENV[@]+"${PROD_ENV[@]}"}" "DS4_LOCK_FILE=${ORCA_BENCH_LOCK:-/tmp/ds4.lock}") flags=()
+    # The acceptance counters need BOTH flags (bench: --mtp enables the spec path,
+    # --mtp-timing only prints; decoupled 2026-10-29 because the first sweep's
+    # "plain" arm silently ran MTP via the CLI's imply-from-timing behaviour).
     case "$arm" in
         plain) flags=() ;;
-        mtp) flags=(--mtp) ;;
-        mtp-d2) flags=(--mtp); envs+=(DS4_QWEN4_MTP_DEPTH=2) ;;
-        mtp-d3) flags=(--mtp); envs+=(DS4_QWEN4_MTP_DEPTH=3) ;;
-        mtp-force) flags=(--mtp); envs+=(DS4_QWEN4_SPEC_FORCE_ACCEPT=1) ;;
+        mtp) flags=(--mtp --mtp-timing) ;;
+        mtp-d2) flags=(--mtp --mtp-timing); envs+=(DS4_QWEN4_MTP_DEPTH=2) ;;
+        mtp-d3) flags=(--mtp --mtp-timing); envs+=(DS4_QWEN4_MTP_DEPTH=3) ;;
+        mtp-force) flags=(--mtp --mtp-timing); envs+=(DS4_QWEN4_SPEC_FORCE_ACCEPT=1) ;;
         *) die "unknown arm $arm" ;;
     esac
-    # --mtp-timing always: the depth-3 acceptance line costs nothing and is
-    # the campaign's raw data.  It prints at session free, i.e. into $err.
-    flags+=(--mtp-timing)
     local swap0 swap1 peak; swap0="$(swap_used_mb)"
     log "arm=$arm rep=$rep ladder=$label swap0=${swap0}MB"
     # shellcheck disable=SC2086  # CTX_* are word-split flags by design
     env ${envs[@]+"${envs[@]}"} ./ds4-bench -m "$MODEL" --ple "$PLE" \
         --prompt-file "$PROMPT" --prefill-chunk "$PREFILL_CHUNK" \
-        --gen-tokens "$GEN" "${flags[@]}" $ctxflags --csv "$out" 2>"$err"
+        --gen-tokens "$GEN" ${flags[@]+"${flags[@]}"} $ctxflags --csv "$out" 2>"$err"
     swap1="$(swap_used_mb)"; peak=$(( swap0 > swap1 ? swap0 : swap1 ))
     local mc ma mp d3c d3a
     mc=$(sed -n 's/.*mtp: \([0-9]*\) verify cycles.*/\1/p' "$err" | tail -1)
@@ -133,8 +133,8 @@ run_ladder() {
     mp=$(sed -n 's/.*drafts accepted (\([0-9.]*\)%.*/\1/p' "$err" | tail -1)
     d3c=$(sed -n 's/.*depth3: \([0-9]*\) cycles.*/\1/p' "$err" | tail -1)
     d3a=$(sed -n 's/.*depth3: [0-9]* cycles, \([0-9]*\) second-draft.*/\1/p' "$err" | tail -1)
-    while IFS=, read -r ctx pt ptps gt gtps gfms gst skv; do
-        echo "$(date -u +%FT%TZ),$arm,$rep,$label,$GIT,$MODEL_TAG,$ctx,$pt,$ptps,$gt,$gtps,$gfms,$gst,$skv,${mc:-},${ma:-},${mp:-},${d3c:-},${d3a:-},$peak" >> "$CSV"
+    while IFS=, read -r ctx pt ptps gt gtps gfms gstk gst skv; do
+        echo "$(date -u +%FT%TZ),$arm,$rep,$label,$GIT,$MODEL_TAG,$ctx,$pt,$ptps,$gt,$gtps,$gfms,$gstk,$gst,$skv,${mc:-},${ma:-},${mp:-},${d3c:-},${d3a:-},$peak" >> "$CSV"
     done < <(tail -n +2 "$out")
     cat > "$OUTDIR/receipt-$arm-r$rep-$label.json" <<JSON
 {
