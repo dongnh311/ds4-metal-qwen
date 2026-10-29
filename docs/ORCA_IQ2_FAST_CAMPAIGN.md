@@ -37,35 +37,60 @@ accepts well below the `~0.95 deterministic continuation` figure cited in
 (8/8 first-draft accepts engages it) measures the wrong signal — it should
 watch accept2 itself, not infer depth-3 payoff from first-draft streaks.
 
+First PRODUCTION telemetry (the deployed 16:16 slot, printed at session-free
+during the 22:04 drain): `96 verify cycles, 80 drafts accepted (83.3%)`,
+depth-3 `4 cycles, 0 second-draft accepts`. At the gateway's real temp 0.6
+traffic acceptance is HIGHER than the greedy bench (83.3% vs 73.2%) — the
+sampling verifier uses the probability ratio, not argmax equality, and the
+profile's cold start pays off in speculation, not against it. Small sample;
+the counters now print on every session-free, so this number only gets more
+trustworthy with use.
+
 ## Baseline sweep (220K-target protocol)
 
-Sweep 2026-10-29 16:50–18:04, receipts `speed-bench/receipts/orca-iq2-20261029-165008/`,
-merged table at `speed-bench/orca-iq2-baseline.csv`. One rep per arm
-(variance lesson below); gen = greedy continuation of a frozen 1.2 MB ds4.c slice.
+Sweep 2026-10-29 16:50–18:04 (arms mtp/d2/d3/force, receipts
+`speed-bench/receipts/orca-iq2-20261029-165008/`) plus the true-`plain`
+re-run 22:06–22:23 (`…/orca-iq2-20261029-220605/`, after the flag-decoupling
+fix — the 16:50 "plain" arm silently ran MTP because `--mtp-timing` implied
+`--mtp`). Merged table: `speed-bench/orca-iq2-baseline.csv`. One rep per arm
+(variance lesson below); gen = greedy continuation of a frozen 1.2 MB ds4.c
+slice, production launch env mirrored from the live registry.
 
-| arm | 32K | 64K | 128K | 192K | 225K | draft-1 acc | depth-3 accept2 |
+| arm (gen t/s) | 32K | 64K | 128K | 192K | 225K | draft-1 acc | depth-3 accept2 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| plain (true) | *rerun pending — first two "plain" arms measured MTP (see harness bugs)* | | | | | | |
+| plain (true, no MTP) | 37.9 | 37.7 | 37.4 | 28.5 | 31.4 | — | — |
 | mtp (auto depth) | 44.7 | 41.3 | 41.7 | 39.5 | 40.6 | 73.2% | 68.8% (32/280 cycles engaged) |
 | mtp-d2 (forced depth 2) | 48.3 | 41.8 | 40.8 | 40.4 | 40.6 | 74.2% | — (never engages) |
 | mtp-d3 (forced depth 3) | 42.4 | 32.2 | 32.8 | 31.4 | 30.9 | 69.9% | 41.6% (99/238) |
 | mtp-force (accept-all ceiling) | 38.2* | 46.6 | 45.7 | 42.7 | 44.5 | 100% (forced) | 100% |
 
 *The 32K cell of mtp-force is a run outlier; the same config measured 46.6 at 64K.
+†plain 192K/225K (and their prefill, 518/531 t/s vs ~640–670 elsewhere) look
+depressed relative to the 32–128K plateau of the same run — a second rep is
+running to separate real high-ctx degradation of the single-row path from a
+one-run artifact. The 32–128K cells agree with the discarded bare-env sweep's
+plain arm (37.8/37.8/36.9), so the low-context baseline is solid.
 
-Readings that matter:
+Readings that matter (corrected against the TRUE plain baseline):
 
-1. **Forced depth-3 costs ~25%**. `reject2_streak >= 2` is the exit that makes
+1. **MTP is a real +10–18% on the main ladder, +29–39% at high ctx** (auto
+   44.7 vs plain 37.9 at 32K; 40.6 vs 31.4 at 225K, pending the rep-2 check
+   of the depressed plain cells). The earlier "MTP is neutral" reading was an
+   artifact of the contaminated plain arm — it compared MTP against MTP.
+2. **The ceiling is near the current auto result.** mtp-force commits 1.93
+   extra tokens per cycle at PERFECT acceptance yet lands at 44.5–46.6,
+   within ~5% of what auto already delivers (40.6–44.7): verification width
+   on this model/quant eats most of the ideal gain. Acceptance tuning has
+   little left to capture — MTP here is a real but sublinear lever, not the
+   2× the plan hoped.
+3. **Forced depth-3 costs ~25%.** `reject2_streak >= 2` is the exit that makes
    the auto policy safe: with it, engagement stayed at 11% of cycles and
-   accept2 held 68.8%; without it, accept2 fell to 41.6% and decode collapsed.
-   Task 4 Step 2 verdict: **do not retune the engage thresholds** — the current
-   policy already measures the right thing on this workload; the forced arms
-   are the counterfactual that proves it.
-2. **The ceiling is near the auto result.** mtp-force commits 1.93 extra tokens
-   per cycle at perfect acceptance yet lands within a few percent of d2 —
-   verification width on this model/quant eats most of the ideal gain. MTP is
-   roughly neutral-to-small-positive here, not a 2× lever.
-3. **Rep variance is ±8%** (two identical auto-MTP configs measured 48.9 vs
+   accept2 held 68.8%; without it, accept2 fell to 41.6% and decode collapsed
+   below the plain baseline (32.2 vs 37.7 at 64K). Task 4 Step 2 verdict:
+   **do not retune the engage thresholds** — the forced arms are the
+   counterfactual that proves the current policy already measures the right
+   thing on this workload.
+4. **Rep variance is ±8%** (two identical auto-MTP configs measured 48.9 vs
    44.7 at 32K). One rep cannot decide kernel-task deltas; the plan's 3 reps
    are mandatory for anything that claims a percentage point.
 
@@ -81,13 +106,21 @@ SSD bandwidth) were confirmed NOT the bottleneck.
 
 ## Task 4 tuning candidates (from measured data, not guesses)
 
-1. Depth-3 engagement on observed accept2 rate, not first-draft streaks.
-2. `--mtp-margin` (default 3) A/B at production temperature 0.6.
-3. Draft-vocab row count: 65568/248320 rows today; wider rows only if the
-   forced-accept vs opportunistic gap (mtp-force arm) proves row misses cost
-   more than verify width.
+1. ~~Depth-3 engagement on observed accept2 rate~~ — measured, closed: the
+   auto policy's reject2 exit keeps engagement at 11% of cycles with 68.8%
+   accept2; forced d3 (the counterfactual) is 25% worse. Leave thresholds.
+2. `--mtp-margin` (default 3) A/B at production temperature 0.6 — the greedy
+   bench accepts 73%, production sampling traffic 83%; margin trades draft
+   commitment against that distribution.
+3. Draft-vocab row count: 65568/248320 rows today; the force-accept ceiling
+   lands ~5% above auto, so row misses cannot be costing more than that —
+   widen only if a cheap experiment shows >5% recoverable.
 4. Keep 4-bit in-kernel KV + grow-on-demand KV as-is (cache_hit 0.75–0.93 in
    production analytics; prefix reuse already works).
+5. NEW from this campaign: the plain (no-MTP) path degrades hard past 128K
+   (37.4 → 28.5 t/s) while MTP holds ~40 — if the rep-2 confirms it, the
+   single-row eval loop's high-context behavior is itself a kernel Task-1
+   candidate, and `--mtp` is load-bearing at long ctx, not just a bonus.
 
 ## Production changes shipped alongside (2026-10-29)
 

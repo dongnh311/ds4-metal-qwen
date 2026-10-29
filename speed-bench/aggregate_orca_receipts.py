@@ -46,8 +46,12 @@ def harvest(d):
     return rows
 
 def main():
-    dirs = sys.argv[1:] or [d for d in glob.glob(os.path.join(REPO, "speed-bench/receipts/orca-iq2-*"))
-                            if "discard" not in os.path.basename(d)]
+    dirs = sys.argv[1:] or sorted(d for d in glob.glob(os.path.join(REPO, "speed-bench/receipts/orca-iq2-*"))
+                                 if "discard" not in os.path.basename(d))
+    # sorted() is load-bearing, not cosmetic: dedup below lets the LAST dir win
+    # per (arm, rep, ladder, ctx), and glob order is arbitrary — unsorted, the
+    # superseded contaminated `plain` rows of 165008 could overwrite the true
+    # re-run rows of 220605 depending on filesystem enumeration order.
     rows = []
     for d in dirs:
         rows.extend(harvest(d))

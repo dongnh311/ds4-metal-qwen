@@ -37,6 +37,7 @@ CTX_MAIN="${ORCA_CTX_MAIN:---ctx-start 32768 --ctx-max 225280 --step-mul 2}"
 CTX_EXTRA="${ORCA_CTX_EXTRA:---ctx-start 196608 --ctx-max 196608}"
 PREFILL_CHUNK="${ORCA_PREFILL_CHUNK:-4096}"    # mirror production
 RUNS="${ORCA_RUNS:-3}"
+REP_FROM="${ORCA_REP_FROM:-1}"        # e.g. ORCA_ARMS=plain ORCA_REP_FROM=2 ORCA_RUNS=2 reruns only rep 2
 ARMS="${ORCA_ARMS:-plain mtp mtp-d2 mtp-d3 mtp-force}"
 
 log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*"; }
@@ -163,7 +164,7 @@ JSON
 
 log "sweep start: arms=[$ARMS] runs=$RUNS main=[$CTX_MAIN]"
 for arm in $ARMS; do
-    for rep in $(seq 1 "$RUNS"); do
+    for rep in $(seq "$REP_FROM" "$RUNS"); do
         run_ladder "$arm" "$rep" "$CTX_MAIN" main
         [ -n "${ORCA_SKIP_192K:-}" ] || run_ladder "$arm" "$rep" "$CTX_EXTRA" 192k
     done
