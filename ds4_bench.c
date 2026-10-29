@@ -276,7 +276,6 @@ static bench_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--mtp")) {
             c.glm_mtp = true;
         } else if (!strcmp(arg, "--mtp-timing")) {
-            c.glm_mtp = true;
             c.glm_mtp_timing = true;
         } else if (!strcmp(arg, "--ple")) {
             c.ple_path = need_arg(&i, argc, argv, arg);
