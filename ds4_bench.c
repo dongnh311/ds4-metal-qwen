@@ -71,6 +71,8 @@ typedef struct {
     bool cuda_tensor_parallel;
     bool show_output;
     bool teacher_forced_decode;
+    bool glm_mtp;         /* embedded nextn MTP (Qwen3.8, Ornith): --mtp */
+    bool glm_mtp_timing;  /* print acceptance counters at session free */
     bool dspark;
     bool dspark_confidence_threshold_set;
     float dspark_confidence_threshold;
@@ -271,6 +273,11 @@ static bench_config parse_options(int argc, char **argv) {
             c.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp-model")) {
             c.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--mtp")) {
+            c.glm_mtp = true;
+        } else if (!strcmp(arg, "--mtp-timing")) {
+            c.glm_mtp = true;
+            c.glm_mtp_timing = true;
         } else if (!strcmp(arg, "--ple")) {
             c.ple_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--dspark")) {
@@ -654,6 +661,8 @@ int main(int argc, char **argv) {
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
         .mtp_path = cfg.mtp_path,
+        .glm_mtp = cfg.glm_mtp,
+        .glm_mtp_timing = cfg.glm_mtp_timing,
         .ple_path = cfg.ple_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,

@@ -63476,6 +63476,12 @@ struct ds4_session {
     float *qwen4_verify_logits;
     uint64_t qwen4_spec_cycles;
     uint64_t qwen4_spec_accepted;
+    /* Depth-3 diagnostics gated by the same --mtp-timing flag.  The rolling
+     * window in qwen4_spec_depth only proves the FIRST draft paid; these
+     * counters separate the second chained draft: depth-3 verify cycles
+     * issued, and how often its draft actually committed. */
+    uint64_t qwen4_spec_cycles3;
+    uint64_t qwen4_spec_accepted2;
 #endif
     uint32_t glm_dense_cache_len;
     /* GLM MTP speculative state.  parent is the token that conditioned the
@@ -77196,6 +77202,14 @@ void ds4_session_free(ds4_session *s) {
                 fprintf(stderr, "ds4: Qwen3.8 mtp: %" PRIu64 " verify cycles, %" PRIu64 " drafts accepted (%.1f%%)\n",
                         s->qwen4_spec_cycles, s->qwen4_spec_accepted,
                         100.0 * (double)s->qwen4_spec_accepted / (double)s->qwen4_spec_cycles);
+                if (s->qwen4_spec_cycles3) {
+                    fprintf(stderr, "ds4: Qwen3.8 mtp depth3: %" PRIu64 " cycles, %" PRIu64
+                            " second-draft accepts (%.1f%%), %.3f extra tokens per cycle\n",
+                            s->qwen4_spec_cycles3, s->qwen4_spec_accepted2,
+                            100.0 * (double)s->qwen4_spec_accepted2 / (double)s->qwen4_spec_cycles3,
+                            (double)(s->qwen4_spec_accepted + s->qwen4_spec_accepted2)
+                                / (double)s->qwen4_spec_cycles);
+                }
             }
             free(s->qwen4_verify_logits);
             if (s->qwen4_slot >= 0 && s->engine) {
@@ -78254,6 +78268,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
     bool accept = sample_argmax(rows, V) == d || qwen4_spec_force_accept();
     bool accept2 = false;
     if (deep) {
+        s->qwen4_spec_cycles3++;
         accept2 = accept && (sample_argmax(rows + V, V) == d2 || qwen4_spec_force_accept());
     }
     int replacement = -1;
@@ -78317,6 +78332,7 @@ static int ds4_session_qwen4_spec_cycle(ds4_session *s, int first_token, float t
             qwen4_pld_override(s, -1, parent, depth);
         }
         s->qwen4_spec_accepted++;
+        if (deep) s->qwen4_spec_accepted2++;
         accepted[0] = first_token;
         accepted[1] = d;
         if (deep) accepted[2] = d2;
