@@ -803,7 +803,8 @@ int main(int argc, char **argv) {
     const bool distributed =
         cfg.dist.role == DS4_DISTRIBUTED_COORDINATOR ||
         cfg.tp.role == DS4_TP_LEADER;
-    const bool speculative = cfg.dspark && ds4_engine_mtp_draft_tokens(engine) > 1;
+    const int draft_tokens = ds4_engine_mtp_draft_tokens(engine);
+    const bool speculative = (cfg.dspark || cfg.glm_mtp) && draft_tokens > 1;
     if (cfg.dspark && !speculative) {
         fprintf(stderr, "ds4-bench: DSpark support model did not enable speculative decoding\n");
         if (out != stdout) fclose(out);
@@ -814,8 +815,9 @@ int main(int argc, char **argv) {
     }
     if (speculative) {
         fprintf(stderr,
-                "ds4-bench: DSpark enabled with draft width %d; frontier restoration uses session snapshots\n",
-                ds4_engine_mtp_draft_tokens(engine));
+                "ds4-bench: speculative decode enabled (%s, draft width %d); "
+                "frontier restoration uses session snapshots\n",
+                cfg.dspark ? "DSpark" : "embedded MTP", draft_tokens);
     }
     ds4_session_snapshot snap = {0};
     const uint64_t snapshot_max_bytes = bench_snapshot_max_bytes();

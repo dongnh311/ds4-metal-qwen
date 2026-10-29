@@ -49,6 +49,31 @@ fi
 [ -f "$MODEL" ] || die "model not found: $MODEL"
 [ -f "$PLE" ]   || die "PLE sidecar not found: $PLE"
 
+# Mirror the production launch environment. The live ds4 row runs the engine
+# under /usr/bin/env VAR=value pairs (MTP draft vocab, grow-on-demand KV,
+# streamed full layers); measuring without them measures a configuration
+# nobody runs. ORCA_SKIP_PROD_ENV=1 opts out (e.g. a machine with no registry).
+PROD_ENV=()
+if [ -z "${ORCA_SKIP_PROD_ENV:-}" ]; then
+    REG="${ORCA_REGISTRY:-$HOME/.local/ai-gateway/runtime-registry.json}"
+    ROW="${ORCA_ROW:-ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2}"
+    [ -f "$REG" ] || die "registry not found: $REG (or set ORCA_SKIP_PROD_ENV=1)"
+    while IFS= read -r kv; do
+        [ -n "$kv" ] && PROD_ENV+=("$kv")
+    done < <(python3 - "$REG" "$ROW" <<'PY'
+import json, sys
+reg, row = sys.argv[1:3]
+pc = json.load(open(reg))["models"][row]["runtimes"]["ds4"]["process_command"]
+for tok in pc[1:]:
+    if "=" in tok and not tok.startswith("/") and tok.split("=", 1)[0].replace("_", "").isalnum():
+        print(tok)
+    else:
+        break
+PY
+    ) || die "could not parse the env prefix from $REG row $ROW"
+    log "production env mirrored: ${PROD_ENV[*]:-none}"
+fi
+
 mkdir -p "$OUTDIR" "$(dirname "$PROMPT")"
 if [ ! -s "$PROMPT" ]; then
     head -c "$PROMPT_BYTES" ds4.c > "$PROMPT"
@@ -83,7 +108,7 @@ run_ladder() {
     local out="$OUTDIR/run-$arm-r$rep-$label.csv" err="$OUTDIR/run-$arm-r$rep-$label.err"
     # the engine takes DS4_LOCK_FILE (default /tmp/ds4.lock); the deploy window
     # holds that lock to keep the gateway's slot down, so benches need their own
-    local -a envs=("DS4_LOCK_FILE=${ORCA_BENCH_LOCK:-/tmp/ds4.lock}") flags=()
+    local -a envs=("${PROD_ENV[@]+"${PROD_ENV[@]}"}" "DS4_LOCK_FILE=${ORCA_BENCH_LOCK:-/tmp/ds4.lock}") flags=()
     case "$arm" in
         plain) flags=() ;;
         mtp) flags=(--mtp) ;;
