@@ -1,0 +1,17 @@
+ds4: PLE sidecar table: /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf (ple.weight [160, 320001536], CPU-only)
+ds4: PLE sidecar demand-paged (insufficient RAM headroom or DS4_QWEN4_PLE_PREFETCH_FULL=0)
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /Users/dongnh/orca/workspaces/ds4-metal/develop/ (exe-relative)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 1.036 ms, residency requested in 316.321 ms, warmup 4.768 ms (mapped 41643.70 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 5.79 GiB (raw 5.59 + compressed 0.20) + buffers 5.50 GiB + resident model 40.67 GiB = 51.96 GiB planned
+ds4: memory detail: ctx=225281 prefill_cap=4096 raw_kv_rows=225281 compressed_kv_rows=56321 backend=metal
+ds4-bench: context buffers 11565.31 MiB (ctx=225281, backend=metal, prefill_chunk=4096, raw_kv_rows=225281, compressed_kv_rows=56321)
+ds4: in-kernel 4-bit KV cache active (per-64-block scale)
+ds4: qwen4 grow-on-demand KV: 32768 of 225281 rows allocated up front
+ds4-bench: speculative decode enabled (embedded MTP, draft width 2); frontier restoration uses session snapshots
+ds4: qwen4 KV capacity 32768 -> 65536 rows (+0.38 GiB)
+ds4: qwen4 KV capacity 65536 -> 225281 rows (+1.86 GiB)

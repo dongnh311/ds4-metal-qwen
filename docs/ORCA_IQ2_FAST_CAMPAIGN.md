@@ -115,14 +115,109 @@ scheduled before Phase 1 kernel rewrites despite the plan's ordering, and why
 the PLE/n-gram disk reads (~24 pread rows/token, sorted, batched; well under
 SSD bandwidth) were confirmed NOT the bottleneck.
 
-## Task 4 tuning candidates (from measured data, not guesses)
+## Task 2 — temperature A/B at the real sampling distribution (2026-10-30)
+
+`speed-bench/run-mtp-accept-ab.py` (server-level, the EXACT registry command =
+PROD binary + steering + draft vocab + `--mtp --mtp-timing`, only
+port/kv-dir/lock swapped), 6 fixed seeded streaming `/v1/completions` prompts
+(py, c, vi, json, math, agent), 300 tokens each, per-arm server SIGTERM drain
+printing the acceptance counters. Raw rows:
+`speed-bench/mtp-accept-task2.csv`; full server logs:
+`speed-bench/receipts/accept-ab-20261030-084242/`.
+
+| temp | cycles | draft-1 acc | committed tok/cycle | mean decode | mean TTFT |
+|---:|---:|---:|---:|---:|---:|
+| 0.0 (greedy) | 1073 | 65.9% | 1.678 | 48.0 t/s | 0.59 s |
+| 0.3 | 969 | 65.9% | 1.759 | 47.1 t/s | 0.59 s |
+| 0.6 (LIVE) | 968 | 68.5% | 1.860 | 46.4 t/s | 0.58 s |
+| 1.0 | 858 | 71.2% | 2.008 | 44.0 t/s | 0.59 s |
+
+Verdicts:
+
+1. **`--mtp-margin` is RETRACTED as a Qwen3.8 lever.** Zero margin references
+   in the qwen4 spec region; the `top0-top1 >= 3` gate (ds4.c:88926) belongs
+   to the Ornith/dspark drafting loop. The gateway profile now says so
+   (AI-Gateway commit ad4b1261).
+2. **The cold-start reasoning was backwards.** Acceptance RISES with
+   temperature (1.678 → 2.008 tokens/cycle): the probability verifier accepts
+   near-miss drafts that strict argmax equality rejects. The measured decode
+   cost of temperature (−3.3% at 0.6, −8.3% at 1.0) is the sampler building a
+   248K-row distribution every cycle — not lost speculation.
+3. **temp 0.6 stands, on an honest argument**: reliability (loop-prone family,
+   agentic JSON) at a known ~3% price, speculation actually slightly better
+   than greedy. The loop-counter half of the pre-registered A/B stays OPEN
+   (needs a working day of `sampling_override` traffic per arm).
+4. Per-request TTFT ~0.6 s at small prompts on a warm session confirms the
+   prefill story below is about MISSES, not about the serving path.
+
+## Task 1 — prefill/TTFT (2026-10-30)
+
+`speed-bench/run-prefill-task1.sh`, receipts `prefill-20261030-085108/`,
+table `speed-bench/prefill-task1.csv`. Morning window (08:52–10:04).
+
+**P1 — rep 3 lands the Task-0 numbers at n=3 paired reps**
+(`orca-iq2-baseline.csv`, all 3 reps of plain+mtp now):
+
+| ctx | plain (3-rep) | mtp (3-rep) | paired gains per rep | MTP gain |
+|---|---:|---:|---|---:|
+| 32K | 37.1 | 43.5 | +18.0 / +15.9 / +18.6 | **+17.5%** |
+| 64K | 36.7 | 40.1 | +9.7 / +4.4 / +14.2 | **+9.4%** |
+| 128K | 36.0 | 40.5 | +11.6 / +15.1 / +11.1 | **+12.6%** |
+| 192K | 31.5 | 39.3 | +38.7 / +17.4 / +20.3 | **+25.4%** |
+| 225K | 32.9 | 40.0 | +29.2 / +17.7 / +18.4 | **+21.8%** |
+
+The rep-1 192K outlier (+38.7%) shrinks to +17–20% with the 22:33 and 08:52
+reps; the durable reading is **MTP = +9–25%, no ctx where it is negative**,
+and the high-ctx half of the curve (192–225K, +22–25%) is where production
+sessions actually live.
+
+**P2 — the prefill depth curve at CONSTANT segment size.** Task-0's doubling
+ladder confounds segment size (32K/64K/94K) with depth; the equal-32K-step
+ladder removes it. Auto-MTP, chunk 4096, gen 128:
+
+```
+depth:     32K     64K     98K    131K    164K    197K    225K
+t/s:    702.96  676.35  672.79  660.46  654.79  646.91  635.04
+```
+
+−9.7% from 32K to 225K at equal segments — prefill is NOT quadratically
+collapsing on this model (4-bit in-kernel KV + chunked attention keep the
+depth curve gentle). A cold 200K-token prompt costs ≈ 200K/660 ≈ 300 s of
+prefill regardless of position; the earlier apparent 518 t/s 'collapse' in
+the Task-0 plain rows was segment-order noise, not depth. **The real TTFT
+lever is therefore cache hits (already 0.75–0.93 in production analytics),
+not faster prefill math.**
+
+**P3 — `--prefill-chunk` sweep, pure prefill (gen 0), same equal ladder:**
+
+| chunk | 32K | 64K | 98K | 131K | 164K | 197K | 225K | mean |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 2048 | 650.6 | 631.2 | 629.1 | 618.8 | 614.5 | 607.9 | 599.7 | 621.7 |
+| **4096 (prod)** | 702.4 | 680.5 | 673.7 | 660.3 | 654.2 | 644.9 | 636.4 | 664.6 |
+| **8192** | 740.4 | 711.9 | 713.1 | 700.6 | 690.2 | 682.1 | 666.6 | **700.7** |
+| 16384 | 720.6 | 660.5 | 636.6 | 627.7 | 631.5 | 616.0 | 451.7 | 620.4 |
+
+**8192 beats production 4096 on EVERY frontier (+4.5–6.5%, mean +5.4%)**,
+and it ran AFTER 4096 in the window — the day-part drift direction makes
+that a floor, not a ceiling. 2048 is −6.5%, 16384 wins only at 32K then
+falls off a cliff at 225K (451 — a residency/scratch cliff worth
+understanding before anyone proposes bigger chunks again).
+
+Decision gate before touching the production flag (window4): (V1) 8192 with
+decode ON and an RSS/swap sampler — it must not push a 64 GB box toward
+pressure; (V2) deploy-smoke BYTE IDENTITY vs the recorded 4096 refs — chunk
+size changes batch shape, and batched reductions have flipped greedy ties
+before in this engine. Only if BOTH pass does `--prefill-chunk` become 8192.
+
 
 1. ~~Depth-3 engagement on observed accept2 rate~~ — measured, closed: the
    auto policy's reject2 exit keeps engagement at 11% of cycles with 68.8%
    accept2; forced d3 (the counterfactual) is 25% worse. Leave thresholds.
-2. `--mtp-margin` (default 3) A/B at production temperature 0.6 — the greedy
-   bench accepts 73%, production sampling traffic 83%; margin trades draft
-   commitment against that distribution.
+2. ~~`--mtp-margin` A/B~~ — CLOSED 2026-10-30, twice: margin is not read by
+   the qwen4 spec path at all (Ornith/dspark-only, ds4.c:88926), AND the
+   temperature A/B that replaced it (Task 2 above) shows acceptance rises with
+   temperature rather than falling, so the cold-start premise was inverted.
+   0.6 stands on reliability grounds at a measured ~3% decode price.
 3. Draft-vocab row count: 65568/248320 rows today; the force-accept ceiling
    lands ~5% above auto, so row misses cannot be costing more than that —
    widen only if a cheap experiment shows >5% recoverable.

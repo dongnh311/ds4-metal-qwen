@@ -64,7 +64,7 @@ PY
 fi
 
 mkdir -p "$OUTDIR"
-[ -f "$CSV" ] || echo "ts,label,prefill_chunk,gen_tokens,ctx,prefill_tokens,prefill_tps,gen_tps,gen_steady_tps,mtp_pct,depth3_cycles,depth3_accept2" >> "$CSV"
+[ -f "$CSV" ] || echo "ts,label,prefill_chunk,gen_tokens,ctx,prefill_tokens,prefill_tps,bench_gen_tokens,gen_tps,mtp_pct,depth3_cycles,depth3_accept2" >> "$CSV"
 
 run_case() {
     local label="$1" chunk="$2" gen="$3"; shift 3
