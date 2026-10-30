@@ -209,6 +209,42 @@ pressure; (V2) deploy-smoke BYTE IDENTITY vs the recorded 4096 refs — chunk
 size changes batch shape, and batched reductions have flipped greedy ties
 before in this engine. Only if BOTH pass does `--prefill-chunk` become 8192.
 
+**Window4 — the two gates (10:18–10:37, receipts `prefill-20261030-101759/`):**
+
+- V2 BYTE GATE **PASSED**: deploy-smoke against a registry COPY carrying 8192,
+  same PROD binary, compared to the recorded greedy 4096 refs — all three
+  outputs (vi 232 tok, code 300 tok, tool 68+102 tok) came back
+  "same as ref". Chunk size does not flip a single token on this model/path.
+- V1 decode/acceptance at 8192 with gen ON: prefill 801.7→668.5 t/s
+  (32K→225K, still above every 4096 frontier), decode 48.2/43.3/…/39.8 t/s,
+  acceptance 74.3% (n=495 cycles) — same distribution as the 4096 ladder.
+  BUT the window's sampler showed machine swap climbing 983→2973 MB. On a
+  64 GB box that is a stop-and-measure flag, not a footnote.
+
+**Window5 — memory A/B on the REAL server command (10:46–10:53, receipts
+`memab-8192-20261030/`):** exact registry `process_command` per arm (262K
+ctx, steering, vision sidecar, KV disk), only `--prefill-chunk` and port/kv
+swapped; 3 min idle sampling + 4 real chat requests per arm.
+
+| arm | swap start | swap peak | server RSS peak | req walls |
+|---|---:|---:|---:|---|
+| 4096 | 2885 MB | 2885 MB | 4173 MB | 5/5/4/4 s |
+| 8192 | 2885 MB | **2885 MB (delta 0)** | 7023 MB | 5/5/4/4 s |
+
+The window4 swap climb was RESIDUAL from the earlier bench windows (both arms
+started at 2885 MB and neither grew); 8192's real cost is RSS ≈ +2.9 GB of
+logits scratch (chunk × vocab × 4 B) with zero swap movement, and identical
+request walls. Pre-registered rule (switch only if swap delta ≤ +1.5 GB):
+**PASSED at 0 MB.**
+
+**DECISION 2026-10-30 11:33: production `--prefill-chunk` 4096 → 8192.**
+Live registry edited (backup `runtime-registry.json.bak-prefillchunk8192-20261030`),
+slot SIGTERMed on a quiet window, gateway relaunched it from the mtime-cached
+registry; running process verified `--prefill-chunk 8192`, gateway `/status`
+green, test request 200. Expected effect: +5.4–14% prefill on cold long
+prompts (TTFT), byte-identical outputs. Rollback = restore the backup and
+SIGTERM the slot.
+
 
 1. ~~Depth-3 engagement on observed accept2 rate~~ — measured, closed: the
    auto policy's reject2 exit keeps engagement at 11% of cycles with 68.8%

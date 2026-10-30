@@ -1,0 +1,63 @@
+ds4: PLE sidecar table: /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf (ple.weight [160, 320001536], CPU-only)
+ds4: PLE sidecar demand-paged (insufficient RAM headroom or DS4_QWEN4_PLE_PREFETCH_FULL=0)
+ds4: Metal device Apple M5 Pro, 64.00 GiB RAM
+ds4: Metal kernel source dir: /Users/dongnh/.local/share/ai-gateway/ds4-metal/ (exe-relative)
+ds4: Metal 4 tensor API enabled for Tensor kernels
+ds4: drift-patch flags hc_stable=on norm_unify=on kv_raw_f32=off rope_exp2_log2=off math_safe=off tensor_matmul=on
+ds4: Metal model views created in 0.879 ms, residency requested in 307.153 ms, warmup 2.372 ms (mapped 41643.70 MiB from offset 10.51 MiB)
+ds4: Metal mapped mmaped model as 2 overlapping shared buffers
+ds4: Metal model views created in 0.063 ms, residency requested in 463.409 ms, warmup 1.119 ms (mapped 588.12 MiB from offset 0.02 MiB)
+ds4: Metal mapped mmaped model as 3 overlapping shared buffers
+ds4: metal backend initialized for graph diagnostics
+ds4: memory: KV 6.76 GiB (raw 6.50 + compressed 0.25) + buffers 11.24 GiB + resident model 40.67 GiB = 58.67 GiB planned
+ds4: memory detail: ctx=262144 prefill_cap=8192 raw_kv_rows=262144 compressed_kv_rows=65537 backend=metal
+1030 10:49:55 ds4-server: context buffers 18433.13 MiB (ctx=262144, backend=metal, prefill_chunk=8192, raw_kv_rows=262144, compressed_kv_rows=65537)
+ds4: in-kernel 4-bit KV cache active (per-64-block scale)
+ds4: qwen4 grow-on-demand KV: 32768 of 262144 rows allocated up front
+ds4: Qwen3.8 directional steering enabled: /Users/dongnh/.local/share/ai-gateway/ds4-models/adapters/refusal-4-44.f32 attn=0 ffn=0.5
+1030 10:49:55 ds4-server: keyed kv cache directory /tmp/ds4-memab/kv-8192/steer-19516f04
+1030 10:49:55 ds4-server: KV disk cache /tmp/ds4-memab/kv-8192/steer-19516f04 (budget=32768 MiB, cross-quant=accept, min=512, cold_max=262144, continued=10000, trim=32, align=2048, hit_half_life=21600s, idle_half_life=86400s)
+1030 10:49:55 ds4-server: listening on http://127.0.0.1:18299
+1030 10:52:56 ds4-server: chat ctx=0..70:70 prompt start
+1030 10:52:56 ds4-server: chat ctx=0..70:70 prefill chunk 70/70 (100.0%) chunk=0.00 t/s avg=139.62 t/s 0.501s
+1030 10:52:56 ds4-server: chat ctx=0..70:70 prompt done 0.501s
+ds4: MTP draft head: 65568 of 248320 vocabulary rows from /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt (170 MiB)
+1030 10:52:57 ds4-server: chat ctx=70..120:50 gen=50 THINKING decoding chunk=43.96 t/s avg=43.96 t/s 1.137s
+1030 10:52:59 ds4-server: chat ctx=120..170:50 gen=100 THINKING decoding chunk=43.10 t/s avg=43.53 t/s 2.297s
+1030 10:53:00 ds4-server: chat ctx=170..220:50 gen=150 THINKING decoding chunk=42.31 t/s avg=43.12 t/s 3.479s
+1030 10:53:00 ds4-server: chat ctx=220..250:30 gen=180 THINKING decoding chunk=44.30 t/s avg=43.31 t/s 4.156s
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+1030 10:53:00 ds4-server: chat ctx=0..70:70 gen=180 THINKING finish=length 4.658s
+1030 10:53:00 ds4-server: live kv cache miss live=250 prompt=75 common=45 vision=match reason=token-mismatch
+1030 10:53:00 ds4-server: chat ctx=0..75:75 prompt start
+1030 10:53:01 ds4-server: chat ctx=0..75:75 prefill chunk 75/75 (100.0%) chunk=0.00 t/s avg=173.62 t/s 0.432s
+1030 10:53:01 ds4-server: chat ctx=0..75:75 prompt done 0.432s
+1030 10:53:02 ds4-server: chat ctx=75..125:50 gen=50 THINKING decoding chunk=42.09 t/s avg=42.09 t/s 1.188s
+1030 10:53:03 ds4-server: chat ctx=125..175:50 gen=100 THINKING decoding chunk=44.68 t/s avg=43.35 t/s 2.307s
+1030 10:53:04 ds4-server: chat ctx=175..225:50 gen=150 THINKING decoding chunk=46.43 t/s avg=44.33 t/s 3.384s
+1030 10:53:05 ds4-server: chat ctx=225..255:30 gen=180 THINKING decoding chunk=39.01 t/s avg=43.35 t/s 4.153s
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+1030 10:53:05 ds4-server: chat ctx=0..75:75 gen=180 THINKING finish=length 4.585s
+1030 10:53:05 ds4-server: live kv cache miss live=255 prompt=73 common=45 vision=match reason=token-mismatch
+1030 10:53:05 ds4-server: chat ctx=0..73:73 prompt start
+1030 10:53:06 ds4-server: chat ctx=0..73:73 prefill chunk 73/73 (100.0%) chunk=0.00 t/s avg=173.17 t/s 0.422s
+1030 10:53:06 ds4-server: chat ctx=0..73:73 prompt done 0.422s
+1030 10:53:07 ds4-server: chat ctx=73..123:50 gen=50 THINKING decoding chunk=46.29 t/s avg=46.29 t/s 1.080s
+1030 10:53:08 ds4-server: chat ctx=123..173:50 gen=100 THINKING decoding chunk=44.16 t/s avg=45.20 t/s 2.212s
+1030 10:53:09 ds4-server: chat ctx=173..223:50 gen=150 THINKING decoding chunk=43.76 t/s avg=44.71 t/s 3.355s
+1030 10:53:10 ds4-server: chat ctx=223..253:30 gen=180 THINKING decoding chunk=44.65 t/s avg=44.70 t/s 4.027s
+ds4-server: thinking not closed, ignoring incomplete Qwen tool calls in reasoning
+1030 10:53:10 ds4-server: chat ctx=0..73:73 gen=180 THINKING finish=length 4.449s
+1030 10:53:10 ds4-server: live kv cache miss live=253 prompt=68 common=45 vision=match reason=token-mismatch
+1030 10:53:10 ds4-server: chat ctx=0..68:68 prompt start
+1030 10:53:10 ds4-server: chat ctx=0..68:68 prefill chunk 68/68 (100.0%) chunk=0.00 t/s avg=163.89 t/s 0.415s
+1030 10:53:10 ds4-server: chat ctx=0..68:68 prompt done 0.415s
+1030 10:53:11 ds4-server: chat ctx=0..68:68 thinking closed after 45 tokens
+1030 10:53:11 ds4-server: chat ctx=68..118:50 gen=50 decoding chunk=50.45 t/s avg=50.45 t/s 0.991s
+1030 10:53:12 ds4-server: chat ctx=118..168:50 gen=100 decoding chunk=53.92 t/s avg=52.13 t/s 1.918s
+1030 10:53:13 ds4-server: chat ctx=168..218:50 gen=150 decoding chunk=55.33 t/s avg=53.15 t/s 2.822s
+1030 10:53:13 ds4-server: chat ctx=218..248:30 gen=180 decoding chunk=56.97 t/s avg=53.75 t/s 3.349s
+1030 10:53:13 ds4-server: chat ctx=0..68:68 gen=180 finish=length 3.764s
+1030 10:53:43 ds4-server: shutdown requested, draining requests
+ds4: Qwen3.8 mtp: 387 verify cycles, 258 drafts accepted (66.7%)
+ds4: Qwen3.8 mtp depth3: 4 cycles, 0 second-draft accepts (0.0%), 0.667 extra tokens per cycle

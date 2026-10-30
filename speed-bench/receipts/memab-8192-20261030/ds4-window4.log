@@ -1,0 +1,17 @@
+=== window4 start Fri Oct 30 10:17:57 +07 2026 ===
+quiet: no real request in the last 300 s, nothing in flight
+w4: window held (pid 52974) Fri Oct 30 10:17:59 +07 2026
+w4: env mirrored: DS4_QWEN4_STREAM_FULL_LAYERS=32 DS4_QWEN4_PLE_PREFETCH_FULL=0 DS4_QWEN4_MTP_DRAFT_VOCAB=/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt DS4_QWEN4_KV_GROW=1 DS4_QWEN4_KVA_SPLIT=36 DS4_QWEN4_KVA_TAIL=2048
+--- V1: equal32k chunk 8192 gen 128 (+RSS sampler) ---
+w4: V1 done; peak RSS: 9276 MB
+--- V2: byte gate — registry COPY at chunk 8192 vs recorded 4096 refs ---
+w4: /tmp/rr-8192.json written, chunk: 8192
+deploy: smoke model: ivanfioravanti--Qwen3.8-Flash-Next-DS4-IQ2
+deploy: smoke: /usr/bin/env DS4_QWEN4_STREAM_FULL_LAYERS=32 DS4_QWEN4_PLE_PREFETCH_FULL=0 DS4_QWEN4_MTP_DRAFT_VOCAB=/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt DS4_QWEN4_KV_GROW=1 DS4_QWEN4_KVA_SPLIT=36 DS4_QWEN4_KVA_TAIL=2048 /Users/dongnh/.local/share/ai-gateway/ds4-metal/ds4-server --metal -m /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-DenseQ4Kselimat-MTP.gguf --ple /Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-PLE-Q4_1.gguf -c 262144 --prefill-chunk 8192 --mtp --mtp-timing --kv-disk-dir /tmp/ds4-smoke-8192/kv --kv-disk-space-mb 32768 --kv-cache-cold-max-tokens 262144 --think-budget 4096 --host 127.0.0.1 --port 18297 --vision /Users/dongnh/.local/share/ai-gateway/ds4-models/mmproj-Qwen3.8-Flash-Next-Q8_0.gguf --dir-steering-file /Users/dongnh/.local/share/ai-gateway/ds4-models/adapters/refusal-4-44.f32 --dir-steering-ffn 0.5
+deploy: smoke vi: 232 tokens in 5.3 s (43.6 t/s incl. prefill), ok, same as ref
+deploy: smoke code: 300 tokens in 6.7 s (45.0 t/s incl. prefill), ok, same as ref
+deploy: smoke tool: leg 1 68 + leg 2 102 tokens in 4.5 s, ok, same as ref
+deploy: smoke outputs in /tmp/ds4-smoke-8192
+--- release ---
+=== window4 DONE Fri Oct 30 10:37:19 +07 2026 ===
+/Users/dongnh/.local/share/opencode/shell/673e778eb4444eb2af1d4b9697757b798311bad2/window4-verify8192.sh: line 93: 52974 Terminated: 15          python3 -c 'import fcntl,os,time; fd=os.open("/tmp/ds4.lock",os.O_RDWR|os.O_CREAT,0o600); fcntl.flock(fd,fcntl.LOCK_EX); os.ftruncate(fd,0); os.write(fd,str(os.getpid()).encode()); time.sleep(7200)'  (wd: ~/Documents/GitHub/ds4-metal)

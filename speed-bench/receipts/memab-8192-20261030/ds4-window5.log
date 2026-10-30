@@ -1,0 +1,9 @@
+=== window5 start Fri Oct 30 10:46:02 +07 2026 ===
+quiet: no real request in the last 300 s, nothing in flight
+w5: window held (pid 77148) Fri Oct 30 10:46:04 +07 2026
+baseline swap now: 2885 MB
+chunk=4096  idle-swap start=2885MB peak=2885MB | server RSS peak=4173MB | req walls ['5', '5', '4', '4']
+chunk=8192  idle-swap start=2885MB peak=2885MB | server RSS peak=7023MB | req walls ['5', '5', '4', '4']
+VERDICT: 4096 peak=2885MB, 8192 peak=2885MB, delta=0MB (rule: switch only if <=1500)
+/Users/dongnh/.local/share/opencode/shell/673e778eb4444eb2af1d4b9697757b798311bad2/window5-run.sh: line 20: 77148 Terminated: 15          python3 -c 'import fcntl,os,time; fd=os.open("/tmp/ds4.lock",os.O_RDWR|os.O_CREAT,0o600); fcntl.flock(fd,fcntl.LOCK_EX); os.ftruncate(fd,0); os.write(fd,str(os.getpid()).encode()); time.sleep(7200)'
+=== window5 DONE Fri Oct 30 10:53:44 +07 2026 ===
