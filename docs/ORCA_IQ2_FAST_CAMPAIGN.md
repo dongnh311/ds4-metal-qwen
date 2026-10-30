@@ -158,18 +158,29 @@ table `speed-bench/prefill-task1.csv`. Morning window (08:52–10:04).
 **P1 — rep 3 lands the Task-0 numbers at n=3 paired reps**
 (`orca-iq2-baseline.csv`, all 3 reps of plain+mtp now):
 
-| ctx | plain (3-rep) | mtp (3-rep) | paired gains per rep | MTP gain |
+| ctx | plain | mtp | paired gains r1 / r2 / r3 / r4 | MTP gain (n=4) |
 |---|---:|---:|---|---:|
-| 32K | 37.1 | 43.5 | +18.0 / +15.9 / +18.6 | **+17.5%** |
-| 64K | 36.7 | 40.1 | +9.7 / +4.4 / +14.2 | **+9.4%** |
-| 128K | 36.0 | 40.5 | +11.6 / +15.1 / +11.1 | **+12.6%** |
-| 192K | 31.5 | 39.3 | +38.7 / +17.4 / +20.3 | **+25.4%** |
-| 225K | 32.9 | 40.0 | +29.2 / +17.7 / +18.4 | **+21.8%** |
+| 32K | 36.8 | 43.5 | +18.0 / +15.9 / +18.6 / +21.9 | **+18.6%** |
+| 64K | 36.2 | 40.2 | +9.7 / +4.4 / +14.2 / +17.1 | **+11.3%** |
+| 128K | 36.2 | 40.5 | +11.6 / +15.1 / +11.1 / +9.6 | **+11.9%** |
+| 192K | 32.3 | 39.3 | +38.7 / +17.4 / +20.3 / +13.3 | **+22.4%** |
+| 225K | 33.3 | 40.1 | +29.2 / +17.7 / +18.4 / +17.2 | **+20.6%** |
 
-The rep-1 192K outlier (+38.7%) shrinks to +17–20% with the 22:33 and 08:52
-reps; the durable reading is **MTP = +9–25%, no ctx where it is negative**,
-and the high-ctx half of the curve (192–225K, +22–25%) is where production
-sessions actually live.
+Reps 1–3 ran at chunk 4096; **rep 4 (12:04, window6) ran at the new
+production chunk 8192** — see the validation note below. The rep-1 192K
+outlier (+38.7%) is now matched by a low draw (+13.3%): the durable reading
+is **MTP = +11–22% mean, never negative at any ctx**, and the 192K cell's
+±10% spread is machine/thermal variance, not sample starvation — four reps
+of a noisy cell say the truth is near +22%, not that +38% was real.
+
+**Rep 4 doubles as the chunk-8192 production validation.** Against the
+reps-1–3 means at identical ladders: mtp-arm DECODE is flat at every
+frontier (−0.1 … +0.6% — the chunk flip has no decode side effect), mtp-arm
+PREFILL rises +8–18% (643→712, 646→712, 620→683 …), matching the pure-prefill
+sweep's +5.4% floor and the V1 ladder reading. Plain-arm decode scatter
+(−6 … +10%) is the known rep variance, same window, same rule as item 4 of
+the Task-0 caveats. `prefill_chunk` is now a column of the baseline CSV, so
+reps and chunk provenance can never be conflated again.
 
 **P2 — the prefill depth curve at CONSTANT segment size.** Task-0's doubling
 ladder confounds segment size (32K/64K/94K) with depth; the equal-32K-step
@@ -245,6 +256,49 @@ green, test request 200. Expected effect: +5.4–14% prefill on cold long
 prompts (TTFT), byte-identical outputs. Rollback = restore the backup and
 SIGTERM the slot.
 
+## Task 2b — loop-attractor replay, the cheap half of the open A/B item (2026-10-30)
+
+`speed-bench/run-loop-attract-ab.py`, rows in `speed-bench/loop-attract-ab.csv`,
+server logs `speed-bench/receipts/loop-ab-20261030-114820/`. Methodology
+inherited from AI-Gateway `reports/loop-sampling-ab-2026-07-27.md`: the real
+27/07 failure's attractor verbatim (aes-gcm ×6) + two synthetic agent-door
+attractors; the backend is deterministic per (prompt, temp, seed) so sampling
+comes from varying SEEDS, not reps; no judge — LOOP = structural line-
+uniqueness (<0.8 over ≥4 lines), identifier correctness = difflib-close-to-
+known (the escape-but-typo `aes_gccm::{Nec256Gcmm}` failure mode is counted
+separately). Arms: greedy/0.3/0.6/1.0, top_p 0.95 + top_k 20 always, the PROD
+registry command.
+
+| temp | LOOPs | bad ids | ok ids | arm acc |
+|---:|---:|---:|---:|---:|
+| 0.0 | 4/7 | 8 | 62 | 63.1% |
+| 0.3 | 4/7 | 6 | 68 | 62.1% |
+| 0.6 (LIVE) | 3/7 | 6 | 65 | 64.6% |
+| 1.0 | 2/7 | 7 | 68 | 67.0% |
+
+Three readings:
+
+1. **The historic aes-gcm attractor does not bite THIS model at ANY
+   temperature — greedy included (uniq 1.00, 4 arms × 3 seeds).** The 27/07
+   loop was a model-generation problem fixed by the upgrade. The profile's
+   argument from the Qwen3 card is weakened as evidence for THIS build.
+2. **The edit-echo attractor shows the real temperature effect**: greedy and
+   0.3 both loop on 2/2 seeds; 0.6 escapes one of two; 1.0 escapes both. Warm
+   sampling is measurably loop-resistant on agent-echo continuation with NO
+   identifier-quality cost (bad ids flat 6–8 across arms).
+3. vienum looped in every arm — admitted harness artifact: the prompt primes
+   an alternating enumeration, so correctly continuing the pattern scores as
+   a loop. Discarded, not counted as evidence.
+
+Verdict on the open item: **0.6 survives the cheap replay** (2→1 loop draws
+on editecho, zero correctness price), but the honest statement is now that on
+Qwen3.8-Flash-Next temperature is a *partial* mitigator (0/2 only at 1.0) and
+the headline 27/07 failure mode would not have reproduced even at greedy.
+n=2–3 draws per arm — directional, not statistical. The FULL half (retry_loop
+/retry_empty/ir_repair counters per sampling_override arm on live traffic,
+analytics.events) still needs a working day of arm rotation and stays open.
+
+## Task 4 tuning candidates (from measured data, not guesses)
 
 1. ~~Depth-3 engagement on observed accept2 rate~~ — measured, closed: the
    auto policy's reject2 exit keeps engagement at 11% of cycles with 68.8%

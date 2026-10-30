@@ -1,0 +1,29 @@
+ts,temp,req,seed,sse_chars,ttft_s,decode_tps,uniq_ratio,loop,ok_ids,bad_ids,mtp_cycles,mtp_accepted,mtp_pct,head
+2026-10-30T04:48:59Z,0.0,aesgcm,901,716,1.357,38.58,1.000,0,18,0,849,536,63.1,"We need to respond to user. User text is repetitive: ""The `r"
+2026-10-30T04:48:59Z,0.0,aesgcm,902,716,1.251,38.26,1.000,0,18,0,849,536,63.1,"We need to respond to user. User text is repetitive: ""The `r"
+2026-10-30T04:48:59Z,0.0,aesgcm,903,716,1.167,39.82,1.000,0,18,0,849,536,63.1,"We need to respond to user. User text is repetitive: ""The `r"
+2026-10-30T04:48:59Z,0.0,editecho,911,858,0.606,53.32,0.700,1,4,4,849,536,63.1,We need respond to user. User says: Task: rename `old_timeou
+2026-10-30T04:48:59Z,0.0,editecho,912,858,0.595,53.65,0.700,1,4,4,849,536,63.1,We need respond to user. User says: Task: rename `old_timeou
+2026-10-30T04:48:59Z,0.0,vienum,921,664,0.566,41.83,0.583,1,0,0,849,536,63.1,"We need answer user's request in Vietnamese. User says: ""Liệ"
+2026-10-30T04:48:59Z,0.0,vienum,922,664,0.560,42.24,0.583,1,0,0,849,536,63.1,"We need answer user's request in Vietnamese. User says: ""Liệ"
+2026-10-30T04:49:40Z,0.3,aesgcm,901,681,1.344,37.19,1.000,0,19,0,824,512,62.1,"We need to respond to user. User text is repetitive: ""The `r"
+2026-10-30T04:49:40Z,0.3,aesgcm,902,669,1.231,33.21,1.000,0,21,0,824,512,62.1,"We need to respond to user. User text is repetitive: ""The `r"
+2026-10-30T04:49:40Z,0.3,aesgcm,903,696,1.257,38.61,1.000,0,17,0,824,512,62.1,"We need to respond to user. User text seems repetitive, mayb"
+2026-10-30T04:49:40Z,0.3,editecho,911,834,0.677,49.91,0.700,1,6,3,824,512,62.1,We need respond to user. User says: Task: rename `old_timeou
+2026-10-30T04:49:40Z,0.3,editecho,912,827,0.601,46.61,0.700,1,5,3,824,512,62.1,We need respond to user. User says: Task: rename `old_timeou
+2026-10-30T04:49:40Z,0.3,vienum,921,653,0.577,36.99,0.583,1,0,0,824,512,62.1,"We need answer user's request in Vietnamese. User: ""Liệt kê "
+2026-10-30T04:49:40Z,0.3,vienum,922,675,0.566,40.94,0.583,1,0,0,824,512,62.1,"We need answer user's request in Vietnamese. User says: ""Liệ"
+2026-10-30T04:50:20Z,0.6,aesgcm,901,703,1.321,38.71,1.000,0,17,0,769,497,64.6,"We need to respond to user. User's message is repetitive, se"
+2026-10-30T04:50:20Z,0.6,aesgcm,902,712,1.213,39.22,1.000,0,20,0,769,497,64.6,"We need to respond to user. User text seems repetitive, poss"
+2026-10-30T04:50:20Z,0.6,aesgcm,903,685,1.245,37.18,1.000,0,20,0,769,497,64.6,We need to respond to user. User text seems garbled/repetiti
+2026-10-30T04:50:20Z,0.6,editecho,911,862,0.628,51.59,0.700,1,4,3,769,497,64.6,We need respond to user. User says: Task: rename `old_timeou
+2026-10-30T04:50:20Z,0.6,editecho,912,841,0.598,45.62,0.800,0,4,3,769,497,64.6,We need respond to user. User says: Task: rename `old_timeou
+2026-10-30T04:50:20Z,0.6,vienum,921,605,0.574,36.16,0.529,1,0,0,769,497,64.6,The user is asking me to list provinces/cities following the
+2026-10-30T04:50:20Z,0.6,vienum,922,682,0.559,39.62,0.421,1,0,0,769,497,64.6,"We need answer user's request in Vietnamese. User says: ""Liệ"
+2026-10-30T04:51:00Z,1.0,aesgcm,901,676,1.336,35.74,1.000,0,19,0,718,481,67.0,We need respond to user. User repeated a phrase: The `rand::
+2026-10-30T04:51:00Z,1.0,aesgcm,902,696,1.283,36.65,1.000,0,21,0,718,481,67.0,We need respond to user. User seems to be rambling repeated:
+2026-10-30T04:51:00Z,1.0,aesgcm,903,690,1.252,38.10,1.000,0,17,0,718,481,67.0,"We need to respond to user. User text:  ""The `rand::Rng` tra"
+2026-10-30T04:51:00Z,1.0,editecho,911,904,0.656,52.13,0.889,0,5,3,718,481,67.0,We need respond to user. User says: Task: rename `old_timeou
+2026-10-30T04:51:00Z,1.0,editecho,912,887,0.609,48.44,1.000,0,6,4,718,481,67.0,We need respond to user. User says: Task: rename `old_timeou
+2026-10-30T04:51:00Z,1.0,vienum,921,531,0.560,33.86,0.385,1,0,0,718,481,67.0,The user asks me to list provinces/cities following the exac
+2026-10-30T04:51:00Z,1.0,vienum,922,652,0.561,35.50,0.583,1,0,0,718,481,67.0,"We need answer user's request in Vietnamese. User says: ""Liệ"

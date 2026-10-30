@@ -35,7 +35,7 @@ PROMPT_BYTES="${ORCA_PROMPT_BYTES:-1200000}"   # ~340K tokens of code text
 GEN=128
 CTX_MAIN="${ORCA_CTX_MAIN:---ctx-start 32768 --ctx-max 225280 --step-mul 2}"
 CTX_EXTRA="${ORCA_CTX_EXTRA:---ctx-start 196608 --ctx-max 196608}"
-PREFILL_CHUNK="${ORCA_PREFILL_CHUNK:-4096}"    # mirror production
+PREFILL_CHUNK="${ORCA_PREFILL_CHUNK:-8192}"    # mirror production (4096 -> 8192 flipped 2026-10-30, see ORCA_IQ2_FAST_CAMPAIGN.md; reps 1-3 ran at 4096)
 RUNS="${ORCA_RUNS:-3}"
 REP_FROM="${ORCA_REP_FROM:-1}"        # e.g. ORCA_ARMS=plain ORCA_REP_FROM=2 ORCA_RUNS=2 reruns only rep 2
 ARMS="${ORCA_ARMS:-plain mtp mtp-d2 mtp-d3 mtp-force}"

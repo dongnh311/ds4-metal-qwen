@@ -10,14 +10,14 @@ bug is repairable without re-benchmarking.
 usage: python3 speed-bench/aggregate_orca_receipts.py [receipts_dir ...]
 Default: every speed-bench/receipts/orca-iq2-* dir except ones named with "-discard".
 """
-import csv, glob, os, re, sys
+import csv, glob, json, os, re, sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PAT = re.compile(r"run-(plain|mtp-force|mtp-d2|mtp-d3|mtp)-r(\d+)-(main|192k)\.csv$")
 COLS = ["arm", "rep", "ladder", "ctx_tokens", "prefill_tokens", "prefill_tps",
         "gen_tokens", "gen_tps", "gen_first_ms", "gen_steady_tokens", "gen_steady_tps",
         "mtp_cycles", "mtp_accepted", "mtp_pct", "depth3_cycles", "depth3_accept2",
-        "extra_tokens_per_cycle"]
+        "extra_tokens_per_cycle", "prefill_chunk"]
 ORDER = {"plain": 0, "mtp": 1, "mtp-d2": 2, "mtp-d3": 3, "mtp-force": 4}
 
 def harvest(d):
@@ -40,8 +40,18 @@ def harvest(d):
             acc["depth3_cycles"], acc["depth3_accept2"] = dd.group(1), dd.group(2)
         if ss:
             acc["extra_tokens_per_cycle"] = ss.group(1)
+        # chunk provenance: production moved 4096 -> 8192 on 2026-10-30, so reps
+        # must say which chunk they ran at (receipt JSON carries it).
+        chunk = ""
+        try:
+            meta = json.load(open(os.path.join(
+                d, "receipt-%s-r%s-%s.json" % (m.group(1), m.group(2), m.group(3)))))
+            chunk = meta.get("prefill_chunk", "")
+        except (OSError, ValueError):
+            pass
         for r in csv.DictReader(open(path)):
-            r.update(arm=m.group(1), rep=m.group(2), ladder=m.group(3), **acc)
+            r.update(arm=m.group(1), rep=m.group(2), ladder=m.group(3),
+                     prefill_chunk=chunk, **acc)
             rows.append(r)
     return rows
 

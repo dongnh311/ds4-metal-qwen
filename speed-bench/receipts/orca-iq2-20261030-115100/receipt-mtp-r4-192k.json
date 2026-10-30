@@ -1,0 +1,20 @@
+{
+ "protocol": "orca-iq2-fast-campaign-task0",
+ "git_commit": "db5d2eeb6ffb92e916abddea6301ee71d11d64b1",
+ "model": "Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-DenseQ4Kselimat-MTP",
+ "model_sha256": "b1dd08509231126b5f1596603fd2589ff8bdf8eae221420f3e4409110fee8bd4",
+ "prompt_sha256": "93383145047f9fb38d3d9dfe36da765b28a90c8219300dd3de95fb93983d1852",
+ "macos": "26.6.2",
+ "chip": "Apple M5 Pro",
+ "gen_tokens": 128,
+ "temp": 0,
+ "prefill_chunk": 8192,
+ "arm": "mtp",
+ "rep": 4,
+ "ladder": "192k",
+ "ctx_flags": "--ctx-start 196608 --ctx-max 196608",
+ "mtp_env": "DS4_QWEN4_STREAM_FULL_LAYERS=32 DS4_QWEN4_PLE_PREFETCH_FULL=0 DS4_QWEN4_MTP_DRAFT_VOCAB=/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-draft-vocab-vi-en-code-64k.txt DS4_QWEN4_KV_GROW=1 DS4_QWEN4_KVA_SPLIT=36 DS4_QWEN4_KVA_TAIL=2048 DS4_LOCK_FILE=/tmp/ds4-bench.lock",
+ "dir_steering": "none — bench has no --dir-steering-file; production carries refusal-4-44 ffn=0.5, measure that delta separately",
+ "swap_peak_mb_coarse": 1545,
+ "golden_checksum": "deferred — run tests/test_qwen4_logit_dump.py once for the Phase-1 bit-identical fixture"
+}
