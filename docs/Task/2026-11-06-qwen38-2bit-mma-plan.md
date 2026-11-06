@@ -80,3 +80,38 @@ three reverted attempts.
 - Fused stage16 dequant for IQ types kept: bit-identical, perf-neutral.
 - Next: Metal System Trace profile of the two kernels to split
   load/dequant/MMA/barrier time before choosing spike A/B.
+
+## Profiling results (clean, ds4-server stopped)
+
+- DS4_QWEN4_MOE_MM_NOMMA=1 diagnostic (stages weights+B, skips matmul2d):
+  mid 7.3->7.0, down 6.5->6.6 — tensor MMA is only ~5% of kernel time.
+  The serial stage->barrier->MMA->barrier pipeline dominates (~95%).
+- Clean baseline T=1856 (earlier 21.8 ms was contaminated by the running
+  ds4-server stealing GPU): IQ2_S/IQ4_NL = 13.7 ms, IQ2_XXS/Q2_0 = 11.0,
+  MXFP4 = 14.8, Q8_0 = 35. NAX=0 simdgroup = 45.7 (tensor path correct).
+- tiles_per_launch / tile-count knobs: no effect (tiles~1 per expert at
+  these shapes; weights are already read once).
+- Added register prefetch (raw16) for IQ2_S type 22 — bit-exact
+  (specialize suite all PASS) but perf-neutral: 13.80 vs 13.74 ms.
+  One-step prefetch does not cover DRAM latency; the loads are also
+  scattered across rows (uncoalesced) every K step.
+
+## Diagnosis
+
+Kernel is latency-bound in the staging pipeline, not MMA- or
+dequant-bound: ~128 threads issue small scattered loads per K step,
+2 barriers per step serialize, and only ~1 K-step of prefetch hides
+~1us of memory latency. nk=80 steps for mid.
+
+## Next spike (recommended)
+
+Coalesced two-phase weight staging: per K-group, cooperatively copy the
+expert row's packed bytes into threadgroup memory with consecutive
+threads reading consecutive addresses (fully coalesced), then dequant
+from tgmem into the f16 A slab. This removes scattered-load latency
+from the critical path and is the concrete form of backlog dir 3
+("expand in-register / avoid f16 materialization cost" being wrong —
+the cost is the load pattern, not the dequant math).
+Alternative cheaper probe: deepen raw16 prefetch to 2-4 K-steps and
+measure whether latency hiding improves at all before committing to
+the tgmem restructure.

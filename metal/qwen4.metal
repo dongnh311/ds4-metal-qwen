@@ -4594,6 +4594,7 @@ struct ds4_metal_args_qwen4_moe_mm {
     uint32_t tiles_per_launch;
     uint32_t tail_base; /* host binds the same value to function constant 905 */
     uint32_t expert_major; /* grid x = tile * row_blocks + row_block, z = 1 */
+    uint32_t skip_mma;  /* diagnostic: stage weights/B but skip tensor MMA */
 };
 
 /* Threadgroup -> (row block, first tile).  Expert-major order keeps one
@@ -4965,6 +4966,17 @@ static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint 
         r.h.x = ((uint)*(device const ushort *)blk) | (ag << 16);
         r.h.y = (ag >> 16) | (auxs << 16);
         r.h.z = auxs >> 16;
+    } else if (type == 22) {
+        /* IQ2_S: 82-byte super-block of 256 values; the K step's 32 values
+         * are quarter group ib32 = b % 8, and q0/q0+1 pick two of its four
+         * 8-value grid lookups. */
+        const uint sb = b / 8, ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 82);
+        r.h.x = *(device const uint *)blk;                    /* d in the low half */
+        r.h.y = blk[66 + ib32];                               /* high grid-index bits */
+        r.h.z = blk[74 + ib32];                               /* scale nibble byte */
+        r.h.w = (uint)blk[2 + 4 * ib32 + q0] | ((uint)blk[2 + 4 * ib32 + q0 + 1] << 8);
+        r.q.x = (uint)blk[34 + 4 * ib32 + q0] | ((uint)blk[34 + 4 * ib32 + q0 + 1] << 8);
     } else {
         device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 17);
 #pragma unroll
@@ -5010,6 +5022,19 @@ static inline void qwen4_dequant_raw16(qwen4_raw16 r, uint b, uint q0, uint type
             constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((ag >> (8u * qq)) & 0xFFu));
             const uint signs = ds4_metal_ksigns_iq2xs[(auxs >> (7u * qq)) & 127u];
             for (uint i = 0; i < 8; i++) dst[h * 8 + i] = (half)(dl * (float)grid[i] * ((signs >> i) & 1u ? -1.0f : 1.0f));
+        }
+        return;
+    }
+    if (type == 22) {
+        const float d = (float)as_type<half>((ushort)(r.h.x & 0xFFFFu));
+        const float db = d * (0.5f + (float)(q0 < 2 ? (r.h.z & 0xFu) : (r.h.z >> 4))) * 0.25f;
+        const uint qh = r.h.y;
+        for (uint h = 0; h < 2; h++) {
+            const uint q = q0 + h;
+            constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2s_grid +
+                (((r.h.w >> (8u * h)) & 0xFFu) | ((qh << (8u - 2u * q)) & 0x300u)));
+            const uint s = (r.q.x >> (8u * h)) & 0xFFu;
+            for (uint i = 0; i < 8; i++) dst[h * 8 + i] = (half)(db * (float)grid[i] * ((s >> i) & 1u ? -1.0f : 1.0f));
         }
         return;
     }
@@ -5403,7 +5428,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
         device const char *urow = ubase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
         /* the register prefetch covers Q4_K, Q2_K, IQ2_XXS and MXFP4; other
          * types (GSQ-RCO) stage straight from their rows */
-        const bool raw = type == 12u || type == 10u || type == 16u || type == 39u;
+        const bool raw = type == 12u || type == 10u || type == 16u || type == 22u || type == 39u;
         qwen4_raw16 rg{}, ru{};
         if (raw) { rg = qwen4_load_raw16(grow, 0, aq * 2, type); ru = qwen4_load_raw16(urow, 0, aq * 2, type); }
         for (uint kb = 0; kb < nk; kb++) {
@@ -5450,12 +5475,10 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
                 auto mB = tB.slice(0, 0);
                 auto mAg = tA_g.slice(0, 0);
                 auto mAu = tA_u.slice(0, 0);
-                mm.run(mB, mAg, cG);
-                mm.run(mB, mAu, cU);
+                if (!args.skip_mma) { mm.run(mB, mAg, cG); mm.run(mB, mAu, cU); }
                 if constexpr (COMP) {
                     auto mBr = tBr.slice(0, 0);
-                    mm.run(mBr, mAg, cG);
-                    mm.run(mBr, mAu, cU);
+                    if (!args.skip_mma) { mm.run(mBr, mAg, cG); mm.run(mBr, mAu, cU); }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5566,7 +5589,7 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
         const bool a_row = row0 + ar < args.out_rows;
         device const char *drow = dbase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
         /* register prefetch for Q4_K, Q2_K, IQ2_XXS and MXFP4 only, as in the mid tiles */
-        const bool raw = type == 12u || type == 10u || type == 16u || type == 39u;
+        const bool raw = type == 12u || type == 10u || type == 16u || type == 22u || type == 39u;
         qwen4_raw16 rd{};
         if (raw) rd = qwen4_load_raw16(drow, 0, aq * 2, type);
         for (uint kb = 0; kb < nk; kb++) {
@@ -5591,10 +5614,10 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
             {
                 auto mB = tB.slice(0, 0);
                 auto mA = tA.slice(0, 0);
-                mm.run(mB, mA, cT);
+                if (!args.skip_mma) mm.run(mB, mA, cT);
                 if constexpr (COMP) {
                     auto mBr = tBr.slice(0, 0);
-                    mm.run(mBr, mA, cT);
+                    if (!args.skip_mma) mm.run(mBr, mA, cT);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);

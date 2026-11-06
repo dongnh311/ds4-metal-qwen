@@ -50118,7 +50118,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
 typedef struct {
     uint32_t n_tokens, n_slots, n_out, in_dim, out_rows, weight_type, row_bytes, list_cap;
     uint64_t expert_bytes;
-    uint32_t n_expert, tiles_per_launch, tail_base, expert_major;
+    uint32_t n_expert, tiles_per_launch, tail_base, expert_major, skip_mma;
 } qwen4_moe_mm_args;
 
 /* Expert-major tile order (DS4_QWEN4_MOE_MM_ORDER=0 restores the tile-major
@@ -54881,6 +54881,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     const bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);
     if (nax) {
         args.tail_base = 0;
+        args.skip_mma = (uint32_t)ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_NOMMA");
         const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;
         if (nax_comp) {
             /* compensated tiles: x stays bound at b[4] (float) and the tiles
@@ -54964,6 +54965,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);
     if (nax) {
         args.tail_base = 0;
+        args.skip_mma = (uint32_t)ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_NOMMA");
         const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;
         if (nax_comp) {
             /* the compensated tiles read the half copy of mid and its
