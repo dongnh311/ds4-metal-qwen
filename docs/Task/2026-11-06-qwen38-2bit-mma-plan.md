@@ -209,6 +209,18 @@ Design (both mid and down nax_t kernels):
    hides under MMA. Expected attack surface: ~7.3 ms skeleton + ~4 ms
    weight staging + ~4.3 ms B staging partially overlapped.
 
-Fallback if pipelining loses: keep direct-store epilogue only if it wins
-on its own; otherwise revert both. Weight repack remains the alternative
-if pipelining cannot hide the scattered loads.
+RESULT (reverted): ping-pong A/B staging with one barrier per K step was
+implemented for the down nax_t kernel (!COMP only, COMP keeps the legacy
+single-buffer layout). Byte-exact correctness held (154 specialize PASS)
+but it measured ~3% SLOWER (down 7.97 vs 7.43 ms @T=1856) even after
+hoisting the parity tensor descriptors - the serial staging section, not
+the barrier count itself, is the critical path, and mm.run is synchronous
+so no overlap materialized. Reverted; host smem bumps reverted with it.
+
+Conclusion: within the current dequant-to-tgmem-then-matmul2d structure,
+every cheap lever is measured and rejected. The remaining candidates are
+the expensive ones: (a) true packed 2-bit dot / bit-sliced MMA that never
+materializes f16 weights (backlog dir 1/3 proper), or (b) load-time weight
+repack so K-step slices across a row block are contiguous (dir 4). Both
+are multi-session kernel projects; pick one deliberately rather than
+continuing to probe this pipeline.
