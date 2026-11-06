@@ -189,3 +189,26 @@ Implication: kernel work on mid+down is correctly aimed (75% of stage),
 but even a 30% kernel win yields only ~-200 ms of MoE. Reaching the
 <=1000 ms target likely ALSO needs router+reduce (~155 ms combined)
 attention, or the weight-layout repack that makes staging coalesced.
+
+## Next spike design: software-pipelined K-loop (justified by mask=7)
+
+The barrier/sync skeleton (~7.3 ms, 34%) is the largest single component.
+NK=64 halves barrier count but loses because each serial staging section
+doubles; the pipeline is bound by the longest serial section per step.
+
+Design (both mid and down nax_t kernels):
+1. Drop the Cs threadgroup roundtrip: cG/cU (and down cT) are already
+   register cooperative tensors; store each owned element directly to its
+   global address via is_valid_element + element->(token,row) mapping.
+   Frees 16 KB tgmem (NR1=64) and removes one barrier + 32 KB tgmem
+   traffic per tile.
+2. Double-buffer A (weights) and B (activations): stage step k+1 while
+   MMA consumes step k. With Cs gone, mid tgmem ~12 KB + 12 KB buffers
+   ~24 KB; down ~8 KB + 8 KB ~16 KB - fits the 32 KB limit.
+3. Barriers drop from 2/step to ~1/step effective and staging latency
+   hides under MMA. Expected attack surface: ~7.3 ms skeleton + ~4 ms
+   weight staging + ~4.3 ms B staging partially overlapped.
+
+Fallback if pipelining loses: keep direct-store epilogue only if it wins
+on its own; otherwise revert both. Weight repack remains the alternative
+if pipelining cannot hide the scattered loads.
