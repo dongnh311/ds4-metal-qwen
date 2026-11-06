@@ -64,3 +64,19 @@ three reverted attempts.
 - No GGUF format changes, no new tensor types.
 - No permanent semantic flags — diagnostic switches only during dev.
 - No CPU-path changes (reference/debug only).
+
+## Findings so far (M5 Pro, synthetic bench T=1856, E=512 S=10)
+
+- mid+down kernel pair: ~21.8 ms/layer-call at T=1856 (IQ2_S mid + IQ4_NL
+  down); ~43.5 ms at T=4096; weak scaling with T → per-expert fixed cost
+  dominates, not token-parallel work.
+- NAX=1/2 tile knobs and mid/down tile counts: ±5% noise. Tensor-op
+  64-token tiles are already the default winner.
+- IQ2_S vs IQ2_XXS vs MXFP4 mid timings are within ~20% despite very
+  different dequant cost → kernels are NOT dequant-bound; suspect
+  MMA/barrier structure or weight-load latency.
+- NK=64 K-step variant (built, env-gated): 24.9 ms — SLOWER, reverted.
+  Larger tgmem (24KB) likely cut occupancy.
+- Fused stage16 dequant for IQ types kept: bit-identical, perf-neutral.
+- Next: Metal System Trace profile of the two kernels to split
+  load/dequant/MMA/barrier time before choosing spike A/B.
