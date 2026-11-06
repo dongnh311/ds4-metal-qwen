@@ -53,6 +53,12 @@ GGUF_SCALAR_SIZES = {
 # GGML quant type -> (block elements, bytes per block, display name).
 # This intentionally includes the formats used by the current DeepSeek V4 Flash
 # GGUFs.  Add entries here if future recipes introduce new tensor types.
+# 2026-11-05 (qwen4exp extension): BF16=30 / MXFP4=39 are the ids in ds4's own
+# quants.h (DS4Q_TYPE_BF16) and qwen4_pack_to_qwen4exp.py (T_BF16, T_MXFP4) —
+# token_embd.weight rides them, and the splicer met 39/30 first on the Orca IQ2
+# pair.  The MXFP4 entry is documentation: every copied tensor's byte size comes
+# from the GGUF offset arithmetic (n_bytes below), never from this table, so a
+# wrong-bytes table entry can not corrupt an output file.
 GGML_QUANT_SIZES = {
     0: (1, 4, "F32"),
     1: (1, 2, "F16"),
@@ -61,6 +67,8 @@ GGML_QUANT_SIZES = {
     12: (256, 144, "Q4_K"),
     16: (256, 66, "IQ2_XXS"),
     26: (1, 4, "I32"),
+    30: (1, 2, "BF16"),
+    39: (32, 17, "MXFP4"),
 }
 
 EXPERT_TENSOR_RE = re.compile(r"^blk\.(\d+)\.ffn_(gate|up|down)_exps\.weight$")
@@ -256,8 +264,22 @@ def qtype_name(ggml_type: int) -> str:
 def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[SplicePlan]:
     if base.version != donor.version:
         raise ValueError(f"GGUF version mismatch: base={base.version} donor={donor.version}")
-    if base.tensor_count != donor.tensor_count:
-        raise ValueError(f"tensor count mismatch: base={base.tensor_count} donor={donor.tensor_count}")
+    # 2026-11-05 (qwen4exp): compare tensor NAME sets, not the bare count. The
+    # DeepSeek pair this tool was written for shares a byte-identical tensor
+    # directory; the Orca IQ2 family does not - the same logical tensor can be
+    # shipped at different types between siblings (token_embd is MXFP4 on the
+    # Q2K mains, Q8_0 on the Q4KDown donor). A count check would refuse splices
+    # that are safe: every NON-selected tensor is copied from the base with its
+    # own dims/type, so the output re-states the base file except for the
+    # selected layers. What must still match exactly is the routed-expert set,
+    # because those are the tensors read from the donor.
+    base_names = {t.name for t in base.tensors}
+    donor_names = {t.name for t in donor.tensors}
+    if base_names != donor_names:
+        only_base = sorted(n for n in base_names - donor_names if EXPERT_TENSOR_RE.match(n))
+        only_donor = sorted(n for n in donor_names - base_names if EXPERT_TENSOR_RE.match(n))
+        if only_base or only_donor:
+            raise ValueError(f"expert tensor set mismatch: base-only={only_base[:3]} donor-only={only_donor[:3]}")
     if base.alignment != donor.alignment:
         raise ValueError(f"alignment mismatch: base={base.alignment} donor={donor.alignment}")
 
@@ -265,11 +287,12 @@ def build_plan(base: GGUFInfo, donor: GGUFInfo, q4_layers: set[int]) -> list[Spl
     next_rel = 0
     for base_tensor in base.tensors:
         donor_tensor = donor.tensor_by_name.get(base_tensor.name)
-        if donor_tensor is None:
-            raise ValueError(f"donor is missing tensor {base_tensor.name}")
-        if base_tensor.dims != donor_tensor.dims:
-            raise ValueError(f"shape mismatch for {base_tensor.name}: {base_tensor.dims} vs {donor_tensor.dims}")
         use_donor = should_take_donor(base_tensor.name, q4_layers)
+        if use_donor:
+            if donor_tensor is None:
+                raise ValueError(f"donor is missing selected tensor {base_tensor.name}")
+            if base_tensor.dims != donor_tensor.dims:
+                raise ValueError(f"shape mismatch for {base_tensor.name}: {base_tensor.dims} vs {donor_tensor.dims}")
         source_tensor = donor_tensor if use_donor else base_tensor
         plan.append(SplicePlan(
             name=base_tensor.name,
