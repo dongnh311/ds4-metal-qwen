@@ -81,11 +81,15 @@ three reverted attempts.
 - Next: Metal System Trace profile of the two kernels to split
   load/dequant/MMA/barrier time before choosing spike A/B.
 
-## Profiling results (clean, ds4-server stopped)
+## Profiling results (CORRECTED - see skip_mma fix)
 
-- DS4_QWEN4_MOE_MM_NOMMA=1 diagnostic (stages weights+B, skips matmul2d):
-  mid 7.3->7.0, down 6.5->6.6 — tensor MMA is only ~5% of kernel time.
-  The serial stage->barrier->MMA->barrier pipeline dominates (~95%).
+- DS4_QWEN4_MOE_MM_NOMMA diagnostic: env_bool returns -1 when the var is
+  unset, which cast to 0xFFFFFFFF and silently disabled MMA in all runs
+  after the diagnostic landed. True T=1856 baseline: mid 13.7 + down
+  7.4 = 21.1 ms. With MMA skipped: 13.7 ms total → MMA ~7.3 ms (~35%).
+  Split per kernel: mid MMA ~6.4 ms (~47%, two matmul2d per K step),
+  down MMA ~0.9 ms (~12%). Staging still dominates down (~88%) and is
+  ~half of mid. Earlier "MMA ~5%" conclusion was an artifact of the bug.
 - Clean baseline T=1856 (earlier 21.8 ms was contaminated by the running
   ds4-server stealing GPU): IQ2_S/IQ4_NL = 13.7 ms, IQ2_XXS/Q2_0 = 11.0,
   MXFP4 = 14.8, Q8_0 = 35. NAX=0 simdgroup = 45.7 (tensor path correct).
