@@ -166,3 +166,22 @@ Remaining directions, in expected-value order:
    to come from eliminating staging, not from faster MMA.
 3. Full-model A/B: quantify how much of the 1438 ms MoE stage is these
    two kernels vs routing/shared/reduce before more kernel work.
+
+## Full-model MoE breakdown (ds4-bench, T=1856, worktree build, no steering)
+
+Per-layer "Qwen MoE ms" profile summed over 48 layers = 910 ms:
+- mid (routed gate+up GEMM): 427 ms (47%)
+- down (routed down proj):   253 ms (28%)
+- reduce:                     79 ms (9%)
+- router:                     76 ms (8%)
+- shared_mid+shared_down:     68 ms (7%)
+- lists:                       9 ms (1%)
+
+Routed mid+down = 680 ms = 75% of the MoE stage, and the synthetic
+bench (13.55 ms) matches the real per-layer cost (14.2 ms) closely —
+the standalone harness is representative. Prefill measured 633 t/s.
+
+Implication: kernel work on mid+down is correctly aimed (75% of stage),
+but even a 30% kernel win yields only ~-200 ms of MoE. Reaching the
+<=1000 ms target likely ALSO needs router+reduce (~155 ms combined)
+attention, or the weight-layout repack that makes staging coalesced.
