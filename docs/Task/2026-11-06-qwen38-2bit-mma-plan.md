@@ -224,3 +224,62 @@ materializes f16 weights (backlog dir 1/3 proper), or (b) load-time weight
 repack so K-step slices across a row block are contiguous (dir 4). Both
 are multi-session kernel projects; pick one deliberately rather than
 continuing to probe this pipeline.
+
+## Direction (a) packed 2-bit dot - assessed INFEASIBLE on this hardware
+
+- IQ2_S/IQ2_XXS are vector-quantized: each 8-weight group indexes a
+  256-entry 8-dim codebook (ds4_metal_iq2s_grid / iq2xxs_grid) plus sign
+  bits and per-group scales. The dot x.w cannot collapse into counters
+  the way scalar 2-bit LUT dots do; every weight still needs its own
+  multiply against a distinct fp16 activation, so "packed dot" reduces
+  to dequant+FMA - exactly what the simdgroup path already does.
+- The simdgroup (NAX=0) MoE tiles are that dequant-in-registers dot
+  product today and measured ~3x slower than the tensor path
+  (pre-diagnostic true-path numbers). Tensor cores deliver ~19+ TFLOPS
+  fp16; any scalar/LUT dot is 1-2 orders of magnitude behind, and it
+  would still pay 100% of the weight-load traffic that dominates staging.
+- Verdict: no competitive packed-2-bit path exists for these quant
+  types on Apple GPUs without a custom MMA pipeline (multi-week R&D).
+
+## Direction (b) weight repack - viable, bounded, designed
+
+Access pattern today: per K-step, thread (row ar, half aq) reads ~11B
+scattered inside its row's superblock; 64 rows sit row_bytes (~820B for
+IQ2_S mid) apart -> each step touches a ~52KB window of DRAM/L2.
+
+Repacked layout (pure permutation, zero size overhead):
+  [row_block of 64][block][row_in_block][block_bytes]
+For IQ2_S (82B/256w superblock): per (rb, sb) a contiguous 64*82 = 5248B
+region; the kernel's per-step loads then hit a 5.2KB window instead of
+52KB -> L1-resident, DRAM-friendly, ~8x fewer distinct pages per step.
+The kernel's existing rb*NR0 row-block tile maps 1:1 onto repacked
+row_blocks (NR0=64 already).
+
+Required changes:
+- stride-parameterized dequant: qwen4_mm_stage8/16, qwen4_load_raw16
+  compute blk = row + idx*UNIT; add a stride arg (0 = legacy UNIT,
+  64*UNIT = repacked) so all other callers stay untouched.
+- kernel: repacked row pointer = dbase + rb*(nblk*64*unit) + ar*unit,
+  pass wstride = rep ? 64*unit : unit. Gate: out_rows % 64 == 0.
+- host: env/flag + repacked expert_bytes (same total for superblock
+  types; step types may drop per-row padding).
+- offline tool: permute GGUF expert tensors once into a sidecar or new
+  file; loader binds repacked tensors for supported types only, legacy
+  path otherwise. SSD streaming can repack per-layer for free (data is
+  already being copied).
+
+Expected ceiling: weight staging marginal cost measured ~1.5-2.5 ms of
+21.3 ms (mask bit1); repack also shortens the serial staging latency
+chain that the mask understates. Realistic estimate 10-20% kernel win
+(~100-200 ms MoE stage), NOT the 2-3x a naive read of "staging bound"
+would suggest - barriers, dequant ALU and MMA remain.
+
+## Status
+
+All cheap levers inside dequant->tgmem->matmul2d are measured and
+rejected (NK64, prefetch depth-2, wcache, fused stage16 neutral,
+ping-pong K-loop correct-but-slower). Remaining honest options:
+1. weight repack project as designed above (~10-20% expected),
+2. warp-specialized/async tensor pipeline (large R&D, uncertain),
+3. accept current MoE kernels and optimize the other ~25% of the MoE
+   stage (router 76ms + reduce 79ms + shared expert 68ms at T=1856).
