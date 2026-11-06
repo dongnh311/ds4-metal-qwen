@@ -115,3 +115,25 @@ the cost is the load pattern, not the dequant math).
 Alternative cheaper probe: deepen raw16 prefetch to 2-4 K-steps and
 measure whether latency hiding improves at all before committing to
 the tgmem restructure.
+
+## E-scaling probe (T=1856, IQ2_S/IQ4_NL, clean)
+
+E=64: 8.4 ms | E=128: 12.7 | E=256: 14.7 | E=512: 15.9 — sub-linear,
+saturating. Effective weight bandwidth ~35-70 GB/s, far below peak:
+consistent with memory-level-parallelism/latency bound, not raw BW.
+
+## Conclusion for spike selection
+
+- MMA ~5%, dequant math cheap, prefetch distance 1 insufficient.
+- The staging loop issues ~6 small scattered loads/thread/K-step with
+  only one step of lookahead; DRAM latency ~1us >> per-step time.
+- Winning move is restructuring weight staging for MLP: either
+  (a) per-thread super-block register caching (82B/row/8 steps, needs
+  careful byte extraction to avoid local-memory spills), or
+  (b) cooperative coalesced tgmem staging of packed rows then dequant
+  from tgmem (needs ~10KB extra tgmem; mid kernel at 16KB may fit in
+  32KB budget).
+- Both are real kernel projects; (a) is smaller and keeps the current
+  tile shape. Recommend (a) first: load the 82-byte IQ2_S super-block
+  (or equivalent per-format block) once per 8 K-steps into registers
+  as uint4s, index bytes via switch/unrolled ib32.
