@@ -5429,13 +5429,14 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
         /* the register prefetch covers Q4_K, Q2_K, IQ2_XXS, IQ2_S and MXFP4; other
          * types (GSQ-RCO) stage straight from their rows */
         const bool raw = type == 12u || type == 10u || type == 16u || type == 22u || type == 39u;
+        const bool skip_w = (args.skip_mma & 2u) != 0u;
         qwen4_raw16 rg{}, ru{};
-        if (raw) { rg = qwen4_load_raw16(grow, 0, aq * 2, type); ru = qwen4_load_raw16(urow, 0, aq * 2, type); }
+        if (raw && !skip_w) { rg = qwen4_load_raw16(grow, 0, aq * 2, type); ru = qwen4_load_raw16(urow, 0, aq * 2, type); }
         for (uint kb = 0; kb < nk; kb++) {
             {
                 threadgroup half *dg = Ag + ar * NK + aq * 16;
                 threadgroup half *du = Au + ar * NK + aq * 16;
-                if (a_row) {
+                if (a_row && !skip_w) {
                     if (raw) {
                         qwen4_dequant_raw16(rg, kb, aq * 2, type, dg);
                         qwen4_dequant_raw16(ru, kb, aq * 2, type, du);
@@ -5446,10 +5447,11 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
                 } else {
                     for (uint i = 0; i < 16; i++) { dg[i] = 0.0h; du[i] = 0.0h; }
                 }
-                if (raw && kb + 1 < nk) { rg = qwen4_load_raw16(grow, kb + 1, aq * 2, type); ru = qwen4_load_raw16(urow, kb + 1, aq * 2, type); }
+                if (raw && !skip_w && kb + 1 < nk) { rg = qwen4_load_raw16(grow, kb + 1, aq * 2, type); ru = qwen4_load_raw16(urow, kb + 1, aq * 2, type); }
             }
+            const bool skip_b = (args.skip_mma & 4u) != 0u;
 #pragma unroll
-            for (int b = 0; b < NB; b++) {
+            for (int b = 0; b < (skip_b ? 0 : NB); b++) {
                 if constexpr (COMP) {
                     /* stage xh and the residual xr: x = xh + xr to ~2^-22 relative */
                     if (xr[b]) {
@@ -5475,10 +5477,10 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
                 auto mB = tB.slice(0, 0);
                 auto mAg = tA_g.slice(0, 0);
                 auto mAu = tA_u.slice(0, 0);
-                if (!args.skip_mma) { mm.run(mB, mAg, cG); mm.run(mB, mAu, cU); }
+                if (!(args.skip_mma & 1u)) { mm.run(mB, mAg, cG); mm.run(mB, mAu, cU); }
                 if constexpr (COMP) {
                     auto mBr = tBr.slice(0, 0);
-                    if (!args.skip_mma) { mm.run(mBr, mAg, cG); mm.run(mBr, mAu, cU); }
+                    if (!(args.skip_mma & 1u)) { mm.run(mBr, mAg, cG); mm.run(mBr, mAu, cU); }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -5590,18 +5592,20 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
         device const char *drow = dbase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
         /* register prefetch for Q4_K, Q2_K, IQ2_XXS, IQ2_S and MXFP4, as in the mid tiles */
         const bool raw = type == 12u || type == 10u || type == 16u || type == 22u || type == 39u;
+        const bool skip_w = (args.skip_mma & 2u) != 0u;
         qwen4_raw16 rd{};
-        if (raw) rd = qwen4_load_raw16(drow, 0, aq * 2, type);
+        if (raw && !skip_w) rd = qwen4_load_raw16(drow, 0, aq * 2, type);
         for (uint kb = 0; kb < nk; kb++) {
             {
                 threadgroup half *dd = As + ar * NK + aq * 16;
-                if (a_row && raw) qwen4_dequant_raw16(rd, kb, aq * 2, type, dd);
-                else if (a_row) qwen4_mm_stage16(drow, kb, aq * 2, type, dd);
+                if (a_row && !skip_w && raw) qwen4_dequant_raw16(rd, kb, aq * 2, type, dd);
+                else if (a_row && !skip_w) qwen4_mm_stage16(drow, kb, aq * 2, type, dd);
                 else for (uint i = 0; i < 16; i++) dd[i] = 0.0h;
-                if (raw && kb + 1 < nk) rd = qwen4_load_raw16(drow, kb + 1, aq * 2, type);
+                if (raw && !skip_w && kb + 1 < nk) rd = qwen4_load_raw16(drow, kb + 1, aq * 2, type);
             }
+            const bool skip_b = (args.skip_mma & 4u) != 0u;
 #pragma unroll
-            for (int b = 0; b < NB; b++) {
+            for (int b = 0; b < (skip_b ? 0 : NB); b++) {
                 if constexpr (COMP) {
                     /* stage the half operand and its residual separately */
                     *(threadgroup uint4 *)bdst[b] = mr[b] ? *(device const uint4 *)(mr[b] + kb * NK) : uint4(0u);
@@ -5614,10 +5618,10 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
             {
                 auto mB = tB.slice(0, 0);
                 auto mA = tA.slice(0, 0);
-                if (!args.skip_mma) mm.run(mB, mA, cT);
+                if (!(args.skip_mma & 1u)) mm.run(mB, mA, cT);
                 if constexpr (COMP) {
                     auto mBr = tBr.slice(0, 0);
-                    if (!args.skip_mma) mm.run(mBr, mA, cT);
+                    if (!(args.skip_mma & 1u)) mm.run(mBr, mA, cT);
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
