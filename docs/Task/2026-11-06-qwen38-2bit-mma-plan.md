@@ -137,3 +137,32 @@ consistent with memory-level-parallelism/latency bound, not raw BW.
   tile shape. Recommend (a) first: load the 82-byte IQ2_S super-block
   (or equivalent per-format block) once per 8 K-steps into registers
   as uint4s, index bytes via switch/unrolled ib32.
+
+## Spike: IQ2_S super-block window cache (reverted)
+
+Built a threadgroup cache of packed IQ2_S super-blocks: per 8 K-steps,
+each row's 82-byte block is fetched as 6 unaligned uint4 loads into
+12 KB of extra threadgroup memory, then dequantized from tgmem.
+Correct (specialize suite passed while enabled) but SLOWER:
+mid 7.9 vs 7.3 ms — the +12 KB threadgroup budget likely cut occupancy
+and per-step tgmem byte reads added LSU pressure. Reverted; env-gated
+code removed entirely.
+
+## Where this leaves the project
+
+Every cheap staging variant is now measured and rejected: wider K
+(NK64), deeper register prefetch, fused dequant, tgmem super-block
+cache. The kernel's ~95% non-MMA time is bound by the serial
+stage->barrier->MMA pipeline at only ~1-2 K-steps of memory-level
+parallelism per thread, and occupancy is already tgmem-limited.
+
+Remaining directions, in expected-value order:
+1. Weight layout change (dir 4): repack expert rows so a K-step's
+   bytes for all 64 rows are contiguous — makes staging loads truly
+   coalesced. Requires GGUF-side or load-time repack; big but is the
+   only change that attacks the actual bottleneck (scattered loads).
+2. True 2-bit MMA (dir 1): bypass f16 staging entirely; large project,
+   uncertain payoff given MMA is only ~5% today — the win would have
+   to come from eliminating staging, not from faster MMA.
+3. Full-model A/B: quantify how much of the 1438 ms MoE stage is these
+   two kernels vs routing/shared/reduce before more kernel work.
