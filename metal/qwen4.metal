@@ -5426,7 +5426,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
         const bool a_row = row0 + ar < args.out_rows;
         device const char *grow = gbase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
         device const char *urow = ubase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
-        /* the register prefetch covers Q4_K, Q2_K, IQ2_XXS and MXFP4; other
+        /* the register prefetch covers Q4_K, Q2_K, IQ2_XXS, IQ2_S and MXFP4; other
          * types (GSQ-RCO) stage straight from their rows */
         const bool raw = type == 12u || type == 10u || type == 16u || type == 22u || type == 39u;
         qwen4_raw16 rg{}, ru{};
@@ -5588,7 +5588,7 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
         threadgroup_barrier(mem_flags::mem_threadgroup);
         const bool a_row = row0 + ar < args.out_rows;
         device const char *drow = dbase + (uint64_t)(row0 + min(ar, args.out_rows - 1u)) * args.row_bytes;
-        /* register prefetch for Q4_K, Q2_K, IQ2_XXS and MXFP4 only, as in the mid tiles */
+        /* register prefetch for Q4_K, Q2_K, IQ2_XXS, IQ2_S and MXFP4, as in the mid tiles */
         const bool raw = type == 12u || type == 10u || type == 16u || type == 22u || type == 39u;
         qwen4_raw16 rd{};
         if (raw) rd = qwen4_load_raw16(drow, 0, aq * 2, type);
