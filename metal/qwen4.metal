@@ -4896,6 +4896,41 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
         for (uint i = 0; i < 16; i++) dst[i] = (D)(ds * (float)((qs[i >> 2] >> (8u * (i & 3u) + shift)) & 3u) - dm);
         return;
     }
+    /* IQ super-blocks: the two 8-value quarters of a stage16 share the
+     * super-block header (d, aux words, scale nibble), so load it once
+     * instead of once per qwen4_gsq_deq8/stage8 call.  Element math is
+     * unchanged, keeping outputs bit-identical. */
+    if (type == 16) {
+        const uint sb = b / 8, ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 66);
+        const float d = (float)(*(device const half *)blk);
+        device const ushort *q2 = (device const ushort *)(blk + 2) + 4 * ib32;
+        const uint aux_g = (uint)q2[0] | ((uint)q2[1] << 16);
+        const uint aux_s = (uint)q2[2] | ((uint)q2[3] << 16);
+        const float dl = d * (0.5f + (float)(aux_s >> 28)) * 0.25f;
+        for (uint h = 0; h < 2; h++) {
+            const uint q = q0 + h;
+            constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2xxs_grid + ((aux_g >> (8 * q)) & 0xFFu));
+            const uint signs = ds4_metal_ksigns_iq2xs[(aux_s >> (7 * q)) & 127u];
+            for (uint i = 0; i < 8; i++) dst[h * 8 + i] = (D)(dl * (float)grid[i] * ((signs >> i) & 1u ? -1.0f : 1.0f));
+        }
+        return;
+    }
+    if (type == 22) {
+        const uint sb = b / 8, ib32 = b % 8;
+        device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 82);
+        const float d = (float)(*(device const half *)blk);
+        const uint qh = blk[66 + ib32], sc = blk[74 + ib32];
+        const float db = d * (0.5f + (float)(q0 < 2 ? (sc & 0xFu) : (sc >> 4))) * 0.25f;
+        for (uint h = 0; h < 2; h++) {
+            const uint q = q0 + h;
+            constant const uchar *grid = (constant const uchar *)(ds4_metal_iq2s_grid +
+                ((uint)blk[2 + 4 * ib32 + q] | ((qh << (8u - 2u * q)) & 0x300u)));
+            const uint s = blk[34 + 4 * ib32 + q];
+            for (uint i = 0; i < 8; i++) dst[h * 8 + i] = (D)(db * (float)grid[i] * ((s >> i) & 1u ? -1.0f : 1.0f));
+        }
+        return;
+    }
     qwen4_mm_stage8(row, b, q0, type, dst);
     qwen4_mm_stage8(row, b, q0 + 1, type, dst + 8);
 }
