@@ -54881,7 +54881,7 @@ int ds4_gpu_qwen4_moe_mm_mid_tensor(
     const bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);
     if (nax) {
         args.tail_base = 0;
-        args.skip_mma = (uint32_t)ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_NOMMA");
+        args.skip_mma = ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_NOMMA") > 0 ? 1u : 0u;
         const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;
         if (nax_comp) {
             /* compensated tiles: x stays bound at b[4] (float) and the tiles
@@ -54965,7 +54965,7 @@ int ds4_gpu_qwen4_moe_mm_down_tensor(
     bool nax_comp = qwen4_moe_mm_nax_comp(weight_type);
     if (nax) {
         args.tail_base = 0;
-        args.skip_mma = (uint32_t)ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_NOMMA");
+        args.skip_mma = ds4_gpu_env_bool("DS4_QWEN4_MOE_MM_NOMMA") > 0 ? 1u : 0u;
         const uint64_t mid_count = (uint64_t)n_tokens * n_out * ff_dim;
         if (nax_comp) {
             /* the compensated tiles read the half copy of mid and its
