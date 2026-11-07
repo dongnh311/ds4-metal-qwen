@@ -3556,6 +3556,38 @@ static void test_dense_mm(arena_t *a, uint32_t in_dim, uint32_t rows, uint32_t T
     ds4_gpu_tensor_free(gout); ds4_gpu_tensor_free(gx);
 }
 
+/* F32 dense mm on the tensor tiles rounds weights through half; the aligned
+ * prefix and the scalar tail must agree with the all-scalar path to fp16
+ * rounding, not bit-exactly. */
+static void test_dense_mm_f32_nax(arena_t *a, uint32_t T) {
+    const uint32_t in_dim = 2560, rows = 512;
+    double *sh;
+    uint64_t off = arena_f32(a, (uint64_t)rows * in_dim, &sh, -0.05f, 0.05f);
+    float *x = rand_vec((uint64_t)T * in_dim, 1.0f);
+    ds4_gpu_tensor *gx = upload(x, (uint64_t)T * in_dim);
+    ds4_gpu_tensor *g1 = upload(NULL, (uint64_t)T * rows);
+    ds4_gpu_tensor *g2 = upload(NULL, (uint64_t)T * rows);
+    require_ok(setenv("DS4_QWEN4_DENSE_NAX_F32", "1", 1) == 0, "dense nax env");
+    require_ok(ds4_gpu_qwen4_dense_mm_tensor(g1, gx, a->base, a->size, off, 0u, T, in_dim, rows), "dense mm nax");
+    require_ok(setenv("DS4_QWEN4_DENSE_NAX_F32", "0", 1) == 0, "dense nax env");
+    require_ok(ds4_gpu_qwen4_dense_mm_tensor(g2, gx, a->base, a->size, off, 0u, T, in_dim, rows), "dense mm scalar");
+    float *h1 = malloc((uint64_t)T * rows * sizeof(float));
+    float *h2 = malloc((uint64_t)T * rows * sizeof(float));
+    require_ok(h1 && h2 &&
+               ds4_gpu_tensor_read(g1, 0, h1, (uint64_t)T * rows * sizeof(float)) &&
+               ds4_gpu_tensor_read(g2, 0, h2, (uint64_t)T * rows * sizeof(float)), "dense mm read");
+    double worst = 0.0;
+    for (uint64_t i = 0; i < (uint64_t)T * rows; i++) {
+        const double d = fabs((double)h1[i] - h2[i]);
+        if (d > worst) worst = d;
+    }
+    printf("  dense mm f32 nax T=%u vs scalar: max|d| %.3g\n", T, worst);
+    require_ok(worst < 1e-2, "dense mm f32 nax drift");
+    free(h2); free(h1); free(x); free(sh);
+    ds4_gpu_tensor_free(g2); ds4_gpu_tensor_free(g1); ds4_gpu_tensor_free(gx);
+    require_ok(setenv("DS4_QWEN4_DENSE_NAX_F32", "1", 1) == 0, "dense nax env restore");
+}
+
 #ifndef __APPLE__
 /* Cross the former 64 MiB output-tile limit with odd output strides. Reuse
  * 17 independent input rows so the full CPU oracle stays inexpensive. */
@@ -3752,7 +3784,14 @@ int main(void) {
     test_moe_mm_tiles_exact(&arena, 39u);
     test_moe_mm_tiles_iq2(&arena);
     printf("dense mm\n");
+    /* The CPU oracle is fp64-exact; the F32 tensor tiles round weights through
+     * half, so keep the strict check on the scalar path.  test_dense_mm_f32_nax
+     * covers the tensor variant against the scalar path instead. */
+    require_ok(setenv("DS4_QWEN4_DENSE_NAX_F32", "0", 1) == 0, "dense nax env");
     test_dense_mm(&arena, 2560, 512, 37, 0u);
+    require_ok(setenv("DS4_QWEN4_DENSE_NAX_F32", "1", 1) == 0, "dense nax env");
+    test_dense_mm_f32_nax(&arena, 64);
+    test_dense_mm_f32_nax(&arena, 70);
 #ifdef __APPLE__
     test_batch_mm_q8(&arena, 2560, 640, 16);
     test_batch_mm_q8(&arena, 6144, 2560, 16);

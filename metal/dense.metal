@@ -2564,6 +2564,12 @@ template [[host_name("kernel_mul_mm_q4_K_f32_nax_direct_rhs_n128")]] kernel mul_
 template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q8_0_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, block_q8_0, 2, dequantize_q8_0_pairs, float, float4x4, float>;
+/* F32 rows on the same tiles: dequantize_f32 narrows only the weight
+ * operand to half4x4; the activation operand and the accumulator stay
+ * float, matching the float-activation dense NAX variants. */
+template [[host_name("kernel_qwen4_dense_nax_f32")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>;
+template [[host_name("kernel_qwen4_dense_nax_f32_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>;
+template [[host_name("kernel_qwen4_dense_nax_f32_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, float4x4, 1, dequantize_f32, float, float4x4, float>;
 #endif
 
 // Tiled matrix-matrix kernel used for prompt batches larger than 8. DS4 uses

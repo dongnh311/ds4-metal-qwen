@@ -212,6 +212,36 @@ tests/test_qwen4_moe_mm_specialize: tests/test_qwen4_moe_mm_specialize.o $(CORE_
 test-qwen4-moe-mm-specialize: tests/test_qwen4_moe_mm_specialize
 	./tests/test_qwen4_moe_mm_specialize
 
+tests/bench_qwen4_moe_mm.o: tests/bench_qwen4_moe_mm.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_qwen4_moe_mm: tests/bench_qwen4_moe_mm.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: bench-qwen4-moe-mm
+bench-qwen4-moe-mm: tests/bench_qwen4_moe_mm
+	./tests/bench_qwen4_moe_mm $(ARGS)
+
+tests/bench_qwen4_moe_reduce.o: tests/bench_qwen4_moe_reduce.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_qwen4_moe_reduce: tests/bench_qwen4_moe_reduce.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: bench-qwen4-moe-reduce
+bench-qwen4-moe-reduce: tests/bench_qwen4_moe_reduce
+	./tests/bench_qwen4_moe_reduce $(ARGS)
+
+tests/bench_qwen4_router.o: tests/bench_qwen4_router.c ds4_gpu.h
+	$(CC) $(CFLAGS) -I. -c -o $@ $<
+
+tests/bench_qwen4_router: tests/bench_qwen4_router.o $(CORE_OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(METAL_LDLIBS)
+
+.PHONY: bench-qwen4-router
+bench-qwen4-router: tests/bench_qwen4_router
+	./tests/bench_qwen4_router $(ARGS)
+
 tests/test_qwen4_conv_parallel.o: tests/test_qwen4_conv_parallel.c ds4_gpu.h
 	$(CC) $(CFLAGS) -fno-fast-math -I. -c -o $@ $<
 
