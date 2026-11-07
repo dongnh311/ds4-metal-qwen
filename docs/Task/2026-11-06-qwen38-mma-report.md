@@ -172,3 +172,29 @@ positive here, but this is one text sample - treat as validated-for-prefill,
 not proven for all inputs.
 
 tests/test_qwen4_kernels and tests/test_qwen35_kernels pass.
+
+## Addendum 5: weight repack spike - measured neutral, reverted
+
+Direction (b) was implemented end-to-end as a spike: stride-parameterized
+`qwen4_load_raw16` (+wstride arg covering Q4_K/Q2_K/IQ2_XXS/IQ2_S/MXFP4),
+repacked [row_block 64][superblock][row][unit] addressing in the mid/down
+NAX tile kernels behind `args.repack`, host gate `DS4_QWEN4_MOE_REPACK`,
+and a permutation path in tests/bench_qwen4_moe_mm.
+
+Result @T=1856 (IQ2_S mid + IQ4_NL down, E=512 S=10): mid 12.55 -> 12.57
+ms, down unchanged - bit-neutral, not a regression.  Reverted in full.
+
+Why it cannot win on M5 Pro: the feared 52 KB scattered window per K step
+is already cache-resident.  Each 82 B IQ2_S super-block is consumed over 8
+consecutive K steps, so the first touch pulls the whole line and the rest
+hit L1/L2; the per-(expert,row-block) working set is ~105 KB for gate+up,
+trivial next to the GPU's caches, and expert-major tile order already
+reuses it across token tiles.  Repack shrinks the *window*, not the
+*traffic* - and traffic was never the binding constraint (barrier/MMA
+skeleton ~34%, MMA ~36%).  Direction (b) is closed: no GGUF repack tool is
+worth building for this hardware.
+
+Remaining MoE-stage items after the router win: routed mid+down (~75%,
+kernel-internal ceiling reached), reduce ~78 ms (fp16 `part` idea, ~20 ms
+upside, semantic), shared expert ~73 ms (Q8_0 dense - worth one profile
+look), lists ~9 ms.
