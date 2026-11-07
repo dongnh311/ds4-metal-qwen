@@ -215,3 +215,31 @@ dequant->tgmem->matmul2d pipeline itself (~34% skeleton, ~36% MMA,
 ~30% staging).  A step change needs the warp-specialized/async-pipeline
 kernel project or a different quantization of the experts - both are
 new projects, not patches.
+
+## Addendum 6: routed-GEMM ceiling analysis (warp-specialization feasibility)
+
+Question asked: can the ~34% skeleton (barrier+loop) overhead be removed
+by a warp-specialized or async-copy pipeline?
+
+Arithmetic check @mid kernel, T=1928, E=512, S=10, F=640, D=2560:
+- MMA work per layer = 19280 slot-rows x 640 x 2560 x 2 (g+u) x 2 flops
+  = ~126 GFLOP -> measured MMA-only ~6.7 ms => ~19 TFLOPS, i.e. the tensor
+  cores are already at roofline for this shape.
+- Weight DRAM traffic per layer = 512 e x 640 rows x 2560 x ~0.32 B x 2
+  ~= 540 MB -> ~36 GB/s effective: nowhere near bandwidth bound (consistent
+  with the repack-neutral result).
+- Dequant+stage measured marginal ~1.5-4 ms: not ALU-bound either.
+
+So the kernel is MMA-roofline-bound plus ~40% pipeline overhead, and the
+overhead is structural: Metal exposes no cp.async for compute, matmul2d
+is a blocking cooperative op per threadgroup, and the ping-pong K-loop
+spike already showed mm.run serialization eats any barrier savings.
+Splitting dequant and MMA into separate kernels fails on DRAM traffic
+(fp16 weight scratch would cost ~3.4 GB/layer vs ~0.5 GB packed reads).
+
+Verdict: warp specialization is not expressible usefully on this stack;
+the remaining ~40% is the price of the dequant->tgmem->matmul2d fusion
+that keeps weights off DRAM.  The only remaining lever of consequence is
+the quantization itself (expert re-quant to a tensor-friendlier format),
+which the earlier Q2_K requant experiment already showed costs decode
+performance.  Kernel work on this model is done.
