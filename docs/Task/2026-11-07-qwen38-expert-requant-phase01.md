@@ -203,6 +203,21 @@ gateway :8090 request cold-started ds4-server pid 48964 on :18086 with
 the candidate and full prod args (ctx 262144, KV disk cache, MTP,
 steering, vision); chat completion returned correctly.
 
+### Production numbers (candidate, live :18086, 2026-11-07)
+
+Full prod args (ctx 262144, prefill-chunk 4096, KV disk cache, MTP +
+64k draft vocab, dir-steering ffn=0.5, vision):
+
+- resident model mapped 42.93 GiB; planned total 55.45 GiB
+  (KV 6.73 + buffers 5.79 + model)
+- prefill 466.6 t/s on a 1643-token prompt through the gateway path
+- decode ~40-47 t/s per chunk, ~41.9 t/s average over 300 tokens with MTP
+- external comparison (specs only, different harnesses): unsloth UD
+  variants run 66-94 GB; ISTA-DASLab GSQ-RCO runs 66.4-83.6 GB with
+  published task averages 89.07-93.26 (their own suite, llama.cpp) —
+  no shared benchmark exists yet, so cross-model quality claims remain
+  unverified.
+
 ## Interim verdict
 
 - Mixed precision by hotness: **no-go** (bounded upside, decode/memory
