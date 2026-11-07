@@ -33,31 +33,39 @@ Prior evidence against: the legacy `metal/moe.metal` simdgroup path measured
 ~3x slower than the tensor path — but that was the DeepSeek V4 MoE kernel with
 a different tiling/staging structure, not a controlled comparison.
 
-## Phase 1 — gating microbenchmark (cheap, do first)
+## Phase 1 — gating microbenchmark — DONE
 
-Standalone `tests/bench_mma_pipeline.m`: compiles an inline `.metal` source at
-runtime (no Makefile plumbing for the spike), allocates fp16 A/B/C buffers,
-and times three variants on the routed-GEMM tile shapes:
+`tests/bench_mma_pipeline.m` (standalone, compiles inline Metal source)
+on the mid-GEMM tile shape, fp16 in / fp32 acc, all variants bit-exact
+(`bad=0` on the all-0.5 input oracle):
 
-- `mid`:  C[32 tokens][64 rows] += A[64][2560] * B[2560][32]  (per expert,
-  one token tile; ~80 K-steps of NK=32)
-- `down`: C[32][2560] += A[2560][640] * B[640][32]
+| variant | T=256 | T=1024 |
+|---|---|---|
+| v0 matmul2d + tg staging (production structure) | 2.60-2.83 TF | 3.24-3.37 TF |
+| v1 same staging + simdgroup_matrix mma | 1.97-2.46 TF | 2.95-3.10 TF |
+| v2 simdgroup_matrix + direct device fragment loads, no staging | 4.31-5.05 TF | 5.91-5.93 TF |
+| v3 double-buffered staging + pipelined simdgroup mma | 1.84-1.88 TF | 1.97-2.01 TF |
+| v4 v1 with NK=64 K-steps | 1.88 TF | 1.97 TF |
 
-Variants:
+Findings:
 
-- V0 `matmul2d`: current structure — threadgroup stage +
-  `matmul2d<descriptor(NR1,NR0,NK,false,true,false,multiply_accumulate),
-  execution_simdgroups<4>>`, 2 barriers/K-step.
-- V1 `simdgroup_matrix`: each simdgroup owns an 8x8 (or 16x16 via 4 sims)
-  accumulator tile; A/B fragments loaded per K-step into registers;
-  `threadgroup_barrier` only around staging, same as V0.
-- V2 `simdgroup_matrix` + register double-buffer: dequant/stage K+1 into
-  registers while MMA on K runs (only possible because there is no
-  cooperative op forcing serialization).
+- v1 ~ v0 minus ~10%: `simdgroup_matrix` is not faster than `matmul2d`
+  under identical staging — the cooperative op is not the problem.
+- v3/v4 much slower: extra threadgroup memory halves occupancy; the
+  barrier skeleton cannot be pipelined away because
+  `threadgroup_barrier` is all-thread and `simdgroup_multiply_accumulate`
+  does not stay in flight across it.
+- v2 is the only winner (~1.8x) and it wins precisely by eliminating the
+  stage->barrier->load chain: each simdgroup streams fragments straight
+  from device memory.  It is unreachable for packed weights — dequant
+  must materialize fp16 somewhere, and threadgroup staging (v1) costs the
+  same barriers as v0 while device scratch costs more DRAM traffic than
+  the MMA win (quantified in the expert-quant project).
 
-Decision gate: if V1 cannot reach >=80% of V0's TFLOPS on pure fp16 data,
-the project stops — `matmul2d`'s tensor scheduling is not beatable by hand.
-If V1 ~ V0, V2 decides whether overlap buys the ~30% staging share.
+**Verdict: no-go.** The staging barrier is structural for any packed
+format; the only escape is fp16-resident operands, which the
+quantization project shows loses on DRAM traffic. Both candidate projects
+converge on the same wall from opposite directions.
 
 ## Phase 2 — fused dequant variant (only if Phase 1 passes)
 
