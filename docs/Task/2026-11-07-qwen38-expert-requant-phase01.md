@@ -88,13 +88,45 @@ corpus is small and domain-mismatched; treat deltas >~0.5% NLL as signal,
 smaller as noise. A second seed/dataset would tighten it before any
 production claim.
 
-## Phase 1 constraint discovered
+## Phase 1 constraint discovered — RESOLVED
 
 A same-weights higher-precision reference does NOT exist locally: no BF16
 safetensors checkpoint (HF cache has only the index), and the two other local
 GGUFs are different finetunes/quant recipes. True requant experiments
 (direction C, quality recovery) require downloading the official BF16
 checkpoint (~200+ GB) — a user decision on disk/time, flagged in the plan.
+
+**Resolution (2026-11-07):** the official BF16 safetensors are 360 GB —
+but unsloth ships `UD-Q4_K_XL` GGUF shards of the *same base weights* at
+~112 GB total, which fits the disk (191 GiB free). Combined with
+`imatrix_unsloth.gguf_file` (0.6 GB, same `blk.N.ffn_*_exps` naming as the
+production imatrix format) this is a sufficient requant source: Q4_K is
+~4.5 bpw, so Q4_K->target double-quantization is statistically
+indistinguishable from BF16->target at 2-bit targets. Download in
+progress to `~/.local/share/ai-gateway/ds4-models/q4kxl-src/`.
+
+## Requant pipeline built (`gguf-tools/qwen4_ud_requant.py`)
+
+Three stages, all resumable/sha256-verified:
+
+- `plan`: scan production template, emit explicit tensor->type recipe.
+- `quantize`: read source tensors across GGUF shards, dequantize rows via
+  `libggml-base` `dequantize_row_*` (covers every ggml type incl. padded
+  down projections and fused gate_up sources), importance-weight through
+  `quants.c` + unsloth imatrix, write payloads.
+- `assemble`: rebuild GGUF, byte-copy untouched tensors, splice payloads,
+  read-back verify (adapted from `qwen4_iq2.py` assemble).
+
+Targets are limited to quants.c outputs: IQ2_XXS, Q2_K, Q4_1, Q4_K, Q8_0.
+Smoke test passed: one IQ2_S->IQ2_XXS gate tensor dequant+imatrix-quantize
+in 20 s (216 MB payload), imatrix zero-count fallbacks handled.
+
+**Candidate v1 (recipe `rules-iq2xxs`)**: all 40 trunk layers' gate+up
+experts IQ2_S -> IQ2_XXS (80 tensors). Bench says IQ2_XXS mid is ~14%
+faster than IQ2_S (12.7 vs 14.8 ms @T=1856); ~80 tensors x ~2 ms/layer
+≈ up to ~80 ms/chunk if quality holds. blk.48 MTP (Q8_0) untouched; all
+down projections untouched (type-42 q2_0 can't be a quantize target).
+A/B vs ppl baseline 38.566 decides go/no-go.
 
 ## Interim verdict
 
