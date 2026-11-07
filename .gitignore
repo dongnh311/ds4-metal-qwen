@@ -65,3 +65,4 @@ speed-bench/ornith/*/omlx/
 /tests/bench_qwen4_moe_mm
 /tests/bench_qwen4_moe_mm
 /tests/bench_qwen4_moe_reduce
+/tests/bench_qwen4_router

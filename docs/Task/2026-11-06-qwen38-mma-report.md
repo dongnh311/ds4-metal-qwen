@@ -110,3 +110,29 @@ Remaining reduce cost is the fp32 `part` intermediate itself (~208 MB/
 layer write+read). Halving it needs fp16 part storage - a semantic
 change to every down-kernel epilogue writer plus NLL validation; parked
 behind the repack project which attacks 75% of the stage instead.
+
+## Addendum 3: router stage decomposition (new bench + full-model)
+
+`tests/bench_qwen4_router` times kernel_qwen4_router_topk alone:
+~0.54 ms/call at T=1928, NE=512, NU=10, dim=2560, F32 gate row
+(~25 ms over 47 layers).  The profiled "router" stage is ~78 ms, so
+~53 ms is the router-logits GEMV, not top-k.
+
+ffn_gate_inp.weight is F32 [512,2560] (5 MiB/layer, verified via
+llama-gguf): qwen4_gemv_rows sends it to kernel_qwen4_dense_mm
+(fp32 simdgroup_float8x8 tiles, ~4.6 TFLOPS effective, n_split=1 at
+976 threadgroups).  F32 is the one dense type with no tensor-op NAX
+variant (F16 exists but is env-gated off by default; GSQ types use
+kernel_qwen4_dense_nax_*).  A tensor path for the router GEMM means
+fp16 operands -> logit rounding ~1e-3 -> rare top-k flips: a semantic
+change needing the NLL suite, same class as the fp16 `part` idea.
+
+Shared expert (~73 ms: shared_mid 47.6 + shared_down 25.8) runs dense
+Q8_0 projections visible in DS4_METAL_Q8_PREFILL_PROFILE output
+(e.g. in=2560 out=640 ~0.6 ms, in=640 out=2560 ~0.5-1.0 ms per layer).
+
+Updated MoE-stage map @T~1900 (47 layers):
+  routed mid ~724 + routed down ~404 (repack target, ~75%)
+  reduce ~79 (v4 done, ~77)
+  router ~78 (GEMV ~53 + topk ~25)
+  shared ~73, lists ~9
