@@ -180,6 +180,29 @@ Conclusion: v1 captured the available requant win. Further down-proj
 gains need either a new quantizer (IQ4_NL, quality-only) or a new
 block geometry that fits K=640 (kernel+format project).
 
+## Direction 4 sweep — context chunking / speculative decode (2026-11-07)
+
+Measured on the candidate, production-equivalent flags:
+
+- `--prefill-chunk` {1024, 2048, 4096, 8192} on a ~10.7k-token prompt:
+  656.8 / **678.8** / 675.4 / 668.6 t/s. Production's 4096 is already at
+  the plateau; 2048 marginally better but within noise. No change.
+- `--mtp-draft` {1,2,3} x `--mtp-margin` {0,3}: identical results —
+  68.2% first-draft acceptance, 0% second-draft, ~39.5 t/s. Depth>1
+  cycles almost never engage; margin only applies at draft_n==2. No
+  tuning headroom; production defaults already optimal.
+
+## Deploy record (2026-11-07)
+
+Candidate promoted to production: `runtime-registry.json` model
+`unsloth--Qwen3.8-Flash-Next-UD-IQ2_XS` now points `-m`/`model_path` at
+`ud/UD-IQ2_XS-mtp-gateup-iq2xxs.gguf` (backup
+`runtime-registry.json.bak-gateup-iq2xxs-20261107`; rollback = restore
+path to `UD-IQ2_XS-mtp.gguf`, still on disk). Verified end-to-end:
+gateway :8090 request cold-started ds4-server pid 48964 on :18086 with
+the candidate and full prod args (ctx 262144, KV disk cache, MTP,
+steering, vision); chat completion returned correctly.
+
 ## Interim verdict
 
 - Mixed precision by hotness: **no-go** (bounded upside, decode/memory
