@@ -1,0 +1,3 @@
+{"name": "candidate-v1", "base": "registry", "registry_model": "unsloth--Qwen3.8-Flash-Next-UD-IQ2_XS",
+ "model": "/Users/dongnh/.local/share/ai-gateway/ud/UD-IQ2_XS-mtp-gateup-iq2xxs.gguf",
+ "args_add": [], "args_remove": [], "env": {}}

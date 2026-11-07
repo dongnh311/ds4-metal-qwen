@@ -1,0 +1,3 @@
+{"name": "orca-uncensored", "base": "registry", "registry_model": "unsloth--Qwen3.8-Flash-Next-UD-IQ2_XS",
+ "model": "/Users/dongnh/.local/share/ai-gateway/ds4-models/Qwen3.8-Flash-Next-OrcaUncensored-IQ2XXS-Q2KDownPad768-DenseQ4Kselimat-MTP.gguf",
+ "args_add": [], "args_remove": [], "env": {}}

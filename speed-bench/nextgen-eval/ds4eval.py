@@ -14,8 +14,8 @@ EVAL_NO_VALUE = {"--metal", "--ssd-streaming", "--ssd-streaming-cold", "--qualit
 # or above: a new candidate flag (runtime projection, YaRN, ...) is refused, never dropped silently.
 SERVER_ONLY_WITH_VALUE = {"-c", "--ctx", "--host", "--port", "--kv-disk-dir", "--kv-disk-space-mb",
                           "--kv-cache-cold-max-tokens", "--kv-cache-continued-interval-tokens",
-                          "--think-budget"}
-SERVER_ONLY_NO_VALUE = {"--mtp"}
+                          "--think-budget", "--vision"}
+SERVER_ONLY_NO_VALUE = {"--mtp", "--mtp-timing"}
 REASON_RUNS = [("core", "GPQA Diamond", 8), ("core", "SuperGPQA", 8), ("core", "AIME2025", 8),
                ("hard", "MMLU-Pro", 20)]
 TOKENS = 32768
