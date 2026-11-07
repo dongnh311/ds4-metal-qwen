@@ -198,3 +198,20 @@ Remaining MoE-stage items after the router win: routed mid+down (~75%,
 kernel-internal ceiling reached), reduce ~78 ms (fp16 `part` idea, ~20 ms
 upside, semantic), shared expert ~73 ms (Q8_0 dense - worth one profile
 look), lists ~9 ms.
+
+## Final stage totals @T=1928 (47 layers, this branch)
+
+mid 706.6 + down 337.5 (routed GEMM, ~84%) | reduce 79.6 | shared 76.5 |
+router 33.5 | lists 9.3 = **1242.9 ms** MoE stage.
+
+Session deltas vs the pre-branch baseline (~1313 ms same harness):
+- router F32 dense_mm -> tensor tiles: -44 ms (77.4 -> 33.5)
+- moe_reduce float4 variant: ~-2 ms (77 -> ~78 noise band)
+- weight repack: measured, rejected, reverted (see addendum 5)
+
+The routed mid+down GEMM is the only remaining large block and every
+in-kernel lever measured so far is exhausted; its floor is the
+dequant->tgmem->matmul2d pipeline itself (~34% skeleton, ~36% MMA,
+~30% staging).  A step change needs the warp-specialized/async-pipeline
+kernel project or a different quantization of the experts - both are
+new projects, not patches.
