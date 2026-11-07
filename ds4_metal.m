@@ -54865,12 +54865,12 @@ static long qwen4_moe_mm_nax_level(uint32_t type) {
      * 0.20505, Q2 0.30418 vs 0.30346), while it carries the full prefill
      * gain (+48/+51% Q4, +29/+36% Q2).  The compensated level 5 keeps the
      * best absolute NLL and stays one env variable away. */
-    if (!v || !v[0]) return (type == 12u || type == 39u || type == 16u || type == 10u || qwen4_mm_gsq_block(type)) ? 2 : 0;
+    if (!v || !v[0]) return (type == 12u || type == 39u || type == 16u || type == 10u || type == 2u || qwen4_mm_gsq_block(type)) ? 2 : 0;
     return strtol(v, NULL, 10);
 }
 static uint32_t qwen4_moe_mm_nax(uint32_t type) {
     if (!ds4_gpu_mpp_available()) return 0;
-    if (!(type == 12u || type == 39u || type == 16u || type == 10u) && !qwen4_mm_gsq_block(type)) return 0;
+    if (!(type == 12u || type == 39u || type == 16u || type == 10u || type == 2u) && !qwen4_mm_gsq_block(type)) return 0;
     const long n = qwen4_moe_mm_nax_level(type);
     if (n <= 0) return 0;
     return (n == 1 || n == 4 || n == 6) ? 32u : 64u;
