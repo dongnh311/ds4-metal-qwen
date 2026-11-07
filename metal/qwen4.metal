@@ -4578,6 +4578,66 @@ kernel void kernel_qwen4_moe_reduce(
     }
 }
 
+/* float4 variant of kernel_qwen4_moe_reduce for dim % 4 == 0: each thread
+ * owns four consecutive dims so every part/weights/out/R access is one
+ * 16-byte vector instead of four scalar streams.  Per-element accumulation
+ * order is unchanged, so results are bit-identical to the scalar kernel. */
+kernel void kernel_qwen4_moe_reduce_v4(
+        constant ds4_metal_args_qwen4_moe_reduce & args,
+        device const float *part,        /* [T][part_stride][dim] */
+        device const float *weights,     /* [T][n_slots] */
+        device const float *shared_gate, /* [T] raw logit */
+        device float       *out,         /* [T][dim] */
+        device float       *R,           /* [T][n_hc*dim] */
+        device const float *inj,         /* [T][n_hc*chunks][n_hc] norm partials */
+        device const float *shared,      /* [T][dim] when shared_src == 2 */
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        ushort tid [[thread_index_in_threadgroup]],
+        ushort3 ntg [[threads_per_threadgroup]]) {
+    const uint d4 = (tgpig.x * ntg.x + tid) * 4u;
+    const uint tok = tgpig.y;
+    if (tok >= args.n_tokens) return;
+    threadgroup float wgt[8];
+    if (args.n_hc && tid < args.n_hc) {
+        wgt[tid] = qwen4_hc_inject_weight(inj + (uint64_t)tok * args.n_hc * QWEN4_HC_CHUNKS * args.n_hc, args.n_hc, tid);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (d4 >= args.dim) return;
+    const uint64_t pbase = ((uint64_t)tok * args.part_stride) * args.dim + d4;
+    const uint64_t wbase = (uint64_t)tok * args.n_slots;
+    float4 acc = 0.0f;
+    for (uint s = 0; s < args.n_slots; s++) {
+        const float w = weights[wbase + s];
+        const float4 p = w * *(device const float4 *)(part + pbase + (uint64_t)s * args.dim);
+        acc.x += isfinite(p.x) ? p.x : 0.0f;
+        acc.y += isfinite(p.y) ? p.y : 0.0f;
+        acc.z += isfinite(p.z) ? p.z : 0.0f;
+        acc.w += isfinite(p.w) ? p.w : 0.0f;
+    }
+    if (args.shared_src == 1) {
+        const float g = qwen4_sigmoid(shared_gate[tok]);
+        const float4 p = g * *(device const float4 *)(part + pbase + (uint64_t)args.n_slots * args.dim);
+        acc.x += isfinite(p.x) ? p.x : 0.0f;
+        acc.y += isfinite(p.y) ? p.y : 0.0f;
+        acc.z += isfinite(p.z) ? p.z : 0.0f;
+        acc.w += isfinite(p.w) ? p.w : 0.0f;
+    } else if (args.shared_src == 2) {
+        const float g = qwen4_sigmoid(shared_gate[tok]);
+        const float4 p = g * *(device const float4 *)(shared + (uint64_t)tok * args.dim + d4);
+        acc.x += isfinite(p.x) ? p.x : 0.0f;
+        acc.y += isfinite(p.y) ? p.y : 0.0f;
+        acc.z += isfinite(p.z) ? p.z : 0.0f;
+        acc.w += isfinite(p.w) ? p.w : 0.0f;
+    }
+    *(device float4 *)(out + (uint64_t)tok * args.dim + d4) = acc;
+    if (args.n_hc) {
+        device float *r = R + (uint64_t)tok * args.dim * args.n_hc + d4;
+        for (uint s = 0; s < args.n_hc; s++) {
+            *(device float4 *)(r + (uint64_t)s * args.dim) += wgt[s] * acc;
+        }
+    }
+}
+
 /* --- prefill: expert-grouped GEMMs -------------------------------------- */
 
 struct ds4_metal_args_qwen4_moe_mm {

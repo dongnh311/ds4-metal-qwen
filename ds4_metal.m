@@ -49943,6 +49943,7 @@ enum {
     QWEN4_K_QWEN35_ATTN_QPACK,
     QWEN4_K_QWEN35_ATTN_FLASH_NAX,
     QWEN4_K_QWEN35_ATTN_FLASH_NAX_SPLIT,
+    QWEN4_K_MOE_REDUCE_V4,
     QWEN4_K_COUNT,
 };
 
@@ -50113,6 +50114,7 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen35_attn_qpack",
     "kernel_qwen35_attn_flash_nax",
     "kernel_qwen35_attn_flash_nax_split",
+    "kernel_qwen4_moe_reduce_v4",
 };
 
 typedef struct {
@@ -54681,6 +54683,14 @@ int ds4_gpu_qwen4_moe_reduce_tensor(
         }
     } else {
         b[6] = b[0];
+    }
+    /* dim % 4 == 0 takes the float4 kernel: same per-element math, a quarter
+     * of the load instructions.  Odd dims keep the scalar kernel.
+     * DS4_QWEN4_MOE_REDUCE_SCALAR=1 is a diagnostic A/B override. */
+    const int reduce_scalar = ds4_gpu_env_bool("DS4_QWEN4_MOE_REDUCE_SCALAR");
+    if ((dim & 3u) == 0 && reduce_scalar <= 0) {
+        return qwen4_dispatch(QWEN4_K_MOE_REDUCE_V4, &args, sizeof(args), b, 7,
+                              MTLSizeMake((dim + 1023) / 1024, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
     }
     return qwen4_dispatch(QWEN4_K_MOE_REDUCE, &args, sizeof(args), b, 7,
                           MTLSizeMake((dim + 255) / 256, n_tokens, 1), MTLSizeMake(256, 1, 1), 0);
