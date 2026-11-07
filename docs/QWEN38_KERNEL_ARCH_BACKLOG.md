@@ -67,3 +67,18 @@ kernel change.
 
 Cross-reference: the AI-Gateway report `reports/qwen38-iq2-local-2026-11-06/RESULT.md`
 holds the full measurements and the reverted patches (`q8-tiled-mm.diff`, Q2_K scripts).
+
+## Post-backlog status (2026-11-07)
+
+Directions 1-3 are now closed with measurements — see
+`docs/Task/2026-11-06-qwen38-mma-report.md` (merged via `feature/qwen38-2bit-mma`)
+and the two spike branches `feature/qwen38-mma-pipeline` /
+`feature/qwen38-expert-quant`. Summary: tensor cores already at ~19 TFLOPS
+roofline, DRAM ~36 GB/s, three independent repack/layout variants all neutral —
+the barrier/MMA skeleton is structural under packed 2-bit weights.
+
+**Direction 4 / system-level (noted, not started):** if prefill speed is still the
+goal after kernel work is exhausted, the remaining levers are outside the MoE
+kernel — context chunking / prompt streaming strategy, speculative-decoding /
+MTP acceptance tuning, and SSD expert hotlist policy. These change scheduling and
+numerics-visible behavior and need their own eval pass.
