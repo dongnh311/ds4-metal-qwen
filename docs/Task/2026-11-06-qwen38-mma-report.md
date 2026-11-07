@@ -86,3 +86,27 @@ fp16 + error compensation like the midh/midr path, or fuse the weighted
 reduce into the down epilogue - both touch logits accuracy and need the
 full correctness suite. Router (76 ms) and shared expert (68 ms) not yet
 profiled at kernel level.
+
+## Addendum 2: reduce kernel float4 variant (kept, small win)
+
+`kernel_qwen4_moe_reduce_v4` (dim % 4 == 0) gives each thread four
+consecutive dims via float4 loads/stores; per-element accumulation order
+is unchanged so output is bit-identical. Scalar kernel remains for odd
+dims and via DS4_QWEN4_MOE_REDUCE_SCALAR=1.
+
+Measured with tests/bench_qwen4_moe_reduce (T=1856, dim=2560, S=10,
+hc=4, shared slot): v4 ~1.68 ms vs scalar ~1.70 ms per call (~1-2%).
+The kernel is DRAM-bound (~230 GB/s effective on the part buffer), so
+the ceiling for load-width tuning is low - confirmed: hc=0/4/8 and
+shared_src 1/2 all within noise-to-6%.
+
+Full-model check (UD-IQ2_XS-mtp.gguf, T=1928, DS4_QWEN4_MOE_PROFILE,
+47 logged layers): reduce stage 79.0 ms with v4 vs 81.0 ms scalar
+(~2.4% of the stage, ~2 ms absolute). test_qwen4_kernels and
+test_qwen35_kernels pass; reduce+combine output matches the double
+reference at 2e-5.
+
+Remaining reduce cost is the fp32 `part` intermediate itself (~208 MB/
+layer write+read). Halving it needs fp16 part storage - a semantic
+change to every down-kernel epilogue writer plus NLL validation; parked
+behind the repack project which attacks 75% of the stage instead.
