@@ -115,6 +115,10 @@ def dequant_tensor(kind, raw, n_rows, n_cols):
     return out.reshape(n_rows, n_cols)
 
 
+class SourceIncomplete(Exception):
+    pass
+
+
 class ShardMap:
     """Tensor lookup across a set of GGUF shard files (multi-file model)."""
 
@@ -132,6 +136,8 @@ class ShardMap:
         rd, kind, dims, off = self.loc[name]
         rd.f.seek(rd.data_start + off)
         raw = rd.f.read(gguf_bytes(kind, dims))
+        if len(raw) != gguf_bytes(kind, dims):
+            raise SourceIncomplete(name)
         n0, n1, n2 = (list(dims) + [1, 1, 1])[:3]
         if cols is not None and n0 != cols:
             # padded source (e.g. down K=768 logical 640): drop trailing pad
@@ -204,11 +210,15 @@ def quantize(args):
             base = name.rsplit(".", 2)[0]  # blk.N.ffn
             fused = f"{base}.ffn_gate_up_exps.weight"
             if not src.has(fused):
-                raise SystemExit(f"no source tensor for {name} "
-                                 f"(tried {src_name}, {fused})")
+                print(f"{name}: SKIP no source tensor", flush=True)
+                continue
         t0 = time.monotonic()
-        vals3 = src.read_f32(src_name if fused is None else fused,
-                             cols=tdims[0])
+        try:
+            vals3 = src.read_f32(src_name if fused is None else fused,
+                                 cols=tdims[0])
+        except SourceIncomplete:
+            print(f"{name}: SKIP source shard still downloading", flush=True)
+            continue
         if fused is not None:
             # fused gate_up: first half of rows is gate, second is up
             half = vals3.shape[1] // 2
