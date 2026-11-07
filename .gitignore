@@ -63,3 +63,5 @@ speed-bench/ornith/oracle/ref-cpu/
 speed-bench/ornith/*/omlx/
 /tests/.qwen35-vision*
 /tests/bench_qwen4_moe_mm
+/tests/bench_qwen4_moe_mm
+/tests/bench_qwen4_moe_reduce
