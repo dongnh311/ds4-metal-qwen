@@ -75,12 +75,18 @@ UD-IQ2_XS is a *dynamic* quant; the 48 layers do not share one format:
 4. Current estimated routed-GEMM total ≈ 1037 ms/chunk @T≈1856, consistent
    with the measured ~1047 ms (mid 717 + down 330 @T≈1928).
 
-## Phase 1 — quality baseline (running)
+## Phase 1 — quality baseline (done)
 
 `ds4 --perplexity-file` teacher-forced NLL on a fixed 8160-token corpus
-(story prompt + model docs, `/tmp/qwen38-ppl-corpus.txt`) — absolute NLL for
-UD-IQ2_XS on this build. This is the anchor any future requant A/B compares
-against. Result pending at time of writing; will be appended.
+(story prompt + model docs, `/tmp/qwen38-ppl-corpus.txt`), UD-IQ2_XS-mtp
++ PLE sidecar, full Metal path:
+
+- tokens=35218 scored=8160 **nll=29803.3632 avg_nll=3.65237 ppl=38.566**
+
+This is the anchor any future requant A/B compares against. Caveat: the
+corpus is small and domain-mismatched; treat deltas >~0.5% NLL as signal,
+smaller as noise. A second seed/dataset would tighten it before any
+production claim.
 
 ## Phase 1 constraint discovered
 
@@ -96,7 +102,19 @@ checkpoint (~200+ GB) — a user decision on disk/time, flagged in the plan.
   conflicts).
 - Format harmonization without recalibration: the dynamic quant is already
   near the speed/quality frontier *for the formats the kernel supports*; the
-  only clear anomaly (layer-4 q4_0) is a kernel gap worth ~12 ms/chunk and
-  belongs in the kernel backlog.
+  only clear anomaly (layer-4 q4_0) was a kernel gap worth ~12 ms/chunk —
+  resolved on this branch, see below.
 - Remaining real lever: calibrated requant from BF16 source (direction C) —
   needs the checkpoint download; or accept current quality and stop.
+
+## Update — layer-4 q4_0 anomaly resolved (kernel side)
+
+The "kernel gap" flagged above is fixed on this branch (`9dd059c8`):
+q4_0 (type 2) expert rows now take the tensor-tile NAX path like every
+other routed format — `stage8` already dequantizes them into sequential
+32-value chunks, so only the two host allowlists needed type 2.
+Bench @T=1856 E=512 S=10: down type-2 **24.19 → 10.34 ms**; the layer-4
+combo (IQ2_S mid + q4_0 down) **56.28 → 28.93 ms**. Correctness:
+`test_qwen4_moe_mm_specialize` type=2 exact at all T. Production impact
+≈10–14 ms per MoE pass (single layer). All routed expert formats in the
+model now have tensor paths — format coverage is complete.
