@@ -163,9 +163,22 @@ kernel delta (~14% on the converted tensors).
 
 **Verdict: GO.** Candidate v1 dominates baseline on quality (-45% ppl),
 prefill (-54 ms/chunk), and model size (-4 GiB). Recommend promoting it
-to production after a decode-side check on the server path; down
-projections (type-42 q2_0, ~321 ms/chunk) are the next requant target —
-quants.c can emit IQ2_XXS for them too (candidate v2).
+to production after a decode-side check on the server path.
+
+## Candidate v2 analysis — down requant is geometrically blocked
+
+Down tensors are `[640, 2560, 512]` (K=640). Every fast quants.c target
+(IQ2_XXS, Q2_K, Q4_K) uses 256-element blocks and 640 % 256 != 0, so they
+cannot legally encode these rows. The only remaining targets have
+32-element blocks: Q4_1 (~5 bpw) and Q8_0 (~8.5 bpw) — both *larger* than
+the current down mix (q2_0 ~2.25 bpw, IQ4_NL ~4.5 bpw), i.e. more DRAM
+traffic for unclear quality. Same-format recalibration is also impossible
+with current tooling: quants.c cannot emit IQ4_NL or the DS4-private
+type-42 q2_0, and type 42 has no libggml dequantizer for reading it back.
+
+Conclusion: v1 captured the available requant win. Further down-proj
+gains need either a new quantizer (IQ4_NL, quality-only) or a new
+block geometry that fits K=640 (kernel+format project).
 
 ## Interim verdict
 
