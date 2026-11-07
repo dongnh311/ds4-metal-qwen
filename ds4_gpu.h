@@ -3848,6 +3848,12 @@ int ds4_gpu_qwen4_moe_reduce_tensor(
 int ds4_gpu_qwen4_moe_build_lists_tensor(
         ds4_gpu_tensor *lists, ds4_gpu_tensor *counts, const ds4_gpu_tensor *selected,
         uint32_t n_tokens, uint32_t n_slots, uint32_t n_expert, uint32_t list_cap);
+/* Diagnostic (DS4_QWEN4_ROUTE_COUNTS): samples the resident-path `selected`
+ * tensor into the route-counts table. No-op unless the env var is set; only
+ * records prefill-sized batches. */
+int ds4_gpu_qwen4_route_counts_note_selected(
+        const ds4_gpu_tensor *selected, uint32_t layer,
+        uint32_t n_tokens, uint32_t n_slots, uint32_t n_total_expert);
 int ds4_gpu_qwen4_moe_mm_mid_tensor(
         ds4_gpu_tensor *mid, const ds4_gpu_tensor *x, const ds4_gpu_tensor *lists, const ds4_gpu_tensor *counts,
         const void *model_map, uint64_t model_size, uint64_t gate_offset, uint64_t up_offset,

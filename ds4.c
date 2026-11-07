@@ -61667,6 +61667,8 @@ static bool qwen4_graph_moe(ds4_qwen4_gpu_graph *g, const ds4_model *m, const ds
      * unless that intervening commit is followed by a full GPU wait. */
     if (mm) {
         if (ok) {
+            (void)ds4_gpu_qwen4_route_counts_note_selected(g->selected, il, T,
+                                                           DS4_N_EXPERT_USED, DS4_N_EXPERT);
             ok = ds4_gpu_qwen4_moe_build_lists_tensor(g->moe_lists, g->moe_counts, g->selected, T, DS4_N_EXPERT_USED,
                                                       DS4_N_EXPERT, g->cap_tokens) &&
                  qwen4_moe_profile_boundary(profile, &last, &elapsed[1]) &&

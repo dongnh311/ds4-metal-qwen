@@ -971,6 +971,60 @@ static uint64_t
 static uint64_t g_moe_selected_hotlist_records;
 static uint64_t g_moe_selected_hotlist_selections;
 
+/* Diagnostic: raw per-(layer, expert) selection counts for the qwen4 streamed
+ * MoE path, dumped by DS4_QWEN4_ROUTE_COUNTS=<path>. Routing is identical in
+ * resident and streamed modes (the router is dense), so streamed runs give the
+ * same expert popularity the resident prefill sees. */
+static int g_qwen4_route_counts_on = -1;
+static int g_qwen4_route_counts_atexit;
+static uint32_t
+    g_qwen4_route_counts[DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER][DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT];
+static uint64_t g_qwen4_route_counts_total;
+
+static void ds4_gpu_qwen4_route_counts_close(void) {
+    const char *path = getenv("DS4_QWEN4_ROUTE_COUNTS");
+    if (!path || !path[0]) return;
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        fprintf(stderr, "ds4: failed to open route counts file %s\n", path);
+        return;
+    }
+    fprintf(fp, "# ds4 qwen4 route counts v1\n# columns: layer expert hits\n");
+    for (uint32_t layer = 0;
+         layer < DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER; layer++) {
+        for (uint32_t expert = 0;
+             expert < DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT; expert++) {
+            const uint32_t hits = g_qwen4_route_counts[layer][expert];
+            if (hits) fprintf(fp, "%u %u %u\n", layer, expert, hits);
+        }
+    }
+    fprintf(fp, "# total_selections %" PRIu64 "\n",
+            (unsigned long long)g_qwen4_route_counts_total);
+    fclose(fp);
+    fprintf(stderr,
+            "ds4: wrote qwen4 route counts to %s (%" PRIu64 " selections)\n",
+            path, (unsigned long long)g_qwen4_route_counts_total);
+}
+
+static void ds4_gpu_qwen4_route_counts_note(
+        uint32_t layer, const int32_t *ids, uint32_t n, uint32_t n_total_expert) {
+    if (g_qwen4_route_counts_on < 0)
+        g_qwen4_route_counts_on = getenv("DS4_QWEN4_ROUTE_COUNTS") != NULL;
+    if (!g_qwen4_route_counts_on) return;
+    if (!g_qwen4_route_counts_atexit) {
+        g_qwen4_route_counts_atexit = 1;
+        atexit(ds4_gpu_qwen4_route_counts_close);
+    }
+    if (layer >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_LAYER) return;
+    for (uint32_t i = 0; i < n; i++) {
+        const int32_t e = ids[i];
+        if (e < 0 || (uint32_t)e >= n_total_expert ||
+            (uint32_t)e >= DS4_METAL_STREAM_EXPERT_CACHE_MAX_EXPERT) continue;
+        g_qwen4_route_counts[layer][(uint32_t)e]++;
+        g_qwen4_route_counts_total++;
+    }
+}
+
 typedef struct {
     __strong id<MTLBuffer> gate_buffer;
     __strong id<MTLBuffer> up_buffer;
@@ -11870,6 +11924,32 @@ int ds4_gpu_end_commands(void) {
     const int ok = ds4_gpu_finish_command_buffer(cb, 1, "command batch");
     ds4_gpu_qpipe_note_all_complete();
     return qgate_check_after_wait() && ok;
+}
+
+/* Resident-path hook: the qwen4 MoE graph keeps `selected` on the GPU, so
+ * sampling it needs a batch commit + wait. Only prefill-sized batches are
+ * recorded (decode T==1 would pay a wait per layer per token); prefill
+ * routing is the distribution the expert-quant design needs anyway. */
+int ds4_gpu_qwen4_route_counts_note_selected(
+        const ds4_gpu_tensor *selected, uint32_t layer,
+        uint32_t n_tokens, uint32_t n_slots, uint32_t n_total_expert) {
+    if (g_qwen4_route_counts_on < 0)
+        g_qwen4_route_counts_on = getenv("DS4_QWEN4_ROUTE_COUNTS") != NULL;
+    if (!g_qwen4_route_counts_on || !selected || n_tokens < 2 || n_slots == 0) {
+        return 1;
+    }
+    const uint64_t n = (uint64_t)n_tokens * n_slots;
+    if (n > ((uint64_t)1 << 26)) return 1;
+    int32_t *ids = (int32_t *)malloc((size_t)n * sizeof(int32_t));
+    if (!ids) return 0;
+    const int had_batch = g_batch_cb != nil;
+    int ok = 1;
+    if (had_batch) ok = ds4_gpu_end_commands();
+    if (ok) ok = ds4_gpu_tensor_read(selected, 0, ids, n * sizeof(int32_t));
+    if (ok) ds4_gpu_qwen4_route_counts_note(layer, ids, (uint32_t)n, n_total_expert);
+    free(ids);
+    if (had_batch) (void)ds4_gpu_begin_commands();
+    return ok;
 }
 
 /* Non-blocking stage timing (DS4_METAL_GPU_STAGE_TIMESTAMPS).  Every stage
@@ -54432,6 +54512,8 @@ int ds4_gpu_qwen4_moe_stream_layer(
             if (e < 0 || (uint32_t)e >= n_total_expert) { valid = 0; break; }
             if (!seen[e]) { seen[e] = 1; unique_ids[n_unique++] = e; }
         }
+        if (valid && n_unique != 0)
+            ds4_gpu_qwen4_route_counts_note(layer, all_ids, n_sel_total, n_total_expert);
         free(all_ids);
         if (!valid || n_unique == 0) { if (getenv("DS4_QWEN4_STREAM_DEBUG")) fprintf(stderr, "ds4: qwen4 stream L%u fail: valid=%d n_unique=%u\n", layer, valid, n_unique); if (had_batch) (void)ds4_gpu_begin_commands(); return 0; }
         if (g_qws_t) g_qws_drain_ms += ds4_gpu_now_ms() - _t0;
