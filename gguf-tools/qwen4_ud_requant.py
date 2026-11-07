@@ -18,6 +18,8 @@ GGUF type ids follow ggml (== ds4 DS4_TENSOR_*); type 42 is the ds4-private
 q2_0 block format (64 elems / 18 bytes).  Quantize targets are limited to
 what quants.c implements: IQ2_XXS, Q2_K, Q4_1, Q4_K, Q8_0.
 """
+from __future__ import annotations
+
 import argparse
 import ctypes
 import hashlib
@@ -57,7 +59,7 @@ _TYPES = {
     29: ("IQ1_M", "dequantize_row_iq1_m"), 30: ("BF16", None),
     34: ("TQ1_0", "dequantize_row_tq1_0"), 35: ("TQ2_0", "dequantize_row_tq2_0"),
     39: ("MXFP4", "dequantize_row_mxfp4"), 40: ("NVFP4", "dequantize_row_nvfp4"),
-    41: ("Q1_0", "dequantize_row_q1_0"), 42: ("Q2_0_D4", None),
+    41: ("Q1_0", "dequantize_row_q1_0"), 42: ("Q2_0", None),
 }
 _NAME_TO_ID = {v[0]: k for k, v in _TYPES.items()}
 
@@ -104,6 +106,17 @@ def dequant_tensor(kind, raw, n_rows, n_cols):
     if kind == 30:
         return bf16_to_f32(np.frombuffer(raw, dtype="<u2", count=total)
                            .reshape(n_rows, n_cols))
+    if kind == 42:
+        # Q2_0: per-64 block fp16 scale + 16 bytes of 2-bit codes, (q-1)*d.
+        nb = n_cols // Q2_0_BLOCK
+        blk = np.frombuffer(raw, dtype=np.uint8).reshape(n_rows, nb, 18)
+        d = blk[:, :, :2].copy().view(np.float16).astype(np.float32)[:, :, 0]
+        qs = blk[:, :, 2:]
+        out = np.empty((n_rows, nb, Q2_0_BLOCK), dtype=np.float32)
+        for j in range(Q2_0_BLOCK):
+            q = (qs[:, :, j // 4] >> ((j % 4) * 2)) & 3
+            out[:, :, j] = (q.astype(np.float32) - 1.0) * d
+        return out.reshape(n_rows, n_cols)
     if sym is None:
         raise SystemExit(f"no dequantizer for ggml type {kind} ({name})")
     fn = getattr(Ggml, sym)
@@ -113,6 +126,64 @@ def dequant_tensor(kind, raw, n_rows, n_cols):
     fn(ctypes.c_char_p(raw),
        out.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), total)
     return out.reshape(n_rows, n_cols)
+
+
+Q2_0_BLOCK = 64
+
+
+def encode_q2_0(values: np.ndarray, imatrix: np.ndarray | None) -> bytes:
+    """ggml type-42 Q2_0 (PrismML ternary 2-bit): per-64 block fp16 scale d,
+    codes q in {0,1,2,3} -> (q-1)*d in {-d, 0, d, 2d}.
+
+    Unlike quantize_row_q2_0_ref (amax RTN) the scale is chosen per block by a
+    weighted-SSE grid search, which uses the +2d level and typically lands well
+    below amax. `values` is (..., ncols) f32 with ncols % 64 == 0; `imatrix`
+    is per-column importance (ncols,)."""
+    if np.asarray(values).dtype == np.dtype("<u2"):
+        src = np.ascontiguousarray(bf16_to_f32(values), dtype=np.float32)
+    else:
+        src = np.ascontiguousarray(values, dtype=np.float32)
+    ncols = src.shape[-1]
+    if ncols % Q2_0_BLOCK:
+        raise SystemExit(f"Q2_0 width {ncols} not divisible by {Q2_0_BLOCK}")
+    v = src.reshape(-1, ncols)
+    nrows = v.shape[0]
+    nb = ncols // Q2_0_BLOCK
+    if imatrix is None:
+        wt = np.ones(ncols, dtype=np.float32)
+    else:
+        wt = np.ascontiguousarray(imatrix, dtype=np.float32)
+        if wt.shape != (ncols,):
+            raise SystemExit(f"Q2_0 imatrix width {wt.size} != {ncols}")
+    w3 = wt.reshape(1, nb, Q2_0_BLOCK)
+
+    # candidate scales: fraction of per-block amax, fp16-rounded like storage
+    ratios = np.linspace(0.35, 1.05, 29, dtype=np.float32)
+    best_sse = np.full((nrows, nb), np.inf, dtype=np.float32)
+    best_d = np.zeros((nrows, nb), dtype=np.float32)
+    best_q = np.zeros((nrows, nb, Q2_0_BLOCK), dtype=np.uint8)
+    for r in ratios:
+        wb = v.reshape(nrows, nb, Q2_0_BLOCK)
+        amax = np.abs(wb).max(axis=2)
+        d = (amax * r).astype(np.float16).astype(np.float32)
+        d = np.where(d > 0, d, np.float32(1e-8))
+        q = np.clip(np.rint(wb / d[:, :, None]) + 1.0, 0, 3).astype(np.uint8)
+        recon = (q.astype(np.float32) - 1.0) * d[:, :, None]
+        sse = (w3 * (wb - recon) ** 2).sum(axis=2)
+        better = sse < best_sse
+        best_sse[better] = sse[better]
+        best_d[better] = d[better]
+        best_q[better] = q[better]
+
+    # pack: per block fp16 d then 16 bytes of 2-bit codes (byte j/4, bits (j%4)*2)
+    d16 = best_d.astype(np.float16)
+    qb = best_q.reshape(nrows, nb, 16, 4)
+    packed = (qb[:, :, :, 0] | (qb[:, :, :, 1] << 2) |
+              (qb[:, :, :, 2] << 4) | (qb[:, :, :, 3] << 6)).astype(np.uint8)
+    out = np.empty((nrows, nb, 18), dtype=np.uint8)
+    out[:, :, :2] = d16.view(np.uint8).reshape(nrows, nb, 2)
+    out[:, :, 2:] = packed.reshape(nrows, nb, 16)
+    return out.tobytes()
 
 
 class SourceIncomplete(Exception):
@@ -157,17 +228,19 @@ def plan(args):
     repl = {}
     for name, (kind, dims, off) in tpl.tensors.items():
         hit = None
+        recode = False
         for rule in rules:
             if re.search(rule["match"], name) and kind in rule.get("from", []):
                 hit = rule["to"].upper()
-        if not hit or hit == type_name(kind):
+                recode = bool(rule.get("recode"))
+        if not hit or (hit == type_name(kind) and not recode):
             continue
         to_id = _NAME_TO_ID.get(hit)
         if to_id is None:
             raise SystemExit(f"unknown target type {hit}")
-        if hit not in QUANT_TARGETS:
+        if hit not in QUANT_TARGETS and hit != "Q2_0":
             raise SystemExit(f"{hit}: quants.c cannot quantize to this type "
-                             f"(supported: {sorted(QUANT_TARGETS)})")
+                             f"(supported: {sorted(QUANT_TARGETS)} + Q2_0)")
         try:
             gguf_bytes(to_id, dims)
         except SystemExit as e:
@@ -229,6 +302,8 @@ def quantize(args):
         def convert(e):
             v = np.ascontiguousarray(vals[e])
             w = imatrix.expert_weights(name, e, v)
+            if spec["to"] == "Q2_0":
+                return encode_q2_0(v, w)
             return quant.encode(v, spec["to"], w)
 
         chunks = []
