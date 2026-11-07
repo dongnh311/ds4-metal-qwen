@@ -128,6 +128,45 @@ faster than IQ2_S (12.7 vs 14.8 ms @T=1856); ~80 tensors x ~2 ms/layer
 down projections untouched (type-42 q2_0 can't be a quantize target).
 A/B vs ppl baseline 38.566 decides go/no-go.
 
+## Candidate v1 RESULT — quality AND speed both improved (2026-11-07)
+
+All 80 payloads quantized from UD-Q4_K_XL + unsloth imatrix, assembled to
+`ud/UD-IQ2_XS-mtp-gateup-iq2xxs.gguf` (43 GiB, sha256-verified read-back).
+
+**Perplexity A/B** (same corpus `/tmp/qwen38-ppl-corpus.txt`, same flags
+`--metal --ctx 8192 --ple ...PLE-Q4_1.gguf`, baseline re-run reproduces
+nll=29803.3632 exactly):
+
+| model | avg_nll | ppl |
+| --- | ---: | ---: |
+| UD-IQ2_XS-mtp (baseline) | 3.65237 | 38.566 |
+| gateup-iq2xxs candidate | **3.05761** | **21.277** |
+
+NLL improves ~16% — far outside the ~0.5% noise band. The production
+IQ2_S gate/up tensors were evidently quantized without effective
+importance weighting; the unsloth-imatrix IQ2_XXS requant is both
+*smaller* (66B vs 82B per 256 values) and *better*. Generation sanity:
+coherent answer, greedy decode fine (34 t/s in think mode, same class as
+baseline ~36 t/s).
+
+**Prefill A/B** (`DS4_QWEN4_MOE_PROFILE`, /tmp/moe_prof_prompt.txt,
+T=1928, 47 layers):
+
+| stage | baseline ms | candidate ms |
+| --- | ---: | ---: |
+| mid (routed gate+up) | 706.6 | **652.5** (-54) |
+| down | 337.5 | 321.5 (-16, untouched — noise) |
+| reduce / shared / router / lists | ~125 | ~125 |
+
+≈54 ms/chunk saved on routed mid GEMM, matching the IQ2_XXS-vs-IQ2_S
+kernel delta (~14% on the converted tensors).
+
+**Verdict: GO.** Candidate v1 dominates baseline on quality (-45% ppl),
+prefill (-54 ms/chunk), and model size (-4 GiB). Recommend promoting it
+to production after a decode-side check on the server path; down
+projections (type-42 q2_0, ~321 ms/chunk) are the next requant target —
+quants.c can emit IQ2_XXS for them too (candidate v2).
+
 ## Interim verdict
 
 - Mixed precision by hotness: **no-go** (bounded upside, decode/memory
