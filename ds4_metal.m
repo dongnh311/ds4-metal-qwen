@@ -49805,9 +49805,9 @@ enum {
     QWEN4_K_MULTI_GEMV,
     QWEN4_K_GSQ_MV_R1, QWEN4_K_GSQ_MV_R2, QWEN4_K_GSQ_MV_R3, QWEN4_K_GSQ_MV_R4,
     QWEN4_K_GSQ_MV2_R1, QWEN4_K_GSQ_MV2_R2, QWEN4_K_GSQ_MV2_R3, QWEN4_K_GSQ_MV2_R4,
-    /* dense GSQ-RCO/BF16/F16 prefill on the tensor-op tiles: 13 types x tiles 32/64/128 (qwen4_dense_nax_kernel) */
+    /* dense GSQ-RCO/BF16/F16/F32 prefill on the tensor-op tiles: 14 types x tiles 32/64/128 (qwen4_dense_nax_kernel) */
     QWEN4_K_DENSE_NAX,
-    QWEN4_K_DENSE_NAX_LAST = QWEN4_K_DENSE_NAX + 38,
+    QWEN4_K_DENSE_NAX_LAST = QWEN4_K_DENSE_NAX + 41,
     QWEN4_K_HC_COMBINE,
     QWEN4_K_CONV_STREAM,
     QWEN4_K_GDN_PREP,
@@ -49979,6 +49979,8 @@ static const char *const qwen4_kernel_names[QWEN4_K_COUNT] = {
     "kernel_qwen4_dense_nax_q5_0", "kernel_qwen4_dense_nax_q5_0_n64", "kernel_qwen4_dense_nax_q5_0_n128",
     "kernel_mul_mm_f16_f32_mpp_direct_rhs", "kernel_mul_mm_f16_f32_mpp_direct_rhs_n64",
     "kernel_mul_mm_f16_f32_mpp_direct_rhs_n128",
+    "kernel_qwen4_dense_nax_f32", "kernel_qwen4_dense_nax_f32_n64",
+    "kernel_qwen4_dense_nax_f32_n128",
     "kernel_qwen4_hc_combine",
     "kernel_qwen4_conv_stream",
     "kernel_qwen4_gdn_prep",
@@ -55413,8 +55415,8 @@ static bool qwen4_dense_mm_partials_ensure(uint64_t bytes) {
  * 4.4 TFLOP/s on the float tiles) joins only with DS4_QWEN4_DENSE_NAX_F16=1, so PROD's F16 hc
  * up keeps its float tiles and its output unless a run opts in. */
 static int qwen4_dense_nax_kernel(uint32_t weight_type, uint32_t n_tokens) {
-    static const uint32_t types[13] = { 13u, 14u, 17u, 18u, 20u, 21u, 22u, 23u, 42u, 30u, 11u, 6u, 1u };
-    for (int i = 0; i < 13; i++) {
+    static const uint32_t types[14] = { 13u, 14u, 17u, 18u, 20u, 21u, 22u, 23u, 42u, 30u, 11u, 6u, 1u, 0u };
+    for (int i = 0; i < 14; i++) {
         if (types[i] != weight_type) continue;
         const int tile = (n_tokens % 128u) == 0 ? 2 : (n_tokens % 64u) == 0 ? 1 : 0;
         return QWEN4_K_DENSE_NAX + i * 3 + tile;
@@ -55423,8 +55425,9 @@ static int qwen4_dense_nax_kernel(uint32_t weight_type, uint32_t n_tokens) {
 }
 
 static bool qwen4_dense_nax_ok(uint32_t weight_type, uint32_t n_tokens, uint32_t in_dim, uint32_t out_rows) {
-    const uint32_t block = (weight_type == 30u || weight_type == 1u) ? 32u : qwen4_mm_gsq_block(weight_type);
+    const uint32_t block = (weight_type == 30u || weight_type == 1u || weight_type == 0u) ? 32u : qwen4_mm_gsq_block(weight_type);
     if (weight_type == 1u && ds4_gpu_env_u64("DS4_QWEN4_DENSE_NAX_F16", 0u, 0u, 1u) == 0) return false;
+    if (weight_type == 0u && ds4_gpu_env_u64("DS4_QWEN4_DENSE_NAX_F32", 1u, 0u, 1u) == 0) return false;
     return block && qwen4_dense_nax_kernel(weight_type, n_tokens) >= 0 && ds4_gpu_mpp_available() &&
            n_tokens >= 32u && (n_tokens % 32u) == 0 && (in_dim % 64u) == 0 && (in_dim % block) == 0 &&
            (out_rows % 64u) == 0 && ds4_gpu_env_u64("DS4_QWEN4_DENSE_NAX", 1u, 0u, 1u) != 0;
@@ -55458,6 +55461,31 @@ int ds4_gpu_qwen4_dense_mm_tensor(
         !qwen4_bind_tensor(&b[1], x, (uint64_t)n_tokens * in_dim * sizeof(float), "dense mm input") ||
         !qwen4_bind_tensor(&b[2], out, (uint64_t)n_tokens * out_rows * sizeof(float), "dense mm output")) {
         return 0;
+    }
+    /* The tensor tiles need a whole number of 32-token steps.  F32 rows
+     * (the router logits GEMV) arrive at arbitrary prefill lengths, so run
+     * the aligned prefix on the tensor kernel and recurse on the short tail
+     * through views, the same split the attention output projection uses. */
+    if (weight_type == 0u && n_tokens >= 32u && (n_tokens % 32u) != 0 &&
+        qwen4_dense_nax_ok(weight_type, n_tokens & ~31u, in_dim, out_rows)) {
+        const uint32_t aligned = n_tokens & ~31u;
+        const uint32_t rem = n_tokens - aligned;
+        const uint32_t tile_n = (aligned % 128u) == 0 ? 128u : (aligned % 64u) == 0 ? 64u : 32u;
+        ds4_gpu_mul_mm_args mm = ds4_gpu_make_mm_args(in_dim, out_rows, aligned, row_bytes);
+        if (!qwen4_dispatch(qwen4_dense_nax_kernel(weight_type, aligned), &mm, sizeof(mm), b, 3,
+                            MTLSizeMake(aligned / tile_n, out_rows / 64u, 1), MTLSizeMake(128, 1, 1),
+                            2u * 64u * 32u * sizeof(uint16_t)))
+            return 0;
+        ds4_gpu_tensor *xv = ds4_gpu_tensor_view(x, (uint64_t)aligned * in_dim * sizeof(float),
+                                                 (uint64_t)rem * in_dim * sizeof(float));
+        ds4_gpu_tensor *ov = ds4_gpu_tensor_view(out, (uint64_t)aligned * out_rows * sizeof(float),
+                                                 (uint64_t)rem * out_rows * sizeof(float));
+        const int rc = xv && ov &&
+            ds4_gpu_qwen4_dense_mm_tensor(ov, xv, model_map, model_size, weight_offset,
+                                          weight_type, rem, in_dim, out_rows);
+        ds4_gpu_tensor_free(ov);
+        ds4_gpu_tensor_free(xv);
+        return rc;
     }
     if (qwen4_dense_nax_ok(weight_type, n_tokens, in_dim, out_rows)) {
         const uint32_t tile_n = (n_tokens % 128u) == 0 ? 128u : (n_tokens % 64u) == 0 ? 64u : 32u;

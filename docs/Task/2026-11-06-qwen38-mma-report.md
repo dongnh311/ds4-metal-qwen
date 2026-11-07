@@ -136,3 +136,39 @@ Updated MoE-stage map @T~1900 (47 layers):
   reduce ~79 (v4 done, ~77)
   router ~78 (GEMV ~53 + topk ~25)
   shared ~73, lists ~9
+
+## Addendum 4: F32 router-logits GEMV on tensor tiles (implemented)
+
+The ~53 ms router-logits GEMV (`ffn_gate_inp` F32 [512x2560]) was the last
+dense type without a tensor-op variant.  Added `kernel_qwen4_dense_nax_f32`
+(+_n64/_n128) in metal/dense.metal: F32 rows stage through `dequantize_f32`
+into half4x4 threadgroup tiles while activations and the accumulator stay
+float - the same weight-only fp16 rounding class as the existing NAX level-2
+path.  `qwen4_dense_nax_kernel` maps type 0; `qwen4_dense_nax_ok` gates it
+behind `DS4_QWEN4_DENSE_NAX_F32` (default on) plus the usual
+`DS4_QWEN4_DENSE_NAX`, MPP, and shape checks (in%64, out%64, T%32).
+
+Prefill lengths are arbitrary, so `ds4_gpu_qwen4_dense_mm_tensor` splits
+F32 calls whose token count is not a multiple of 32: the aligned prefix runs
+on the tensor kernel and the <32-token tail recurses through tensor views
+into the existing scalar/k-split path (same pattern as the attention output
+projection's matrix_rows/tail split).
+
+Measured (UD-IQ2_XS-mtp.gguf, T=1928, DS4_QWEN4_MOE_PROFILE, 47 layers):
+router stage 77.4 ms -> ~33 ms steady state (~0.70 ms/layer vs ~1.66;
+the first layer pays ~106 ms one-time shader compile).  mid/down/reduce/
+shared/lists unchanged within noise.  Roughly -45 ms per ~2k-token chunk.
+
+Numerics: NAX vs scalar dense_mm agrees to max|d| ~1.5e-3 (fp16 weight
+rounding; new test_dense_mm_f32_nax covers T=64 pure-tile and T=70 split).
+Full-model --dump-logits A/B (F32 NAX on vs DS4_QWEN4_DENSE_NAX_F32=0,
+all other NAX types identical - verified bit-identical baseline): final
+logits max|d| 2.31, argmax unchanged (id 1596), top-20 overlap 18/20.
+Perplexity on the 1870-token profile prompt: NLL 3739.96 (ppl 7.651) with
+the F32 tensor path vs 3762.23 (ppl 7.744) scalar - no regression on this
+sample.  Expert top-k flips are possible in principle (logit deltas ~1e-3
+vs logit gaps); the NLL result says the aggregate effect is neutral-to-
+positive here, but this is one text sample - treat as validated-for-prefill,
+not proven for all inputs.
+
+tests/test_qwen4_kernels and tests/test_qwen35_kernels pass.
