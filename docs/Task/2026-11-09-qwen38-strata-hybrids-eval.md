@@ -58,3 +58,20 @@ Strata: Strata requires 48-layer metadata, ds4 MTP requires 49.
 - candv1 (IQ2_XS) is the practical choice: top code score, ~equal total,
   file intact, already on HF public repo
   `dongnhdev/Qwen3.8-Flash-Next-Strata-Q2mix`.
+
+## Rebuild note (2026-11-09)
+
+q2mix (IQ1_M dense + Q2_0 experts) was rebuilt from scratch after the
+original shard1 was deleted: same rules-q2_0.json + same unsloth imatrix +
+same Q2_0 encoder => deterministic expert payloads; dense tensors copied
+verbatim from UD-IQ1_M shards 1+2 (shard3 = PLE sidecar, unchanged).
+Artifacts:
+- Strata: models/q2-ud-iq1m-mix/ shard1 rebuilt (38.8GB, pack rebuilt as
+  packs/q2_0 with --compat-bf16, ple_conv1d.weight BF16->F16). Serving on
+  :8080, coherent.
+- ds4: ud/UD-IQ1_M-Q2_0-experts-mtp.gguf (41.6GB, 49 blocks, blk.48 MTP
+  tensors from UD-IQ2_XS-mtp-gateup-iq2xxs.gguf, 96 hc_*_inject BF16->F32,
+  ple_conv1d.weight BF16->F16). Verified on ds4-server --metal --mtp --ple,
+  ctx 32k: decode ~42 t/s avg.
+Expected quality = the q2mix row above (141/164) since weights are
+recipe-identical; not re-evaluated.
