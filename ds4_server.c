@@ -4888,6 +4888,10 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
+                                      bool *summary_opted_in,
+                                      bool *effort_seen);
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -5026,6 +5030,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         } else if (!strcmp(key, "chat_template_kwargs")) {
             if (!parse_chat_template_kwargs_ex(&p, &thinking_enabled, &got_thinking, &reasoning_effort,
                                                &r->think_budget, &r->tmpl)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning")) {
+            /* OpenRouter-style {"effort": ...}; only the effort is applied */
+            if (!parse_responses_reasoning(&p, &reasoning_effort, NULL, NULL)) {
                 free(key);
                 goto bad;
             }
@@ -16707,7 +16717,7 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens, bool has_vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -16721,6 +16731,10 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
     buf_printf(b,
         ","
         "\"context_length\":%d,"
+        "\"architecture\":{"
+            "\"modality\":\"%s->text\","
+            "\"input_modalities\":[\"text\"%s],"
+            "\"output_modalities\":[\"text\"]},"
         "\"top_provider\":{"
             "\"context_length\":%d,"
             "\"max_completion_tokens\":%d,"
@@ -16737,8 +16751,13 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stop\","
             "\"seed\","
             "\"stream\","
+            "\"reasoning\","
+            "\"include_reasoning\","
             "\"reasoning_effort\"]}",
         ctx,
+        /* clients gate image attachments on the advertised input modalities */
+        has_vision ? "text+image" : "text",
+        has_vision ? ",\"image\"" : "",
         ctx,
         max_completion);
 }
@@ -16748,7 +16767,8 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -23891,7 +23911,7 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -23900,12 +23920,29 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
+}
+
+static void test_model_metadata_reports_modalities(void) {
+    for (int vision = 0; vision <= 1; vision++) {
+        buf b = {0};
+        append_model_json_values(&b, "model", "Model", 32768, 4096, vision);
+        const char *json = b.ptr;
+        TEST_ASSERT(json_skip_value(&json));
+        TEST_ASSERT(*json == '\0');
+        TEST_ASSERT(strstr(b.ptr, "\"architecture\":{") != NULL);
+        TEST_ASSERT(strstr(b.ptr, vision ?
+            "\"input_modalities\":[\"text\",\"image\"]" :
+            "\"input_modalities\":[\"text\"]") != NULL);
+        TEST_ASSERT(strstr(b.ptr, "\"output_modalities\":[\"text\"]") != NULL);
+        if (!vision) TEST_ASSERT(strstr(b.ptr, "\"image\"") == NULL);
+        buf_free(&b);
+    }
 }
 
 static void test_live_prefix_rewind_target(void) {
@@ -26906,6 +26943,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_model_metadata_reports_modalities();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
