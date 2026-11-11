@@ -12950,7 +12950,15 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
      * miss. Baking the check into the probe keeps routing and execution in
      * agreement and stops image-mismatched requests from evicting good
      * checkpoints. */
-    if (!ds4_session_vision_fingerprint_prefix_matches(slot->session,
+    /* A vision rewind point intentionally stops before the last turn's image:
+     * the incoming request is expected to replace or add that image, so the
+     * full-session fingerprint prefix must not veto it.  The prefix-match and
+     * build_live_prompt_suffix() still re-validate every image before the cut
+     * and turn a mismatch into a safe cold miss. */
+    const bool vision_rewind_candidate =
+        slot->rewind_point.valid && slot->rewind_point.vision;
+    if (!vision_rewind_candidate &&
+        !ds4_session_vision_fingerprint_prefix_matches(slot->session,
                                                        req->images,
                                                        req->image_count))
         return pr;
@@ -13944,10 +13952,22 @@ static int server_session_sync_multimodal(server *s, server_slot *slot,
         return server_session_sync(s, slot, prompt, err, errlen);
     if (!s || !slot || !prompt || !images) return 1;
     if (!s->batched_mode) {
+        /* A prefix sync can end before the request's last image (the vision
+         * rewind cut stops at the last user turn).  Pass only the images
+         * wholly inside this prefix, exactly like the batched path below;
+         * otherwise the engine sees an image span past the prompt and fails. */
+        size_t prefix_images = 0;
+        while (prefix_images < image_count) {
+            const uint64_t end = (uint64_t)images[prefix_images].token_start +
+                                 images[prefix_images].embedding.token_count;
+            if (end > (uint64_t)prompt->len) break;
+            prefix_images++;
+        }
         if (!server_prefill_enter(s, slot)) return DS4_SESSION_SYNC_INTERRUPTED;
-        int rc = ds4_session_sync_multimodal(slot->session, prompt,
-                                             images, image_count,
-                                             err, errlen);
+        int rc = prefix_images ?
+            ds4_session_sync_multimodal(slot->session, prompt, images,
+                                        prefix_images, err, errlen) :
+            ds4_session_sync(slot->session, prompt, err, errlen);
         server_prefill_leave(s);
         return rc;
     }
