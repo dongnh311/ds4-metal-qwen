@@ -10906,6 +10906,7 @@ struct server_slot {
      * the point still exists (ds4_session_rewind_point_pos). Guarded by tool_mu. */
     struct {
         bool valid;
+        bool vision;                /* cut before the last turn's image */
         int live_tokens;
         char *text;                 /* marker-normalized (visible_prompt_key) */
         size_t text_len;
@@ -11414,7 +11415,7 @@ static void rewind_point_clear(server *s, server_slot *slot) {
 }
 
 static void rewind_point_remember(server *s, server_slot *slot, const request *req,
-                                  size_t text_len, int live_tokens) {
+                                  size_t text_len, int live_tokens, bool vision) {
     visible_image_key images;
     char *key = visible_prompt_key(req, req->prompt_text, &images);
     if (!key || text_len > strlen(key)) {
@@ -11430,10 +11431,11 @@ static void rewind_point_remember(server *s, server_slot *slot, const request *r
     slot->rewind_point.text_len = text_len;
     slot->rewind_point.images = images;
     slot->rewind_point.live_tokens = live_tokens;
+    slot->rewind_point.vision = vision;
     slot->rewind_point.valid = true;
     pthread_mutex_unlock(&s->tool_mu);
-    server_log(DS4_LOG_KVCACHE, "ds4-server: rewind point remembered pos=%d text=%zu images=%zu",
-               live_tokens, text_len, images.count);
+    server_log(DS4_LOG_KVCACHE, "ds4-server: rewind point remembered pos=%d text=%zu images=%zu%s",
+               live_tokens, text_len, images.count, vision ? " vision" : "");
 }
 
 /* Same images at the same offsets up to the point and none after it: what
@@ -11442,6 +11444,19 @@ static void rewind_point_remember(server *s, server_slot *slot, const request *r
 static bool rewind_point_images_match(const visible_image_key *incoming,
                                       const visible_image_key *old, size_t text_len) {
     if (incoming->count != old->count) return false;
+    for (size_t i = 0; i < old->count; i++)
+        if (incoming->offsets[i] != old->offsets[i] || incoming->offsets[i] >= text_len) return false;
+    return true;
+}
+
+/* The vision rewind point stops before the last turn, so the incoming request
+ * may add or replace images after the cut.  Only the images before it must be
+ * byte-identical; the execution path still validates their fingerprints
+ * against the live KV (ds4_session_vision_prefix_matches). */
+static bool rewind_point_images_prefix_match(const visible_image_key *incoming,
+                                             const visible_image_key *old,
+                                             size_t text_len) {
+    if (incoming->count < old->count) return false;
     for (size_t i = 0; i < old->count; i++)
         if (incoming->offsets[i] != old->offsets[i] || incoming->offsets[i] >= text_len) return false;
     return true;
@@ -12454,6 +12469,23 @@ static size_t prompt_end_text_len(const request *r) {
     return prompt_end_text_len_for(r, false);
 }
 
+/* Last index where `needle` occurs in `hay`, or -1.  Used to find the last
+ * <|im_start|>user marker without detokenizing the prompt. */
+static int token_sequence_last(const ds4_tokens *hay, const ds4_tokens *needle) {
+    if (!hay || !needle || needle->len <= 0 || hay->len < needle->len) return -1;
+    for (int i = hay->len - needle->len; i >= 0; i--) {
+        bool same = true;
+        for (int j = 0; j < needle->len; j++) {
+            if (hay->v[i + j] != needle->v[j]) {
+                same = false;
+                break;
+            }
+        }
+        if (same) return i;
+    }
+    return -1;
+}
+
 /* Index where tail starts when prompt ends with it after at least one token. */
 static int prompt_tail_token_start(const ds4_tokens *prompt, const ds4_tokens *tail) {
     if (!prompt || !tail || tail->len <= 0 || tail->len >= prompt->len) return -1;
@@ -12569,12 +12601,62 @@ static bool rewind_point_images_before(const request *r, int limit) {
     return true;
 }
 
+/* Qwen3.8 image sessions: cut at the start of the last user turn, before its
+ * image markers.  The text prefix and all earlier images stay valid when the
+ * client replaces or adds a screenshot in that turn; only the turn itself is
+ * evaluated again.  Opt-in until the PLE-state restore is validated live. */
+static bool qwen4_vision_rewind_enabled(void) {
+    const char *e = getenv("DS4_QWEN4_VISION_REWIND");
+    return e && e[0] && strcmp(e, "0") != 0;
+}
+
+/* Byte offset of the last user-turn marker, or 0 when the text starts with it
+ * or does not contain one. */
+static size_t last_user_turn_offset(const char *text) {
+    static const char marker[] = "<|im_start|>user\n";
+    const size_t marker_len = sizeof(marker) - 1;
+    if (!text) return 0;
+    const char *last = NULL;
+    for (const char *p = text; (p = strstr(p, marker)) != NULL; p += marker_len) {
+        last = p;
+    }
+    return last && last != text ? (size_t)(last - text) : 0;
+}
+
+static int vision_rewind_point_cut(server *s, const request *r,
+                                   const ds4_tokens *prompt, int cached,
+                                   size_t *text_len) {
+    static const char marker[] = "<|im_start|>user\n";
+    if (!s || !r || !r->prompt_text || !prompt || r->image_count == 0) return 0;
+    const size_t text_off = last_user_turn_offset(r->prompt_text);
+    if (!text_off) return 0;
+    ds4_tokens mark = {0};
+    ds4_tokenize_rendered_chat(s->engine, marker, &mark);
+    const int cut = token_sequence_last(prompt, &mark);
+    ds4_tokens_free(&mark);
+    /* --rewind-point-min-tokens remains the operator override; without it the
+     * vision path uses a conservative 8K floor. */
+    const int min_tokens = s->rewind_point_min_tokens > 0 ? s->rewind_point_min_tokens : 8192;
+    if (cut <= cached || cut < min_tokens) return 0;
+    *text_len = text_off;
+    server_log(DS4_LOG_KVCACHE,
+               "ds4-server: vision rewind cut at last user turn pos=%d text=%zu prompt=%d",
+               cut, text_off, prompt->len);
+    return cut;
+}
+
 /* Ornith admitted: the key is byte-exact, so a template that does not replay
  * a past turn as these bytes simply never matches. */
 static int rewind_point_cut(server *s, const request *r, const ds4_tokens *prompt,
                             int cached, size_t *text_len) {
     *text_len = 0;
-    if (!s || s->rewind_point_min_tokens <= 0 || !rewind_point_supported() || !prompt ||
+    if (!s || !prompt) return 0;
+    if (cached == 0 && r->kind == REQ_CHAT && r->api == API_OPENAI &&
+        !server_qwen_is_ornith() && r->model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+        r->image_count > 0 && qwen4_vision_rewind_enabled()) {
+        return vision_rewind_point_cut(s, r, prompt, cached, text_len);
+    }
+    if (s->rewind_point_min_tokens <= 0 || !rewind_point_supported() ||
         prompt->len < s->rewind_point_min_tokens) return 0;
     const size_t n = prompt_end_text_len_for(r, true);
     if (!n) return 0;
@@ -13020,8 +13102,12 @@ static slot_reuse slot_probe_reuse_locked(server *s, server_slot *slot,
          * point (what follows it is evaluated as text). */
         visible_image_key vimages;
         char *vkey = visible_prompt_key(req, ptext, &vimages);
-        const bool hit = vkey &&
-            rewind_point_images_match(&vimages, &slot->rewind_point.images, slot->rewind_point.text_len) &&
+        const bool images_match = slot->rewind_point.vision ?
+            rewind_point_images_prefix_match(&vimages, &slot->rewind_point.images,
+                                             slot->rewind_point.text_len) :
+            rewind_point_images_match(&vimages, &slot->rewind_point.images,
+                                      slot->rewind_point.text_len);
+        const bool hit = vkey && images_match &&
             byte_prefix_match(vkey, plen, slot->rewind_point.text, slot->rewind_point.text_len);
         free(vkey);
         if (hit) {
@@ -15265,7 +15351,14 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
     size_t rewind_text_len = 0;
     int rewind_cut = prompt_sync_rc == 0 ?
         rewind_point_cut(s, &j->req, prompt_for_sync, cached, &rewind_text_len) : 0;
-    if (rewind_cut > 0 && multimodal && !rewind_point_images_before(&j->req, rewind_cut)) rewind_cut = 0;
+    /* The vision cut intentionally ends before the last turn's image: that
+     * image is re-evaluated by the suffix, while earlier images stay valid. */
+    const bool vision_rewind_cut = rewind_cut > 0 && j->req.kind == REQ_CHAT &&
+        j->req.api == API_OPENAI && !server_qwen_is_ornith() &&
+        j->req.model_syntax == SERVER_MODEL_SYNTAX_QWEN &&
+        j->req.image_count > 0 && qwen4_vision_rewind_enabled();
+    if (rewind_cut > 0 && multimodal && !vision_rewind_cut &&
+        !rewind_point_images_before(&j->req, rewind_cut)) rewind_cut = 0;
     if (rewind_cut > 0) {
         /* a short gap to the cut (a compaction's user message after a hit)
          * also goes through evals rather than its own prefill pass */
@@ -15284,7 +15377,8 @@ static void generate_job_inner(server *s, server_slot *slot, job *j) {
             const bool marked = ds4_session_mark_rewind_point(slot->session);
             server_inference_unlock(s);
             if (marked) {
-                rewind_point_remember(s, slot, &j->req, rewind_text_len, rewind_cut);
+                rewind_point_remember(s, slot, &j->req, rewind_text_len, rewind_cut,
+                                      vision_rewind_cut);
                 prompt_sync_rc = rewind_point_eval_to(s, slot, &j->req, prompt_for_sync, prompt_for_sync->len,
                                                       err, sizeof(err));
             } else {
@@ -17700,9 +17794,16 @@ int main(int argc, char **argv) {
             server_log(DS4_LOG_KVCACHE,
                        "ds4-server: rewind point at the prompt end of tool-chat prompts >= %d tokens",
                        s.rewind_point_min_tokens);
-        else
+        else if (!qwen4_vision_rewind_enabled())
             server_log(DS4_LOG_DEFAULT,
                        "ds4-server: --rewind-point-min-tokens ignored: Ornith only");
+    }
+    if (!server_qwen_is_ornith() && qwen4_vision_rewind_enabled()) {
+        const int min_tokens = s.rewind_point_min_tokens > 0 ?
+                               s.rewind_point_min_tokens : 8192;
+        server_log(DS4_LOG_KVCACHE,
+                   "ds4-server: Qwen3.8 vision rewind point at the last user turn >= %d tokens",
+                   min_tokens);
     }
     if (s.disable_exact_dsml_tool_replay) {
         server_log(DS4_LOG_DEFAULT,
@@ -20348,6 +20449,39 @@ static void test_rewind_point_images_match(void) {
     TEST_ASSERT(!rewind_point_images_match(&extra, &old, 30));   /* an image after the point */
     TEST_ASSERT(!rewind_point_images_match(&none, &old, 30));
     TEST_ASSERT(rewind_point_images_match(&none, &none, 30));
+
+    /* A vision rewind point ends before the last turn: images after the cut
+     * are expected to be new, while every image before it must still match. */
+    TEST_ASSERT(rewind_point_images_prefix_match(&extra, &old, 30));
+    TEST_ASSERT(rewind_point_images_prefix_match(&same, &old, 30));
+    TEST_ASSERT(!rewind_point_images_prefix_match(&moved, &old, 30));
+    TEST_ASSERT(!rewind_point_images_prefix_match(&none, &old, 30));
+    visible_image_key late = {.count = 1, .offsets = {35}};
+    TEST_ASSERT(!rewind_point_images_prefix_match(&late, &old, 30));
+}
+
+static void test_token_sequence_last(void) {
+    int hv[] = {1, 2, 3, 4, 2, 3, 5};
+    int nv[] = {2, 3};
+    int miss[] = {2, 4};
+    int empty[] = {0};
+    ds4_tokens hay = {.v = hv, .len = 7, .cap = 7};
+    ds4_tokens needle = {.v = nv, .len = 2, .cap = 2};
+    ds4_tokens absent = {.v = miss, .len = 2, .cap = 2};
+    ds4_tokens none = {.v = empty, .len = 0, .cap = 0};
+    TEST_ASSERT(token_sequence_last(&hay, &needle) == 4);
+    TEST_ASSERT(token_sequence_last(&hay, &absent) == -1);
+    TEST_ASSERT(token_sequence_last(&hay, &none) == -1);
+    TEST_ASSERT(token_sequence_last(&none, &needle) == -1);
+    TEST_ASSERT(token_sequence_last(&hay, &hay) == 0);
+
+    const char *text = "<|im_start|>user\nfirst<|im_end|>\n"
+                       "<|im_start|>assistant\nhi<|im_end|>\n"
+                       "<|im_start|>user\nsecond";
+    const char *last = strstr(text, "<|im_start|>user\nsecond");
+    TEST_ASSERT(last_user_turn_offset(text) == (size_t)(last - text));
+    TEST_ASSERT(last_user_turn_offset("<|im_start|>user\nonly") == 0);
+    TEST_ASSERT(last_user_turn_offset("no marker") == 0);
 }
 
 static void test_rewind_point_reuse_tier_images(void) {
@@ -20368,7 +20502,7 @@ static void test_rewind_point_reuse_tier_images(void) {
     first.image_markers = markers;
     first.images = &img;
     first.prompt_text = (char *)"<sys>u:\036DS4_IMAGE_aa\037 see<tool>";
-    rewind_point_remember(&s, &slot, &first, strlen(first.prompt_text), 200);
+    rewind_point_remember(&s, &slot, &first, strlen(first.prompt_text), 200, false);
     TEST_ASSERT(slot.rewind_point.valid && slot.rewind_point.images.count == 1);
 
     /* the re-send carries a fresh nonce: normalized, it matches */
@@ -26815,6 +26949,7 @@ static void ds4_server_unit_tests_run(void) {
     test_rewind_point_cut_plan();
     test_rewind_point_reuse_tier();
     test_rewind_point_images_match();
+    test_token_sequence_last();
     test_rewind_point_reuse_tier_images();
     test_memory_text_tier_images();
     test_rewind_point_resend_and_model();
