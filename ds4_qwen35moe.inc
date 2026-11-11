@@ -1153,7 +1153,8 @@ static bool qwen35_graph_set_h_last(ds4_qwen4_gpu_graph *g, const float *h) {
 }
 
 /* Rewind point buffers: one GDN state + conv history per recurrent layer,
- * allocated on the first mark and kept for the graph's life. */
+ * plus Qwen3.8's PLE history, allocated on the first mark and kept for the
+ * graph's life.  Ornith has no PLE history, so its tensor stays NULL. */
 static bool qwen35_graph_rw_ensure(ds4_qwen4_gpu_graph *g) {
     if (g->rw_ready) return true;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
@@ -1171,19 +1172,33 @@ static bool qwen35_graph_rw_ensure(ds4_qwen4_gpu_graph *g) {
             return false;
         }
     }
+    if (g->ple_hist && ds4_model_is_qwen4()) {
+        g->rw_ple_hist = qwen4_graph_alloc_f32(
+            (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM * DS4_N_EMBD * DS4_N_HC);
+        if (!g->rw_ple_hist) {
+            for (uint32_t j = 0; j < DS4_N_LAYER; j++) {
+                ds4_gpu_tensor_free(g->rw_lin_state[j]);
+                ds4_gpu_tensor_free(g->rw_lin_hist[j]);
+                g->rw_lin_state[j] = g->rw_lin_hist[j] = NULL;
+            }
+            return false;
+        }
+    }
     g->rw_ready = true;
     return true;
 }
 
-/* Copy every GDN state and conv history into (save) or out of the rewind
- * point buffers.  A copy, not a swap: the point survives a restore, so the
- * same prompt can be re-sent any number of times. */
+/* Copy every GDN state, conv history and (for Qwen3.8) the PLE history into
+ * (save) or out of the rewind point buffers.  A copy, not a swap: the point
+ * survives a restore, so the same prompt can be re-sent any number of times. */
 static bool qwen35_graph_rw_copy(ds4_qwen4_gpu_graph *g, bool save) {
     if (!g->rw_ready) return false;
     const uint64_t conv_dim = DS4_N_LIN_CONV_DIM;
     const uint64_t v_dim = (uint64_t)DS4_N_LIN_V_HEAD * DS4_N_LIN_HEAD_DIM;
     const uint64_t state_bytes = v_dim * DS4_N_LIN_HEAD_DIM * sizeof(float);
     const uint64_t hist_bytes = (uint64_t)(DS4_N_LIN_CONV - 1u) * conv_dim * sizeof(float);
+    const uint64_t ple_bytes = (uint64_t)(DS4_N_PLE_CONV - 1u) * DS4_N_PLE_NGRAM *
+                               DS4_N_EMBD * DS4_N_HC * sizeof(float);
     if (!glm_graph_begin_commands_if_needed()) return false;
     bool ok = true;
     for (uint32_t il = 0; il < DS4_N_LAYER && ok; il++) {
@@ -1192,6 +1207,15 @@ static bool qwen35_graph_rw_copy(ds4_qwen4_gpu_graph *g, bool save) {
         ds4_gpu_tensor *live_h = g->layer_lin_hist[il], *rw_h = g->rw_lin_hist[il];
         ok = ds4_gpu_tensor_copy(save ? rw_s : live_s, 0, save ? live_s : rw_s, 0, state_bytes) != 0 &&
              ds4_gpu_tensor_copy(save ? rw_h : live_h, 0, save ? live_h : rw_h, 0, hist_bytes) != 0;
+    }
+    if (ok && g->rw_ple_hist) {
+        ok = ds4_gpu_tensor_copy(save ? g->rw_ple_hist : g->ple_hist, 0,
+                                 save ? g->ple_hist : g->rw_ple_hist, 0, ple_bytes) != 0;
+        if (save) {
+            memcpy(g->rw_ple_prev, g->ple_prev, sizeof(g->ple_prev));
+        } else {
+            memcpy(g->ple_prev, g->rw_ple_prev, sizeof(g->ple_prev));
+        }
     }
     if (!ds4_gpu_end_commands()) ok = false;
     return ok;
