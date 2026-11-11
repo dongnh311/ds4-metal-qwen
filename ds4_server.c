@@ -2336,6 +2336,18 @@ static bool parse_openai_content(const char **p, chat_msg *msg) {
     return true;
 }
 
+/* A must-echo client replays an assistant turn that produced no reasoning as a
+ * single space, because the hosted API rejects an empty string.  A
+ * whitespace-only body is not reasoning: rendering it emits a token between the
+ * think markers that the model never sampled, so the replayed prompt no longer
+ * re-tokenises to the cached prefix and the whole conversation is re-prefilled. */
+static bool text_is_blank(const char *s) {
+    if (!s) return true;
+    for (; *s; s++)
+        if (!isspace((unsigned char)*s)) return false;
+    return true;
+}
+
 static bool parse_messages(const char **p, chat_msgs *msgs) {
     json_ws(p);
     if (**p != '[') return false;
@@ -2373,6 +2385,10 @@ static bool parse_messages(const char **p, chat_msgs *msgs) {
                 if (!json_content_replace(p, &msg.reasoning)) {
                     free(key);
                     goto fail;
+                }
+                if (text_is_blank(msg.reasoning)) {
+                    free(msg.reasoning);
+                    msg.reasoning = NULL;
                 }
             } else if (!strcmp(key, "tool_call_id")) {
                 char *id = NULL;
@@ -4402,6 +4418,9 @@ static DS4_SERVER_MAYBE_UNUSED char *render_chat_prompt_text(
                                               tool_orders, think_mode);
 }
 
+/* Per-request image cap; session and TP image state is sized dynamically. */
+#define SERVER_MAX_IMAGES 256
+
 static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
                                                request *r,
                                                const chat_msgs *msgs,
@@ -4413,8 +4432,9 @@ static bool request_tokenize_multimodal_prompt(ds4_engine *e, server *s,
         if (e) ds4_tokenize_rendered_chat(e, r->prompt_text, &r->prompt);
         return true;
     }
-    if (count > 16) {
-        snprintf(err, errlen, "too many images; at most 16 are allowed");
+    if (count > SERVER_MAX_IMAGES) {
+        snprintf(err, errlen, "too many images; at most %d are allowed",
+                 SERVER_MAX_IMAGES);
         return false;
     }
     if (!e || !s || !ds4_engine_has_vision(e)) {
@@ -4868,6 +4888,10 @@ static void anthropic_prepare_live_continuation(server *s, request *r,
  * fields that affect model semantics, rendering, streaming, or cache keys, and
  * skip extension fields.  The output is always a rendered DS4 chat/completion
  * prompt plus the small amount of protocol state needed to translate the reply. */
+static bool parse_responses_reasoning(const char **p, ds4_think_mode *effort,
+                                      bool *summary_opted_in,
+                                      bool *effort_seen);
+
 static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int def_tokens,
                                int ctx_size, request *r, char *err, size_t errlen) {
     request_init(r, REQ_CHAT, def_tokens);
@@ -5006,6 +5030,12 @@ static bool parse_chat_request(ds4_engine *e, server *s, const char *body, int d
         } else if (!strcmp(key, "chat_template_kwargs")) {
             if (!parse_chat_template_kwargs_ex(&p, &thinking_enabled, &got_thinking, &reasoning_effort,
                                                &r->think_budget, &r->tmpl)) {
+                free(key);
+                goto bad;
+            }
+        } else if (!strcmp(key, "reasoning")) {
+            /* OpenRouter-style {"effort": ...}; only the effort is applied */
+            if (!parse_responses_reasoning(&p, &reasoning_effort, NULL, NULL)) {
                 free(key);
                 goto bad;
             }
@@ -10796,13 +10826,13 @@ typedef struct {
  * before any prefix is reused. Normalization preserves all byte offsets. */
 typedef struct {
     size_t count;
-    size_t offsets[16];
+    size_t offsets[SERVER_MAX_IMAGES];
 } visible_image_key;
 
 static char *visible_prompt_key(const request *req, const char *text,
                                  visible_image_key *images) {
     memset(images, 0, sizeof(*images));
-    if (!req || !text || req->image_count > 16 ||
+    if (!req || !text || req->image_count > SERVER_MAX_IMAGES ||
         (req->image_count && !req->image_markers)) return NULL;
     char *key = xstrdup(text);
     const char *cursor = text;
@@ -12662,8 +12692,8 @@ static bool build_live_prompt_suffix(server *s, server_slot *slot,
                                       const request *req, const char *suffix,
                                       ds4_tokens *out) {
     const ds4_tokens *live = ds4_session_tokens(slot->session);
-    if (!live || !suffix || req->image_count > 16) return false;
-    ds4_vision_span spans[16];
+    if (!live || !suffix || req->image_count > SERVER_MAX_IMAGES) return false;
+    ds4_vision_span spans[SERVER_MAX_IMAGES];
     size_t old_count = req->image_count;
     for (size_t i = 0; i < req->image_count; i++) {
         if (!req->image_markers) return false;
@@ -16622,11 +16652,22 @@ static long content_length(const char *h, size_t n) {
     return 0;
 }
 
+static size_t server_max_body_bytes(void) {
+    size_t limit = 256 * (size_t)1024 * 1024;
+    const char *env = getenv("DS4_SERVER_MAX_BODY_MB");
+    if (env && env[0]) {
+        char *end = NULL;
+        long v = strtol(env, &end, 10);
+        if (end != env && *end == '\0' && v > 0) limit = (size_t)v * 1024 * 1024;
+    }
+    return limit;
+}
+
 static bool read_http_request(int fd, http_request *r) {
     buf b = {0};
     ssize_t hend = -1;
     const size_t max_header = 64 * 1024;
-    const size_t max_body = 64 * 1024 * 1024;
+    const size_t max_body = server_max_body_bytes();
 
     while (hend < 0 && b.len < max_header) {
         char tmp[4096];
@@ -16676,7 +16717,7 @@ typedef struct {
 } client_arg;
 
 static void append_model_json_values(buf *b, const char *id, const char *name,
-                                     int ctx, int default_tokens) {
+                                     int ctx, int default_tokens, bool has_vision) {
     const int max_completion = default_tokens < ctx ? default_tokens : ctx;
     buf_printf(b,
         "{\"id\":");
@@ -16690,6 +16731,10 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
     buf_printf(b,
         ","
         "\"context_length\":%d,"
+        "\"architecture\":{"
+            "\"modality\":\"%s->text\","
+            "\"input_modalities\":[\"text\"%s],"
+            "\"output_modalities\":[\"text\"]},"
         "\"top_provider\":{"
             "\"context_length\":%d,"
             "\"max_completion_tokens\":%d,"
@@ -16706,8 +16751,13 @@ static void append_model_json_values(buf *b, const char *id, const char *name,
             "\"stop\","
             "\"seed\","
             "\"stream\","
+            "\"reasoning\","
+            "\"include_reasoning\","
             "\"reasoning_effort\"]}",
         ctx,
+        /* clients gate image attachments on the advertised input modalities */
+        has_vision ? "text+image" : "text",
+        has_vision ? ",\"image\"" : "",
         ctx,
         max_completion);
 }
@@ -16717,7 +16767,8 @@ static void append_model_json(buf *b, const server *s, const char *id) {
                              id,
                              ds4_engine_model_name(s->engine),
                              s->ctx_size,
-                             s->default_tokens);
+                             s->default_tokens,
+                             ds4_engine_has_vision(s->engine));
 }
 
 static bool send_model(server *s, int fd, const char *id) {
@@ -20554,6 +20605,44 @@ static void test_render_think_max_prompt_prefix(void) {
     chat_msgs_free(&msgs);
 }
 
+/* A must-echo client replays an assistant turn that produced no reasoning as a
+ * single space, because the hosted API rejects an empty string.  A
+ * whitespace-only body is not reasoning: rendering it puts a token between
+ * <think> and </think> that the model never sampled, so the replayed prompt no
+ * longer tokenises to the cached prefix and the whole conversation is
+ * re-prefilled.  Render a blank body exactly like an absent one.
+ */
+static void test_render_blank_reasoning_is_absent(void) {
+    const char *pad_json =
+        "[{\"role\":\"user\",\"content\":\"Hello\"},"
+        "{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\" \","
+        "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]";
+    const char *none_json =
+        "[{\"role\":\"user\",\"content\":\"Hello\"},"
+        "{\"role\":\"assistant\",\"content\":\"\","
+        "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\","
+        "\"function\":{\"name\":\"run\",\"arguments\":\"{}\"}}]}]";
+
+    chat_msgs pad = {0}, none = {0};
+    const char *p1 = pad_json, *p2 = none_json;
+    TEST_ASSERT(parse_messages(&p1, &pad));
+    TEST_ASSERT(parse_messages(&p2, &none));
+
+    char *a = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
+                                                &pad, NULL, NULL, DS4_THINK_MEDIUM);
+    char *b = render_chat_prompt_text_for_syntax(SERVER_MODEL_SYNTAX_DEEPSEEK41,
+                                                &none, NULL, NULL, DS4_THINK_MEDIUM);
+    TEST_ASSERT(a != NULL);
+    TEST_ASSERT(b != NULL);
+    TEST_ASSERT(strcmp(a, b) == 0);
+
+    free(a);
+    free(b);
+    chat_msgs_free(&pad);
+    chat_msgs_free(&none);
+}
+
 static void test_render_non_thinking_prompt_closes_think(void) {
     chat_msgs msgs = {0};
     chat_msg user = {0};
@@ -23822,7 +23911,7 @@ static void test_tool_history_validation_handles_large_replays(void) {
 static void test_model_metadata_clamps_completion_to_context(void) {
     buf b = {0};
     append_model_json_values(&b, "deepseek-v4-flash", "DeepSeek V4 Flash",
-                             32768, 393216);
+                             32768, 393216, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Flash\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":32768") != NULL);
@@ -23831,12 +23920,29 @@ static void test_model_metadata_clamps_completion_to_context(void) {
     buf_free(&b);
 
     append_model_json_values(&b, "deepseek-v4-pro", "DeepSeek V4 Pro",
-                             100000, 4096);
+                             100000, 4096, false);
     TEST_ASSERT(strstr(b.ptr, "\"id\":\"deepseek-v4-pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"name\":\"DeepSeek V4 Pro\"") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"context_length\":100000") != NULL);
     TEST_ASSERT(strstr(b.ptr, "\"max_completion_tokens\":4096") != NULL);
     buf_free(&b);
+}
+
+static void test_model_metadata_reports_modalities(void) {
+    for (int vision = 0; vision <= 1; vision++) {
+        buf b = {0};
+        append_model_json_values(&b, "model", "Model", 32768, 4096, vision);
+        const char *json = b.ptr;
+        TEST_ASSERT(json_skip_value(&json));
+        TEST_ASSERT(*json == '\0');
+        TEST_ASSERT(strstr(b.ptr, "\"architecture\":{") != NULL);
+        TEST_ASSERT(strstr(b.ptr, vision ?
+            "\"input_modalities\":[\"text\",\"image\"]" :
+            "\"input_modalities\":[\"text\"]") != NULL);
+        TEST_ASSERT(strstr(b.ptr, "\"output_modalities\":[\"text\"]") != NULL);
+        if (!vision) TEST_ASSERT(strstr(b.ptr, "\"image\"") == NULL);
+        buf_free(&b);
+    }
 }
 
 static void test_live_prefix_rewind_target(void) {
@@ -26715,6 +26821,7 @@ static void ds4_server_unit_tests_run(void) {
     test_rewind_point_tail_by_eval();
     test_render_think_max_prompt_prefix();
     test_render_non_thinking_prompt_closes_think();
+    test_render_blank_reasoning_is_absent();
     test_render_drops_old_reasoning_without_tools();
     test_render_preserves_reasoning_with_tools();
     test_render_chat_prompt_text_renders_tools_before_system();
@@ -26836,6 +26943,7 @@ static void ds4_server_unit_tests_run(void) {
     test_json_int_handles_non_finite_values();
     test_tool_history_validation_handles_large_replays();
     test_model_metadata_clamps_completion_to_context();
+    test_model_metadata_reports_modalities();
     test_live_prefix_rewind_target();
     test_client_socket_nonblocking_flag();
     test_client_disconnect_probe();
