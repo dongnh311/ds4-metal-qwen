@@ -23,6 +23,19 @@ static void check_row_bytes(void) {
     CHECK(routed_expert_row_bytes(&t) == 368);
     t.dim[0] = 768;
     CHECK(routed_expert_row_bytes(&t) == 432);
+
+    CHECK(q2k_row_bytes(768) == 252);
+    CHECK(q2k_row_bytes(640) == 216);
+    CHECK(q2k_row_bytes(704) == 248);
+    CHECK(q2k_row_bytes(576) == 216);
+    CHECK(q2k_row_bytes(672) == 0);
+    CHECK(tensor_nbytes_dims(DS4_TENSOR_Q2_K, 640, 640ull * 2560 * 512, &b) && b == 216ull * 2560 * 512);
+    CHECK(tensor_nbytes_dims(DS4_TENSOR_Q2_K, 768, 768ull * 2560 * 512, &b) && b == 252ull * 2560 * 512);
+    CHECK(!tensor_nbytes_dims(DS4_TENSOR_Q2_K, 672, 672ull * 4, &b));
+    ds4_tensor q2 = { .ndim = 3, .dim = {640, 2560, 512}, .type = DS4_TENSOR_Q2_K };
+    CHECK(routed_expert_row_bytes(&q2) == 216);
+    q2.dim[0] = 768;
+    CHECK(routed_expert_row_bytes(&q2) == 252);
 }
 
 static void check_trimmed_layouts(void) {
@@ -37,10 +50,17 @@ static void check_trimmed_layouts(void) {
     CHECK(!qwen4_down_is_trimmed(&t));                 /* whole blocks: nothing to trim */
     g_ds4_shape.n_ff_exp = 640;
 
+    ds4_tensor q2 = { .ndim = 3, .dim = {640, 2560, 512}, .type = DS4_TENSOR_Q2_K };
+    CHECK(qwen4_down_is_trimmed(&q2));
+    q2.dim[0] = 768;
+    CHECK(!qwen4_down_is_trimmed(&q2));                /* padded */
+    q2.dim[0] = 640;
+
 #ifdef DS4_HAS_QWEN4_GPU
-    /* the Metal graph runs trimmed down rows; a Q4_K row of 640 that is not the ff width stays refused */
+    /* the Metal graph runs trimmed down rows; a Q4_K/Q2_K row of 640 that is not the ff width stays refused */
     ds4_tensor down = { .ndim = 3, .dim = {640, 2560, 512}, .type = DS4_TENSOR_Q4_K };
     CHECK(qwen4_graph_expert_ok(&down));
+    CHECK(qwen4_graph_expert_ok(&q2));
     ds4_tensor odd = { .ndim = 3, .dim = {640, 2560, 512}, .type = DS4_TENSOR_Q4_K };
     g_ds4_shape.n_ff_exp = 512;
     CHECK(!qwen4_graph_expert_ok(&odd));
@@ -49,11 +69,13 @@ static void check_trimmed_layouts(void) {
     CHECK(qwen4_graph_expert_ok(&gate));
 #endif
 
-    /* a Q8_0 MTP down beside trimmed Q4_K layers is accepted (the call returns) */
+    /* a Q8_0 MTP down beside trimmed Q4_K/Q2_K layers is accepted (the call returns) */
     const bool tr[3] = { true, true, false };
     const uint32_t ty[3] = { DS4_TENSOR_Q4_K, DS4_TENSOR_Q4_K, DS4_TENSOR_Q8_0 };
     qwen4_check_down_layouts(tr, ty, 3);
-    /* trimmed and padded Q4_K in one model is refused with exit status 1 */
+    const uint32_t q2t[3] = { DS4_TENSOR_Q2_K, DS4_TENSOR_Q2_K, DS4_TENSOR_Q8_0 };
+    qwen4_check_down_layouts(tr, q2t, 3);
+    /* trimmed and padded, or trimmed Q2_K and Q4_K, in one model are refused with exit status 1 */
     fflush(NULL);
     const pid_t pid = fork();
     if (pid == 0) {
@@ -66,6 +88,19 @@ static void check_trimmed_layouts(void) {
     int st = 0;
     waitpid(pid, &st, 0);
     CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 1);
+
+    fflush(NULL);
+    const pid_t pid2 = fork();
+    if (pid2 == 0) {
+        if (!freopen("/dev/null", "w", stderr)) _exit(2);
+        const bool all[2] = { true, true };
+        const uint32_t mt[2] = { DS4_TENSOR_Q2_K, DS4_TENSOR_Q4_K };
+        qwen4_check_down_layouts(all, mt, 2);
+        _exit(0);
+    }
+    int st2 = 0;
+    waitpid(pid2, &st2, 0);
+    CHECK(WIFEXITED(st2) && WEXITSTATUS(st2) == 1);
 }
 
 /* the bound nextn (MTP) layers after the executable range count toward the down layout, so a
@@ -118,11 +153,40 @@ static void check_ref_row(void) {
     }
 }
 
+/* the CPU reference reads a trimmed Q2_K row exactly like the first 640 values of its padded twin */
+static void check_ref_row_q2k(void) {
+    enum { ROWS = 3 };
+    static uint8_t pad[ROWS * 252], trim[ROWS * 216];
+    for (uint32_t i = 0; i < sizeof(pad); i++) pad[i] = (uint8_t)(i * 37u + 11u);
+    for (uint32_t r = 0; r < ROWS; r++) {
+        uint8_t *src = pad + r * 252, *dst = trim + r * 216;
+        /* d and dmin = f16 0x2000 (2^-7) in every block header, so every value is finite */
+        for (uint32_t b = 0; b < 3; b++) {
+            src[b * 84 + 80] = 0x00; src[b * 84 + 81] = 0x20;
+            src[b * 84 + 82] = 0x00; src[b * 84 + 83] = 0x20;
+        }
+        memcpy(dst, src, 168);                 /* two full blocks */
+        memcpy(dst + 168, src + 168, 8);       /* real scales of block 2 */
+        memcpy(dst + 176, src + 248, 4);       /* d/dmin moved into the header tail */
+        memcpy(dst + 184, src + 184, 32);      /* real qs bytes of block 2 */
+    }
+    float a[768], b[640];
+    for (uint32_t r = 0; r < ROWS; r++) {
+        qwen4_ref_q2k_row(pad, 768, r, a);
+        qwen4_ref_q2k_row(trim, 640, r, b);
+        CHECK(memcmp(a, b, sizeof(b)) == 0);
+        bool nonzero = false;
+        for (uint32_t i = 512; i < 640; i++) nonzero |= b[i] != 0.0f;
+        CHECK(nonzero);                        /* the short block's real values were read */
+    }
+}
+
 int main(void) {
     check_row_bytes();
     check_trimmed_layouts();
     check_collect_includes_nextn();
     check_ref_row();
+    check_ref_row_q2k();
     if (failures) { fprintf(stderr, "%d failure(s)\n", failures); return 1; }
     printf("test_qwen4_down_trim: ok\n");
     return 0;

@@ -23,6 +23,61 @@ def q4k_row_bytes(n):
     return n // 256 * 144 + (16 + n % 256 // 2 if n % 256 else 0)
 
 
+def q2k_row_bytes(n):
+    """Bytes of a trimmed Q2_K row of n values. A row that ends inside a super-block keeps a 16-byte header
+    (the real scale bytes, d/dmin moved into the unused tail of that header) and only the qs bytes of its real
+    values; 0 if n is not a multiple of 64. Full blocks keep the standard 84-byte layout."""
+    if n % 64:
+        return 0
+    rem = n % 256
+    if not rem:
+        return n // 256 * 84
+    groups = rem // 16
+    qs = 32 if groups <= 8 else 64
+    return n // 256 * 84 + 16 + qs
+
+
+def q2k_trim_rows(buf, in_row, out_row, ff_dim):
+    """Rewrite whole padded Q2_K rows (three 84-byte blocks for 640 logical values) as compact rows. The
+    last super-block keeps its real scales, qs bytes and d/dmin; d/dmin move to the unused tail of the
+    16-byte header so the hot kernels only need a different header offset for that block."""
+    if len(buf) % in_row:
+        raise ValueError("%d bytes are not whole %d-byte rows" % (len(buf), in_row))
+    full = ff_dim // 256
+    rem = ff_dim % 256
+    if not rem:
+        raise ValueError("Q2_K row of %d has no partial block" % ff_dim)
+    groups = rem // 16
+    qs = 32 if groups <= 8 else 64
+    d_off = 8 if groups <= 8 else 12
+    full_bytes = full * 84
+    if out_row != full_bytes + 16 + qs:
+        raise ValueError("Q2_K compact row is %d bytes, expected %d" % (full_bytes + 16 + qs, out_row))
+    rows = len(buf) // in_row
+    try:
+        import numpy as np
+    except ImportError:
+        np = None
+    if np is not None:
+        src = np.frombuffer(buf, dtype=np.uint8).reshape(rows, in_row)
+        dst = np.zeros((rows, out_row), dtype=np.uint8)
+        dst[:, :full_bytes] = src[:, :full_bytes]
+        dst[:, full_bytes:full_bytes + groups] = src[:, full_bytes:full_bytes + groups]
+        dst[:, full_bytes + d_off:full_bytes + d_off + 4] = src[:, full_bytes + 80:full_bytes + 84]
+        dst[:, full_bytes + 16:full_bytes + 16 + qs] = src[:, full_bytes + 16:full_bytes + 16 + qs]
+        return dst.tobytes()
+    out = bytearray()
+    for r in range(rows):
+        row = buf[r * in_row:(r + 1) * in_row]
+        dst = bytearray(out_row)
+        dst[:full_bytes] = row[:full_bytes]
+        dst[full_bytes:full_bytes + groups] = row[full_bytes:full_bytes + groups]
+        dst[full_bytes + d_off:full_bytes + d_off + 4] = row[full_bytes + 80:full_bytes + 84]
+        dst[full_bytes + 16:full_bytes + 16 + qs] = row[full_bytes + 16:full_bytes + 16 + qs]
+        out += dst
+    return bytes(out)
+
+
 def nbytes(ttype, dims):
     if ttype not in BLOCK:
         raise ValueError("unknown tensor type %d" % ttype)
@@ -30,6 +85,13 @@ def nbytes(ttype, dims):
         row = q4k_row_bytes(dims[0])
         if not row:
             raise ValueError("Q4_K row of %d is not a multiple of 64" % dims[0])
+        for d in dims[1:]:
+            row *= d
+        return row
+    if ttype == 10 and dims[0] % 256:
+        row = q2k_row_bytes(dims[0])
+        if not row:
+            raise ValueError("Q2_K row of %d is not a multiple of 64" % dims[0])
         for d in dims[1:]:
             row *= d
         return row
@@ -161,6 +223,21 @@ def write(path, kv, tensors, alignment, nocache=False):
                         if len(buf) != n * in_row:
                             raise ValueError("%s: source %s ends early" % (t["name"], src))
                         piece = trim_rows(buf, in_row, out_row)
+                        out.write(piece)
+                        h.update(piece)
+                        rows_left -= n
+            elif "q2k" in t:
+                src, at, in_row, out_row, ff_dim = t["q2k"]
+                rows_left = t["nbytes"] // out_row
+                step = max(1, CHUNK // in_row)
+                with keep(open(src, "rb")) as f:
+                    f.seek(at)
+                    while rows_left:
+                        n = min(step, rows_left)
+                        buf = f.read(n * in_row)
+                        if len(buf) != n * in_row:
+                            raise ValueError("%s: source %s ends early" % (t["name"], src))
+                        piece = q2k_trim_rows(buf, in_row, out_row, ff_dim)
                         out.write(piece)
                         h.update(piece)
                         rows_left -= n

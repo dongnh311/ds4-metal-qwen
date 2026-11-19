@@ -2638,10 +2638,22 @@ static uint64_t q4k_row_bytes(uint64_t n) {
     return n / 256u * 144u + ((n % 256u) ? 16u + (n % 256u) / 2u : 0u);
 }
 
-/* tensor_nbytes with the row length: Q4_K rows may end in a short block. */
+/* Bytes of a trimmed Q2_K row of n values.  The last, partial super-block
+ * keeps a 16-byte header (its real scale bytes, with d/dmin moved into the
+ * unused tail) and only the qs bytes of its real values.  Full blocks keep
+ * the standard 84-byte layout. 0 if n is not a multiple of 64. */
+static uint64_t q2k_row_bytes(uint64_t n) {
+    if (n % 64u) return 0;
+    const uint64_t rem = n % 256u;
+    if (rem == 0) return n / 256u * 84u;
+    const uint64_t groups = rem / 16u;
+    return n / 256u * 84u + 16u + (groups <= 8u ? 32u : 64u);
+}
+
+/* tensor_nbytes with the row length: Q4_K/Q2_K rows may end in a short block. */
 static bool tensor_nbytes_dims(uint32_t type, uint64_t dim0, uint64_t elements, uint64_t *bytes) {
-    if (type == DS4_TENSOR_Q4_K && dim0 != 0 && (dim0 % 256u) != 0) {
-        const uint64_t row = q4k_row_bytes(dim0);
+    if ((type == DS4_TENSOR_Q4_K || type == DS4_TENSOR_Q2_K) && dim0 != 0 && (dim0 % 256u) != 0) {
+        const uint64_t row = type == DS4_TENSOR_Q4_K ? q4k_row_bytes(dim0) : q2k_row_bytes(dim0);
         if (row == 0 || elements % dim0 != 0 || elements / dim0 > UINT64_MAX / row) return false;
         *bytes = elements / dim0 * row;
         return true;
@@ -5296,9 +5308,9 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
 }
 
 static DS4_MAYBE_UNUSED uint64_t routed_expert_row_bytes(const ds4_tensor *t) {
-    if (t->type == DS4_TENSOR_Q4_K) {
-        const uint64_t row = q4k_row_bytes(t->dim[0]);
-        if (row == 0) ds4_die("routed expert Q4_K row is not a multiple of 64 values");
+    if (t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K) {
+        const uint64_t row = t->type == DS4_TENSOR_Q4_K ? q4k_row_bytes(t->dim[0]) : q2k_row_bytes(t->dim[0]);
+        if (row == 0) ds4_die("routed expert Q4_K/Q2_K row is not a multiple of 64 values");
         return row;
     }
     const gguf_type_info *info = tensor_type(t->type);
@@ -5823,23 +5835,30 @@ static void tensor_expect_qwen4_expert_layout(
     tensor_expect_layout(t, t->type, 3, d0, d1, d2);
 }
 
-/* A routed down tensor stored as trimmed Q4_K rows: ff_dim values per row,
- * the last super-block cut after its header and real qs chunks. */
+/* A routed down tensor stored as trimmed Q4_K or Q2_K rows: ff_dim values per
+ * row, the last super-block cut after its header and real values. */
 static bool qwen4_down_is_trimmed(const ds4_tensor *t) {
-    return t && t->type == DS4_TENSOR_Q4_K && t->ndim == 3 && t->dim[0] == DS4_N_FF_EXP &&
+    return t && (t->type == DS4_TENSOR_Q4_K || t->type == DS4_TENSOR_Q2_K) &&
+           t->ndim == 3 && t->dim[0] == DS4_N_FF_EXP &&
            (DS4_N_FF_EXP % 256u) != 0 && (DS4_N_FF_EXP % 64u) == 0;
 }
 
-/* The Metal down stride is one per-model setting, so the Q4_K routed down
- * tensors must all be trimmed or all padded; other types do not count. */
+/* The Metal down stride is one per-model setting, so the Q4_K/Q2_K routed down
+ * tensors must all be trimmed or all padded; a trimmed file may use only one
+ * of the two types because the flag is shared.  Other types do not count. */
 static void qwen4_check_down_layouts(const bool *trimmed, const uint32_t *types, uint32_t n) {
     int first = -1;
+    uint32_t first_type = 0;
     for (uint32_t i = 0; i < n; i++) {
-        if (types[i] != DS4_TENSOR_Q4_K) continue;
+        if (types[i] != DS4_TENSOR_Q4_K && types[i] != DS4_TENSOR_Q2_K) continue;
         if (first < 0) {
             first = trimmed[i] ? 1 : 0;
+            first_type = types[i];
         } else if ((trimmed[i] ? 1 : 0) != first) {
-            fprintf(stderr, "ds4: routed Q4_K down experts mix trimmed and padded rows (layer slot %u)\n", i);
+            fprintf(stderr, "ds4: routed Q4_K/Q2_K down experts mix trimmed and padded rows (layer slot %u)\n", i);
+            exit(1);
+        } else if (first && types[i] != first_type) {
+            fprintf(stderr, "ds4: trimmed routed down experts mix Q4_K and Q2_K rows (layer slot %u)\n", i);
             exit(1);
         }
     }
@@ -5861,7 +5880,7 @@ static uint32_t qwen4_collect_down_layouts(const ds4_weights *w, uint32_t start,
 }
 
 /* Q2_K and Q4_K down rows store 640 logical inputs in three 256-value blocks
- * (Q4_K super-blocks) unless the Q4_K rows are trimmed to 640 (the last block
+ * (Q4_K/Q2_K super-blocks) unless the rows are trimmed to 640 (the last block
  * cut after its real values). Activations remain 640 wide; only the weight
  * row stride differs. */
 static void qwen4_expect_down_layout(const ds4_tensor *down) {
@@ -6010,7 +6029,7 @@ static void weights_validate_qwen4_layout(
     ds4_gpu_qwen4_set_down_trimmed(any_trimmed);
 #elif defined(DS4_HAS_QWEN4_GPU)
     if (any_trimmed) {
-        fprintf(stderr, "ds4: trimmed Q4_K down rows need the Metal backend\n");
+        fprintf(stderr, "ds4: trimmed Q4_K/Q2_K down rows need the Metal backend\n");
         exit(1);
     }
 #else
@@ -70717,6 +70736,37 @@ static void qwen4_ref_q4k_row(const uint8_t *data, uint64_t n, uint64_t row, flo
     }
 }
 
+/* One Q2_K row of n values; a trimmed row's last super-block carries d/dmin
+ * inside its 16-byte header and only its real scale/qs bytes. */
+static void qwen4_ref_q2k_row(const uint8_t *data, uint64_t n, uint64_t row, float *out) {
+    const uint64_t row_bytes = q2k_row_bytes(n);
+    if (row_bytes == 0) ds4_die("qwen4 reference: Q2_K row is not a multiple of 64 values");
+    const uint8_t *p = data + row * row_bytes;
+    const uint64_t full = n / 256u;
+    for (uint64_t b = 0; b < full; b++, p += 84u) {
+        const block_q2_K *blk = (const block_q2_K *)p;
+        for (uint32_t j = 0; j < 256u; j++) out[b * 256u + j] = q2_k_value_f32(blk, j);
+    }
+    const uint64_t rem = n % 256u;
+    if (rem == 0) return;
+    const uint64_t groups = rem / 16u;
+    const uint64_t d_off = groups <= 8u ? 8u : 12u;
+    uint16_t dh, mh;
+    memcpy(&dh, p + d_off, 2);
+    memcpy(&mh, p + d_off + 2, 2);
+    const float d = f16_to_f32(dh), dmin = f16_to_f32(mh);
+    const uint8_t *qs = p + 16;
+    for (uint64_t g = 0; g < groups; g++) {
+        const uint32_t q_base = 32u * (uint32_t)(g / 8u) + 16u * (uint32_t)(g & 1u);
+        const uint32_t shift = ((uint32_t)(g / 2u) & 3u) * 2u;
+        const float ds = d * (float)(p[g] & 0x0Fu), dm = dmin * (float)(p[g] >> 4);
+        for (uint32_t l = 0; l < 16u; l++) {
+            const uint32_t q = (qs[q_base + l] >> shift) & 3u;
+            out[full * 256u + g * 16u + l] = ds * (float)q - dm;
+        }
+    }
+}
+
 static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row, float *out) {
     const uint64_t n = t->dim[0];
     switch (t->type) {
@@ -70792,12 +70842,9 @@ static void qwen4_ref_row(const ds4_model *m, const ds4_tensor *t, uint64_t row,
         }
         break;
     }
-    case DS4_TENSOR_Q2_K: {
-        const uint64_t blocks = n / 256u;
-        const block_q2_K *p = (const block_q2_K *)((const uint8_t *)tensor_data(m, t) + row * blocks * 84u);
-        for (uint64_t k = 0; k < blocks * 256u; k++) out[k] = q2_k_value_f32(p, (uint32_t)k);
+    case DS4_TENSOR_Q2_K:
+        qwen4_ref_q2k_row((const uint8_t *)tensor_data(m, t), n, row, out);
         break;
-    }
     case DS4_TENSOR_IQ2_XXS: case DS4_TENSOR_Q5_K: case DS4_TENSOR_Q6_K:
     case DS4_TENSOR_IQ2_XS: case DS4_TENSOR_IQ2_S: case DS4_TENSOR_IQ3_XXS: case DS4_TENSOR_IQ3_S:
     case DS4_TENSOR_IQ4_NL: case DS4_TENSOR_IQ4_XS: case DS4_TENSOR_Q2_0:

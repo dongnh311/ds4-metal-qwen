@@ -13,7 +13,7 @@
  * of group g takes its fifth bit from bit g of qh[j]. */
 static inline float qwen35_row_dot(device const char *row, device const float *x,
                                    uint weight_type, uint in_dim, ushort tiisg) {
-    if (weight_type != 13u) return qwen4_row_dot(row, x, weight_type, in_dim, tiisg);
+    if (weight_type != 13u) return qwen4_row_dot(row, x, weight_type, in_dim, tiisg, false);
     float acc = 0.0f;
     const uint nb = in_dim / 256u;
     const uint group = tiisg / 4, l = (tiisg % 4) * 8;

@@ -50441,12 +50441,22 @@ void ds4_gpu_qwen4_set_down_trimmed(bool on) {
 }
 
 /* Routed down rows: Q2_K and Q4_K pad ff_dim to whole 256-value blocks, except
- * trimmed Q4_K files, whose last block keeps its 16-byte header and the qs
- * chunks of the real values only.  Every kernel skips values from ff_dim on
- * before loading them, so only the row stride differs. */
+ * trimmed files, whose last block keeps only its real values.  Q4_K's header
+ * is at the front, so a prefix row works; Q2_K's d/dmin move into the unused
+ * tail of the 16-byte header and the kernels adjust that one offset. */
+static uint32_t qwen4_q2k_qs_bytes(uint32_t ff_dim) {
+    const uint32_t groups = (ff_dim % 256u) / 16u;
+    return groups <= 8u ? 32u : 64u;
+}
+
 static uint32_t qwen4_down_row_bytes(uint32_t type, uint32_t ff_dim) {
-    if (type == 12u && g_qwen4_down_trimmed && (ff_dim % 256u) != 0) {
-        return (ff_dim % 64u) ? 0u : ff_dim / 256u * 144u + 16u + (ff_dim % 256u) / 2u;
+    if (g_qwen4_down_trimmed && (ff_dim % 256u) != 0) {
+        if (type == 12u) {
+            return (ff_dim % 64u) ? 0u : ff_dim / 256u * 144u + 16u + (ff_dim % 256u) / 2u;
+        }
+        if (type == 10u) {
+            return (ff_dim % 64u) ? 0u : ff_dim / 256u * 84u + 16u + qwen4_q2k_qs_bytes(ff_dim);
+        }
     }
     const uint32_t dim = (type == 10u || type == 12u) ? (ff_dim + 255u) / 256u * 256u : ff_dim;
     return qwen4_expert_row_bytes(type, dim);

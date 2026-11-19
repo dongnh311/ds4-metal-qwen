@@ -2088,6 +2088,77 @@ static void test_moe_grouped(arena_t *a) {
     free(sel); free(x);
 }
 
+/* Trimmed Q2_K down rows: the last block's d/dmin moves into the unused tail of its 16-byte header and only
+ * the real scale/qs bytes remain.  The padded arena's tail is random and nonzero, so a wrong stride or a
+ * wrong header offset changes the result. */
+static void q2k_make_trim(uint8_t *dst, const uint8_t *src, uint32_t F) {
+    const uint32_t full = F / 256u, rem = F % 256u;
+    const uint32_t groups = rem / 16u;
+    const uint32_t qs = groups <= 8u ? 32u : 64u;
+    const uint32_t d_off = groups <= 8u ? 8u : 12u;
+    memcpy(dst, src, full * 84u);
+    memcpy(dst + full * 84u, src + full * 84u, groups);
+    memcpy(dst + full * 84u + d_off, src + full * 84u + 80u, 4u);
+    memcpy(dst + full * 84u + 16u, src + full * 84u + 16u, qs);
+}
+
+static void test_down_trim_q2k(arena_t *a, uint32_t F, uint32_t T) {
+    const uint32_t NE = 8, slots = 6, E = 256, DF = (F + 255u) / 256u * 256u;
+    const uint32_t in_row = DF / 256u * 84u;
+    const uint32_t groups = (F % 256u) / 16u, out_row = F / 256u * 84u + 16u + (groups <= 8u ? 32u : 64u);
+    double *dw;
+    const uint64_t pad_off = arena_q2_K(a, (uint64_t)NE * E, DF, &dw, 0.05f);
+    free(dw);
+    const uint64_t trim_off = arena_alloc(a, (uint64_t)NE * E * out_row);
+    for (uint64_t r = 0; r < (uint64_t)NE * E; r++)
+        q2k_make_trim(a->base + trim_off + r * out_row, a->base + pad_off + r * in_row, F);
+    float *mid = rand_vec((uint64_t)T * slots * F, 1.0f);
+    int32_t *sel = malloc((uint64_t)T * slots * 4);
+    for (uint32_t t = 0; t < T; t++)
+        for (uint32_t s = 0; s < slots; s++) sel[t * slots + s] = (int32_t)((t * 5u + s * 3u) % NE);
+    ds4_gpu_tensor *gmid = upload(mid, (uint64_t)T * slots * F);
+    ds4_gpu_tensor *gsel = ds4_gpu_tensor_alloc((uint64_t)T * slots * 4);
+    require_ok(ds4_gpu_tensor_write(gsel, 0, sel, (uint64_t)T * slots * 4), "q2k trim sel write");
+    ds4_gpu_tensor *gpart = upload(NULL, (uint64_t)T * slots * E);
+    const uint64_t np = (uint64_t)T * slots * E;
+    float *ref = malloc(np * sizeof(float)), *got = malloc(np * sizeof(float));
+    require_ok(ref && got, "q2k trim allocation");
+    const char *mr[] = {"0", "2", "4"};
+    for (uint32_t spec = 0; spec < 2u; spec++) {
+        setenv("DS4_QWEN4_MOE_MV_SPECIALIZE", spec ? "1" : "0", 1);
+        for (uint32_t m = 0; m < 3u; m++) {
+            setenv("DS4_QWEN4_MOE_MR_DOWN", mr[m], 1);
+            ds4_gpu_qwen4_set_down_trimmed(false);
+            require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, pad_off, 10u, NE, T, slots,
+                                                     F, E, 0, UINT32_MAX), "q2k padded down");
+            require_ok(ds4_gpu_tensor_read(gpart, 0, ref, np * sizeof(float)), "q2k padded down read");
+            ds4_gpu_qwen4_set_down_trimmed(true);
+            require_ok(ds4_gpu_qwen4_moe_down_tensor(gpart, gmid, gsel, a->base, a->size, trim_off, 10u, NE, T, slots,
+                                                     F, E, 0, UINT32_MAX), "q2k trimmed down");
+            require_ok(ds4_gpu_tensor_read(gpart, 0, got, np * sizeof(float)), "q2k trimmed down read");
+            check_exact_f32("trimmed Q2_K down (decode rows)", got, ref, np);
+        }
+    }
+    unsetenv("DS4_QWEN4_MOE_MV_SPECIALIZE");
+    unsetenv("DS4_QWEN4_MOE_MR_DOWN");
+    ds4_gpu_tensor *glists = ds4_gpu_tensor_alloc((uint64_t)NE * T * 4);
+    ds4_gpu_tensor *gcounts = ds4_gpu_tensor_alloc((uint64_t)NE * 4);
+    require_ok(ds4_gpu_qwen4_moe_build_lists_tensor(glists, gcounts, gsel, T, slots, NE, T), "q2k trim lists");
+    ds4_gpu_qwen4_set_down_trimmed(false);
+    require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, pad_off, 10u,
+                                                NE, T, slots, slots, F, E, T), "q2k padded mm down");
+    require_ok(ds4_gpu_tensor_read(gpart, 0, ref, np * sizeof(float)), "q2k padded mm read");
+    ds4_gpu_qwen4_set_down_trimmed(true);
+    require_ok(ds4_gpu_qwen4_moe_mm_down_tensor(gpart, gmid, glists, gcounts, a->base, a->size, trim_off, 10u,
+                                                NE, T, slots, slots, F, E, T), "q2k trimmed mm down");
+    require_ok(ds4_gpu_tensor_read(gpart, 0, got, np * sizeof(float)), "q2k trimmed mm read");
+    check_exact_f32("trimmed Q2_K down (prefill GEMM)", got, ref, np);
+    free(ref); free(got); free(mid); free(sel);
+    ds4_gpu_tensor_free(glists); ds4_gpu_tensor_free(gcounts);
+    ds4_gpu_tensor_free(gmid); ds4_gpu_tensor_free(gsel); ds4_gpu_tensor_free(gpart);
+    printf("  trimmed Q2_K down F=%u T=%u: decode rows and prefill GEMM byte-exact vs padded\n", F, T);
+}
+
 /* Trimmed Q4_K down rows (docs/superpowers/specs/2026-10-03-qwen4-q4k-down-trim-design.md): a padded arena
  * and its trimmed copy (each row cut after 16 + (F % 256) / 2 bytes of its last block; the padded arena's
  * tail is random and nonzero) must give bit-identical down outputs through every decode geometry and the
@@ -3709,6 +3780,11 @@ int main(void) {
     test_down_trim(&arena, 640, 128);
     test_down_trim(&arena, 320, 2);
     test_down_trim(&arena, 320, 128);
+    test_down_trim_q2k(&arena, 640, 1);
+    test_down_trim_q2k(&arena, 640, 2);
+    test_down_trim_q2k(&arena, 640, 9);
+    test_down_trim_q2k(&arena, 640, 128);
+    test_down_trim_q2k(&arena, 704, 9);
 #endif
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);

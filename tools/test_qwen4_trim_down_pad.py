@@ -16,6 +16,17 @@ def padded_rows(rows, seed):
     return bytes((i * 7 + seed) & 0xFF for i in range(rows * 432))
 
 
+def padded_q2k_rows(rows, seed):
+    """rows x 252 bytes: three padded Q2_K blocks per row; d/dmin are finite and padding is nonzero."""
+    buf = bytearray((i * 11 + seed) & 0xFF for i in range(rows * 252))
+    for r in range(rows):
+        for b in range(3):
+            off = r * 252 + b * 84
+            buf[off + 80:off + 82] = b"\x00\x20"   # f16 2^-7
+            buf[off + 82:off + 84] = b"\x00\x20"
+    return bytes(buf)
+
+
 class TrimTest(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -67,6 +78,32 @@ class TrimTest(unittest.TestCase):
         self.assertEqual((t["bytes"], t["trimmed_from"]), (6 * 368, [768, 3, 2]))
         self.assertIsNone(m["tensors"]["blk.0.attn_norm.weight"]["trimmed_from"])
         self.assertEqual(m["bytes"], (self.p / "out.gguf").stat().st_size)
+
+    def test_converts_q2k_down_only(self):
+        self.kv["qwen4exp.expert_feed_forward_length"] = (g.T_U32, 640)
+        down = padded_q2k_rows(6, 5)
+        tensors = [
+            {"name": "blk.0.ffn_down_exps.weight", "dims": [768, 3, 2], "type": 10, "nbytes": 6 * 252,
+             "data": down},
+            {"name": "blk.0.attn_norm.weight", "dims": [16], "type": 0, "nbytes": 64,
+             "data": bytes(range(64))},
+            {"name": "blk.1.ffn_down_exps.weight", "dims": [640, 3, 2], "type": 8, "nbytes": 6 * 20 * 34,
+             "data": bytes(6 * 20 * 34)},
+        ]
+        g.write(self.p / "q2k-in.gguf", self.kv, tensors, 32)
+        r = self.run_tool(self.p / "q2k-in.gguf", self.p / "q2k-out.gguf")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        out = g.Reader(self.p / "q2k-out.gguf")
+        by = {t["name"]: t for t in out.tensors}
+        d = by["blk.0.ffn_down_exps.weight"]
+        self.assertEqual((d["dims"], d["type"], d["nbytes"]), ([640, 3, 2], 10, 6 * 216))
+        with open(self.p / "q2k-out.gguf", "rb") as f:
+            f.seek(d["abs"])
+            self.assertEqual(f.read(d["nbytes"]), g.q2k_trim_rows(down, 252, 216, 640))
+            f.seek(by["blk.0.attn_norm.weight"]["abs"])
+            self.assertEqual(f.read(64), bytes(range(64)))
+        m = json.loads((self.p / "q2k-out.gguf.json").read_text())
+        self.assertEqual(m["tensors"]["blk.0.ffn_down_exps.weight"]["trimmed_from"], [768, 3, 2])
 
     def test_already_trimmed_refused(self):
         self.run_tool(self.p / "in.gguf", self.p / "out.gguf")

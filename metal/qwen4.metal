@@ -30,8 +30,24 @@ static inline float qwen4_silu(float x) {
     return x * qwen4_sigmoid(x);
 }
 
+/* Trimmed Q2_K routed down rows: the last, partial super-block keeps a 16-byte
+ * header whose free tail holds d/dmin, then only the qs bytes of the real
+ * values.  Full blocks keep the standard 84-byte layout. */
+static inline uint qwen4_q2k_qs_bytes(uint in_dim) {
+    return ((in_dim % 256u) / 16u) <= 8u ? 32u : 64u;
+}
+
+static inline uint qwen4_q2k_d_off(uint in_dim) {
+    return ((in_dim % 256u) / 16u) <= 8u ? 8u : 12u;
+}
+
+static inline bool qwen4_q2k_trimmed(uint in_dim, uint row_bytes) {
+    if ((in_dim % 256u) == 0u) return false;
+    return row_bytes == in_dim / 256u * 84u + 16u + qwen4_q2k_qs_bytes(in_dim);
+}
+
 static inline float qwen4_row_dot(device const char *row, device const float *x,
-                                  uint weight_type, uint in_dim, ushort tiisg);
+                                  uint weight_type, uint in_dim, ushort tiisg, bool trimmed);
 
 /* --- hyper-connections -------------------------------------------------- */
 
@@ -1160,7 +1176,7 @@ kernel void kernel_qwen4_router_topk(
         gpart = acc4.x + acc4.y + acc4.z + acc4.w;
         gpart = simd_sum(gpart);
     } else if (args.in_dim && sgitg == nsg - 1) {
-        gpart = qwen4_row_dot(w_gate, x + (uint64_t)tok * args.in_dim, args.gate_type, args.in_dim, tiisg);
+        gpart = qwen4_row_dot(w_gate, x + (uint64_t)tok * args.in_dim, args.gate_type, args.in_dim, tiisg, false);
     }
     if (args.in_dim && tiisg == 0) redg[sgitg] = gpart;
 
@@ -3051,7 +3067,7 @@ static inline float qwen4_lane_q6_k(device const uchar *row, device const float 
 /* dot of one quantized expert row with x, lanes split as in the K3 kernels:
  * ix = block stride, it = element pair inside the block */
 static inline float qwen4_row_dot(device const char *row, device const float *x,
-                                  uint weight_type, uint in_dim, ushort tiisg) {
+                                  uint weight_type, uint in_dim, ushort tiisg, bool trimmed) {
     float acc = 0.0f;
     if (weight_type == 8) {
         const short ix = tiisg / 8, it = tiisg % 8;
@@ -3122,9 +3138,11 @@ static inline float qwen4_row_dot(device const char *row, device const float *x,
         for (uint ib = 0; ib < nb; ib++) {
             /* Padded Q2_K down weights have no corresponding activation tail. */
             if (ib * 256u + group * 16u + l >= in_dim) continue;
+            const bool last = trimmed && (in_dim % 256u) != 0u && ib + 1u == nb;
             device const uchar *blk = (device const uchar *)(row + (uint64_t)ib * 84);
-            const float d = (float)(*(device const half *)(blk + 80));
-            const float dmin = (float)(*(device const half *)(blk + 82));
+            const uint d_off = last ? qwen4_q2k_d_off(in_dim) : 80u;
+            const float d = (float)(*(device const half *)(blk + d_off));
+            const float dmin = (float)(*(device const half *)(blk + d_off + 2u));
             const uint sc = blk[group];
             const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
             device const uchar *qs = blk + 16 + q_base + l;
@@ -3231,7 +3249,8 @@ kernel void kernel_qwen4_multi_gemv(
         while (i + 1 < args.n_out && local >= args.out_rows[i]) { local -= args.out_rows[i]; i++; }
         device const char *w = i == 0 ? w0 : i == 1 ? w1 : i == 2 ? w2 : w3;
         device float *o = i == 0 ? o0 : i == 1 ? o1 : i == 2 ? o2 : o3;
-        const float v = qwen4_row_dot(w + (uint64_t)local * args.row_bytes[i], xt, args.types[i], args.in_dim, tiisg);
+        const float v = qwen4_row_dot(w + (uint64_t)local * args.row_bytes[i], xt, args.types[i], args.in_dim, tiisg,
+                                     qwen4_q2k_trimmed(args.in_dim, args.row_bytes[i]));
         if (tiisg == 0) o[(uint64_t)tok * args.out_rows[i] + local] = v;
     }
 }
@@ -3528,8 +3547,8 @@ kernel void kernel_qwen4_moe_mid(
     device const float *xt = x + (uint64_t)tok * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         const uint64_t off = ebase + (uint64_t)r * row_bytes;
-        const float g = qwen4_row_dot(gb + off, xt, type, dim, tiisg);
-        const float u = qwen4_row_dot(ub + off, xt, type, dim, tiisg);
+        const float g = qwen4_row_dot(gb + off, xt, type, dim, tiisg, false);
+        const float u = qwen4_row_dot(ub + off, xt, type, dim, tiisg, false);
         if (tiisg == 0) {
             mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
         }
@@ -3563,8 +3582,8 @@ kernel void kernel_qwen4_moe_mid_q4k(
     if (slot == args.n_slots) {
         for (uint r = row0; r < row0 + NR && r < args.out_rows; r++) {
             const uint64_t off = (uint64_t)r * args.shared_row_bytes;
-            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg);
-            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg);
+            const float g = qwen4_row_dot(sh_gate + off, xt, args.shared_type, args.in_dim, tiisg, false);
+            const float u = qwen4_row_dot(sh_up + off, xt, args.shared_type, args.in_dim, tiisg, false);
             if (tiisg == 0) mid[mid_base + r] = qwen4_silu(g) * u;
         }
         return;
@@ -3806,7 +3825,8 @@ kernel void kernel_qwen4_moe_down(
     const uint64_t ebase = shared ? 0 : (uint64_t)(uint)selected[(uint64_t)tok * args.n_slots + slot] * args.expert_bytes;
     device const float *m = mid + pair * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
-        const float v = qwen4_row_dot(db + ebase + (uint64_t)r * row_bytes, m, type, dim, tiisg);
+        const float v = qwen4_row_dot(db + ebase + (uint64_t)r * row_bytes, m, type, dim, tiisg,
+                                     qwen4_q2k_trimmed(dim, row_bytes));
         if (tiisg == 0) part[pair * args.out_rows + r] = v;
     }
 }
@@ -3894,8 +3914,8 @@ kernel void kernel_qwen4_moe_mid_addr(
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         if (absent) { if (tiisg == 0) mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = 0.0f; continue; }
         const uint64_t off = (uint64_t)r * row_bytes;
-        const float g = qwen4_row_dot(gb + off, xt, type, dim, tiisg);
-        const float u = qwen4_row_dot(ub + off, xt, type, dim, tiisg);
+        const float g = qwen4_row_dot(gb + off, xt, type, dim, tiisg, false);
+        const float u = qwen4_row_dot(ub + off, xt, type, dim, tiisg, false);
         if (tiisg == 0) mid[((uint64_t)tok * n_out + slot) * args.out_rows + r] = qwen4_silu(g) * u;
     }
 }
@@ -3935,7 +3955,8 @@ kernel void kernel_qwen4_moe_down_addr(
     device const float *m = mid + pair * args.in_dim;
     for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
         if (absent) { if (tiisg == 0) part[pair * args.out_rows + r] = 0.0f; continue; }
-        const float v = qwen4_row_dot(db + (uint64_t)r * row_bytes, m, type, dim, tiisg);
+        const float v = qwen4_row_dot(db + (uint64_t)r * row_bytes, m, type, dim, tiisg,
+                                     qwen4_q2k_trimmed(dim, row_bytes));
         if (tiisg == 0) part[pair * args.out_rows + r] = v;
     }
 }
@@ -4035,7 +4056,8 @@ static inline void qwen4_iq2_mid_rows(device const char *gb, device const char *
  * no activation tail (qwen4_row_dot types 12 and 10). */
 template <uint TYPE, uint NR>
 static inline void qwen4_kdown_rows(device const char *db, uint row_bytes, uint row0, uint out_rows,
-                                    device const float *m, uint in_dim, ushort tiisg, thread float *acc) {
+                                    device const float *m, uint in_dim, ushort tiisg, thread float *acc,
+                                    bool trimmed) {
     for (uint r = 0; r < NR; r++) acc[r] = 0.0f;
     const uint nb = (in_dim + 255u) / 256u;
     if (TYPE == 12u) {
@@ -4082,8 +4104,9 @@ static inline void qwen4_kdown_rows(device const char *db, uint row_bytes, uint 
             const float y[8] = { ya.x, ya.y, ya.z, ya.w, yb.x, yb.y, yb.z, yb.w };
             for (uint r = 0; r < NR; r++) {
                 if (row0 + r >= out_rows) break;
+                const bool last = trimmed && (in_dim % 256u) != 0u && ib + 1u == nb;
                 device const uchar *blk = (device const uchar *)(db + (uint64_t)(row0 + r) * row_bytes + (uint64_t)ib * 84);
-                const half2 dd = *(device const half2 *)(blk + 80);
+                const half2 dd = *(device const half2 *)(blk + (last ? qwen4_q2k_d_off(in_dim) : 80u));
                 const float d = (float)dd.x;
                 const float dmin = (float)dd.y;
                 const uint sc = blk[group];
@@ -4123,8 +4146,8 @@ static inline void qwen4_kdown_rows(device const char *db, uint row_bytes, uint 
 #define QWEN4_MR_MID_SHARED(NR_) do { \
     for (uint r = row0; r < row0 + (NR_) && r < args.out_rows; r++) { \
         const uint64_t off = (uint64_t)r * args.shared_row_bytes; \
-        const float g = qwen4_row_dot(sh_gate + off, xt, st, dim, tiisg); \
-        const float u = qwen4_row_dot(sh_up + off, xt, st, dim, tiisg); \
+        const float g = qwen4_row_dot(sh_gate + off, xt, st, dim, tiisg, false); \
+        const float u = qwen4_row_dot(sh_up + off, xt, st, dim, tiisg, false); \
         if (tiisg == 0) mo[r] = qwen4_silu(g) * u; \
     } \
 } while (0)
@@ -4196,14 +4219,15 @@ kernel void kernel_qwen4_moe_mid_iq2_addr(
 
 #define QWEN4_MR_DOWN_SHARED(NR_) do { \
     for (uint r = row0; r < row0 + (NR_) && r < args.out_rows; r++) { \
-        const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m, st, dim, tiisg); \
+        const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m, st, dim, tiisg, false); \
         if (tiisg == 0) po[r] = v; \
     } \
 } while (0)
 
 #define QWEN4_MR_DOWN_ROUTED(TYPE_, NR_, DB_) do { \
     float acc[NR_]; \
-    qwen4_kdown_rows<TYPE_, NR_>((DB_), args.row_bytes, row0, args.out_rows, m, dim, tiisg, acc); \
+    qwen4_kdown_rows<TYPE_, NR_>((DB_), args.row_bytes, row0, args.out_rows, m, dim, tiisg, acc, \
+                                 qwen4_q2k_trimmed(dim, args.row_bytes)); \
     for (uint r = 0; r < (NR_) && row0 + r < args.out_rows; r++) { \
         const float v = simd_sum(acc[r]); \
         if (tiisg == 0) po[row0 + r] = v; \
@@ -4326,7 +4350,7 @@ kernel void kernel_qwen4_moe_down_mxfp4_pf(
     device const float *m = mid + pair * args.in_dim;
     if (slot == args.n_slots) {
         for (uint r = row0; r < row0 + nr && r < args.out_rows; r++) {
-            const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m, st, dim, tiisg);
+            const float v = qwen4_row_dot(sh_down + (uint64_t)r * args.shared_row_bytes, m, st, dim, tiisg, false);
             if (tiisg == 0) part[pair * args.out_rows + r] = v;
         }
         return;
@@ -4851,7 +4875,8 @@ static inline void qwen4_gsq_deq8(device const char *row, uint b, uint q, uint t
 
 /* dequantize 8 consecutive values (quarter q of 32-wide block b of a row) */
 template <typename D>
-static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint type, threadgroup D *dst) {
+static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint type, threadgroup D *dst,
+                                  uint in_dim, bool trimmed) {
     if (type == 2) {
         /* q4_0: 18-byte blocks of 32 (f16 scale, 16 nibble bytes; low nibbles first) */
         device const uchar *blk = (device const uchar *)(row + (uint64_t)b * 18);
@@ -4887,9 +4912,11 @@ static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint 
     }
     if (type == 10) {
         const uint sb = b / 8, group = (b % 8) * 2 + q / 2, l = (q % 2) * 8;
+        const bool last = trimmed && (in_dim % 256u) != 0u && sb == in_dim / 256u;
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 84);
-        const float d = (float)(*(device const half *)(blk + 80));
-        const float dmin = (float)(*(device const half *)(blk + 82));
+        const uint d_off = last ? qwen4_q2k_d_off(in_dim) : 80u;
+        const float d = (float)(*(device const half *)(blk + d_off));
+        const float dmin = (float)(*(device const half *)(blk + d_off + 2u));
         const uint sc = blk[group];
         const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
         device const uchar *qs = blk + 16 + 32u * (group / 8u) + 16u * (group & 1u) + l;
@@ -4933,7 +4960,8 @@ static inline void qwen4_mm_stage8(device const char *row, uint b, uint q, uint 
  * even): the K-quant scales are unpacked once and the nibbles read as one
  * 16-byte word; other types take two 8-value steps */
 template <typename D>
-static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uint type, threadgroup D *dst) {
+static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uint type, threadgroup D *dst,
+                                   uint in_dim, bool trimmed) {
     if (type == 12) {
         const uint sb = b / 8, group = b % 8;
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 144);
@@ -4951,9 +4979,11 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
     }
     if (type == 10) {
         const uint sb = b / 8, group = (b % 8) * 2 + q0 / 2;
+        const bool last = trimmed && (in_dim % 256u) != 0u && sb == in_dim / 256u;
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 84);
-        const float d = (float)(*(device const half *)(blk + 80));
-        const float dmin = (float)(*(device const half *)(blk + 82));
+        const uint d_off = last ? qwen4_q2k_d_off(in_dim) : 80u;
+        const float d = (float)(*(device const half *)(blk + d_off));
+        const float dmin = (float)(*(device const half *)(blk + d_off + 2u));
         const uint sc = blk[group];
         const float ds = d * (float)(sc & 0xFu), dm = dmin * (float)(sc >> 4);
         device const uint *qs = (device const uint *)(blk + 16 + 32u * (group / 8u) + 16u * (group & 1u));
@@ -4996,8 +5026,8 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
         }
         return;
     }
-    qwen4_mm_stage8(row, b, q0, type, dst);
-    qwen4_mm_stage8(row, b, q0 + 1, type, dst + 8);
+    qwen4_mm_stage8(row, b, q0, type, dst, in_dim, trimmed);
+    qwen4_mm_stage8(row, b, q0 + 1, type, dst + 8, in_dim, trimmed);
 }
 
 /* Raw words of one 32-block (K step) of an expert row, for the tensor tiles'
@@ -5007,7 +5037,8 @@ static inline void qwen4_mm_stage16(device const char *row, uint b, uint q0, uin
  * 32-bit grid indices and the sign/scale word of the block; MXFP4 keeps the
  * 17 block bytes. */
 struct qwen4_raw16 { uint4 h; uint4 q; uchar m[17]; };
-static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint q0, uint type) {
+static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint q0, uint type,
+                                           uint in_dim, bool trimmed) {
     qwen4_raw16 r;
     if (type == 12) {
         const uint sb = b / 8, group = b % 8;
@@ -5016,8 +5047,9 @@ static inline qwen4_raw16 qwen4_load_raw16(device const char *row, uint b, uint 
         r.q = *(device const uint4 *)(blk + 16 + (group >> 1) * 32 + q0 * 8);
     } else if (type == 10) {
         const uint sb = b / 8, g = (b % 8) * 2 + q0 / 2;
+        const bool last = trimmed && (in_dim % 256u) != 0u && sb == in_dim / 256u;
         device const uchar *blk = (device const uchar *)(row + (uint64_t)sb * 84);
-        r.h.x = *(device const uint *)(blk + 80);   /* d | dmin << 16 */
+        r.h.x = *(device const uint *)(blk + (last ? qwen4_q2k_d_off(in_dim) : 80u));   /* d | dmin << 16 */
         r.h.y = blk[g];                            /* scale | min nibbles */
         device const uint *qs = (device const uint *)(blk + 16 + 32u * (g / 8u) + 16u * (g & 1u));
         r.q.x = qs[0]; r.q.y = qs[1]; r.q.z = qs[2]; r.q.w = qs[3];
@@ -5155,6 +5187,7 @@ kernel void kernel_qwen4_moe_mm_mid(
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * QWEN4_MM_ROWS;
     const uint nk = args.in_dim / QWEN4_MM_KS;
+    const bool down_trimmed = qwen4_q2k_trimmed(args.in_dim, args.row_bytes);
     for (uint tile = block.y; tile * TT < work_count; tile += args.tiles_per_launch) {
         const uint t0 = work_start + tile * TT;
         const uint n_tile = min((uint)TT, work_count - tile * TT);
@@ -5177,8 +5210,8 @@ kernel void kernel_qwen4_moe_mm_mid(
                     device const char *urow = ubase + (uint64_t)(row0 + r) * args.row_bytes;
                     const uint b = kb * 2 + (q >> 1), quarter0 = (q & 1) * 2;
                     const uint type = qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type;
-                    qwen4_mm_stage16(grow, b, quarter0, type, dg);
-                    qwen4_mm_stage16(urow, b, quarter0, type, du);
+                    qwen4_mm_stage16(grow, b, quarter0, type, dg, args.in_dim, down_trimmed);
+                    qwen4_mm_stage16(urow, b, quarter0, type, du, args.in_dim, down_trimmed);
                 } else {
                     for (uint i = 0; i < 16; i++) { dg[i] = 0.0h; du[i] = 0.0h; }
                 }
@@ -5277,6 +5310,7 @@ kernel void kernel_qwen4_moe_mm_down(
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * QWEN4_MM_ROWS;
     const uint nk = args.in_dim / QWEN4_MM_KS;
+    const bool down_trimmed = qwen4_q2k_trimmed(args.in_dim, args.row_bytes);
     for (uint tile = block.y; tile * TT < work_count; tile += args.tiles_per_launch) {
         const uint t0 = work_start + tile * TT;
         const uint n_tile = min((uint)TT, work_count - tile * TT);
@@ -5294,7 +5328,7 @@ kernel void kernel_qwen4_moe_mm_down(
                     device const char *drow = dbase + (uint64_t)(row0 + r) * args.row_bytes;
                     const uint b = kb * 2 + (q >> 1), quarter0 = (q & 1) * 2;
                     const uint type = qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type;
-                    qwen4_mm_stage16(drow, b, quarter0, type, dd);
+                    qwen4_mm_stage16(drow, b, quarter0, type, dd, args.in_dim, down_trimmed);
                 } else {
                     for (uint i = 0; i < 16; i++) dd[i] = 0.0h;
                 }
@@ -5458,6 +5492,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * NR0;
     const uint nk = args.in_dim / NK;
+    const bool down_trimmed = qwen4_q2k_trimmed(args.in_dim, args.row_bytes);
     const uint type = qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type;
     auto tA_g = tensor(Ag, dextents<int32_t, 2>(NK, NR0));
     auto tA_u = tensor(Au, dextents<int32_t, 2>(NK, NR0));
@@ -5495,7 +5530,7 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
         const bool raw = type == 12u || type == 10u || type == 16u || type == 22u || type == 39u;
         const bool skip_w = (args.skip_mma & 2u) != 0u;
         qwen4_raw16 rg{}, ru{};
-        if (raw && !skip_w) { rg = qwen4_load_raw16(grow, 0, aq * 2, type); ru = qwen4_load_raw16(urow, 0, aq * 2, type); }
+        if (raw && !skip_w) { rg = qwen4_load_raw16(grow, 0, aq * 2, type, args.in_dim, down_trimmed); ru = qwen4_load_raw16(urow, 0, aq * 2, type, args.in_dim, down_trimmed); }
         for (uint kb = 0; kb < nk; kb++) {
             {
                 threadgroup half *dg = Ag + ar * NK + aq * 16;
@@ -5505,13 +5540,13 @@ kernel void kernel_qwen4_moe_mm_mid_nax_t(
                         qwen4_dequant_raw16(rg, kb, aq * 2, type, dg);
                         qwen4_dequant_raw16(ru, kb, aq * 2, type, du);
                     } else {
-                        qwen4_mm_stage16(grow, kb, aq * 2, type, dg);
-                        qwen4_mm_stage16(urow, kb, aq * 2, type, du);
+                        qwen4_mm_stage16(grow, kb, aq * 2, type, dg, args.in_dim, down_trimmed);
+                        qwen4_mm_stage16(urow, kb, aq * 2, type, du, args.in_dim, down_trimmed);
                     }
                 } else {
                     for (uint i = 0; i < 16; i++) { dg[i] = 0.0h; du[i] = 0.0h; }
                 }
-                if (raw && !skip_w && kb + 1 < nk) { rg = qwen4_load_raw16(grow, kb + 1, aq * 2, type); ru = qwen4_load_raw16(urow, kb + 1, aq * 2, type); }
+                if (raw && !skip_w && kb + 1 < nk) { rg = qwen4_load_raw16(grow, kb + 1, aq * 2, type, args.in_dim, down_trimmed); ru = qwen4_load_raw16(urow, kb + 1, aq * 2, type, args.in_dim, down_trimmed); }
             }
             const bool skip_b = (args.skip_mma & 4u) != 0u;
 #pragma unroll
@@ -5623,6 +5658,7 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
     device const int32_t *list = lists + (uint64_t)e * args.list_cap;
     const uint row0 = rb * NR0;
     const uint nk = args.in_dim / NK;
+    const bool down_trimmed = qwen4_q2k_trimmed(args.in_dim, args.row_bytes);
     const uint type = qwen4_moe_weight_type ? qwen4_moe_weight_type : args.weight_type;
     auto tA = tensor(As, dextents<int32_t, 2>(NK, NR0));
     auto tB = tensor(Bs, dextents<int32_t, 2>(NK, NR1));   /* left operand: k contiguous, one token per column */
@@ -5658,14 +5694,14 @@ kernel void kernel_qwen4_moe_mm_down_nax_t(
         const bool raw = type == 12u || type == 10u || type == 16u || type == 22u || type == 39u;
         const bool skip_w = (args.skip_mma & 2u) != 0u;
         qwen4_raw16 rd{};
-        if (raw && !skip_w) rd = qwen4_load_raw16(drow, 0, aq * 2, type);
+        if (raw && !skip_w) rd = qwen4_load_raw16(drow, 0, aq * 2, type, args.in_dim, down_trimmed);
         for (uint kb = 0; kb < nk; kb++) {
             {
                 threadgroup half *dd = As + ar * NK + aq * 16;
                 if (a_row && !skip_w && raw) qwen4_dequant_raw16(rd, kb, aq * 2, type, dd);
-                else if (a_row && !skip_w) qwen4_mm_stage16(drow, kb, aq * 2, type, dd);
+                else if (a_row && !skip_w) qwen4_mm_stage16(drow, kb, aq * 2, type, dd, args.in_dim, down_trimmed);
                 else for (uint i = 0; i < 16; i++) dd[i] = 0.0h;
-                if (raw && !skip_w && kb + 1 < nk) rd = qwen4_load_raw16(drow, kb + 1, aq * 2, type);
+                if (raw && !skip_w && kb + 1 < nk) rd = qwen4_load_raw16(drow, kb + 1, aq * 2, type, args.in_dim, down_trimmed);
             }
             const bool skip_b = (args.skip_mma & 4u) != 0u;
 #pragma unroll
@@ -5798,7 +5834,7 @@ static inline void qwen4_dm_stage8(device const char *row, uint k0, uint k_end, 
         device const ushort *w = (device const ushort *)row + k0;
         for (uint i = 0; i < 8; i++) dst[i] = k0 + i < k_end ? as_type<float>((uint)w[i] << 16) : 0.0f;
     } else {
-        qwen4_mm_stage8<float>(row, k0 / 32, (k0 % 32) / 8, type, dst);
+        qwen4_mm_stage8<float>(row, k0 / 32, (k0 % 32) / 8, type, dst, k_end, false);
     }
 }
 
@@ -6157,7 +6193,8 @@ kernel void kernel_qwen4_gdn_front(
             for (uint rr = (uint)sgitg - 2u; rr < 2 * per_k; rr += nsg - 2u) {
                 const uint j = h + (rr / 2) * Hk;
                 device const char *wrow = (rr & 1u) ? w_beta : w_alpha;
-                const float v = qwen4_row_dot(wrow + (uint64_t)j * args.row_bytes, x, args.weight_type, args.in_dim, tiisg);
+                const float v = qwen4_row_dot(wrow + (uint64_t)j * args.row_bytes, x, args.weight_type, args.in_dim, tiisg,
+                                           qwen4_q2k_trimmed(args.in_dim, args.row_bytes));
                 if (tiisg == 0) {
                     if (rr & 1u) gb[(uint64_t)tok * Hv + j] = qwen4_sigmoid(v);
                     else ga[(uint64_t)tok * Hv + j] = exp(ssm_a[j] * qwen4_softplus(v + dt_bias[j]));

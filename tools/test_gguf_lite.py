@@ -73,6 +73,32 @@ class GgufLiteTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             g.nbytes(12, [672, 3])
 
+    def test_q2k_short_final_block(self):
+        self.assertEqual(g.q2k_row_bytes(768), 252)
+        self.assertEqual(g.q2k_row_bytes(640), 216)
+        self.assertEqual(g.q2k_row_bytes(704), 248)
+        self.assertEqual(g.q2k_row_bytes(576), 216)
+        self.assertEqual(g.q2k_row_bytes(672), 0)
+        self.assertEqual(g.nbytes(10, [640, 3, 2]), 216 * 6)
+        self.assertEqual(g.nbytes(10, [768, 3]), 252 * 3)
+        with self.assertRaises(ValueError):
+            g.nbytes(10, [672, 3])
+
+    def test_q2k_trim_rows(self):
+        # one padded row (768 physical) with nonzero padding
+        row = bytes((i * 7 + 3) & 0xFF for i in range(252))
+        out = g.q2k_trim_rows(row, 252, 216, 640)
+        self.assertEqual(len(out), 216)
+        self.assertEqual(out[:168], row[:168])          # two full blocks
+        self.assertEqual(out[168:176], row[168:176])    # real scales
+        self.assertEqual(out[176:180], row[248:252])    # d/dmin moved into the header tail
+        self.assertEqual(out[184:216], row[184:216])    # real qs bytes
+        self.assertEqual(out[180:184], b"\0\0\0\0")
+        # 704 values keeps 12 scales and all 64 qs bytes, d/dmin at 12
+        out2 = g.q2k_trim_rows(row, 252, 248, 704)
+        self.assertEqual(out2[180:184], row[248:252])
+        self.assertEqual(out2[184:248], row[184:248])
+
     def test_not_gguf(self):
         (self.p / "x").write_bytes(b"NOPE" + bytes(20))
         with self.assertRaises(ValueError):
