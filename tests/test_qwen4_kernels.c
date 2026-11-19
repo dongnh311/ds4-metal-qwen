@@ -3785,6 +3785,7 @@ int main(void) {
     test_down_trim_q2k(&arena, 640, 9);
     test_down_trim_q2k(&arena, 640, 128);
     test_down_trim_q2k(&arena, 704, 9);
+    test_down_trim_q2k(&arena, 320, 9);
 #endif
     test_hc_mix_prefetch(&arena);
     test_hc(&arena, 2560, 320, 3, 1u);
